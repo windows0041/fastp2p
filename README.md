@@ -1,6 +1,6 @@
 # openp2p-test
 
-OpenP2P 自建网关与客户端。Go 版本是已经完成本地和跨公网联调的基线；C 版本使用独立目录，目前仅保留迁移说明，尚未实现。
+OpenP2P 自建网关与客户端。Go 版本是已经完成本地和跨公网联调的基线；Linux C 客户端首版已实现，使用独立目录并与 Go 版本互通。
 
 ```text
 openp2p-test/
@@ -9,7 +9,7 @@ openp2p-test/
 │   ├── gateway/      # Go 网关，独立 module openp2p-gateway
 │   └── scripts/      # Go 构建与检查
 ├── c/
-│   ├── client/       # C 客户端及 libopenp2p 计划
+│   ├── client/       # Linux C 客户端及 libopenp2p.so.1
 │   └── gateway/      # C 网关计划
 └── UPSTREAM.md       # 来源、版本和本地适配记录
 ```
@@ -63,7 +63,9 @@ bash go/gateway/scripts/local-client.sh my-node-a
 
 ## C 版本
 
-目标是提供稳定的 C 库接口，先实现 Linux 客户端核心，并尽早验证 QUIC 与 Go 客户端互通。当前 C 目录只有 [迁移范围说明](c/README.md)，不包含可运行的 C 实现。
+Linux C 客户端提供 `openp2p-c` 命令行程序和 ABI 1 的 `libopenp2p.so.1`，实现了私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发，运行时不依赖 Go。
+
+已完成 C↔Go、C↔C 的本地隔离网络测试、ASan/UBSan 检查，以及本机 C 客户端经现有公网网关连接远端 Go 节点的数据回传。构建和使用见 [C 客户端说明](c/client/README.md)，覆盖范围见 [验证记录](c/client/VALIDATION-ZH.md)。C 网关、Windows、SD-WAN/TUN 和中继尚未实现。
 
 ## 配置与许可证
 

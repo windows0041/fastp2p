@@ -1,0 +1,31 @@
+{
+  "network": {
+    "Node": "c-client-node-a",
+    "Token": 0,
+    "ServerHost": "127.0.0.1",
+    "ServerPort": 27183
+  },
+  "CACertFile": "/absolute/path/to/ca.crt",
+  "apps": [
+    {
+      "AppName": "ssh-over-tcp-punch",
+      "Protocol": "tcp",
+      "BindIP": "127.0.0.1",
+      "SrcPort": 23322,
+      "PeerNode": "peer-node-b",
+      "DstHost": "127.0.0.1",
+      "DstPort": 22,
+      "UnderlayProtocol": "tcp"
+    },
+    {
+      "AppName": "udp-over-quic",
+      "Protocol": "udp",
+      "BindIP": "127.0.0.1",
+      "SrcPort": 24401,
+      "PeerNode": "peer-node-b",
+      "DstHost": "127.0.0.1",
+      "DstPort": 24401,
+      "UnderlayProtocol": "quic"
+    }
+  ]
+}

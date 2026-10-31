@@ -11,4 +11,6 @@
 
 2026-10-31 整理为 `go/client`、`go/gateway`、`c/client` 和 `c/gateway`。C 目录目前只包含迁移说明，不作为已实现功能发布。
 
+2026-11-01 实现 `c/client` Linux 首版，包含独立 C 命令行客户端、ABI 1 的共享库、协议/加密适配及互通测试。以现有 Go 实现为协议参考，QUIC 适配参考 ngtcp2 v1.11.0 的公开示例，保留其 MIT 声明。C 客户端许可证与第三方来源见 `c/client/LICENSE` 和 `c/client/THIRD_PARTY.md`；C 网关仍未实现。
+
 提供过的 `openp2p-gateway-edge:3.24.37` 镜像用于分析参考，未作为源码或二进制纳入本仓库；公开 `gateway-lite` 并非其完整对应源码。

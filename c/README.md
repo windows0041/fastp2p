@@ -1,10 +1,10 @@
-# C 版本迁移计划
+# C 版本
 
-本目录与 `go/` 分开维护。目前尚未开始 C 实现，没有可运行的客户端或网关。
+本目录与 `go/` 分开维护。Linux C 客户端首版已实现；网关仍使用已经验证的 Go 实现。
 
-- `client/`：以稳定的 `libopenp2p` C 接口为目标，先做 Linux 客户端核心。
-- `gateway/`：后续实现兼容现有客户端协议的 C 网关。
+- [client/](client/)：`openp2p-c` 和 `libopenp2p.so.1`，已实现 TLS/WSS、NAT 探测、TCP 打洞、UDP 打洞/QUIC 及 TCP/UDP 应用转发。
+- [gateway/](gateway/)：预留后续 C 网关实现，目前尚未实现。
 
-迁移顺序：先整理协议和生命周期接口，同时验证 C QUIC 与现有 Go QUIC 的互通；然后实现 Linux 客户端的 WSS 登录、自签 CA 校验、心跳、NAT 探测、TCP 打洞和应用转发；再实现 C 网关，逐步补齐 UDP/QUIC、Windows 和 SD-WAN。
+客户端通过不透明句柄、ABI 版本和 `struct_size` 提供创建、启动、轮询、停止、销毁、转发规则与事件接口。QUIC 使用 ngtcp2/GnuTLS，WSS 使用 libcurl，JSON 使用 json-c，加密使用 OpenSSL；客户端运行时不依赖 Go。
 
-保留 Go 版本作为兼容性基准，验证 C 客户端连接 Go 网关、Go 客户端连接 C 网关，以及 C 客户端连接 C 网关。QUIC 库选型需要先验证 UDP socket/端口控制、`openp2pv1` ALPN 和自定义流协议。
+已用现有 Go 网关验证 C→Go、Go→C、C→C 的 TCP/QUIC 隧道及 TCP/UDP 转发，完成内存检查、心跳和重连测试，也完成本机 C 客户端到现有公网网关/远端 Go 节点的打洞与数据回传。当前没有 C 网关，因此没有将 C 网关计入互通覆盖。使用方法及尚未支持的功能见 [客户端说明](client/README.md)。
