@@ -112,7 +112,7 @@ func newWebRouter() *gin.Engine {
 }
 
 func runWeb() error {
-	server := &http.Server{Addr: listenAddress(gOptions.APIPort), Handler: newWebRouter(),
+	server := &http.Server{Addr: apiListenAddress(), Handler: newWebRouter(),
 		ReadHeaderTimeout: 10 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	return server.ListenAndServeTLS(gOptions.CertFile, gOptions.KeyFile)
 }

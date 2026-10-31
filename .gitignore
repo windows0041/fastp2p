@@ -4,6 +4,9 @@
 !.env.example
 config.json
 local.env
+credentials.json
+gateway.env
+client.env
 
 # Certificates and signing material
 certs/
@@ -25,6 +28,12 @@ log/
 *.exe
 *.dll
 *.so
+*.a
+*.o
+*.out
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
 *.test
 *.zip
 *.tar.gz

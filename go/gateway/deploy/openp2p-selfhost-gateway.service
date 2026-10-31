@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenP2P self-hosted gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=openp2p-gw
+Group=openp2p-gw
+WorkingDirectory=/opt/openp2p-selfhost
+EnvironmentFile=/etc/openp2p-selfhost/gateway.env
+ExecStart=/opt/openp2p-selfhost/bin/openp2p-gateway -bind 0.0.0.0 -apibind 127.0.0.1 -cert /etc/openp2p-selfhost/tls/server.crt -key /etc/openp2p-selfhost/tls/server.key
+Restart=on-failure
+RestartSec=3
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/openp2p-selfhost/bin/log
+
+[Install]
+WantedBy=multi-user.target

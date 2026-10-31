@@ -12,6 +12,7 @@ import (
 
 type gatewayOptions struct {
 	CertFile, KeyFile, BindHost, PprofAddress, SDWANFile string
+	APIBindHost                                          string
 	APIPort, WSPort                                      int
 	SDWAN                                                SDWANInfo
 }
@@ -22,6 +23,7 @@ func parseParams() error {
 	flag.StringVar(&gOptions.CertFile, "cert", envDefault("OPENP2P_TLS_CERT", "api.crt"), "TLS certificate chain in PEM format")
 	flag.StringVar(&gOptions.KeyFile, "key", envDefault("OPENP2P_TLS_KEY", "api.key"), "TLS private key in PEM format")
 	flag.StringVar(&gOptions.BindHost, "bind", "", "IP address to listen on; empty listens on all interfaces")
+	flag.StringVar(&gOptions.APIBindHost, "apibind", "", "management API IP address; defaults to -bind")
 	flag.IntVar(&gOptions.APIPort, "apiport", 10008, "HTTPS management API port")
 	flag.IntVar(&gOptions.WSPort, "port", WsPort, "WSS client login port")
 	flag.StringVar(&gOptions.PprofAddress, "pprof", "", "optional debug HTTP address, e.g. 127.0.0.1:6060")
@@ -29,6 +31,9 @@ func parseParams() error {
 	flag.Parse()
 	if gOptions.BindHost != "" && net.ParseIP(gOptions.BindHost) == nil {
 		return fmt.Errorf("-bind must be an IP address")
+	}
+	if gOptions.APIBindHost != "" && net.ParseIP(gOptions.APIBindHost) == nil {
+		return fmt.Errorf("-apibind must be an IP address")
 	}
 	if _, err := tls.LoadX509KeyPair(gOptions.CertFile, gOptions.KeyFile); err != nil {
 		return fmt.Errorf("load gateway TLS certificate: %w", err)
@@ -71,4 +76,12 @@ func envDefault(name, fallback string) string {
 
 func listenAddress(port int) string {
 	return net.JoinHostPort(gOptions.BindHost, strconv.Itoa(port))
+}
+
+func apiListenAddress() string {
+	host := gOptions.APIBindHost
+	if host == "" {
+		host = gOptions.BindHost
+	}
+	return net.JoinHostPort(host, strconv.Itoa(gOptions.APIPort))
 }

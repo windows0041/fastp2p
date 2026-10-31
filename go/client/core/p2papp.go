@@ -76,7 +76,6 @@ type p2pApp struct {
 	preDirectSuccessIP string
 }
 
-
 func (app *p2pApp) Tunnel(idx int) *P2PTunnel {
 	if idx > app.tunnelNum-1 {
 		return nil
@@ -576,7 +575,11 @@ func (app *p2pApp) listenUDP() error {
 	gLog.d("appid:%d udp accept on port %d start", app.id, app.config.SrcPort)
 	defer gLog.d("appid:%d udp accept on port %d end", app.id, app.config.SrcPort)
 	var err error
-	app.listenerUDP, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: app.config.SrcPort})
+	listenIP := net.IPv4zero
+	if IsLocalhost(app.config.Whitelist) {
+		listenIP = net.IPv4(127, 0, 0, 1)
+	}
+	app.listenerUDP, err = net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: app.config.SrcPort})
 	if err != nil {
 		gLog.e("appid:%d listen udp error:%s", app.id, err)
 		return err
@@ -787,7 +790,7 @@ func (app *p2pApp) WriteNodeDataMP(IPPacket []byte) (err error) {
 }
 
 func (app *p2pApp) handleNodeDataMP(seq uint64, data []byte, t *P2PTunnel) {
-		GNetwork.nodeData <- data
+	GNetwork.nodeData <- data
 
 }
 
@@ -877,4 +880,3 @@ func (app *p2pApp) ReadMessage(mainType uint16, subType uint16, timeout time.Dur
 		}
 	}
 }
-

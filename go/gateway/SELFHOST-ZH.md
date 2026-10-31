@@ -5,6 +5,7 @@
 ## 已完成的适配
 
 - 使用 `-cert`、`-key` 或 `OPENP2P_TLS_CERT`、`OPENP2P_TLS_KEY` 指定证书链和私钥；HTTPS API 与 WSS 使用同一组证书。
+- 可用 `-apibind 127.0.0.1` 单独限制管理 API 的监听地址，节点服务仍可通过 `-bind 0.0.0.0` 对外提供连接。
 - 客户端增加 `-cacert`，导入私有 CA，同时校验证书链和 SAN 主机名。默认保留 TLS 验证。
 - 补齐纳秒时间戳心跳、基础信息确认、LAN 地址查询、新版应用状态推送及 SD-WAN 配置分发。
 - NAT 服务兼容新客户端的 UDP 27180/27181，并保留旧端口 27182/27183；公网端口探测会向客户端监听端口回包。
@@ -17,11 +18,11 @@
 
 - Debian 13 / WSL2，用户 `maoyu`。
 - Go 1.20.14：`/opt/go1.20.14`；Delve 1.21.2：`~/go/bin/dlv`。
-- 源码：`/mnt/d/Codex/openp2p-selfhost/gateway`、`/mnt/d/Codex/openp2p-selfhost/client`。
+- 源码：`/mnt/d/Codex/openp2p-selfhost/go/gateway`、`/mnt/d/Codex/openp2p-selfhost/go/client`。
 - 二进制、证书和日志：`~/openp2p-dev/`。
 
 ```bash
-cd /mnt/d/Codex/openp2p-selfhost/gateway
+cd /mnt/d/Codex/openp2p-selfhost/go/gateway
 bash scripts/local-gateway.sh start
 bash scripts/local-gateway.sh status
 curl --cacert ~/openp2p-dev/certs/local/ca.crt https://127.0.0.1:10008/healthz
@@ -37,10 +38,10 @@ bash scripts/local-gateway.sh stop
 
 ```bash
 # 终端 1：目标节点
-bash /mnt/d/Codex/openp2p-selfhost/gateway/scripts/local-client.sh my-node-b
+bash /mnt/d/Codex/openp2p-selfhost/go/gateway/scripts/local-client.sh my-node-b
 
 # 终端 2：把目标节点的 SSH 服务映射到本地 23322
-bash /mnt/d/Codex/openp2p-selfhost/gateway/scripts/local-client.sh my-node-a \
+bash /mnt/d/Codex/openp2p-selfhost/go/gateway/scripts/local-client.sh my-node-a \
   -appname remote-ssh -peernode my-node-b -dstip 127.0.0.1 -dstport 22 -srcport 23322
 ```
 
@@ -53,7 +54,7 @@ bash /mnt/d/Codex/openp2p-selfhost/gateway/scripts/local-client.sh my-node-a \
 为实际服务器生成一组新证书：
 
 ```bash
-cd /mnt/d/Codex/openp2p-selfhost/gateway
+cd /mnt/d/Codex/openp2p-selfhost/go/gateway
 bash scripts/generate-cert.sh certs/my-server gateway.example.com 203.0.113.10
 export OPENP2P_USER='your-user'
 export OPENP2P_PASSWORD='your-long-random-password'
@@ -103,18 +104,18 @@ curl --cacert /path/to/ca.crt https://gateway.example.com:10008/api/v1/device/my
 
 网关负责登录、探测和连接协调，数据优先在节点间直传。需要中继时，在公网服务器额外运行一个同账号的 OpenP2P 客户端作为中继节点；网关程序本身不承担业务数据中继。
 
-可用 `-sdwan-config /absolute/path/to/sdwan.json` 分发虚拟组网配置，格式见 `sdwan.example.json`。未配置时返回禁用的组网信息。启用虚拟组网的客户端需要 TUN 和相应网络管理权限；本轮端到端验证针对 TCP/UDP 端口转发，尚未验证跨公网打洞或虚拟网段互通。
+可用 `-sdwan-config /absolute/path/to/sdwan.json` 分发虚拟组网配置，格式见 `sdwan.example.json`。未配置时返回禁用的组网信息。启用虚拟组网的客户端需要 TUN 和相应网络管理权限。跨公网 UDP 打洞/QUIC、TCP 打洞、TCP/UDP 转发及 SSH 登录已实测，见 [远程调试部署记录](deploy/REMOTE-DEBUG-ZH.md)；虚拟网段互通尚未验证。
 
 ## 构建与验证
 
 ```bash
 # 网关
-cd /mnt/d/Codex/openp2p-selfhost/gateway
+cd /mnt/d/Codex/openp2p-selfhost/go/gateway
 go build -mod=readonly -o ~/openp2p-dev/bin/openp2p-gateway .
 go test -race -count=1 -skip '^TestNetInfo$' .
 
 # 客户端
-cd /mnt/d/Codex/openp2p-selfhost/client
+cd /mnt/d/Codex/openp2p-selfhost/go/client
 go build -mod=readonly -o ~/openp2p-dev/bin/openp2p ./cmd
 go test -race -count=1 -skip '^TestNetInfo$' ./core ./cmd ./pkg/upnp
 ```
@@ -126,7 +127,7 @@ go test -race -count=1 -skip '^TestNetInfo$' ./core ./cmd ./pkg/upnp
 ## Docker
 
 ```bash
-cd /mnt/d/Codex/openp2p-selfhost/gateway
+cd /mnt/d/Codex/openp2p-selfhost/go/gateway
 cp .env.example .env
 # 编辑 .env 设置账号密码；默认仅监听 127.0.0.1。
 bash scripts/generate-cert.sh certs/local
