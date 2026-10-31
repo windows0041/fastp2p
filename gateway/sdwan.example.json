@@ -1,0 +1,13 @@
+{
+  "id": 1,
+  "name": "private-network",
+  "gateway": "10.80.0.254/24",
+  "mode": "fullmesh",
+  "enable": 1,
+  "tunnelNum": 2,
+  "mtu": 1420,
+  "Nodes": [
+    {"name": "my-node-a", "ip": "10.80.0.1", "enable": 1},
+    {"name": "my-node-b", "ip": "10.80.0.2", "enable": 1}
+  ]
+}

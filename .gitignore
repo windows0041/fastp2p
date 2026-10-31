@@ -1,0 +1,36 @@
+# Local credentials and runtime configuration
+.env
+.env.*
+!.env.example
+config.json
+local.env
+
+# Certificates and signing material
+certs/
+*.key
+*.pem
+*.crt
+*.csr
+*.srl
+*.jks
+*.p12
+*.pfx
+
+# Build and runtime output
+dist/
+build/
+vendor/
+log/
+*.log*
+*.exe
+*.dll
+*.so
+*.test
+*.zip
+*.tar.gz
+__debug_bin*
+__pycache__/
+.vscode/
+.idea/
+go.work
+go.work.sum
