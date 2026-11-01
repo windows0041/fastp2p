@@ -41,6 +41,6 @@
 
 CI 输出 `openp2p-c-gateway-debian12-x86_64.tar.gz`、`openp2p-c-gateway-debian13-x86_64.tar.gz`，包含可执行程序、说明、许可证和 systemd 模板。Debian 12 Docker 镜像完成构建、版本检查和使用自有 CA 的 HTTPS 健康检查；未把 Docker 中的端到端 NAT 路径计入上述互通测试。
 
-这些测试验证控制协议和隔离 Linux 网络中的客户端互通。C 网关尚未替换 `gz.itq.cc.cd` 上的 Go 服务，未新增公网 NAT 类型覆盖；未单独对 Android、Windows、macOS 客户端连接此 C 网关进行实机回归。SD-WAN 配置与中继协调已测，不代表完整 TUN 或中继业务数据路径已测。
+上述 CI 测试验证控制协议和隔离 Linux 网络中的客户端互通。随后已将 `gz.itq.cc.cd` 切换到同版 C 网关，新增 WSL Go、WSL C、Windows 原生 C 与 xrwmaster Go 节点的公网 TCP 打洞 / QUIC、TCP/UDP 转发、TLS/NAT 及网关重启恢复验证，详见 [公网切换记录](deploy/REMOTE-DEBUG-ZH.md)。未新增 Android、macOS 连接 C 网关的实机回归，未扩展到其他公网 NAT 类型。SD-WAN 配置与中继协调已测，不代表完整 TUN 或中继业务数据路径已测。
 
 运行方法见 [README](README.md)。测试使用随机临时凭据和证书；CI 仅上传不含凭据的布尔结果，不上传原始客户端日志。

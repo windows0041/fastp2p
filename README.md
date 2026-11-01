@@ -69,7 +69,7 @@ C 客户端 0.2.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp
 
 Windows、Android 和 macOS 两种架构的 SDK / 调试包见 [0.2.0 验证与构建产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 已在连接的 Android 12 x86_64 设备上经自建公网网关与远端 Go 节点联调；arm64 已构建，尚未在 ARM 设备上运行。
 
-C 网关 0.1.0 实现自定义 TLS 证书、HTTPS/WSS、JWT 管理鉴权、节点发现与心跳、TCP/UDP NAT 探测、打洞控制消息、应用管理、SD-WAN 成员配置和中继节点协调。通过 C→Go、Go→C、C→C 的 TCP 打洞 / QUIC 及 TCP/UDP 应用联调，业务数据仍由客户端直传。构建、自签证书与部署见 [C 网关说明](c/gateway/README.md)，测试范围和发行包见 [网关验证记录](c/gateway/VALIDATION-ZH.md)。现网 Go 服务保留，C 网关可独立部署。
+C 网关 0.1.0 实现自定义 TLS 证书、HTTPS/WSS、JWT 管理鉴权、节点发现与心跳、TCP/UDP NAT 探测、打洞控制消息、应用管理、SD-WAN 成员配置和中继节点协调。通过 C→Go、Go→C、C→C 的 TCP 打洞 / QUIC 及 TCP/UDP 应用联调，业务数据仍由客户端直传。构建、自签证书与部署见 [C 网关说明](c/gateway/README.md)，测试范围和发行包见 [网关验证记录](c/gateway/VALIDATION-ZH.md)。`gz.itq.cc.cd` 已切换到 C 网关，完成本机 Go / WSL C / Windows C 与 xrwmaster 的公网联调，原 Go 程序保留供回退，详见 [切换记录](c/gateway/deploy/REMOTE-DEBUG-ZH.md)。
 
 ## 配置与许可证
 
