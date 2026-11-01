@@ -170,6 +170,22 @@ json_object *gw_json(const void *data, size_t len) {
     if (!utf8_valid(data, len))
         return NULL;
     const unsigned char *input = data;
+    /* json-c 0.16 accepts literal controls in strings even with STRICT. */
+    int quoted = 0, escaped = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned c = input[i];
+        if (quoted) {
+            if (c < 0x20)
+                return NULL;
+            if (escaped)
+                escaped = 0;
+            else if (c == '\\')
+                escaped = 1;
+            else if (c == '"')
+                quoted = 0;
+        } else if (c == '"')
+            quoted = 1;
+    }
     size_t input_len = len;
     char *normalized = NULL;
     for (size_t i = 0; i < len; ++i)

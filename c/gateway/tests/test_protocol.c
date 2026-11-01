@@ -38,6 +38,15 @@ int main(void) {
                             "{\"x\":\"\xe4\xb8\xad\"}{}", "{\"x\":\"a\n\xe4\xb8\xad\"}"};
     for (size_t i = 0; i < sizeof(syntax) / sizeof(syntax[0]); ++i)
         assert(!gw_json(syntax[i], strlen(syntax[i])));
+    for (unsigned control = 0; control < 0x20; ++control) {
+        char raw[] = "{\"x\":\"a?b\"}";
+        raw[7] = (char)control;
+        assert(!gw_json(raw, sizeof(raw) - 1));
+    }
+    const char escaped[] = "{\"x\":\"a\\nb\\tc\\r\"}";
+    utf = gw_json(escaped, sizeof(escaped) - 1);
+    assert(utf);
+    json_object_put(utf);
     unsigned char data[8];
     gw_put64(data, UINT64_MAX);
     assert(gw_u64(data) == UINT64_MAX);
