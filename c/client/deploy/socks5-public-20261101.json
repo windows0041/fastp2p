@@ -1,0 +1,36 @@
+{
+  "version": "0.3.0",
+  "ABI": 1,
+  "gateway": "gz.itq.cc.cd",
+  "CI": "https://github.com/windows0041/openp2p-test/actions/runs/41284347086",
+  "windows_to_xrwmaster": {
+    "quic_TCP_262144B": true,
+    "quic_UDP_1000B": true,
+    "quic_SSH_host_key_and_identity": true,
+    "tcp_punch_TCP_262144B": true,
+    "tcp_punch_UDP_1000B": true,
+    "tcp_punch_SSH_host_key_and_identity": true,
+    "quic_35s_heartbeat": true,
+    "tcp_punch_35s_heartbeat": true,
+    "TCP_transport_confirmed": true,
+    "QUIC_transport_confirmed": true,
+    "success": true
+  },
+  "android_12_x86_64": {
+    "SOCKS5-quic": "passed",
+    "SOCKS5-tcp": "passed",
+    "android-quic-tcp": "passed",
+    "android-quic-udp": "passed",
+    "android-tcp-tcp": "passed",
+    "android-tcp-udp": "passed",
+    "backgroundHeartbeat": "passed",
+    "encryptedConfiguration": "passed",
+    "platformTrustStore": "passed",
+    "serviceRestart": "passed",
+    "shutdown": "passed",
+    "version": "0.3.0"
+  },
+  "android_peer": "c-wsl-socks-exit",
+  "first_same_public_IP_attempt_passed": false,
+  "secrets_included": false
+}

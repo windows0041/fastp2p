@@ -1,5 +1,25 @@
 # C 客户端验证记录
 
+## 0.3.0 SOCKS5（2026-11-01）
+
+公开 ABI 保持 1，增加 `op2p_client_add_socks5`，共导出 12 个 C API。入口和出口均使用 C 0.3.0；普通固定转发继续兼容 Go 3.25.11。
+
+[CI 运行与 SDK 发行包](https://github.com/windows0041/openp2p-test/actions/runs/41284347086)，提交 `7cfe0dfbcd12550d7479f5bb9ba2b9e6fb74c8bb` 的 Linux、macOS arm64、macOS x86_64、交叉构建及 Windows 原生共五个作业全部通过。后续文档及 Android 设备测试代码调整未修改运行时核心。
+
+- Debian 12 原生、WSL Debian 13 ASan/UBSan、Windows 原生、两种 macOS 原生均完成 SOCKS5 端到端测试。覆盖 TCP/QUIC、IPv4/域名、无认证/用户名密码认证、TCP CONNECT、UDP ASSOCIATE、多目标 UDP 和 0/1000/4096 字节数据报。
+- 12 个并发 TCP 请求混合成功目标及拒绝连接目标，验证按连接 ID 确认和错误隔离；另覆盖逐字节握手、合并握手与提前发送的 16000 字节数据、错误密码、无可用认证方式、BIND/IPv6/错误保留字拒绝、UDP 来源端口限制、分片丢弃和关联关闭。
+- 80 次握手断开循环，Linux 检查文件描述符无增长；各平台保留原有 C ABI 生命周期和句柄检查。Linux/本机 Windows 另验证旧 Go 出口被拒绝，不返回虚假的 CONNECT 成功。
+- 关闭并重新启动测试网关，新建 SOCKS5 会话恢复；再等待 35 秒，两个隧道中的 TCP/UDP 代理仍正常。Linux 网关和客户端 sanitizer 检查未发现内存错误。
+- 原有 Go→C、C→Go、C→C 共 12 组固定转发、最后 TCP 响应、心跳和网关重启回归全部通过；macOS/Windows 保留原有 Go/C 转发、独立双向 QUIC 与安装后 SDK 消费验证。Windows MSVC 消费者也链接并验证新增 API。
+
+公网测试中，Windows 原生入口通过 `gz.itq.cc.cd` C 网关连接 `c-xrw-socks-exit`，经 TCP 打洞 / QUIC 分别完成 262144 字节 TCP 和 1000 字节 UDP 回传、SSH 主机密钥/账号校验及 35 秒后再次转发。网关和原有 Go 客户端未替换。
+
+Android 双 ABI 构建、lint、12 个公开符号边界和 16 KB ELF/APK 对齐检查通过。已连接的 Android 12 / x86_64 设备通过 Activity → Service → JNI → C 路径连接 WSL C 出口，两个隧道均完成 SOCKS5 TCP/UDP、用户名密码认证、私有 CA、加密配置保存、35 秒后台心跳、停止及重新启动验证；同轮 Go 固定转发四组也通过。arm64 已构建，未新增 ARM 实机运行覆盖。
+
+Android 首轮到 xrwmaster 的固定 TCP 打洞未通过；切换到不同公网地址的 WSL 对端后通过。后续 SOCKS5 测试又修正了 echo 端口配置和 Windows ADB 输出的 UTF-8 解码，最终完整设备测试通过。此处不将首轮同公网地址回流路径记为已验证，也不据此宣称覆盖所有 NAT 拓扑。
+
+实际入口、进程管理与不含凭据的结果见 [SOCKS5 公网部署记录](deploy/SOCKS5-DEBUG-ZH.md)，配置与限制见 [SOCKS5-ZH.md](SOCKS5-ZH.md)。
+
 ## 0.2.0 跨平台验证（2026-11-01）
 
 公开接口保持 ABI 1。Windows / Android / macOS 使用固定依赖：OpenSSL 3.5.7、ngtcp2 1.22.1、curl 8.23.0、json-c 0.18；Linux 系统 GnuTLS 后端继续回归。运行时无需 Go，Go 1.20.14 仅用于构建协议参考对端。

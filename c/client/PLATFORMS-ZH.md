@@ -2,6 +2,8 @@
 
 C 核心版本 0.3.0，公开 C ABI 1，固定转发协议兼容仓库中的 Go 3.25.11 客户端及自建网关。各平台复用同一份 C 核心，无 Go 运行时。新增 [SOCKS5](SOCKS5-ZH.md) 使用 C 0.3.0+ 出口；平台验证结果见 [VALIDATION-ZH.md](VALIDATION-ZH.md)。
 
+0.3.0 的 Linux Debian 12 x86_64、Windows x86_64、macOS arm64/x86_64 SDK 及 Android 调试包见 [完整 CI 与发行产物](https://github.com/windows0041/openp2p-test/actions/runs/41284347086)。Linux 原生发行包为 `openp2p-c-linux-debian12-x86_64.tar.gz`，包含 CLI、共享库、CMake 导入和 SOCKS5 示例；TLS/QUIC/JSON 依赖已静态链接进共享库，使用匹配的 Linux x86_64 / glibc 运行环境，不需要依赖 Debian 12 较旧的系统 curl/ngtcp2。
+
 | 平台 | 架构与最低版本 | 入口 |
 | --- | --- | --- |
 | Linux | x86_64；已验证 Debian 13 / WSL | CLI、`libopenp2p.so.1` |

@@ -150,8 +150,6 @@ public final class LiveInstrumentation extends Instrumentation {
                 require(passed, "Forwarding failed: " + app.getString("AppName"));
                 result.putString(app.getString("AppName"), "passed");
             }
-            require(OpenP2PService.eventText().contains("TCP tunnel connected"), "TCP transport was not exercised");
-            require(OpenP2PService.eventText().contains("QUIC tunnel connected"), "QUIC transport was not exercised");
             JSONArray proxies = config.optJSONArray("socks5");
             for (int i = 0; proxies != null && i < proxies.length(); ++i) {
                 JSONObject proxy = proxies.getJSONObject(i); boolean passed = false;
@@ -164,6 +162,17 @@ public final class LiveInstrumentation extends Instrumentation {
                 require(passed, "SOCKS5 forwarding failed");
                 result.putString("SOCKS5-" + proxy.optString("UnderlayProtocol", "quic"), "passed");
             }
+            boolean needsTCP = false, needsQUIC = false;
+            for (int i = 0; i < apps.length(); ++i) {
+                if (apps.getJSONObject(i).optString("UnderlayProtocol", "quic").equals("tcp")) needsTCP = true;
+                else needsQUIC = true;
+            }
+            for (int i = 0; proxies != null && i < proxies.length(); ++i) {
+                if (proxies.getJSONObject(i).optString("UnderlayProtocol", "quic").equals("tcp")) needsTCP = true;
+                else needsQUIC = true;
+            }
+            require(!needsTCP || OpenP2PService.eventText().contains("TCP tunnel connected"), "TCP transport was not exercised");
+            require(!needsQUIC || OpenP2PService.eventText().contains("QUIC tunnel connected"), "QUIC transport was not exercised");
             // Cover foreground/background activity lifecycle while service owns the C instance.
             runOnMainSync(() -> getUiAutomation().performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME));
             Thread.sleep(35000);
@@ -190,6 +199,7 @@ public final class LiveInstrumentation extends Instrumentation {
         } catch (Throwable error) {
             context.startService(new Intent(context, OpenP2PService.class).setAction(OpenP2PService.STOP));
             result.putString("failure", error instanceof AssertionError ? error.getMessage() : error.getClass().getSimpleName());
+            result.putString("events", OpenP2PService.eventText());
             finish(ActivityResult.FAIL, result);
         }
     }
