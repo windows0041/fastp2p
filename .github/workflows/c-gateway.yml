@@ -13,10 +13,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        debian: ['12', '13']
+        include:
+          - debian: '12'
+            image: python:3.13-slim-bookworm
+          - debian: '13'
+            image: python:3.13-slim-trixie
     runs-on: ubuntu-24.04
     container:
-      image: debian:${{ matrix.debian }}
+      image: ${{ matrix.image }}
       options: --privileged
     timeout-minutes: 35
     steps:
