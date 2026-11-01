@@ -3,6 +3,15 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
+#if defined(__ANDROID__)
+#define OP2P_PLATFORM_OS "android-c"
+#elif defined(_WIN32)
+#define OP2P_PLATFORM_OS "windows-c"
+#elif defined(__APPLE__)
+#define OP2P_PLATFORM_OS "darwin-c"
+#else
+#define OP2P_PLATFORM_OS "linux-c"
+#endif
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

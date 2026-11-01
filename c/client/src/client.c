@@ -1449,7 +1449,7 @@ static void service_gateway(op2p_client *c) {
             strlen(ip) < sizeof(c->local_ip))
             strcpy(c->local_ip, ip);
         json_object *j = json_object_new_object();
-        op_js(j, "os", "linux-c");
+        op_js(j, "os", OP2P_PLATFORM_OS);
         op_js(j, "version", COMPAT_VERSION);
         op_js(j, "lanIP", c->local_ip);
         op_ju(j, "publicIPPort", c->public_port);
