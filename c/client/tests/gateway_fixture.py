@@ -74,14 +74,14 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         path=urlsplit(self.path);query=parse_qs(path.query)
         if self.headers.get('Upgrade','').lower()=='websocket':
             name=query.get('node',[''])[0]
-            if path.path!='/api/v1/login' or query.get('protocol')!=['fastp2p1'] or query.get('token')!=[str(key)] or not 8<=len(name)<=31:
+            if path.path!='/api/v1/login' or query.get('protocol')!=['fastp2p2'] or query.get('token')!=[str(key)] or not 8<=len(name)<=31:
                 self.reply({},401);return
             self.send_response(101);self.send_header('Upgrade','websocket');self.send_header('Connection','Upgrade')
             self.send_header('Sec-WebSocket-Accept',base64.b64encode(hashlib.sha1((self.headers['Sec-WebSocket-Key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode());self.end_headers()
             self.node=name;self.send_lock=threading.Lock();self.metadata={};self.close_connection=True
             with lock:nodes[name]=self
             try:
-                self.send(packet(0,0,{'error':0,'token':key,'node':name,'protocol':'fastp2p1','user':user,'ts':int(time.time())}))
+                self.send(packet(0,0,{'error':0,'token':key,'node':name,'protocol':'fastp2p2','user':user,'ts':int(time.time())}))
                 while True:
                     first,second=self.exact(2);length=second&127
                     if length==126:length=struct.unpack('!H',self.exact(2))[0]
@@ -135,8 +135,7 @@ class HTTP(http.server.BaseHTTPRequestHandler):
             meta=peer.metadata
             self.send(packet(7,1,{'online':1,'peerNode':peer.node,'version':'1.0.0','IPv4':peer.client_address[0],
                 'lanIP':meta.get('lanIP','127.0.0.1'),'natType':1,'hasIPv4':meta.get('hasIPv4',0),'hasUPNPorNATPMP':0}))
-        elif main==8:self.send(packet(8,1,{'tunnelNum':2,'mtu':1420}))
-        elif main==5:self.send(packet(5,1,{'mode':'private','relayName':'','relayToken':0}))
+        elif main==5:self.send(packet(5,1,{'relay':'','error':1}))
 servers=[]
 try:
     context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(args.cert,args.key)

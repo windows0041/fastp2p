@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* One ordered bidirectional stream, ALPN fastp2pv1. The caller owns the UDP
+/* One ordered bidirectional stream, ALPN fastp2pv2. The caller owns the UDP
  * descriptor and must keep it bound for the lifetime of this object. Peer
  * certificates follow the existing Go peer transport's self-signed policy;
  * gateway TLS trust is a separate, verified connection. */

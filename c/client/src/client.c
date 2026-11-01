@@ -3,6 +3,7 @@
 #include "wire.h"
 #include "quic.h"
 #include "socks.h"
+#include "secure.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -17,9 +18,38 @@
 #define NA 64
 #define NO 256
 #define NP 16
+#define NPK 32
+#define NRL 32
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define WIRE_VERSION FASTP2P_VERSION
+#define WIRE_PROTOCOL "fastp2p2"
+/* Tunnel frames.  Frames carrying application data or application control are
+ * sealed with the session keys; handshake, keepalive and relay joining are
+ * plaintext because they precede, or are handled outside, the session. */
+enum {
+    TUN_HELLO = 2,
+    TUN_HELLO_ACK = 3,
+    TUN_KEEPALIVE = 4,
+    TUN_KEEPALIVE_ACK = 5,
+    TUN_OPEN = 6,
+    TUN_OPEN_ACK = 7,
+    TUN_CLOSE = 8,
+    TUN_DATA = 9,
+    TUN_RELAY_JOIN = 10,
+    TUN_RELAY_READY = 11
+};
+/* Control-plane push sub-codes between two clients. */
+enum {
+    PUSH_CONNECT = 1,
+    PUSH_CONNECT_REPLY = 2,
+    PUSH_APPS = 7,
+    PUSH_READY = 8,
+    PUSH_RULE = 9,
+    PUSH_SESSION = 13,
+    PUSH_SESSION_ACK = 14,
+    PUSH_ONLINE = 15
+};
 enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
 enum tunnel_state {
     T_FREE,
@@ -45,14 +75,31 @@ typedef struct {
     size_t probe_len;
     op_buffer rx, tx, alternate_rx;
     opq *quic;
+    /* One encrypted session per tunnel.  The initiator creates the session and
+     * its secret; the responder installs both from the gateway push. */
+    uint64_t session;
+    uint8_t secret[FP_SESSION_SECRET];
+    int has_secret, keyed, key_acked, relay_wait, session_owner;
+    fp_crypto crypto;
+    /* Relay role: forward this tunnel's application frames to a paired tunnel. */
+    int relay_link;
+    int relay_ready;
+    char relay_peer[32];
 } tunnel;
 typedef struct {
     int used, local, udp, transport, tunnel_index, synced, socks;
     op_socket fd;
-    uint64_t id, key, retry, ready_at;
+    uint64_t id, retry, ready_at;
     char name[64], peer[32], destination[256], bind_ip[INET_ADDRSTRLEN];
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
+    int attempts, relay_wanted, relay_requested;
+    uint64_t peer_nat;
+    /* The session belongs to the rule so the secret survives a failed punch and
+     * can be reused when the same link falls back to a relay. */
+    uint64_t session;
+    uint8_t secret[FP_SESSION_SECRET];
+    int has_session;
 } app;
 typedef struct {
     int used, udp, connected, local_udp, app_index, tunnel_index, waiting, peer_closed;
@@ -72,6 +119,21 @@ typedef struct {
     struct sockaddr_in peer;
     op_buffer rx;
 } pending;
+/* A session secret received from the initiating peer before its tunnel is
+ * usable.  Pending entries expire so a failed punch cannot leak state. */
+typedef struct {
+    int used;
+    uint64_t session, peer_id, deadline;
+    uint8_t secret[FP_SESSION_SECRET];
+    char relay[32];
+} pending_key;
+/* Relay bookkeeping: two tunnels joined with the same session are spliced
+ * together and forward each other's application frames verbatim. */
+typedef struct {
+    int used;
+    uint64_t session, peer_a, peer_b, deadline;
+    int ta, tb;
+} relay_link;
 struct fastp2p_client {
     char host[256], ca[4096], node[32], ip[INET_ADDRSTRLEN], local_ip[INET_ADDRSTRLEN];
     char error[192], path[2048], hostname[256], device_id[33];
@@ -82,6 +144,7 @@ struct fastp2p_client {
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
     int nat_phase, nat_type;
+    int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
     op_socket listener, nat_fd;
     uint16_t nat_port;
     uint64_t nat_deadline;
@@ -99,13 +162,18 @@ struct fastp2p_client {
     app apps[NA];
     overlay overlays[NO];
     pending pending[NP];
+    pending_key keys[NPK];
+    relay_link relays[NRL];
 };
 static void connect_gateway(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
+static void release_relay(fastp2p_client *, int);
+static void bind_pending_key(fastp2p_client *, int);
+static void relay_join(fastp2p_client *, int);
+static void session_ready(fastp2p_client *, int);
 static void close_overlay(fastp2p_client *, int, int);
 static void tunnel_message(fastp2p_client *, int, uint16_t, const uint8_t *, size_t);
-static void synchronize_app(fastp2p_client *, int);
 static void socks_failure(fastp2p_client *, int, unsigned);
 static void overlay_ack(fastp2p_client *, int, unsigned);
 static void socks_udp_reply(fastp2p_client *, int, const uint8_t *, size_t);
@@ -303,9 +371,10 @@ static int push(fastp2p_client *c, const char *peer, uint16_t sub, json_object *
 static int tframe(tunnel *t, uint16_t sub, const void *data, size_t len) {
     return op_frame_add(&t->tx, 4, sub, data, len);
 }
-static int tjson(tunnel *t, uint16_t sub, json_object *obj) {
+static int tseal(fastp2p_client *c, tunnel *t, uint16_t sub, const void *data, size_t len);
+static int tjson_sealed(fastp2p_client *c, tunnel *t, uint16_t sub, json_object *obj) {
     const char *s = obj ? json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN) : "null";
-    return tframe(t, sub, s, strlen(s));
+    return tseal(c, t, sub, s, strlen(s));
 }
 static int tunnel_by_id(fastp2p_client *c, uint64_t id) {
     for (int i = 0; i < NT; ++i)
@@ -331,7 +400,7 @@ static void close_overlay(fastp2p_client *c, int index, int notify) {
     if (notify && o->tunnel_index >= 0 && c->tunnels[o->tunnel_index].state == T_ACTIVE) {
         json_object *j = json_object_new_object();
         op_ju(j, "id", o->id);
-        tjson(&c->tunnels[o->tunnel_index], 8, j);
+        tjson_sealed(c, &c->tunnels[o->tunnel_index], TUN_CLOSE, j);
         json_object_put(j);
     }
     if (o->socks_state == S_UDP) {
@@ -351,6 +420,20 @@ static void close_overlay(fastp2p_client *c, int index, int notify) {
     op_buffer_clear(&o->socks_rx);
     memset(o, 0, sizeof(*o));
     o->fd = o->socks_udp = -1;
+}
+static void release_relay(fastp2p_client *c, int index) {
+    for (int i = 0; i < NRL; ++i) {
+        relay_link *r = &c->relays[i];
+        if (!r->used || (r->ta != index && r->tb != index))
+            continue;
+        int other = r->ta == index ? r->tb : r->ta;
+        memset(r, 0, sizeof(*r));
+        if (other >= 0 && other < NT && c->tunnels[other].state) {
+            c->tunnels[other].relay_link = -1;
+            c->tunnels[other].relay_ready = 0;
+            close_tunnel(c, other, "relay peer disconnected");
+        }
+    }
 }
 static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
@@ -374,6 +457,8 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             if (!c->apps[i].local)
                 memset(&c->apps[i], 0, sizeof(c->apps[i]));
         }
+    if (t->relay_link >= 0)
+        release_relay(c, index);
     if (t->quic)
         opq_free(t->quic);
     if (t->fd >= 0)
@@ -385,10 +470,64 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     op_buffer_clear(&t->rx);
     op_buffer_clear(&t->tx);
     op_buffer_clear(&t->alternate_rx);
+    fp_crypto_clear(&t->crypto);
+    OPENSSL_cleanse(t->secret, sizeof(t->secret));
     memset(t, 0, sizeof(*t));
     t->fd = t->listen_fd = t->alternate_fd = -1;
+    t->relay_link = -1;
     if (reason)
         emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EIO, reason);
+}
+static int hex_value(char ch) {
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+static int secret_from_hex(const char *text, uint8_t out[FP_SESSION_SECRET]) {
+    if (!text || strlen(text) != FP_SESSION_SECRET * 2)
+        return -1;
+    for (unsigned i = 0; i < FP_SESSION_SECRET; ++i) {
+        int hi = hex_value(text[i * 2]), lo = hex_value(text[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+static void secret_to_hex(const uint8_t *secret, char out[FP_SESSION_SECRET * 2 + 1]) {
+    for (unsigned i = 0; i < FP_SESSION_SECRET; ++i)
+        snprintf(out + i * 2, 3, "%02x", secret[i]);
+}
+static void push_session_to(fastp2p_client *c, const char *peer, uint64_t session,
+                            const uint8_t *secret, const char *relay, int transport) {
+    char hex[FP_SESSION_SECRET * 2 + 1];
+    json_object *j = json_object_new_object();
+    secret_to_hex(secret, hex);
+    /* "peer" names the sender so the receiver can validate the push against the
+     * node it punched, and can address its acknowledgement back. */
+    op_js(j, "peer", c->node);
+    op_ju(j, "session", session);
+    op_js(j, "secret", hex);
+    op_js(j, "transport", transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
+    if (relay && *relay)
+        op_js(j, "relay", relay);
+    push(c, peer, PUSH_SESSION, j);
+    json_object_put(j);
+    OPENSSL_cleanse(hex, sizeof(hex));
+}
+static void push_session(fastp2p_client *c, tunnel *t, const char *relay) {
+    push_session_to(c, t->peer, t->session, t->secret, relay, t->transport);
+}
+static void push_session_ack(fastp2p_client *c, const char *peer, uint64_t session) {
+    json_object *j = json_object_new_object();
+    op_js(j, "peer", peer);
+    op_ju(j, "session", session);
+    push(c, peer, PUSH_SESSION_ACK, j);
+    json_object_put(j);
 }
 static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
@@ -398,6 +537,7 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
             tunnel *t = &c->tunnels[i];
             memset(t, 0, sizeof(*t));
             t->fd = t->listen_fd = t->alternate_fd = -1;
+            t->relay_link = -1;
             t->state = T_REPLY;
             t->id = id;
             t->peer_id = op_node_id(peer);
@@ -405,6 +545,17 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
             t->transport = transport;
             t->initiator = initiator;
             t->deadline = mono() + 15 * NS;
+            if (initiator) {
+                /* The side that opens the tunnel owns the session secret. */
+                t->session = random_id();
+                fp_random(t->secret, sizeof(t->secret));
+                t->has_secret = t->session_owner = 1;
+                if (fp_crypto_init(&t->crypto, t->secret, t->session, c->node_id, t->peer_id, 1)) {
+                    t->state = T_FREE;
+                    return -1;
+                }
+                t->keyed = 1;
+            }
             return i;
         }
     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "tunnel limit reached");
@@ -451,11 +602,10 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_ju(j, "coneNatPort", t->mapped_port);
     op_ju(j, "id", t->id);
     if (t->initiator) {
-        op_ju(j, "token", c->token);
         op_js(j, "linkMode", t->mode);
         op_ju(j, "isServer", 1);
         op_js(j, "underlayProtocol", t->transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp");
-        push(c, t->peer, 1, j);
+        push(c, t->peer, PUSH_CONNECT, j);
         t->state = T_REPLY;
         t->deadline = mono() + 12 * NS;
     } else {
@@ -533,6 +683,155 @@ static void start_underlay(fastp2p_client *c, int index) {
     }
     t->state = T_TCP_CONNECT;
 }
+static void session_ready(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    int relayed = t->relay_link >= 0 || t->relay_wait || t->relay_ready;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == index &&
+            !c->apps[i].synced) {
+            c->apps[i].synced = 1;
+            c->apps[i].ready_at = mono() + 100 * MS;
+            c->apps[i].attempts = c->apps[i].relay_wanted = c->apps[i].relay_requested = 0;
+            emit(c, FASTP2P_EVENT_FORWARD, c->apps[i].id, 0,
+                 relayed ? "forward attached to relay" : "forward attached to tunnel");
+        }
+}
+static void bind_pending_key(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    if (t->keyed || t->session_owner)
+        return;
+    for (int i = 0; i < NPK; ++i) {
+        pending_key *k = &c->keys[i];
+        if (!k->used || k->peer_id != t->peer_id || k->relay[0])
+            continue;
+        t->session = k->session;
+        memcpy(t->secret, k->secret, sizeof(t->secret));
+        if (fp_crypto_init(&t->crypto, t->secret, t->session, t->peer_id, c->node_id, 0)) {
+            close_tunnel(c, index, "session key derivation failed");
+            return;
+        }
+        t->keyed = 1;
+        OPENSSL_cleanse(k->secret, sizeof(k->secret));
+        memset(k, 0, sizeof(*k));
+        push_session_ack(c, t->peer, t->session);
+        session_ready(c, index);
+        return;
+    }
+}
+static void relay_join(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    uint8_t frame[32];
+    op_put64(frame, t->session);
+    op_put64(frame + 8, op_node_id(t->relay_peer));
+    fp_join_proof(c->token, t->session, op_node_id(t->relay_peer), frame + 16);
+    tframe(t, TUN_RELAY_JOIN, frame, sizeof(frame));
+}
+static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport) {
+    int ti = new_tunnel(c, peer, random_id(), transport, 1);
+    if (ti < 0)
+        return -1;
+    tunnel *t = &c->tunnels[ti];
+    if (a->has_session) {
+        fp_crypto_clear(&t->crypto);
+        t->session = a->session;
+        memcpy(t->secret, a->secret, FP_SESSION_SECRET);
+        if (fp_crypto_init(&t->crypto, t->secret, t->session, c->node_id, t->peer_id, 1)) {
+            close_tunnel(c, ti, "session key derivation failed");
+            return -1;
+        }
+    } else {
+        a->session = t->session;
+        memcpy(a->secret, t->secret, FP_SESSION_SECRET);
+        a->has_session = 1;
+    }
+    t->keyed = 1;
+    t->session_owner = 1;
+    return ti;
+}
+static int relay_tunnel(fastp2p_client *c, app *a, const char *relay, const char *peer, int owner) {
+    int ti = new_tunnel(c, relay, random_id(), a->transport, 1);
+    if (ti < 0)
+        return -1;
+    tunnel *t = &c->tunnels[ti];
+    fp_crypto_clear(&t->crypto);
+    t->session = a->session;
+    memcpy(t->secret, a->secret, FP_SESSION_SECRET);
+    t->has_secret = 1;
+    t->session_owner = owner;
+    copy_string(t->relay_peer, sizeof(t->relay_peer), peer);
+    uint64_t initiator = owner ? c->node_id : op_node_id(peer);
+    uint64_t responder = owner ? op_node_id(peer) : c->node_id;
+    if (fp_crypto_init(&t->crypto, t->secret, t->session, initiator, responder, owner)) {
+        close_tunnel(c, ti, "session key derivation failed");
+        return -1;
+    }
+    t->keyed = 1;
+    t->relay_wait = 1;
+    return ti;
+}
+static void start_punch(fastp2p_client *c, int ti) {
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, t->transport == FASTP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
+    json_object *j = json_object_new_object();
+    op_js(j, "peerNode", t->peer);
+    ws_json(c, 7, 0, j);
+    json_object_put(j);
+    if (start_probe(c, ti))
+        close_tunnel(c, ti, "NAT probe could not start");
+}
+/* The initiating peer delivered the session secret.  For a direct tunnel the
+ * secret is bound to the tunnel it punched; for a relayed link we punch the
+ * relay ourselves and join the session there. */
+static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *peer, uint64_t session,
+                            const uint8_t *secret, const char *relay, int transport) {
+    int slot = -1;
+    for (int i = 0; i < NPK; ++i)
+        if (c->keys[i].used && c->keys[i].session == session && c->keys[i].peer_id == peer_id) {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        for (int i = 0; i < NPK; ++i)
+            if (!c->keys[i].used) {
+                slot = i;
+                break;
+            }
+    if (slot < 0) {
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "too many pending sessions");
+        return;
+    }
+    pending_key *k = &c->keys[slot];
+    memset(k, 0, sizeof(*k));
+    k->used = 1;
+    k->session = session;
+    k->peer_id = peer_id;
+    k->deadline = mono() + 30 * NS;
+    memcpy(k->secret, secret, FP_SESSION_SECRET);
+    if (relay && *relay) {
+        if (!valid_node(relay)) {
+            memset(k, 0, sizeof(*k));
+            return;
+        }
+        app probe = {0};
+        probe.transport = transport;
+        probe.session = session;
+        memcpy(probe.secret, secret, FP_SESSION_SECRET);
+        probe.has_session = 1;
+        strcpy(probe.peer, peer);
+        int ti = relay_tunnel(c, &probe, relay, peer, 0);
+        if (ti < 0)
+            memset(k, 0, sizeof(*k));
+        else
+            start_punch(c, ti);
+        return;
+    }
+    for (int i = 0; i < NT; ++i)
+        if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].peer_id == peer_id &&
+            !c->tunnels[i].keyed) {
+            bind_pending_key(c, i);
+            return;
+        }
+}
 static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
@@ -545,33 +844,22 @@ static void tunnel_active(fastp2p_client *c, int index) {
     op_buffer_clear(&t->alternate_rx);
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
          t->transport == FASTP2P_TRANSPORT_TCP ? "TCP tunnel connected" : "QUIC tunnel connected");
+    if (t->relay_wait) {
+        /* Join the relay, and (on the side that owns the session) tell the far
+         * endpoint which relay to punch so it can join the same session. */
+        relay_join(c, index);
+        if (t->session_owner)
+            push_session_to(c, t->relay_peer, t->session, t->secret, t->peer, t->transport);
+        return;
+    }
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && !strcmp(c->apps[i].peer, t->peer) &&
-            c->apps[i].transport == t->transport) {
+            c->apps[i].transport == t->transport)
             c->apps[i].tunnel_index = index;
-            c->apps[i].synced = 0;
-            synchronize_app(c, i);
-        }
-}
-static void synchronize_app(fastp2p_client *c, int index) {
-    app *a = &c->apps[index];
-    if (a->synced || a->tunnel_index < 0 || c->tunnels[a->tunnel_index].state != T_ACTIVE)
-        return;
-    tunnel *t = &c->tunnels[a->tunnel_index];
-    json_object *j = json_object_new_object();
-    op_ju(j, "appID", a->id);
-    op_ju(j, "appKey", a->key);
-    push(c, a->peer, 13, j);
-    op_js(j, "from", c->node);
-    op_js(j, "node", c->node);
-    op_ju(j, "tunnelID", t->id);
-    op_ju(j, "tunnelNum", 2);
-    op_ju(j, "srcPort", a->port);
-    push(c, a->peer, 18, j);
-    json_object_put(j);
-    a->synced = 1;
-    a->ready_at = mono() + 200 * MS;
-    emit(c, FASTP2P_EVENT_FORWARD, a->id, 0, "forward attached to tunnel");
+    if (t->session_owner)
+        push_session(c, t, NULL);
+    else
+        bind_pending_key(c, index);
 }
 static int overlay_slot(fastp2p_client *c) {
     for (int i = 0; i < NO; ++i)
@@ -590,29 +878,31 @@ static int overlay_slot(fastp2p_client *c) {
 }
 static int overlay_data(fastp2p_client *c, int oi, const uint8_t *data, size_t len) {
     overlay *o = &c->overlays[oi];
-    app *a = &c->apps[o->app_index];
-    uint8_t encrypted[4096 + 32 + 8];
-    size_t n = 0;
-    if (len > 4096 || op_crypt(1, a->key, data, len, encrypted + 8, sizeof(encrypted) - 8, &n))
+    uint8_t payload[8 + 4096];
+    if (len > 4096 || o->tunnel_index < 0)
         return -1;
-    op_put64(encrypted, o->id);
+    op_put64(payload, o->id);
+    memcpy(payload + 8, data, len);
     o->activity = mono();
-    return tframe(&c->tunnels[o->tunnel_index], 9, encrypted, n + 8);
+    return tseal(c, &c->tunnels[o->tunnel_index], TUN_DATA, payload, len + 8);
 }
 static void request_overlay(fastp2p_client *c, int oi) {
     overlay *o = &c->overlays[oi];
     app *a = &c->apps[o->app_index];
     json_object *j = json_object_new_object();
     op_ju(j, "id", o->id);
-    op_ju(j, "token", c->token);
-    op_ju(j, "appID", a->id);
     op_js(j, "dstIP", a->socks ? o->socks.host : a->destination);
     op_ju(j, "dstPort", a->socks ? o->socks.port : a->dst_port);
     op_js(j, "protocol", o->udp ? "udp" : "tcp");
     if (a->socks)
         op_ju(j, "socks5", 1);
-    tjson(&c->tunnels[o->tunnel_index], 6, j);
+    const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
+    int rv = tseal(c, &c->tunnels[o->tunnel_index], TUN_OPEN, text, strlen(text));
     json_object_put(j);
+    if (rv) {
+        close_overlay(c, oi, 1);
+        return;
+    }
     o->waiting = 1;
     o->deadline = mono() + (a->socks ? 15 : 5) * NS;
 }
@@ -626,7 +916,7 @@ static void socks_failure(fastp2p_client *c, int oi, unsigned status) {
         c->tunnels[o->tunnel_index].state == T_ACTIVE) {
         json_object *j = json_object_new_object();
         op_ju(j, "id", o->id);
-        tjson(&c->tunnels[o->tunnel_index], 8, j);
+        tjson_sealed(c, &c->tunnels[o->tunnel_index], TUN_CLOSE, j);
         json_object_put(j);
     }
     uint8_t reply[10];
@@ -641,14 +931,13 @@ static void socks_failure(fastp2p_client *c, int oi, unsigned status) {
 }
 static void overlay_ack(fastp2p_client *c, int oi, unsigned status) {
     overlay *o = &c->overlays[oi];
-    uint8_t prefix[8];
-    op_put64(prefix, c->apps[o->app_index].id);
     if (!o->socks_exit) {
-        uint8_t ack[12];
-        memcpy(ack, prefix, 8);
-        memcpy(ack + 8, "null", 4);
-        if (!status)
-            tframe(&c->tunnels[o->tunnel_index], 7, ack, sizeof(ack));
+        if (status)
+            return;
+        json_object *ack = json_object_new_object();
+        op_ju(ack, "id", o->id);
+        tjson_sealed(c, &c->tunnels[o->tunnel_index], TUN_OPEN_ACK, ack);
+        json_object_put(ack);
         return;
     }
     struct sockaddr_in local = {0};
@@ -664,11 +953,7 @@ static void overlay_ack(fastp2p_client *c, int oi, unsigned status) {
     op_js(j, "boundIP", ip);
     op_ju(j, "boundPort", ntohs(local.sin_port));
     op_js(j, "remoteIP", remote);
-    const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
-    op_buffer b = {0};
-    if (!op_buffer_add(&b, prefix, 8, 1024) && !op_buffer_add(&b, text, strlen(text), 1024))
-        tframe(&c->tunnels[o->tunnel_index], 7, b.data, b.len);
-    op_buffer_clear(&b);
+    tjson_sealed(c, &c->tunnels[o->tunnel_index], TUN_OPEN_ACK, j);
     json_object_put(j);
 }
 static void socks_acknowledged(fastp2p_client *c, int oi, json_object *ack) {
@@ -926,7 +1211,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         return;
     }
     uint64_t sender = 0;
-    if (main == 3 && (sub == 1 || sub == 2 || sub == 8 || sub == 13 || sub == 18)) {
+    if (main == 3 &&
+        (sub == PUSH_CONNECT || sub == PUSH_CONNECT_REPLY || sub == PUSH_READY ||
+         sub == PUSH_SESSION || sub == PUSH_SESSION_ACK)) {
         if (len < 16 || op_u64(data + 8) != c->node_id)
             return;
         sender = op_u64(data);
@@ -950,7 +1237,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         return;
     }
     if (main == 0) {
-        if (strcmp(op_string(j, "protocol"), "fastp2p1") || op_integer(j, "error") || op_integer(j, "token") != c->token) {
+        if (strcmp(op_string(j, "protocol"), WIRE_PROTOCOL) || op_integer(j, "error") || op_integer(j, "token") != c->token) {
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway rejected login");
             c->stopping = 1;
         } else {
@@ -981,8 +1268,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         uint64_t id = op_integer(j, "id"), port = op_integer(j, "coneNatPort");
         struct in_addr peer_ip;
         int udp = !strcmp(mode, "udppunch") || !strcmp(mode, "udp4");
-        if (valid_node(from) && sender == op_node_id(from) && op_integer(j, "token") == c->token &&
-            id && tunnel_by_id(c, id) < 0 && port > 0 && port <= 65535 &&
+        if (valid_node(from) && sender == op_node_id(from) && id && tunnel_by_id(c, id) < 0 &&
+            port > 0 && port <= 65535 &&
             inet_pton(AF_INET, op_string(j, "fromIP"), &peer_ip) == 1 &&
             (!strcmp(mode, "tcppunch") || !strcmp(mode, "tcp4") || !strcmp(mode, "intranet") ||
              udp)) {
@@ -1032,34 +1319,60 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             } else if (t->state == T_REPLY)
                 close_tunnel(c, ti, "peer rejected connection or sent an invalid response");
         }
-    } else if (main == 3 && sub == 18) {
-        int ti = tunnel_by_id(c, op_integer(j, "tunnelID"));
-        uint64_t aid = op_integer(j, "appID");
-        if (ti >= 0 && aid && c->tunnels[ti].peer_id == sender && !op_integer(j, "relayTunnelID")) {
-            int ai = -1;
-            for (int i = 0; i < NA; ++i)
-                if (c->apps[i].used && c->apps[i].id == aid && !c->apps[i].local &&
-                    !strcmp(c->apps[i].peer, c->tunnels[ti].peer)) {
-                    ai = i;
-                    break;
-                }
-            if (ai < 0)
-                for (int i = 0; i < NA; ++i)
-                    if (!c->apps[i].used) {
-                        ai = i;
-                        break;
-                    }
-            if (ai >= 0) {
-                app *a = &c->apps[ai];
-                memset(a, 0, sizeof(*a));
-                a->used = 1;
-                a->fd = -1;
-                a->id = aid;
-                a->key = op_integer(j, "appKey");
-                a->tunnel_index = ti;
-                strcpy(a->peer, c->tunnels[ti].peer);
-            }
+    } else if (main == 3 && sub == PUSH_SESSION) {
+        uint64_t session = op_integer(j, "session");
+        const char *peer = op_string(j, "peer"), *relay = op_string(j, "relay");
+        const char *transport = op_string(j, "transport");
+        uint8_t secret[FP_SESSION_SECRET];
+        int ok = session && valid_node(peer) && sender == op_node_id(peer) &&
+                 !secret_from_hex(op_string(j, "secret"), secret);
+        if (ok) {
+            int quic = !transport || strcmp(transport, "tcp");
+            session_receive(c, sender, peer, session, secret,
+                            relay && *relay ? relay : NULL,
+                            quic ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP);
+        } else {
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid session key");
         }
+        OPENSSL_cleanse(secret, sizeof(secret));
+    } else if (main == 3 && sub == PUSH_SESSION_ACK) {
+        uint64_t session = op_integer(j, "session");
+        for (int i = 0; i < NT; ++i) {
+            tunnel *t = &c->tunnels[i];
+            if (t->state != T_ACTIVE || !t->session_owner || t->session != session)
+                continue;
+            uint64_t peer =
+                t->relay_wait || t->relay_ready ? op_node_id(t->relay_peer) : t->peer_id;
+            if (peer != sender)
+                continue;
+            t->key_acked = 1;
+            session_ready(c, i);
+        }
+    } else if (main == 5 && sub == 1) {
+        /* Relay offer for the rule that asked for one. */
+        const char *relay = op_string(j, "relay");
+        if (!relay || !*relay || !valid_node(relay))
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "no relay node available");
+        for (int i = 0; i < NA; ++i) {
+            app *a = &c->apps[i];
+            if (!a->used || !a->local || !a->relay_requested || a->synced)
+                continue;
+            a->relay_requested = 0;
+            if (!relay || !*relay || !valid_node(relay))
+                continue;
+            int ti = relay_tunnel(c, a, relay, a->peer, 1);
+            if (ti < 0)
+                continue;
+            a->tunnel_index = ti;
+            a->relay_wanted = 0;
+            start_punch(c, ti);
+        }
+    } else if (main == 7 && sub == 1) {
+        const char *peer = op_string(j, "peerNode");
+        if (valid_node(peer))
+            for (int i = 0; i < NA; ++i)
+                if (c->apps[i].used && !strcmp(c->apps[i].peer, peer))
+                    c->apps[i].peer_nat = op_integer(j, "natType");
     } else if (main == 3 && sub == 7)
         report_apps(c);
     else if (main == 3 && sub == 9) {
@@ -1082,14 +1395,109 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
     }
     json_object_put(j);
 }
-static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, size_t len) {
+/* Seal one application frame into the tunnel.  Every frame that carries
+ * application data or application control is authenticated and encrypted with
+ * the session keys, so a relay hop only ever sees opaque bytes. */
+static int tseal(fastp2p_client *c, tunnel *t, uint16_t sub, const void *data, size_t len) {
+    uint8_t buffer[8 + 4096 + 256 + 2 * FP_TAG + 8];
+    size_t written = 0;
+    (void)c;
+    if (!t->keyed || len > sizeof(buffer) - 32)
+        return -1;
+    if (fp_seal(&t->crypto, sub, 0, data, len, buffer, sizeof(buffer), &written))
+        return -1;
+    return tframe(t, sub, buffer, written);
+}
+/* Returns 0 on success, 1 when the frame is a duplicate and must be ignored,
+ * and -1 when the tunnel must be closed. */
+static int topen(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, size_t len,
+                 uint8_t *out, size_t capacity, size_t *written) {
+    tunnel *t = &c->tunnels[ti];
+    if (!t->keyed) {
+        close_tunnel(c, ti, "peer sent application data before the session was ready");
+        return -1;
+    }
+    int rv = fp_open(&t->crypto, sub, 0, data, len, out, capacity, written);
+    if (rv == -1)
+        return 1;
+    if (rv) {
+        if (getenv("FP_DEBUG_KEYS"))
+            fprintf(stderr, "auth fail ti=%d sub=%u len=%zu rxmax=%llu\n", ti, sub, len,
+                    (unsigned long long)t->crypto.rx_max);
+        close_tunnel(c, ti, "tunnel authentication failed");
+        return -1;
+    }
+    return 0;
+}
+/* Relay side: pair two tunnels that joined with the same session. */
+static void relay_receive(fastp2p_client *c, int ti, const uint8_t *data, size_t len) {
+    tunnel *t = &c->tunnels[ti];
+    if (len != 32 || t->relay_link >= 0) {
+        close_tunnel(c, ti, "invalid relay join");
+        return;
+    }
+    uint64_t session = op_u64(data), peer = op_u64(data + 8);
+    uint8_t proof[16];
+    fp_join_proof(c->token, session, peer, proof);
+    if (!fp_equal(proof, data + 16, 16) || peer == t->peer_id) {
+        emit(c, FASTP2P_EVENT_ERROR, t->id, FASTP2P_EINVAL, "relay join rejected");
+        close_tunnel(c, ti, "relay join rejected");
+        return;
+    }
+    int link = -1;
+    for (int i = 0; i < NRL; ++i)
+        if (c->relays[i].used && c->relays[i].session == session) {
+            link = i;
+            break;
+        }
+    if (link < 0)
+        for (int i = 0; i < NRL; ++i)
+            if (!c->relays[i].used) {
+                link = i;
+                break;
+            }
+    if (link < 0) {
+        close_tunnel(c, ti, "relay table full");
+        return;
+    }
+    relay_link *r = &c->relays[link];
+    if (!r->used) {
+        memset(r, 0, sizeof(*r));
+        r->used = 1;
+        r->session = session;
+        r->ta = r->tb = -1;
+        r->deadline = mono() + 30 * NS;
+    }
+    if (r->ta < 0) {
+        r->ta = ti;
+        r->peer_a = t->peer_id;
+    } else if (r->tb < 0) {
+        r->tb = ti;
+        r->peer_b = t->peer_id;
+    } else {
+        close_tunnel(c, ti, "relay session already paired");
+        return;
+    }
+    t->relay_link = link;
+    if (r->ta >= 0 && r->tb >= 0) {
+        tunnel *a = &c->tunnels[r->ta], *b = &c->tunnels[r->tb];
+        uint8_t frame[8];
+        a->relay_ready = b->relay_ready = 1;
+        op_put64(frame, session);
+        tframe(a, TUN_RELAY_READY, frame, sizeof(frame));
+        tframe(b, TUN_RELAY_READY, frame, sizeof(frame));
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "relay session paired");
+    }
+}
+static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data,
+                           size_t len) {
     tunnel *t = &c->tunnels[ti];
     t->last_rx = mono();
     if (t->state == T_HANDSHAKE || t->state == T_QUIC) {
-        if (t->server && sub == 2 && len == 8 && op_u64(data) == t->id) {
-            tframe(t, 3, data, len);
+        if (t->server && sub == TUN_HELLO && len == 8 && op_u64(data) == t->id) {
+            tframe(t, TUN_HELLO_ACK, data, len);
             tunnel_active(c, ti);
-        } else if (!t->server && sub == 3)
+        } else if (!t->server && sub == TUN_HELLO_ACK)
             tunnel_active(c, ti);
         else
             close_tunnel(c, ti, "invalid tunnel handshake");
@@ -1097,68 +1505,78 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
     }
     if (t->state != T_ACTIVE)
         return;
-    if (sub == 4) {
-        uint8_t id[8];
-        op_put64(id, c->node_id);
-        tframe(t, 5, id, 8);
+    if (sub == TUN_RELAY_JOIN) {
+        relay_receive(c, ti, data, len);
         return;
     }
-    if (sub == 5)
-        return;
-    if (sub == 9) {
-        if (len < 8 || len > 4096 + 32 + 8)
+    if (sub == TUN_RELAY_READY) {
+        if (len != 8 || op_u64(data) != t->session) {
+            close_tunnel(c, ti, "invalid relay ready");
             return;
+        }
+        t->relay_ready = 1;
+        if (t->session_owner)
+            session_ready(c, ti);
+        else
+            push_session_ack(c, t->relay_peer, t->session);
+        return;
+    }
+    if (sub == TUN_KEEPALIVE) {
+        uint8_t id[8];
+        op_put64(id, c->node_id);
+        tframe(t, TUN_KEEPALIVE_ACK, id, sizeof(id));
+        return;
+    }
+    if (sub == TUN_KEEPALIVE_ACK)
+        return;
+    /* Acting as a relay hop: pass application frames through untouched. */
+    if (t->relay_link >= 0 && t->relay_ready) {
+        if (sub != TUN_OPEN && sub != TUN_OPEN_ACK && sub != TUN_CLOSE && sub != TUN_DATA)
+            return;
+        relay_link *r = &c->relays[t->relay_link];
+        int other = r->ta == ti ? r->tb : r->ta;
+        if (other < 0 || other >= NT || c->tunnels[other].state != T_ACTIVE ||
+            tframe(&c->tunnels[other], sub, data, len))
+            close_tunnel(c, ti, "relay forwarding failed");
+        return;
+    }
+    uint8_t plain[4096 + 256];
+    size_t n = 0;
+    int rv = topen(c, ti, sub, data, len, plain, sizeof(plain), &n);
+    if (rv)
+        return;
+    if (sub == TUN_DATA) {
+        if (n < 8)
+            return;
+        uint64_t id = op_u64(plain);
         for (int i = 0; i < NO; ++i) {
             overlay *o = &c->overlays[i];
-            if (!o->used || o->id != op_u64(data) || o->tunnel_index != ti)
+            if (!o->used || o->id != id || o->tunnel_index != ti)
                 continue;
-            uint8_t plain[4096 + 64];
-            size_t n = 0;
-            if (op_crypt(0, c->apps[o->app_index].key, data + 8, len - 8, plain, sizeof(plain),
-                         &n)) {
-                close_overlay(c, i, 1);
-                return;
-            }
+            const uint8_t *payload = plain + 8;
+            size_t length = n - 8;
             o->activity = mono();
             if (o->socks_parent) {
-                socks_udp_reply(c, i, plain, n);
+                socks_udp_reply(c, i, payload, length);
             } else if (o->udp) {
-                op_ssize sent = o->local_udp
-                                    ? op_sendto(o->fd, plain, n, MSG_DONTWAIT,
-                                                (struct sockaddr *)&o->source, sizeof(o->source))
-                                    : op_send(o->fd, plain, n, MSG_DONTWAIT | MSG_NOSIGNAL);
-                if (sent != (op_ssize)n)
+                op_ssize sent =
+                    o->local_udp ? op_sendto(o->fd, payload, length, MSG_DONTWAIT,
+                                             (struct sockaddr *)&o->source, sizeof(o->source))
+                                 : op_send(o->fd, payload, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (sent != (op_ssize)length)
                     close_overlay(c, i, 1);
-            } else if (op_buffer_add(&o->tx, plain, n, OP_QUEUE_LIMIT))
+            } else if (op_buffer_add(&o->tx, payload, length, OP_QUEUE_LIMIT)) {
                 close_overlay(c, i, 1);
+            }
             return;
         }
         return;
     }
-    if (sub == 7 && len >= 8) {
-        uint64_t aid = op_u64(data);
-        json_object *ack = op_json(data + 8, len - 8);
-        /* The Go wire ACK identifies the application, not the overlay. Release
-         * all pending connections for that application on this tunnel. */
-        for (int i = 0; i < NO; ++i)
-            if (c->overlays[i].used && c->overlays[i].tunnel_index == ti &&
-                c->apps[c->overlays[i].app_index].id == aid) {
-                overlay *o = &c->overlays[i];
-                if (c->apps[o->app_index].socks) {
-                    if (o->socks_state == S_ACK || (o->socks_state == S_FLOW && o->waiting))
-                        socks_acknowledged(c, i, ack);
-                } else
-                    o->waiting = 0;
-            }
-        if (ack)
-            json_object_put(ack);
-        return;
-    }
-    json_object *j = op_json(data, len);
+    json_object *j = op_json(plain, n);
     if (!j)
         return;
     uint64_t id = op_integer(j, "id");
-    if (sub == 8) {
+    if (sub == TUN_CLOSE) {
         for (int i = 0; i < NO; ++i)
             if (c->overlays[i].used && c->overlays[i].id == id &&
                 c->overlays[i].tunnel_index == ti) {
@@ -1176,28 +1594,33 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
                 } else
                     close_overlay(c, i, 0);
             }
-    } else if (sub == 6 && id && op_integer(j, "token") == c->token &&
-               !op_integer(j, "relayTunnelID")) {
-        uint64_t aid = op_integer(j, "appID"), port = op_integer(j, "dstPort");
-        int ai = -1, duplicate = 0;
+    } else if (sub == TUN_OPEN_ACK) {
+        for (int i = 0; i < NO; ++i)
+            if (c->overlays[i].used && c->overlays[i].id == id &&
+                c->overlays[i].tunnel_index == ti) {
+                overlay *o = &c->overlays[i];
+                int socks = o->app_index >= 0 && c->apps[o->app_index].socks;
+                if (socks)
+                    socks_acknowledged(c, i, j);
+                else
+                    o->waiting = 0;
+                break;
+            }
+    } else if (sub == TUN_OPEN) {
+        const char *proto = op_string(j, "protocol"), *host = op_string(j, "dstIP");
+        uint64_t port = op_integer(j, "dstPort");
+        int duplicate = 0;
         for (int i = 0; i < NO; ++i)
             if (c->overlays[i].used && c->overlays[i].id == id && c->overlays[i].tunnel_index == ti)
                 duplicate = 1;
-        for (int i = 0; i < NA; ++i)
-            if (c->apps[i].used && c->apps[i].id == aid && c->apps[i].tunnel_index == ti &&
-                !c->apps[i].local) {
-                ai = i;
-                break;
-            }
-        const char *proto = op_string(j, "protocol"), *host = op_string(j, "dstIP");
-        if (!duplicate && ai >= 0 && port > 0 && port <= 65535 && strlen(host) < 256 &&
+        if (!duplicate && id && port > 0 && port <= 65535 && host && strlen(host) < 256 &&
             (!strcmp(proto, "tcp") || !strcmp(proto, "udp"))) {
             struct sockaddr_in peer;
             int oi = overlay_slot(c);
             if (oi >= 0) {
                 overlay *o = &c->overlays[oi];
                 o->id = id;
-                o->app_index = ai;
+                o->app_index = -1;
                 o->tunnel_index = ti;
                 o->udp = !strcmp(proto, "udp");
                 o->socks_exit = op_integer(j, "socks5") == 1;
@@ -1655,30 +2078,37 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             int ti = active_tunnel(c, a->peer, a->transport);
             if (ti >= 0) {
                 a->tunnel_index = ti;
-                synchronize_app(c, i);
+                if (c->tunnels[ti].key_acked)
+                    session_ready(c, ti);
+            } else if (a->relay_requested) {
+                /* Waiting for the gateway to name a relay node. */
             } else {
                 int in_progress = 0;
                 for (int k = 0; k < NT; ++k)
                     if (c->tunnels[k].state && c->tunnels[k].transport == a->transport &&
-                        !strcmp(c->tunnels[k].peer, a->peer))
+                        (!strcmp(c->tunnels[k].peer, a->peer) ||
+                         (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
                         in_progress = 1;
                 if (!in_progress) {
-                    ti = new_tunnel(c, a->peer, random_id(), a->transport, 1);
-                    if (ti >= 0) {
-                        tunnel *t = &c->tunnels[ti];
-                        strcpy(t->mode,
-                               a->transport == FASTP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
+                    /* Two failed punches, symmetric NAT on both sides, or an
+                     * explicit diagnostic request means a direct path is not
+                     * reachable: ask the gateway for a relay. */
+                    if (a->attempts >= 2 || c->force_relay ||
+                        (c->nat_type == 2 && a->peer_nat == 2)) {
+                        a->relay_requested = 1;
                         json_object *j = json_object_new_object();
-                        op_ju(j, "token", c->token);
                         op_js(j, "peerNode", a->peer);
-                        ws_json(c, 7, 0, j);
+                        ws_json(c, 5, 0, j);
                         json_object_put(j);
-                        if (start_probe(c, ti))
-                            close_tunnel(c, ti, "NAT probe could not start");
+                    } else {
+                        ++a->attempts;
+                        ti = app_tunnel(c, a, a->peer, a->transport);
+                        if (ti >= 0)
+                            start_punch(c, ti);
                     }
                 }
-                a->retry = now + 2 * NS;
             }
+            a->retry = now + 2 * NS;
         }
         if (a->tunnel_index < 0 || !a->synced || now < a->ready_at)
             continue;
@@ -1798,7 +2228,7 @@ static void connect_gateway(fastp2p_client *c) {
     }
     snprintf(c->path, sizeof(c->path),
              "wss://%s:%u/api/v1/login?node=%s&token=%" PRIu64
-             "&protocol=fastp2p1&version=%s&nattype=%d&sharebandwidth=0",
+             "&protocol=" WIRE_PROTOCOL "&version=%s&nattype=%d&sharebandwidth=0",
              c->host, c->port, c->node, c->token, WIRE_VERSION, c->nat_type);
     if (c->automatic_node) {
         char hostname[32];
@@ -2038,6 +2468,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     c->callback = cfg->on_event;
     c->user = cfg->user;
     c->listener = c->nat_fd = -1;
+    c->force_relay = getenv("FASTP2P_FORCE_RELAY") != NULL;
     strcpy(c->ip, "0.0.0.0");
     strcpy(c->local_ip, "0.0.0.0");
     for (int i = 0; i < NT; ++i)
@@ -2078,7 +2509,9 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
             if (inet_pton(AF_INET, a->bind_ip, &check) != 1)
                 return FASTP2P_EINVAL;
             a->id = random_id();
-            a->key = random_id();
+            a->session = random_id();
+            fp_random(a->secret, sizeof(a->secret));
+            a->has_session = 1;
             a->port = f->local_port;
             a->dst_port = f->destination_port;
             a->udp = !strcmp(f->protocol, "udp");

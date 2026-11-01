@@ -133,7 +133,9 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             send_push_result(c, 1, "sender mismatch");
             return 0;
         }
-        if (!(sub <= 5 || sub == 8 || sub == 13 || sub == 18)) {
+        /* 1 connect request, 2 connect reply, 8 peer ready, 13 session key,
+         * 14 session key ack.  Everything else is not a client-to-client push. */
+        if (!(sub == 1 || sub == 2 || sub == 8 || sub == 13 || sub == 14)) {
             send_push_result(c, 1, "unsupported push");
             return 0;
         }
@@ -143,19 +145,10 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             return 0;
         }
         if (sub == 1) {
-            json_object *request = gw_json(data + 16, len - 16);
-            int valid =
-                request && !strcmp(gw_string(request, "from"), c->node) &&
-                (gw_token_valid(gw_integer(request, "token"), g.token, gw_wall_ns() / 1000000000) ||
-                 gw_integer(request, "fromToken") == g.token);
-            if (request)
-                json_object_put(request);
-            if (!valid) {
-                send_push_result(c, 1, "push denied");
-                return 0;
-            }
+            /* The gateway has already authenticated this connection; a peer
+             * query grants the right to ask it for a tunnel. */
             grant(c, target);
-        } else if (sub != 13 && sub != 18 && g.grants[c->slot][target->slot] <= gw_mono_ms()) {
+        } else if (sub != 13 && sub != 14 && g.grants[c->slot][target->slot] <= gw_mono_ms()) {
             send_push_result(c, 1, "push denied");
             return 0;
         }
@@ -163,9 +156,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         send_push_result(c, result ? 1 : 0, result ? "peer backpressure" : "push accepted");
         return 0;
     }
-    json_object *j = (main == 8 && sub == 0 && len == 4 && !memcmp(data, "null", 4))
-                         ? json_object_new_object()
-                         : gw_json(data, len);
+    json_object *j = gw_json(data, len);
     if (!j || !json_object_is_type(j, json_type_object)) {
         if (j)
             json_object_put(j);
@@ -214,7 +205,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         json_object *response = json_object_new_object();
         const char *name = gw_string(j, "peerNode");
         struct connection *target = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
-        if (target && gw_token_valid(gw_integer(j, "token"), g.token, gw_wall_ns() / 1000000000)) {
+        if (target) {
             grant(c, target);
             gw_ju(response, "online", 1);
             gw_js(response, "peerNode", target->node);
@@ -224,45 +215,30 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             gw_ju(response, "natType", target->nat);
             gw_ju(response, "hasIPv4", target->has_ipv4);
             gw_ju(response, "hasUPNPorNATPMP", target->has_upnp);
-            if (gw_integer(j, "token") == g.token)
-                gw_js(response, "IPv6", target->ipv6);
+            gw_js(response, "IPv6", target->ipv6);
         } else
             gw_ju(response, "online", 0);
         send_json(c, 7, 1, response);
         json_object_put(response);
-    } else if (main == 8 && sub == 0) {
-        int member = 0;
-        json_object *nodes = gw_get(g.sdwan, "Nodes");
-        if (!nodes)
-            nodes = gw_get(g.sdwan, "nodes");
-        if (nodes && json_object_is_type(nodes, json_type_array))
-            for (size_t i = 0; i < json_object_array_length(nodes); ++i)
-                if (!strcmp(gw_string(json_object_array_get_idx(nodes, i), "name"), c->node))
-                    member = 1;
-        if (member && gw_integer(g.sdwan, "enable"))
-            send_json(c, 8, 1, g.sdwan);
-        else {
-            json_object *empty = json_object_new_object();
-            gw_ju(empty, "tunnelNum", 2);
-            gw_ju(empty, "mtu", 1420);
-            send_json(c, 8, 1, empty);
-            json_object_put(empty);
-        }
     } else if (main == 5 && sub == 0) {
-        struct connection *peer = find_node(gw_node_id(gw_string(j, "peerNode"))), *relay = NULL;
-        if (peer)
-            for (unsigned i = 0; i < g.max_nodes; ++i) {
-                struct connection *n = g.nodes[i];
-                if (!n || n->closing || n->nat == 2 || n->major != c->major ||
-                    !strcmp(n->ip, c->ip) || !strcmp(n->ip, peer->ip))
-                    continue;
-                if (!relay || n->relay_time < relay->relay_time)
-                    relay = n;
-            }
+        /* Relay offer.  Prefer a node that is neither endpoint, is not behind a
+         * symmetric NAT, runs the same protocol major, and served a relay least
+         * recently, so no single node carries every relayed session. */
+        const char *name = gw_string(j, "peerNode");
+        struct connection *peer = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
+        struct connection *relay = NULL;
+        for (unsigned i = 0; i < g.max_nodes; ++i) {
+            struct connection *n = g.nodes[i];
+            if (!n || n->closing || n->slot == c->slot || n->nat == 2 || n->major != c->major)
+                continue;
+            if (peer && n->slot == peer->slot)
+                continue;
+            if (!relay || n->relay_time < relay->relay_time)
+                relay = n;
+        }
         json_object *response = json_object_new_object();
-        gw_js(response, "mode", "private");
-        gw_js(response, "relayName", relay ? relay->node : "");
-        gw_ju(response, "relayToken", relay ? gw_totp(g.token, gw_wall_ns() / 1000000000) : 0);
+        gw_js(response, "relay", relay ? relay->node : "");
+        gw_ju(response, "error", relay ? 0 : 1);
         if (relay)
             relay->relay_time = gw_mono_ms();
         send_json(c, 5, 1, response);
@@ -758,7 +734,7 @@ static int login_status(struct lws *wsi) {
         (strcmp(uri, "/api/v1/login") && strcmp(uri, "/fastp2p/v1/login")))
         return 404;
     char protocol[32];
-    if (query(wsi, "protocol=", protocol, sizeof(protocol)) || strcmp(protocol, "fastp2p1"))
+    if (query(wsi, "protocol=", protocol, sizeof(protocol)) || strcmp(protocol, "fastp2p2"))
         return 426;
     if (query(wsi, "node=", node, sizeof(node)) || !gw_node_valid(node))
         return 400;
@@ -854,7 +830,7 @@ static int establish(struct lws *wsi, struct connection *c) {
     json_object *login = json_object_new_object();
     gw_js(login, "user", g.user);
     gw_js(login, "node", c->node);
-    gw_js(login, "protocol", "fastp2p1");
+    gw_js(login, "protocol", "fastp2p2");
     gw_ju(login, "token", g.token);
     gw_ju(login, "ts", gw_wall_ns() / 1000000000);
     gw_ju(login, "error", 0);
@@ -1020,61 +996,9 @@ static void tick(lws_sorted_usec_list_t *sul) {
     }
     lws_sul_schedule(g.context, 0, &g.tick, tick, 10000);
 }
-static int sdwan_valid(json_object *j) {
-    if (!j || !json_object_is_type(j, json_type_object))
-        return 0;
-    if (!gw_integer(j, "enable"))
-        return 1;
-    const char *mode = gw_string(j, "mode");
-    if (strcmp(mode, "central") && strcmp(mode, "fullmesh"))
-        return 0;
-    uint64_t tunnels = gw_integer(j, "tunnelNum"), mtu = gw_integer(j, "mtu");
-    if (tunnels < 2 || tunnels > 8 || mtu < 576 || mtu > 1500)
-        return 0;
-    char network[128];
-    snprintf(network, sizeof(network), "%s", gw_string(j, "gateway"));
-    char *slash = strchr(network, '/');
-    if (!slash)
-        return 0;
-    *slash++ = 0;
-    int family = strchr(network, ':') ? AF_INET6 : AF_INET;
-    uint64_t bits;
-    unsigned char subnet[16];
-    if (gw_decimal(slash, &bits) || bits > (family == AF_INET ? 32u : 128u) ||
-        inet_pton(family, network, subnet) != 1)
-        return 0;
-    json_object *nodes = gw_get(j, "Nodes");
-    if (!nodes)
-        nodes = gw_get(j, "nodes");
-    if (!nodes || !json_object_is_type(nodes, json_type_array) ||
-        json_object_array_length(nodes) > GW_MAX_NODES)
-        return 0;
-    int central = 0;
-    for (size_t i = 0; i < json_object_array_length(nodes); ++i) {
-        json_object *n = json_object_array_get_idx(nodes, i);
-        const char *name = gw_string(n, "name"), *ip = gw_string(n, "ip");
-        unsigned char addr[16];
-        if (!gw_node_valid(name) || inet_pton(family, ip, addr) != 1)
-            return 0;
-        for (uint64_t b = 0; b < bits; ++b)
-            if ((addr[b / 8] & (0x80 >> (b % 8))) != (subnet[b / 8] & (0x80 >> (b % 8))))
-                return 0;
-        for (size_t k = 0; k < i; ++k) {
-            json_object *other = json_object_array_get_idx(nodes, k);
-            unsigned char previous[16];
-            if (!strcmp(name, gw_string(other, "name")) ||
-                (inet_pton(family, gw_string(other, "ip"), previous) == 1 &&
-                 !memcmp(addr, previous, family == AF_INET ? 4 : 16)))
-                return 0;
-        }
-        if (!strcmp(name, gw_string(j, "centralNode")))
-            central = 1;
-    }
-    return strcmp(mode, "central") || central;
-}
 static void usage(void) {
     puts("fastp2p-gateway --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
-         "  [--port 27183] [--apiport 10008] [--sdwan-config FILE] [--database FILE]\n"
+         "  [--port 27183] [--apiport 10008] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
          "  [--reset-admin] (stop the gateway before resetting its account)\n"
          "Set FASTP2P_USER, FASTP2P_PASSWORD and a 16-digit FASTP2P_TOKEN.\n"
@@ -1097,7 +1021,6 @@ static int options(int argc, char **argv) {
     g.key = getenv("FASTP2P_TLS_KEY");
     if (!g.key)
         g.key = "api.key";
-    const char *sdwan = NULL;
     static const struct option opts[] = {{"cert", required_argument, 0, 'c'},
                                          {"key", required_argument, 0, 'k'},
                                          {"bind", required_argument, 0, 'b'},
@@ -1107,7 +1030,6 @@ static int options(int argc, char **argv) {
                                          {"max-clients", required_argument, 0, 'm'},
                                          {"heartbeat-timeout", required_argument, 0, 't'},
                                          {"run-seconds", required_argument, 0, 'r'},
-                                         {"sdwan-config", required_argument, 0, 's'},
                                          {"database", required_argument, 0, 'd'},
                                          {"public-host", required_argument, 0, 'H'},
                                          {"enrollment-ca", required_argument, 0, 'C'},
@@ -1134,9 +1056,6 @@ static int options(int argc, char **argv) {
             if (strlen(optarg) >= sizeof(g.api_bind))
                 return -1;
             strcpy(g.api_bind, optarg);
-            break;
-        case 's':
-            sdwan = optarg;
             break;
         case 'd':
             g.database = optarg;
@@ -1196,25 +1115,6 @@ static int options(int argc, char **argv) {
         return -1;
     if (!g.token)
         return -1;
-    if (sdwan) {
-        FILE *file = fopen(sdwan, "rb");
-        if (!file)
-            return -1;
-        char *data = malloc(GW_FRAME_LIMIT + 1);
-        if (!data) {
-            fclose(file);
-            return -1;
-        }
-        size_t n = fread(data, 1, GW_FRAME_LIMIT + 1, file);
-        int bad = ferror(file) || n > GW_FRAME_LIMIT;
-        fclose(file);
-        if (!bad)
-            g.sdwan = gw_json(data, n);
-        free(data);
-        if (bad || !sdwan_valid(g.sdwan))
-            return -1;
-    } else
-        g.sdwan = json_object_new_object();
     if (!g.public_host || !*g.public_host)
         g.public_host = strcmp(g.bind, "0.0.0.0") ? g.bind : "127.0.0.1";
     if (!fastp2p_enrollment_host_valid(g.public_host))
@@ -1239,19 +1139,17 @@ static int options(int argc, char **argv) {
     char *profile = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token, g.enrollment_ca);
     if (!profile) return -1;
     OPENSSL_cleanse(profile, strlen(profile)); free(profile);
-    return g.sdwan ? 0 : -1;
+    return 0;
 }
 int main(int argc, char **argv) {
     int parsed = options(argc, argv);
     if (parsed) {
         if (parsed < 0) {
             fputs("Invalid gateway configuration; check credentials, options and "
-                  "SD-WAN file\n",
+                  "database path\n",
                   stderr);
             usage();
         }
-        if (g.sdwan)
-            json_object_put(g.sdwan);
         return parsed < 0 ? 2 : 0;
     }
     signal(SIGINT, signal_stop);
@@ -1261,8 +1159,7 @@ int main(int argc, char **argv) {
     umask(0077);
     if (gw_store_open(&g.db, g.database)) {
         fputs("Cannot open node SQLite database\n", stderr);
-        json_object_put(g.sdwan);
-        return 1;
+return 1;
     }
     int admin_status = gw_store_admin_read(g.db, &g.admin);
     if (admin_status == 1 || g.reset_admin) {
@@ -1270,19 +1167,18 @@ int main(int argc, char **argv) {
     }
     if (admin_status) {
         fputs("Cannot initialize gateway account\n", stderr);
-        json_object_put(g.sdwan); sqlite3_close(g.db); return 1;
+sqlite3_close(g.db); return 1;
     }
     g.user = g.admin.user;
     snprintf(g.secret, sizeof(g.secret), "%s", g.admin.secret);
     g.auth_generation = 1;
     if (g.reset_admin) {
         puts("Gateway account reset from FASTP2P_USER and FASTP2P_PASSWORD");
-        json_object_put(g.sdwan); sqlite3_close(g.db); return 0;
+sqlite3_close(g.db); return 0;
     }
     if (gw_nat_start(&g.nat, g.bind)) {
         fputs("Cannot bind NAT ports\n", stderr);
-        json_object_put(g.sdwan);
-        sqlite3_close(g.db);
+sqlite3_close(g.db);
         return 1;
     }
     struct lws_context_creation_info info;
@@ -1339,7 +1235,6 @@ int main(int argc, char **argv) {
     lws_context_destroy(g.context);
     gw_nat_stop(&g.nat);
     sqlite3_close(g.db);
-    json_object_put(g.sdwan);
     OPENSSL_cleanse(g.secret, sizeof(g.secret));
     return result;
 failed:
@@ -1347,7 +1242,6 @@ failed:
         lws_context_destroy(g.context);
     gw_nat_stop(&g.nat);
     sqlite3_close(g.db);
-    json_object_put(g.sdwan);
     OPENSSL_cleanse(g.secret, sizeof(g.secret));
     return 1;
 }

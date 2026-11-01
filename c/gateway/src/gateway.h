@@ -65,7 +65,6 @@ struct gateway {
     uint64_t token;
     int reset_admin;
     uint64_t started_ms;
-    json_object *sdwan;
     sqlite3 *db;
     const char *database;
     const char *public_host, *enrollment_ca_file;

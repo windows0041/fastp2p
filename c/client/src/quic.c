@@ -170,7 +170,7 @@ static int select_alpn(SSL *ssl, const unsigned char **out, unsigned char *outle
                        const unsigned char *in, unsigned int inlen, void *argument) {
     (void)ssl;
     (void)argument;
-    static const unsigned char protocol[] = "\x09" "fastp2pv1";
+    static const unsigned char protocol[] = "\x09" "fastp2pv2";
     unsigned char *selected = NULL;
     if (SSL_select_next_proto(&selected, outlen, protocol, sizeof(protocol) - 1, in, inlen) !=
         OPENSSL_NPN_NEGOTIATED)
@@ -307,7 +307,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
             goto error;
     } else {
         SSL_set_connect_state(q->tls);
-        static const unsigned char alpn[] = "\x09" "fastp2pv1";
+        static const unsigned char alpn[] = "\x09" "fastp2pv2";
         if (SSL_set_alpn_protos(q->tls, alpn, sizeof(alpn) - 1) ||
             ngtcp2_crypto_ossl_configure_client_session(q->tls))
             goto error;
@@ -329,7 +329,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
     gnutls_session_set_ptr(q->tls, &q->ref);
     if (gnutls_credentials_set(q->tls, GNUTLS_CRD_CERTIFICATE, q->cred))
         goto error;
-    gnutls_datum_t alpn = {(unsigned char *)"fastp2pv1", 9};
+    gnutls_datum_t alpn = {(unsigned char *)"fastp2pv2", 9};
     if (gnutls_alpn_set_protocols(q->tls, &alpn, 1, GNUTLS_ALPN_MANDATORY))
         goto error;
 #endif
