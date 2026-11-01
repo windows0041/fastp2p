@@ -84,6 +84,7 @@ typedef struct {
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
     int has_secret, keyed, key_acked, relay_wait, session_owner;
+    int lan;
     fp_crypto crypto;
     /* Relay role: forward this tunnel's application frames to a paired tunnel. */
     int relay_link;
@@ -104,6 +105,7 @@ typedef struct {
      * them so one unreachable candidate cannot pin the link forever. */
     char relay_failed[4][32];
     int relay_failed_count;
+    char peer_lan[INET_ADDRSTRLEN];
     /* The session belongs to the rule so the secret survives a failed punch and
      * can be reused when the same link falls back to a relay. */
     uint64_t session;
@@ -181,6 +183,7 @@ static void release_relay(fastp2p_client *, int);
 static void bind_pending_key(fastp2p_client *, int);
 static void relay_join(fastp2p_client *, int);
 static void session_ready(fastp2p_client *, int);
+static void probe_complete(fastp2p_client *, int);
 static void close_overlay(fastp2p_client *, int, int);
 static void tunnel_message(fastp2p_client *, int, uint16_t, const uint8_t *, size_t);
 static void socks_failure(fastp2p_client *, int, unsigned);
@@ -208,6 +211,27 @@ static int valid_node(const char *s) {
               *s == '_' || *s == '-'))
             return 0;
     return 1;
+}
+static int private_address(uint32_t be) {
+    uint32_t a = ntohl(be);
+    if ((a & 0xFF000000u) == 0x0A000000u)
+        return 1; /* 10/8 */
+    if ((a & 0xFFF00000u) == 0xAC100000u)
+        return 1; /* 172.16/12 */
+    if ((a & 0xFFFF0000u) == 0xC0A80000u)
+        return 1; /* 192.168/16 */
+    return 0;
+}
+/* A LAN punch is possible when both ends hold a private address for each other.
+ * Punching the gateway-mapped address instead needs NAT hairpin support, which
+ * is exactly what fails on a flat site behind one router. */
+static int lan_punch_possible(const fastp2p_client *c, const app *a) {
+    struct in_addr peer, local;
+    if (!a->peer_lan[0] || inet_pton(AF_INET, a->peer_lan, &peer) != 1)
+        return 0;
+    if (inet_pton(AF_INET, c->local_ip, &local) != 1)
+        return 0;
+    return private_address(peer.s_addr) && private_address(local.s_addr);
 }
 static size_t node_base(char out[32], const char *hostname) {
     size_t used = 0;
@@ -634,6 +658,15 @@ static int start_probe(fastp2p_client *c, int index) {
         return -1;
     t->local_port = socket_port(t->fd);
     t->deadline = mono() + 5 * NS;
+    if (t->lan) {
+        /* Both peers have a private address for each other, so the gateway's
+         * mapped address is not needed: exchange local ports and punch on the
+         * LAN.  Going through the public address instead would need NAT
+         * hairpin support, which is what made these links fail. */
+        t->mapped_port = t->local_port;
+        probe_complete(c, index);
+        return 0;
+    }
     struct sockaddr_in peer = c->gateway;
     peer.sin_port = htons(27180);
     if (t->transport == FASTP2P_TRANSPORT_QUIC) {
@@ -649,14 +682,17 @@ static void probe_complete(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     json_object *j = json_object_new_object();
     op_js(j, "from", c->node);
-    op_js(j, "fromIP", c->ip);
+    /* On a LAN punch the peers exchange private addresses and local ports; the
+     * gateway-observed address is only meaningful when a NAT is in between. */
+    op_js(j, "fromIP", t->lan ? c->local_ip : c->ip);
     op_js(j, "version", WIRE_VERSION);
     op_ju(j, "natType", (uint64_t)c->nat_type);
-    op_ju(j, "coneNatPort", t->mapped_port);
+    op_ju(j, "coneNatPort", t->lan ? t->local_port : t->mapped_port);
     op_ju(j, "id", t->id);
     if (t->initiator) {
         op_js(j, "linkMode", t->mode);
         op_ju(j, "isServer", 1);
+        op_ju(j, "lan", t->lan ? 1 : 0);
         op_js(j, "underlayProtocol", t->transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp");
         push(c, t->peer, PUSH_CONNECT, j);
         t->state = T_REPLY;
@@ -1375,6 +1411,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 strcpy(t->ip, op_string(j, "fromIP"));
                 t->remote_port = (uint16_t)port;
                 t->server = op_integer(j, "isServer") != 0;
+                t->lan = op_integer(j, "lan") != 0;
                 if (udp && !strcmp(mode, "udp4") && t->server)
                     close_tunnel(c, ti, "direct UDP listener is not supported; use UDP punching");
                 else if (!udp && strcmp(mode, "tcppunch")) {
@@ -1464,11 +1501,15 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             start_punch(c, ti);
         }
     } else if (main == 7 && sub == 1) {
-        const char *peer = op_string(j, "peerNode");
+        const char *peer = op_string(j, "peerNode"), *lan = op_string(j, "lanIP");
+        struct in_addr lan_address;
         if (valid_node(peer))
             for (int i = 0; i < NA; ++i)
-                if (c->apps[i].used && !strcmp(c->apps[i].peer, peer))
+                if (c->apps[i].used && !strcmp(c->apps[i].peer, peer)) {
                     c->apps[i].peer_nat = op_integer(j, "natType");
+                    if (lan && inet_pton(AF_INET, lan, &lan_address) == 1)
+                        copy_string(c->apps[i].peer_lan, sizeof(c->apps[i].peer_lan), lan);
+                }
     } else if (main == 3 && sub == 7)
         report_apps(c);
     else if (main == 3 && sub == 9) {
@@ -2245,8 +2286,17 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                 if (!in_progress) {
                     /* Two failed punches, symmetric NAT on both sides, or an
                      * explicit diagnostic request means a direct path is not
-                     * reachable: ask the gateway for a relay. */
-                    if (a->attempts >= 2 || c->force_relay ||
+                     * reachable: ask the gateway for a relay.  A reachable LAN
+                     * address is tried first, because it needs no NAT support
+                     * at all and stays direct. */
+                    if (lan_punch_possible(c, a) && a->attempts < 2 && !c->force_relay) {
+                        ++a->attempts;
+                        ti = app_tunnel(c, a, a->peer, a->transport);
+                        if (ti >= 0) {
+                            c->tunnels[ti].lan = 1;
+                            start_punch(c, ti);
+                        }
+                    } else if (a->attempts >= 2 || c->force_relay ||
                         (c->nat_type == 2 && a->peer_nat == 2)) {
                         a->relay_requested = 1;
                         json_object *j = json_object_new_object();
