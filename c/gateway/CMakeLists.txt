@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(openp2p_c_gateway VERSION 0.1.0 LANGUAGES C)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "The gateway targets Linux; use WSL on Windows")
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)

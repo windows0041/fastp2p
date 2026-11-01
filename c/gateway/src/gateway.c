@@ -420,7 +420,13 @@ static void handle_http(struct connection *c) {
     }
     if (c->post && !strcmp(c->uri, "/api/v1/user/login")) {
         json_object *j = gw_json(c->request, c->request_length);
-        int valid = j && gw_secret_equal(gw_string(j, "user"), g.user) &&
+        if (!j || !json_object_is_type(j, json_type_object)) {
+            if (j)
+                json_object_put(j);
+            http_error(c, 400, 1, "invalid JSON");
+            return;
+        }
+        int valid = gw_secret_equal(gw_string(j, "user"), g.user) &&
                     gw_secret_equal(gw_string(j, "password"), g.password);
         if (j)
             json_object_put(j);
@@ -710,11 +716,15 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
             }
             char length[32];
             uint64_t size;
-            if (lws_hdr_copy(wsi, length, sizeof(length), WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0 &&
-                (gw_decimal(length, &size) || size > GW_HTTP_LIMIT)) {
+            int has_length =
+                lws_hdr_copy(wsi, length, sizeof(length), WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0;
+            if (has_length && (gw_decimal(length, &size) || size > GW_HTTP_LIMIT)) {
                 http_error(c, 413, 1, "request too large");
                 return 0;
             }
+            if ((has_length && size == 0) ||
+                (!has_length && !lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_TRANSFER_ENCODING)))
+                handle_http(c);
             return 0;
         }
         handle_http(c);

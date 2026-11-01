@@ -36,7 +36,7 @@ jobs:
       - name: Build reference clients
         run: |
           mkdir -p build/go
-          (cd go/client && go build -mod=readonly -o ../../build/go/openp2p ./cmd)
+          (cd go/client && go build -buildvcs=false -mod=readonly -o ../../build/go/openp2p ./cmd)
           python3 c/client/scripts/build-deps.py linux-x86_64
           cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
           cmake --build build/c --parallel 3

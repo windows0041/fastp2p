@@ -157,6 +157,10 @@ try:
         wait(lambda:api('/healthz')[0]==200)
         assert api('/api/v1/devices')[0]==401
         assert api('/api/v1/user/login',{'user':user,'password':'incorrect'})[0]==401
+        assert api('/api/v1/user/login',{'user':user,'password':password+'\0suffix'})[0]==401
+        empty=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
+        empty.request('POST','/api/v1/user/login',b'');response=empty.getresponse()
+        assert response.status==400;response.read();empty.close()
         status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and login['nodeToken']==str(token)
         jwt=login['token'];head,body,sig=jwt.split('.')
         expected=hmac.new((user+password+'@openp2p.cn').encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
