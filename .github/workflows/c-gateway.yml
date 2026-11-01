@@ -73,6 +73,7 @@ jobs:
           cmake --build build/c-gateway-release --parallel 3
           cmake --install build/c-gateway-release
           cp c/gateway/README.md c/gateway/VALIDATION-ZH.md c/gateway/THIRD_PARTY.md c/gateway/LICENSE c/gateway/.env.example dist/c-gateway-debian${{ matrix.debian }}-x86_64/
+          cp c/NODE-STORAGE-ZH.md dist/c-gateway-debian${{ matrix.debian }}-x86_64/
           cp -R c/gateway/deploy dist/c-gateway-debian${{ matrix.debian }}-x86_64/
           mkdir -p dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts
           cp go/gateway/scripts/generate-cert.sh dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts/

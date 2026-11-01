@@ -15,6 +15,7 @@ for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY
     shutil.copyfile(project/file,sdk/file)
 (sdk/'examples').mkdir(exist_ok=True)
 (sdk/'include').mkdir(exist_ok=True)
+shutil.copyfile(project.parent/'NODE-STORAGE-ZH.md',sdk/'NODE-STORAGE-ZH.md')
 shutil.copyfile(project/'include/openp2p.h',sdk/'include/openp2p.h')
 shutil.copyfile(project/'examples/embed.c',sdk/'examples/embed.c')
 notices=sdk/'licenses';notices.mkdir(exist_ok=True)

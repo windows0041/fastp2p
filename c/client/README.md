@@ -69,7 +69,7 @@ build/c/openp2p-c --config "$HOME/openp2p-dev/c-client/config.json"
 
 省略配置的 `network.Node` 和 `--node`，会读取主机名并由 C 网关 0.3.0+ 分配唯一名称。短于 8 位补随机数字，重名加数字后缀，CLI 自动保存设备标识供重连复用；Android 节点名留空时使用相同逻辑。已有固定名称保留。可用 `--identity-file FILE` 区分多个实例，身份文件不可跨机器复制。
 
-库接口、身份文件位置与数据库规则见 [节点存储和命名](../NODE-STORAGE-ZH.md)。
+库接口、身份文件位置与数据库规则见 [节点存储和命名](https://github.com/windows0041/openp2p-test/blob/main/c/NODE-STORAGE-ZH.md)。
 
 ## C 库接口
 

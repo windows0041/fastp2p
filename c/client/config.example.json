@@ -1,6 +1,6 @@
 {
   "network": {
-    "Node": "c-client-node-a",
+    "AutoNode": true,
     "Token": 0,
     "ServerHost": "127.0.0.1",
     "ServerPort": 27183

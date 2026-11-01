@@ -65,7 +65,7 @@ curl --cacert "$HOME/openp2p-dev/c-gateway-local/tls/ca.crt" https://127.0.0.1:1
 
 新增 SQLite 节点登记，保留离线节点、主机名与首次/最近在线时间。`--database FILE` / `OPENP2P_DATABASE` 指定路径，默认当前目录的 `nodes.sqlite3`。systemd 使用独立 StateDirectory，Docker 需要挂载可写的持久目录或命名卷。
 
-C 0.4 客户端省略节点名后，网关依据主机名自动分配：短于 8 位补随机数字，重名追加数字后缀，通过数据库唯一约束防止冲突，设备标识保证重启后复用。已有显式节点名保留。配置、C 接口与备份方法见 [节点存储和命名](../NODE-STORAGE-ZH.md)。
+C 0.4 客户端省略节点名后，网关依据主机名自动分配：短于 8 位补随机数字，重名追加数字后缀，通过数据库唯一约束防止冲突，设备标识保证重启后复用。已有显式节点名保留。配置、C 接口与备份方法见 [节点存储和命名](https://github.com/windows0041/openp2p-test/blob/main/c/NODE-STORAGE-ZH.md)。
 
 ## Web 控制台
 
