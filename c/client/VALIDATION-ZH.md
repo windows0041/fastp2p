@@ -1,4 +1,22 @@
-# Linux C 客户端首版验证记录
+# C 客户端验证记录
+
+## 0.2.0 跨平台验证（2026-11-01）
+
+公开接口保持 ABI 1。Windows / Android / macOS 使用固定依赖：OpenSSL 3.5.7、ngtcp2 1.22.1、curl 8.23.0、json-c 0.18；Linux 系统 GnuTLS 后端继续回归。运行时无需 Go，Go 1.20.14 仅用于构建协议参考对端。
+
+Windows x86_64 在本机原生运行 CLI / DLL，已通过协议/加密、地址比较、非阻塞 socket、时钟、ABI / uint64 JSON 工厂及 40 次生命周期句柄计数检查。错误 CA、错误主机名均在 HTTP 登录请求前被拒绝，有效 CA 允许 TLS。独立 QUIC 覆盖 C 和 Go 两种客户端/服务端角色。
+
+Windows 与真实 Go 网关、Go/C 目的节点的 8 组转发均通过。另以独立临时节点经 `gz.itq.cc.cd` 连接 `xrwmaster-selfhost`，验证 TCP 打洞 / QUIC 各自的 TCP 应用 262144 字节、UDP 应用 1000 字节回传；核对两种隧道日志，35 秒后再次转发通过，程序正常退出。
+
+Android 应用安装到 ADB 连接的 Android 12 / API 31 / x86_64 设备，通过真实 Activity → 前台服务 → JNI → C 核心路径运行。经同一公网网关连接远端 Go 节点，四种转发组合均通过，数据量同 Windows；后台心跳 35 秒、主动断开、再次连接、第二次资源释放和平台 CA 导出均通过。arm64-v8a 已构建，尚未在 ARM 设备上运行。
+
+Android APK 同时包含两种 ABI 的独立 C 库和 JNI 库。已检查各库 ELF 架构、11 个公开 C 符号的导出边界、16 KB ELF 与 APK 对齐，以及完整第三方许可证。Gradle 构建与 lint 通过；16 KB 检查属于产物验证，未代替 16 KB 页大小设备上的实际运行。
+
+更新后的 Linux 核心通过常规与 ASan/UBSan 组件测试、独立双向 QUIC，以及六节点完整互通回归。12 组转发、TCP 最后响应数据、35 秒心跳、网关重启重连均通过，退出日志无 Sanitizer / undefined behavior 报错。
+
+macOS 两架构原生测试及 MSVC 消费 DLL 的运行结果随平台工作流记录。当前平台边界和使用方法见 [PLATFORMS-ZH.md](PLATFORMS-ZH.md)。本轮保留现有 Go 部署，Windows 和 Android 使用独立 C 测试节点，测试后已停止连接。
+
+## 0.1.0 Linux 首版
 
 日期：2026-11-01。C 程序版本 0.1.0，公开接口 ABI 1。参考对端为本仓库 Go 客户端 3.25.11 和自建 Go 网关。测试没有替换现有 Go 部署。
 

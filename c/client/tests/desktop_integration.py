@@ -5,6 +5,7 @@ Use on a disposable CI runner: the gateway uses its standard local ports.
 QUIC is forced by the C initiator; quic_interop.py separately covers both TLS roles.
 """
 import argparse
+import http.client
 import json
 import os
 from pathlib import Path
@@ -82,6 +83,8 @@ try:
     token=str(secrets.randbits(63)|(1<<63)|1)
     environment=os.environ.copy()
     environment.update(OPENP2P_USER='desktop-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=token)
+    environment['NO_PROXY']=environment.get('NO_PROXY','')+','+gateway_host+',127.0.0.1,localhost'
+    environment['no_proxy']=environment['NO_PROXY']
     context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'))
     def start(command,name,directory):
         f=(root/(name+'.log')).open('w');files.append(f)
@@ -90,8 +93,11 @@ try:
     gateway=start([build/('gateway'+suffix),'-bind',gateway_host,'-apibind',gateway_host,
         '-cert',root/'certs/server.crt','-key',root/'certs/server.key'],'gateway',root)
     def health():
-        with urllib.request.urlopen('https://'+gateway_host+':10008/healthz',context=context,timeout=2) as r:
-            return r.status==200
+        connection=http.client.HTTPSConnection(gateway_host,10008,context=context,timeout=2)
+        try:
+            connection.request('GET','/healthz')
+            return connection.getresponse().status==200
+        finally:connection.close()
     wait(health)
     ports={}
     for proto,cls,handler in [('tcp',socketserver.ThreadingTCPServer,TCP),('udp',socketserver.ThreadingUDPServer,UDP)]:
@@ -126,6 +132,8 @@ try:
     log=(root/'desktop-c-source.log').read_text()
     assert 'TCP tunnel connected' in log and 'QUIC tunnel connected' in log
     results['both_transports_confirmed']=True
+    results.pop('last_wait_error',None)
+    results['phase']='complete'
     results['success']=True
 finally:
     for p in reversed(processes):

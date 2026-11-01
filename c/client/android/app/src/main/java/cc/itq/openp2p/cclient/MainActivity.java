@@ -91,7 +91,11 @@ public final class MainActivity extends Activity {
             JSONObject net = config.optJSONObject("network");
             gateway.setText(net == null ? "gz.itq.cc.cd" : net.optString("ServerHost", "gz.itq.cc.cd"));
             port.setText(String.valueOf(net == null ? 27183 : net.optInt("ServerPort", 27183)));
-            String defaultNode = "android-c-" + Integer.toHexString(android.os.Process.myUid());
+            String defaultNode = p.getString("defaultNode", "");
+            if (defaultNode.isEmpty()) {
+                defaultNode = "android-c-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+                p.edit().putString("defaultNode", defaultNode).apply();
+            }
             node.setText(net == null ? defaultNode : net.optString("Node", defaultNode));
             JSONArray apps = config.optJSONArray("apps");
             rules.setText(apps == null ? "[]" : apps.toString(2));
