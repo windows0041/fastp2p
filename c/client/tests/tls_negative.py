@@ -17,7 +17,7 @@ parser.add_argument('--cert-script', help='Deprecated: certificates are generate
 args = parser.parse_args()
 client = str(Path(args.client).resolve())
 results = {}
-with tempfile.TemporaryDirectory(prefix='openp2p-c-tls-') as runtime:
+with tempfile.TemporaryDirectory(prefix='fastp2p-tls-') as runtime:
     runtime = Path(runtime)
     for case, hostname, trust in [('trusted_valid_host', '127.0.0.1', True),
                                    ('untrusted_ca', '127.0.0.1', False),
@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix='openp2p-c-tls-') as runtime:
         if trust:
             command += ['--cacert', str(directory / 'ca.crt')]
         env = os.environ.copy()
-        env['OPENP2P_TOKEN'] = '9007199254740993'
+        env['FASTP2P_TOKEN'] = '9007199254740993'
         try:
             result = subprocess.run(command, env=env, capture_output=True, timeout=12)
             assert result.returncode == 1, case

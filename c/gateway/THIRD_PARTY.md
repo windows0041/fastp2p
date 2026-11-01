@@ -5,9 +5,9 @@ from the target Linux distribution; see https://www.sqlite.org/copyright.html
 and https://www.sqlite.org/c3ref/intro.html. No SQLite amalgamation is vendored.
 
 This independent C implementation follows the control protocol of the Go
-reference in `go/gateway`, based on https://github.com/openp2p-cn/gateway-lite.
+reference formerly in `go/gateway` (now retained in Git history), based on https://github.com/openp2p-cn/gateway-lite.
 The upstream MIT license is preserved in LICENSE. Go is not linked or invoked
-at runtime; Go clients are used only as interoperability test peers.
+at runtime. The current branch builds and tests only C clients with the fastp2p1 protocol.
 
 CRC64/ISO node IDs, little-endian frames and HMAC-SHA256 TOTP follow the existing
 OpenP2P protocol. TOTP is compatible with https://github.com/openp2p-cn/totp; a

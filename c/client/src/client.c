@@ -1,5 +1,5 @@
 #include "platform.h"
-#include "openp2p.h"
+#include "fastp2p.h"
 #include "wire.h"
 #include "quic.h"
 #include "socks.h"
@@ -19,7 +19,7 @@
 #define NP 16
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
-#define COMPAT_VERSION "3.25.11"
+#define WIRE_VERSION "1.0.0"
 enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
 enum tunnel_state {
     T_FREE,
@@ -72,14 +72,14 @@ typedef struct {
     struct sockaddr_in peer;
     op_buffer rx;
 } pending;
-struct op2p_client {
+struct fastp2p_client {
     char host[256], ca[4096], node[32], ip[INET_ADDRSTRLEN], local_ip[INET_ADDRSTRLEN];
     char error[192], path[2048], hostname[256], device_id[33];
     int automatic_node;
     uint16_t port, public_port;
     uint64_t token, node_id, reconnect_at, last_rx, heartbeat_at, heartbeat_sent;
     int64_t clock_delta;
-    op2p_state state;
+    fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
     int nat_phase, nat_type;
     op_socket listener, nat_fd;
@@ -93,23 +93,23 @@ struct op2p_client {
     int ws_connected;
     size_t ws_remaining;
     op_buffer ws_rx, ws_tx;
-    op2p_event_fn callback;
+    fastp2p_event_fn callback;
     void *user;
     tunnel tunnels[NT];
     app apps[NA];
     overlay overlays[NO];
     pending pending[NP];
 };
-static void connect_gateway(op2p_client *);
-static void control_message(op2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
-static void close_tunnel(op2p_client *, int, const char *);
-static void close_overlay(op2p_client *, int, int);
-static void tunnel_message(op2p_client *, int, uint16_t, const uint8_t *, size_t);
-static void synchronize_app(op2p_client *, int);
-static void socks_failure(op2p_client *, int, unsigned);
-static void overlay_ack(op2p_client *, int, unsigned);
-static void socks_udp_reply(op2p_client *, int, const uint8_t *, size_t);
-static void socks_acknowledged(op2p_client *, int, json_object *);
+static void connect_gateway(fastp2p_client *);
+static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
+static void close_tunnel(fastp2p_client *, int, const char *);
+static void close_overlay(fastp2p_client *, int, int);
+static void tunnel_message(fastp2p_client *, int, uint16_t, const uint8_t *, size_t);
+static void synchronize_app(fastp2p_client *, int);
+static void socks_failure(fastp2p_client *, int, unsigned);
+static void overlay_ack(fastp2p_client *, int, unsigned);
+static void socks_udp_reply(fastp2p_client *, int, const uint8_t *, size_t);
+static void socks_acknowledged(fastp2p_client *, int, json_object *);
 static uint64_t mono(void) {
     return op_monotonic_ns();
 }
@@ -146,7 +146,7 @@ static size_t node_base(char out[32], const char *hostname) {
     out[used] = 0;
     return used;
 }
-static void automatic_candidate(op2p_client *c) {
+static void automatic_candidate(fastp2p_client *c) {
     size_t used = node_base(c->node, c->hostname), i = 0;
     while (used < 8) {
         unsigned char digit = (unsigned char)c->device_id[i++];
@@ -155,20 +155,20 @@ static void automatic_candidate(op2p_client *c) {
     c->node[used] = 0;
     c->node_id = op_node_id(c->node);
 }
-int op2p_client_set_identity(op2p_client *c, const char *identity) {
+int fastp2p_client_set_identity(fastp2p_client *c, const char *identity) {
     if (!c || !c->automatic_node || c->running || c->in_callback || !identity || strlen(identity) != 32)
-        return OP2P_EINVAL;
+        return FASTP2P_EINVAL;
     for (const char *p = identity; *p; ++p)
         if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
-            return OP2P_EINVAL;
+            return FASTP2P_EINVAL;
     memcpy(c->device_id, identity, 33);
     automatic_candidate(c);
-    return OP2P_OK;
+    return FASTP2P_OK;
 }
-const char *op2p_client_device_id(const op2p_client *c) {
+const char *fastp2p_client_device_id(const fastp2p_client *c) {
     return c ? c->device_id : "";
 }
-const char *op2p_client_node(const op2p_client *c) {
+const char *fastp2p_client_node(const fastp2p_client *c) {
     return c ? c->node : "";
 }
 static int copy_string(char *dst, size_t cap, const char *src) {
@@ -177,20 +177,20 @@ static int copy_string(char *dst, size_t cap, const char *src) {
     memcpy(dst, src, strlen(src) + 1);
     return 0;
 }
-static void emit(op2p_client *c, op2p_event_type type, uint64_t id, int code, const char *message) {
-    if (type == OP2P_EVENT_ERROR)
+static void emit(fastp2p_client *c, fastp2p_event_type type, uint64_t id, int code, const char *message) {
+    if (type == FASTP2P_EVENT_ERROR)
         snprintf(c->error, sizeof(c->error), "%s", message);
     if (c->callback) {
-        op2p_event e = {sizeof(e), type, c->state, id, code, message};
+        fastp2p_event e = {sizeof(e), type, c->state, id, code, message};
         c->in_callback = 1;
         c->callback(c, &e, c->user);
         c->in_callback = 0;
     }
 }
-static void set_state(op2p_client *c, op2p_state s, const char *msg) {
+static void set_state(fastp2p_client *c, fastp2p_state s, const char *msg) {
     if (c->state != s) {
         c->state = s;
-        emit(c, OP2P_EVENT_STATE, 0, 0, msg);
+        emit(c, FASTP2P_EVENT_STATE, 0, 0, msg);
     }
 }
 static int resolve4(const char *host, uint16_t port, struct sockaddr_in *out) {
@@ -276,18 +276,18 @@ static int read_socket(op_socket fd, op_buffer *b, size_t limit) {
     }
     return 0;
 }
-static int ws_frame(op2p_client *c, uint16_t main, uint16_t sub, const void *data, size_t len) {
+static int ws_frame(fastp2p_client *c, uint16_t main, uint16_t sub, const void *data, size_t len) {
     if (!c->ws || !c->running)
         return -1;
     if (op_frame_add(&c->ws_tx, main, sub, data, len))
         return -1;
     return 0;
 }
-static int ws_json(op2p_client *c, uint16_t main, uint16_t sub, json_object *obj) {
+static int ws_json(fastp2p_client *c, uint16_t main, uint16_t sub, json_object *obj) {
     const char *s = obj ? json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN) : "null";
     return ws_frame(c, main, sub, s, strlen(s));
 }
-static int push(op2p_client *c, const char *peer, uint16_t sub, json_object *obj) {
+static int push(fastp2p_client *c, const char *peer, uint16_t sub, json_object *obj) {
     op_buffer b = {0};
     uint8_t header[16];
     op_put64(header, c->node_id);
@@ -307,20 +307,20 @@ static int tjson(tunnel *t, uint16_t sub, json_object *obj) {
     const char *s = obj ? json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN) : "null";
     return tframe(t, sub, s, strlen(s));
 }
-static int tunnel_by_id(op2p_client *c, uint64_t id) {
+static int tunnel_by_id(fastp2p_client *c, uint64_t id) {
     for (int i = 0; i < NT; ++i)
         if (c->tunnels[i].state && c->tunnels[i].id == id)
             return i;
     return -1;
 }
-static int active_tunnel(op2p_client *c, const char *peer, int transport) {
+static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
     for (int i = 0; i < NT; ++i)
         if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].transport == transport &&
             !strcmp(c->tunnels[i].peer, peer))
             return i;
     return -1;
 }
-static void close_overlay(op2p_client *c, int index, int notify) {
+static void close_overlay(fastp2p_client *c, int index, int notify) {
     overlay *o = &c->overlays[index];
     if (!o->used)
         return;
@@ -352,7 +352,7 @@ static void close_overlay(op2p_client *c, int index, int notify) {
     memset(o, 0, sizeof(*o));
     o->fd = o->socks_udp = -1;
 }
-static void close_tunnel(op2p_client *c, int index, const char *reason) {
+static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
     if (!t->state)
         return;
@@ -388,9 +388,9 @@ static void close_tunnel(op2p_client *c, int index, const char *reason) {
     memset(t, 0, sizeof(*t));
     t->fd = t->listen_fd = t->alternate_fd = -1;
     if (reason)
-        emit(c, OP2P_EVENT_ERROR, id, OP2P_EIO, reason);
+        emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EIO, reason);
 }
-static int new_tunnel(op2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
+static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
         return -1;
     for (int i = 0; i < NT; ++i)
@@ -407,7 +407,7 @@ static int new_tunnel(op2p_client *c, const char *peer, uint64_t id, int transpo
             t->deadline = mono() + 15 * NS;
             return i;
         }
-    emit(c, OP2P_EVENT_ERROR, 0, OP2P_ELIMIT, "tunnel limit reached");
+    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "tunnel limit reached");
     return -1;
 }
 static int udp_packet(op_socket fd, const struct sockaddr_in *peer, uint16_t main, uint16_t sub,
@@ -421,18 +421,18 @@ static int udp_packet(op_socket fd, const struct sockaddr_in *peer, uint16_t mai
     op_buffer_clear(&b);
     return rv ? -1 : 0;
 }
-static int start_probe(op2p_client *c, int index) {
+static int start_probe(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     if (t->fd >= 0)
         op_close(t->fd);
-    t->fd = socket_bound(t->transport == OP2P_TRANSPORT_QUIC, c->local_ip, 0, 1);
+    t->fd = socket_bound(t->transport == FASTP2P_TRANSPORT_QUIC, c->local_ip, 0, 1);
     if (t->fd < 0)
         return -1;
     t->local_port = socket_port(t->fd);
     t->deadline = mono() + 5 * NS;
     struct sockaddr_in peer = c->gateway;
     peer.sin_port = htons(27180);
-    if (t->transport == OP2P_TRANSPORT_QUIC) {
+    if (t->transport == FASTP2P_TRANSPORT_QUIC) {
         t->state = T_NAT_UDP;
         return udp_packet(t->fd, &peer, 2, 0, NULL);
     }
@@ -441,12 +441,12 @@ static int start_probe(op2p_client *c, int index) {
         return -1;
     return 0;
 }
-static void probe_complete(op2p_client *c, int index) {
+static void probe_complete(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     json_object *j = json_object_new_object();
     op_js(j, "from", c->node);
     op_js(j, "fromIP", c->ip);
-    op_js(j, "version", COMPAT_VERSION);
+    op_js(j, "version", WIRE_VERSION);
     op_ju(j, "natType", (uint64_t)c->nat_type);
     op_ju(j, "coneNatPort", t->mapped_port);
     op_ju(j, "id", t->id);
@@ -454,7 +454,7 @@ static void probe_complete(op2p_client *c, int index) {
         op_ju(j, "token", c->token);
         op_js(j, "linkMode", t->mode);
         op_ju(j, "isServer", 1);
-        op_js(j, "underlayProtocol", t->transport == OP2P_TRANSPORT_QUIC ? "quic" : "tcp");
+        op_js(j, "underlayProtocol", t->transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp");
         push(c, t->peer, 1, j);
         t->state = T_REPLY;
         t->deadline = mono() + 12 * NS;
@@ -470,7 +470,7 @@ static void probe_complete(op2p_client *c, int index) {
             t->at = mono();
     }
     json_object_put(j);
-    if (t->transport == OP2P_TRANSPORT_TCP) {
+    if (t->transport == FASTP2P_TRANSPORT_TCP) {
         if (t->fd >= 0)
             op_close(t->fd);
         t->fd = -1;
@@ -481,7 +481,7 @@ static void probe_complete(op2p_client *c, int index) {
         }
     }
 }
-static void start_underlay(op2p_client *c, int index) {
+static void start_underlay(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     struct sockaddr_in peer = {.sin_family = AF_INET, .sin_port = htons(t->remote_port)};
     if (inet_pton(AF_INET, t->ip, &peer.sin_addr) != 1) {
@@ -489,7 +489,7 @@ static void start_underlay(op2p_client *c, int index) {
         return;
     }
     t->deadline = mono() + 10 * NS;
-    if (t->transport == OP2P_TRANSPORT_QUIC) {
+    if (t->transport == FASTP2P_TRANSPORT_QUIC) {
         if (!t->server && !t->notified) {
             t->state = T_UNDERLAY;
             return;
@@ -533,7 +533,7 @@ static void start_underlay(op2p_client *c, int index) {
     }
     t->state = T_TCP_CONNECT;
 }
-static void tunnel_active(op2p_client *c, int index) {
+static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
     t->last_rx = t->last_hb = mono();
@@ -543,8 +543,8 @@ static void tunnel_active(op2p_client *c, int index) {
         op_close(t->alternate_fd);
     t->listen_fd = t->alternate_fd = -1;
     op_buffer_clear(&t->alternate_rx);
-    emit(c, OP2P_EVENT_TUNNEL, t->id, 0,
-         t->transport == OP2P_TRANSPORT_TCP ? "TCP tunnel connected" : "QUIC tunnel connected");
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+         t->transport == FASTP2P_TRANSPORT_TCP ? "TCP tunnel connected" : "QUIC tunnel connected");
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && !strcmp(c->apps[i].peer, t->peer) &&
             c->apps[i].transport == t->transport) {
@@ -553,7 +553,7 @@ static void tunnel_active(op2p_client *c, int index) {
             synchronize_app(c, i);
         }
 }
-static void synchronize_app(op2p_client *c, int index) {
+static void synchronize_app(fastp2p_client *c, int index) {
     app *a = &c->apps[index];
     if (a->synced || a->tunnel_index < 0 || c->tunnels[a->tunnel_index].state != T_ACTIVE)
         return;
@@ -571,9 +571,9 @@ static void synchronize_app(op2p_client *c, int index) {
     json_object_put(j);
     a->synced = 1;
     a->ready_at = mono() + 200 * MS;
-    emit(c, OP2P_EVENT_FORWARD, a->id, 0, "forward attached to tunnel");
+    emit(c, FASTP2P_EVENT_FORWARD, a->id, 0, "forward attached to tunnel");
 }
-static int overlay_slot(op2p_client *c) {
+static int overlay_slot(fastp2p_client *c) {
     for (int i = 0; i < NO; ++i)
         if (!c->overlays[i].used) {
             overlay *o = &c->overlays[i];
@@ -585,10 +585,10 @@ static int overlay_slot(op2p_client *c) {
             o->deadline = o->activity + 5 * NS;
             return i;
         }
-    emit(c, OP2P_EVENT_ERROR, 0, OP2P_ELIMIT, "overlay connection limit reached");
+    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "overlay connection limit reached");
     return -1;
 }
-static int overlay_data(op2p_client *c, int oi, const uint8_t *data, size_t len) {
+static int overlay_data(fastp2p_client *c, int oi, const uint8_t *data, size_t len) {
     overlay *o = &c->overlays[oi];
     app *a = &c->apps[o->app_index];
     uint8_t encrypted[4096 + 32 + 8];
@@ -599,7 +599,7 @@ static int overlay_data(op2p_client *c, int oi, const uint8_t *data, size_t len)
     o->activity = mono();
     return tframe(&c->tunnels[o->tunnel_index], 9, encrypted, n + 8);
 }
-static void request_overlay(op2p_client *c, int oi) {
+static void request_overlay(fastp2p_client *c, int oi) {
     overlay *o = &c->overlays[oi];
     app *a = &c->apps[o->app_index];
     json_object *j = json_object_new_object();
@@ -616,7 +616,7 @@ static void request_overlay(op2p_client *c, int oi) {
     o->waiting = 1;
     o->deadline = mono() + (a->socks ? 15 : 5) * NS;
 }
-static void socks_failure(op2p_client *c, int oi, unsigned status) {
+static void socks_failure(fastp2p_client *c, int oi, unsigned status) {
     overlay *o = &c->overlays[oi];
     if (o->socks_state == S_FLOW) {
         close_overlay(c, oi, 1);
@@ -639,7 +639,7 @@ static void socks_failure(op2p_client *c, int oi, unsigned status) {
     o->socks_state = S_CLOSING;
     o->deadline = mono() + NS;
 }
-static void overlay_ack(op2p_client *c, int oi, unsigned status) {
+static void overlay_ack(fastp2p_client *c, int oi, unsigned status) {
     overlay *o = &c->overlays[oi];
     uint8_t prefix[8];
     op_put64(prefix, c->apps[o->app_index].id);
@@ -671,10 +671,10 @@ static void overlay_ack(op2p_client *c, int oi, unsigned status) {
     op_buffer_clear(&b);
     json_object_put(j);
 }
-static void socks_acknowledged(op2p_client *c, int oi, json_object *ack) {
+static void socks_acknowledged(fastp2p_client *c, int oi, json_object *ack) {
     overlay *o = &c->overlays[oi];
     if (!ack || !json_object_is_type(ack, json_type_object)) {
-        emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "SOCKS5 exit requires C client 0.3.0 or newer");
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "SOCKS5 exit requires C client 0.3.0 or newer");
         socks_failure(c, oi, 7);
         return;
     }
@@ -705,13 +705,13 @@ static void socks_acknowledged(op2p_client *c, int oi, json_object *ack) {
     }
     o->socks_state = S_STREAM;
 }
-static overlay *socks_parent(op2p_client *c, uint64_t id) {
+static overlay *socks_parent(fastp2p_client *c, uint64_t id) {
     for (int i = 0; i < NO; ++i)
         if (c->overlays[i].used && c->overlays[i].id == id && c->overlays[i].socks_state == S_UDP)
             return &c->overlays[i];
     return NULL;
 }
-static void socks_udp_reply(op2p_client *c, int oi, const uint8_t *data, size_t len) {
+static void socks_udp_reply(fastp2p_client *c, int oi, const uint8_t *data, size_t len) {
     overlay *o = &c->overlays[oi], *parent = socks_parent(c, o->socks_parent);
     if (!parent || o->waiting || len > 4096)
         return;
@@ -723,7 +723,7 @@ static void socks_udp_reply(op2p_client *c, int oi, const uint8_t *data, size_t 
     op_sendto(parent->socks_udp, packet, len + 10, MSG_DONTWAIT,
               (struct sockaddr *)&parent->socks_peer, sizeof(parent->socks_peer));
 }
-static void tick_socks_udp(op2p_client *c, int index) {
+static void tick_socks_udp(fastp2p_client *c, int index) {
     overlay *parent = &c->overlays[index];
     app *a = &c->apps[parent->app_index];
     for (int k = 0; k < 8; ++k) {
@@ -780,7 +780,7 @@ static void tick_socks_udp(op2p_client *c, int index) {
             close_overlay(c, oi, 1);
     }
 }
-static void tick_socks(op2p_client *c, uint64_t now) {
+static void tick_socks(fastp2p_client *c, uint64_t now) {
     for (int i = 0; i < NO; ++i) {
         overlay *o = &c->overlays[i];
         if (!o->used || !o->socks_state || o->socks_state == S_STREAM || o->socks_state == S_FLOW)
@@ -883,7 +883,7 @@ static void tick_socks(op2p_client *c, uint64_t now) {
         }
     }
 }
-static void report_apps(op2p_client *c) {
+static void report_apps(fastp2p_client *c) {
     json_object *root = json_object_new_object(), *list = json_object_new_array();
     for (int i = 0; i < NA; ++i) {
         app *a = &c->apps[i];
@@ -898,19 +898,19 @@ static void report_apps(op2p_client *c) {
         op_ju(j, "srcPort", a->port);
         op_ju(j, "enabled", 1);
         op_ju(j, "isActive", a->tunnel_index >= 0 && c->tunnels[a->tunnel_index].state == T_ACTIVE);
-        op_js(j, "linkMode", a->transport == OP2P_TRANSPORT_QUIC ? "udppunch" : "ipv4");
+        op_js(j, "linkMode", a->transport == FASTP2P_TRANSPORT_QUIC ? "udppunch" : "ipv4");
         json_object_array_add(list, j);
     }
     json_object_object_add(root, "Apps", list);
     ws_json(c, 6, 3, root);
     json_object_put(root);
 }
-static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const uint8_t *data,
+static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, const uint8_t *data,
                             size_t len) {
     c->last_rx = mono();
     if (main == 1) {
         if (len != 8) {
-            emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "invalid gateway heartbeat");
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "invalid gateway heartbeat");
             return;
         }
         uint64_t now = wall();
@@ -922,7 +922,7 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
             if (delta >= -(int64_t)(86400 * NS) && delta <= (int64_t)(86400 * NS))
                 c->clock_delta = delta;
         }
-        emit(c, OP2P_EVENT_HEARTBEAT, 0, 0, "gateway heartbeat received");
+        emit(c, FASTP2P_EVENT_HEARTBEAT, 0, 0, "gateway heartbeat received");
         return;
     }
     uint64_t sender = 0;
@@ -950,14 +950,14 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
         return;
     }
     if (main == 0) {
-        if (op_integer(j, "error") || op_integer(j, "token") != c->token) {
-            emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "gateway rejected login");
+        if (strcmp(op_string(j, "protocol"), "fastp2p1") || op_integer(j, "error") || op_integer(j, "token") != c->token) {
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway rejected login");
             c->stopping = 1;
         } else {
             if (c->automatic_node) {
                 const char *assigned = op_string(j, "node");
                 if (!valid_node(assigned)) {
-                    emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "gateway returned an invalid node name");
+                    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway returned an invalid node name");
                     c->stopping = 1;
                     json_object_put(j);
                     return;
@@ -966,16 +966,16 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
                 c->node_id = op_node_id(c->node);
                 char message[64];
                 snprintf(message, sizeof(message), "node name: %s", c->node);
-                emit(c, OP2P_EVENT_STATE, c->node_id, 0, message);
+                emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
             }
             c->login_ok = 1;
             if (c->report_ok)
-                set_state(c, OP2P_ONLINE, "gateway authenticated");
+                set_state(c, FASTP2P_ONLINE, "gateway authenticated");
         }
     } else if (main == 6 && sub == 7) {
         c->report_ok = 1;
         if (c->login_ok)
-            set_state(c, OP2P_ONLINE, "gateway authenticated");
+            set_state(c, FASTP2P_ONLINE, "gateway authenticated");
     } else if (main == 3 && sub == 1) {
         const char *from = op_string(j, "from"), *mode = op_string(j, "linkMode");
         uint64_t id = op_integer(j, "id"), port = op_integer(j, "coneNatPort");
@@ -986,7 +986,7 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
             inet_pton(AF_INET, op_string(j, "fromIP"), &peer_ip) == 1 &&
             (!strcmp(mode, "tcppunch") || !strcmp(mode, "tcp4") || !strcmp(mode, "intranet") ||
              udp)) {
-            int ti = new_tunnel(c, from, id, udp ? OP2P_TRANSPORT_QUIC : OP2P_TRANSPORT_TCP, 0);
+            int ti = new_tunnel(c, from, id, udp ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP, 0);
             if (ti >= 0) {
                 tunnel *t = &c->tunnels[ti];
                 strcpy(t->mode, mode);
@@ -1002,7 +1002,7 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
                     close_tunnel(c, ti, "NAT probe could not start");
             }
         } else
-            emit(c, OP2P_EVENT_ERROR, id, OP2P_EINVAL, "peer connection request rejected");
+            emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EINVAL, "peer connection request rejected");
     } else if (main == 3 && sub == 2) {
         int ti = tunnel_by_id(c, op_integer(j, "id"));
         if (ti >= 0) {
@@ -1065,7 +1065,7 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
     else if (main == 3 && sub == 9) {
         uint64_t src = op_integer(j, "srcPort"), dst = op_integer(j, "dstPort");
         if (src && src <= 65535 && dst && dst <= 65535) {
-            op2p_forward f = {.struct_size = sizeof(f),
+            fastp2p_forward f = {.struct_size = sizeof(f),
                               .name = op_string(j, "appName"),
                               .local_port = (uint16_t)src,
                               .peer_node = op_string(j, "peerNode"),
@@ -1073,16 +1073,16 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
                               .destination_port = (uint16_t)dst,
                               .protocol = op_string(j, "protocol"),
                               .transport = (op_integer(j, "punchPriority") & 2)
-                                               ? OP2P_TRANSPORT_TCP
-                                               : OP2P_TRANSPORT_QUIC};
-            int rv = op2p_client_add_forward(c, &f, NULL);
+                                               ? FASTP2P_TRANSPORT_TCP
+                                               : FASTP2P_TRANSPORT_QUIC};
+            int rv = fastp2p_client_add_forward(c, &f, NULL);
             if (rv)
-                emit(c, OP2P_EVENT_ERROR, 0, rv, "could not add gateway forwarding rule");
+                emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add gateway forwarding rule");
         }
     }
     json_object_put(j);
 }
-static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *data, size_t len) {
+static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, size_t len) {
     tunnel *t = &c->tunnels[ti];
     t->last_rx = mono();
     if (t->state == T_HANDSHAKE || t->state == T_QUIC) {
@@ -1222,7 +1222,7 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
     }
     json_object_put(j);
 }
-static void read_tunnel_frames(op2p_client *c, int ti) {
+static void read_tunnel_frames(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     for (int i = 0; i < 64 && t->state; ++i) {
         uint16_t main, sub;
@@ -1240,7 +1240,7 @@ static void read_tunnel_frames(op2p_client *c, int ti) {
         free(body);
     }
 }
-static void accept_punch(op2p_client *c, int ti) {
+static void accept_punch(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     if (t->listen_fd < 0 || (t->state != T_TCP_CONNECT && t->state != T_HANDSHAKE))
         return;
@@ -1270,7 +1270,7 @@ static void accept_punch(op2p_client *c, int ti) {
     else
         op_close(fd);
 }
-static void read_alternate(op2p_client *c, int ti) {
+static void read_alternate(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     if (t->alternate_fd < 0)
         return;
@@ -1296,7 +1296,7 @@ static void read_alternate(op2p_client *c, int ti) {
     }
     free(body);
 }
-static void tick_tunnel(op2p_client *c, int ti, uint64_t now) {
+static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     if (!t->state)
         return;
@@ -1367,7 +1367,7 @@ static void tick_tunnel(op2p_client *c, int ti, uint64_t now) {
         }
     }
     if (t->state == T_TIME && now >= t->at) {
-        if (t->transport == OP2P_TRANSPORT_QUIC && !strcmp(t->mode, "udppunch")) {
+        if (t->transport == FASTP2P_TRANSPORT_QUIC && !strcmp(t->mode, "udppunch")) {
             t->state = T_PUNCH;
             t->punch_next = 0;
         } else
@@ -1478,7 +1478,7 @@ static void tick_tunnel(op2p_client *c, int ti, uint64_t now) {
         }
     }
 }
-static void tick_accept(op2p_client *c, uint64_t now) {
+static void tick_accept(fastp2p_client *c, uint64_t now) {
     for (int k = 0; k < 8; ++k) {
         struct sockaddr_in peer;
         op_socklen len = sizeof(peer);
@@ -1535,7 +1535,7 @@ static void tick_accept(op2p_client *c, uint64_t now) {
         }
     }
 }
-static void tick_overlays(op2p_client *c, uint64_t now) {
+static void tick_overlays(fastp2p_client *c, uint64_t now) {
     for (int i = 0; i < NO; ++i) {
         overlay *o = &c->overlays[i];
         if (!o->used)
@@ -1623,7 +1623,7 @@ static void tick_overlays(op2p_client *c, uint64_t now) {
         }
     }
 }
-static void tick_apps(op2p_client *c, uint64_t now) {
+static void tick_apps(fastp2p_client *c, uint64_t now) {
     for (int i = 0; i < NA; ++i) {
         app *a = &c->apps[i];
         if (!a->used || !a->local)
@@ -1651,7 +1651,7 @@ static void tick_apps(op2p_client *c, uint64_t now) {
                 o->deadline = now + 10 * NS;
             }
         }
-        if (a->tunnel_index < 0 && now >= a->retry && c->state == OP2P_ONLINE) {
+        if (a->tunnel_index < 0 && now >= a->retry && c->state == FASTP2P_ONLINE) {
             int ti = active_tunnel(c, a->peer, a->transport);
             if (ti >= 0) {
                 a->tunnel_index = ti;
@@ -1667,7 +1667,7 @@ static void tick_apps(op2p_client *c, uint64_t now) {
                     if (ti >= 0) {
                         tunnel *t = &c->tunnels[ti];
                         strcpy(t->mode,
-                               a->transport == OP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
+                               a->transport == FASTP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
                         json_object *j = json_object_new_object();
                         op_ju(j, "token", c->token);
                         op_js(j, "peerNode", a->peer);
@@ -1712,7 +1712,7 @@ static void tick_apps(op2p_client *c, uint64_t now) {
                 if (n < 0)
                     break;
                 if (n > 4096) {
-                    emit(c, OP2P_EVENT_ERROR, a->id, OP2P_ELIMIT,
+                    emit(c, FASTP2P_EVENT_ERROR, a->id, FASTP2P_ELIMIT,
                          "UDP application datagram exceeds 4096 bytes");
                     continue;
                 }
@@ -1751,7 +1751,7 @@ static void tick_apps(op2p_client *c, uint64_t now) {
         }
     }
 }
-static void send_heartbeat(op2p_client *c) {
+static void send_heartbeat(fastp2p_client *c) {
     c->heartbeat_sent = wall();
     c->heartbeat_at = mono();
     ws_json(c, 1, 0, NULL);
@@ -1761,7 +1761,7 @@ static CURLcode curl_initialization;
 static void initialize_curl(void) {
     curl_initialization = curl_global_init(CURL_GLOBAL_DEFAULT);
 }
-static void close_gateway(op2p_client *c) {
+static void close_gateway(fastp2p_client *c) {
     if (c->ws) {
         curl_multi_remove_handle(c->multi, c->ws);
         curl_easy_cleanup(c->ws);
@@ -1782,15 +1782,15 @@ static void close_gateway(op2p_client *c) {
     if (c->running && !c->stopping) {
         unsigned shift = c->reconnect_attempt < 5 ? (unsigned)c->reconnect_attempt++ : 5;
         c->reconnect_at = mono() + ((uint64_t)1 << shift) * NS;
-        set_state(c, OP2P_RECONNECTING, "gateway disconnected; retry scheduled");
+        set_state(c, FASTP2P_RECONNECTING, "gateway disconnected; retry scheduled");
     }
 }
-static void gateway_failed(op2p_client *c) {
-    emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO,
+static void gateway_failed(fastp2p_client *c) {
+    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
          "WSS connection failed: check gateway address, CA, certificate hostname and token");
     close_gateway(c);
 }
-static void connect_gateway(op2p_client *c) {
+static void connect_gateway(fastp2p_client *c) {
     c->ws = curl_easy_init();
     if (!c->ws) {
         gateway_failed(c);
@@ -1798,8 +1798,8 @@ static void connect_gateway(op2p_client *c) {
     }
     snprintf(c->path, sizeof(c->path),
              "wss://%s:%u/api/v1/login?node=%s&token=%" PRIu64
-             "&version=%s&nattype=%d&sharebandwidth=0",
-             c->host, c->port, c->node, c->token, COMPAT_VERSION, c->nat_type);
+             "&protocol=fastp2p1&version=%s&nattype=%d&sharebandwidth=0",
+             c->host, c->port, c->node, c->token, WIRE_VERSION, c->nat_type);
     if (c->automatic_node) {
         char hostname[32];
         node_base(hostname, c->hostname);
@@ -1843,7 +1843,7 @@ static void connect_gateway(op2p_client *c) {
     if (curl_multi_add_handle(c->multi, c->ws) != CURLM_OK)
         gateway_failed(c);
 }
-static void service_gateway(op2p_client *c) {
+static void service_gateway(fastp2p_client *c) {
     int active = 0;
     if (curl_multi_perform(c->multi, &active) != CURLM_OK) {
         gateway_failed(c);
@@ -1867,9 +1867,9 @@ static void service_gateway(op2p_client *c) {
             strlen(ip) < sizeof(c->local_ip))
             strcpy(c->local_ip, ip);
         json_object *j = json_object_new_object();
-        op_js(j, "os", OP2P_PLATFORM_OS);
+        op_js(j, "os", FASTP2P_PLATFORM_OS);
         op_js(j, "hostname", c->hostname);
-        op_js(j, "version", COMPAT_VERSION);
+        op_js(j, "version", WIRE_VERSION);
         op_js(j, "lanIP", c->local_ip);
         op_ju(j, "publicIPPort", c->public_port);
         ws_json(c, 6, 0, j);
@@ -1943,7 +1943,7 @@ static void service_gateway(op2p_client *c) {
         }
     }
 }
-static void tick_nat(op2p_client *c, uint64_t now) {
+static void tick_nat(fastp2p_client *c, uint64_t now) {
     if (c->nat_fd < 0)
         return;
     uint8_t data[1024];
@@ -1979,7 +1979,7 @@ static void tick_nat(op2p_client *c, uint64_t now) {
     if (now > c->nat_deadline) {
         c->nat_type = 314;
         finish = 1;
-        emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO,
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
              "UDP NAT discovery unavailable; TCP transport can still be attempted");
     }
     if (finish) {
@@ -1988,35 +1988,35 @@ static void tick_nat(op2p_client *c, uint64_t now) {
         connect_gateway(c);
     }
 }
-uint32_t op2p_abi_version(void) {
-    return OP2P_ABI_VERSION;
+uint32_t fastp2p_abi_version(void) {
+    return FASTP2P_ABI_VERSION;
 }
-const char *op2p_version(void) {
-    return OP2P_VERSION;
+const char *fastp2p_version(void) {
+    return FASTP2P_VERSION;
 }
-int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
+int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     if (!out)
-        return OP2P_EINVAL;
+        return FASTP2P_EINVAL;
     *out = NULL;
     if (op_platform_init())
-        return OP2P_EIO;
-    if (!cfg || cfg->struct_size < sizeof(*cfg) || cfg->abi_version != OP2P_ABI_VERSION ||
+        return FASTP2P_EIO;
+    if (!cfg || cfg->struct_size < sizeof(*cfg) || cfg->abi_version != FASTP2P_ABI_VERSION ||
         (cfg->node && *cfg->node && !valid_node(cfg->node)) || !cfg->token || !cfg->gateway_host || !*cfg->gateway_host)
-        return OP2P_EINVAL;
-    op2p_client *c = calloc(1, sizeof(*c));
+        return FASTP2P_EINVAL;
+    fastp2p_client *c = calloc(1, sizeof(*c));
     if (!c)
-        return OP2P_ENOMEM;
+        return FASTP2P_ENOMEM;
     if (copy_string(c->host, sizeof(c->host), cfg->gateway_host) ||
         (cfg->node && copy_string(c->node, sizeof(c->node), cfg->node)) ||
         (cfg->ca_file && copy_string(c->ca, sizeof(c->ca), cfg->ca_file))) {
         free(c);
-        return OP2P_EINVAL;
+        return FASTP2P_EINVAL;
     }
     for (const char *p = c->host; *p; ++p)
         if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
               *p == '.' || *p == '-' || *p == '_')) {
             free(c);
-            return OP2P_EINVAL;
+            return FASTP2P_EINVAL;
         }
     c->port = cfg->gateway_port ? cfg->gateway_port : 27183;
     c->public_port = cfg->public_port;
@@ -2028,7 +2028,7 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
         unsigned char bytes[16];
         if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
             free(c);
-            return OP2P_EIO;
+            return FASTP2P_EIO;
         }
         for (unsigned i = 0; i < sizeof(bytes); ++i)
             snprintf(c->device_id + i * 2, 3, "%02x", bytes[i]);
@@ -2049,19 +2049,19 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
     for (int i = 0; i < NP; ++i)
         c->pending[i].fd = -1;
     *out = c;
-    return OP2P_OK;
+    return FASTP2P_OK;
 }
-int op2p_client_add_forward(op2p_client *c, const op2p_forward *f, uint64_t *id) {
+int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint64_t *id) {
     if (!c || !f || f->struct_size < sizeof(*f) || c->in_callback || !valid_node(f->peer_node) ||
         ((!c->automatic_node || c->login_ok) && !strcmp(f->peer_node, c->node)) || !f->local_port || !f->destination_port ||
         !f->destination_host || !*f->destination_host || !f->protocol ||
         (strcmp(f->protocol, "tcp") && strcmp(f->protocol, "udp")) ||
-        (f->transport != OP2P_TRANSPORT_TCP && f->transport != OP2P_TRANSPORT_QUIC))
-        return OP2P_EINVAL;
+        (f->transport != FASTP2P_TRANSPORT_TCP && f->transport != FASTP2P_TRANSPORT_QUIC))
+        return FASTP2P_EINVAL;
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && c->apps[i].port == f->local_port &&
             c->apps[i].udp == !strcmp(f->protocol, "udp"))
-            return OP2P_ESTATE;
+            return FASTP2P_ESTATE;
     for (int i = 0; i < NA; ++i)
         if (!c->apps[i].used) {
             app *a = &c->apps[i];
@@ -2073,10 +2073,10 @@ int op2p_client_add_forward(op2p_client *c, const op2p_forward *f, uint64_t *id)
                 copy_string(a->bind_ip, sizeof(a->bind_ip),
                             f->bind_ip ? f->bind_ip : "127.0.0.1") ||
                 copy_string(a->name, sizeof(a->name), f->name ? f->name : "forward"))
-                return OP2P_EINVAL;
+                return FASTP2P_EINVAL;
             struct in_addr check;
             if (inet_pton(AF_INET, a->bind_ip, &check) != 1)
-                return OP2P_EINVAL;
+                return FASTP2P_EINVAL;
             a->id = random_id();
             a->key = random_id();
             a->port = f->local_port;
@@ -2089,21 +2089,21 @@ int op2p_client_add_forward(op2p_client *c, const op2p_forward *f, uint64_t *id)
                 if (a->fd >= 0)
                     op_close(a->fd);
                 a->used = 0;
-                return OP2P_EIO;
+                return FASTP2P_EIO;
             }
             if (id)
                 *id = a->id;
-            return OP2P_OK;
+            return FASTP2P_OK;
         }
-    return OP2P_ELIMIT;
+    return FASTP2P_ELIMIT;
 }
-int op2p_client_add_socks5(op2p_client *c, const op2p_socks5 *p, uint64_t *id) {
+int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64_t *id) {
     if (!p || p->struct_size < sizeof(*p))
-        return OP2P_EINVAL;
+        return FASTP2P_EINVAL;
     const char *user = p->username ? p->username : "", *password = p->password ? p->password : "";
     if (strlen(user) > 255 || strlen(password) > 255 || (!*user != !*password))
-        return OP2P_EINVAL;
-    op2p_forward f = {.struct_size = sizeof(f),
+        return FASTP2P_EINVAL;
+    fastp2p_forward f = {.struct_size = sizeof(f),
                       .name = p->name ? p->name : "socks5",
                       .bind_ip = p->bind_ip,
                       .local_port = p->local_port,
@@ -2113,7 +2113,7 @@ int op2p_client_add_socks5(op2p_client *c, const op2p_socks5 *p, uint64_t *id) {
                       .protocol = "tcp",
                       .transport = p->transport};
     uint64_t aid;
-    int rv = op2p_client_add_forward(c, &f, &aid);
+    int rv = fastp2p_client_add_forward(c, &f, &aid);
     if (rv)
         return rv;
     for (int i = 0; i < NA; ++i)
@@ -2128,24 +2128,24 @@ int op2p_client_add_socks5(op2p_client *c, const op2p_socks5 *p, uint64_t *id) {
         }
     if (id)
         *id = aid;
-    return OP2P_OK;
+    return FASTP2P_OK;
 }
-int op2p_client_start(op2p_client *c) {
+int fastp2p_client_start(fastp2p_client *c) {
     if (!c || c->in_callback || c->running || c->multi)
-        return OP2P_ESTATE;
+        return FASTP2P_ESTATE;
     op_once_run(&curl_once, initialize_curl);
     if (curl_initialization != CURLE_OK)
-        return OP2P_EIO;
+        return FASTP2P_EIO;
     if (resolve4(c->host, c->port, &c->gateway)) {
-        emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "gateway DNS resolution failed");
-        return OP2P_EIO;
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway DNS resolution failed");
+        return FASTP2P_EIO;
     }
     c->listener = socket_bound(0, NULL, c->public_port, 1);
     if (c->listener < 0 || op_listen(c->listener, 32)) {
         if (c->listener >= 0)
             op_close(c->listener);
         c->listener = -1;
-        return OP2P_EIO;
+        return FASTP2P_EIO;
     }
     c->public_port = socket_port(c->listener);
     for (int i = 0; i < NA; ++i)
@@ -2153,20 +2153,20 @@ int op2p_client_start(op2p_client *c) {
             app *a = &c->apps[i];
             a->fd = socket_bound(a->udp, a->bind_ip, a->port, 0);
             if (a->fd < 0 || (!a->udp && op_listen(a->fd, 64))) {
-                op2p_client_stop(c);
-                return OP2P_EIO;
+                fastp2p_client_stop(c);
+                return FASTP2P_EIO;
             }
         }
     c->multi = curl_multi_init();
     if (!c->multi) {
-        op2p_client_stop(c);
-        return OP2P_EIO;
+        fastp2p_client_stop(c);
+        return FASTP2P_EIO;
     }
     c->running = 1;
     c->stopping = 0;
     c->reconnect_at = 0;
     c->nat_type = 314;
-    set_state(c, OP2P_CONNECTING, "discovering NAT and connecting to gateway");
+    set_state(c, FASTP2P_CONNECTING, "discovering NAT and connecting to gateway");
     c->nat_fd = socket_bound(1, NULL, 0, 0);
     c->nat_phase = 1;
     c->nat_deadline = mono() + 2 * NS;
@@ -2176,15 +2176,15 @@ int op2p_client_start(op2p_client *c) {
         connect_gateway(c);
     else
         udp_packet(c->nat_fd, &peer, 2, 0, NULL);
-    return OP2P_OK;
+    return FASTP2P_OK;
 }
-int op2p_client_step(op2p_client *c, unsigned wait_ms) {
+int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     if (!c || !c->running || c->in_callback || c->stepping)
-        return OP2P_ESTATE;
+        return FASTP2P_ESTATE;
     c->stepping = 1;
     if (c->stopping) {
         c->stepping = 0;
-        return op2p_client_stop(c);
+        return fastp2p_client_stop(c);
     }
     uint64_t now = mono();
     tick_nat(c, now);
@@ -2221,15 +2221,15 @@ int op2p_client_step(op2p_client *c, unsigned wait_ms) {
     }
     c->stepping = 0;
     if (c->stopping)
-        return op2p_client_stop(c);
-    return OP2P_OK;
+        return fastp2p_client_stop(c);
+    return FASTP2P_OK;
 }
-int op2p_client_stop(op2p_client *c) {
+int fastp2p_client_stop(fastp2p_client *c) {
     if (!c)
-        return OP2P_EINVAL;
+        return FASTP2P_EINVAL;
     if (c->in_callback || c->stepping) {
         c->stopping = 1;
-        return OP2P_OK;
+        return FASTP2P_OK;
     }
     c->stopping = 1;
     c->running = 0;
@@ -2264,22 +2264,22 @@ int op2p_client_stop(op2p_client *c) {
     op_buffer_clear(&c->ws_rx);
     op_buffer_clear(&c->ws_tx);
     c->login_ok = c->report_ok = 0;
-    set_state(c, OP2P_STOPPED, "client stopped");
-    return OP2P_OK;
+    set_state(c, FASTP2P_STOPPED, "client stopped");
+    return FASTP2P_OK;
 }
-void op2p_client_destroy(op2p_client *c) {
+void fastp2p_client_destroy(fastp2p_client *c) {
     if (!c || c->in_callback || c->stepping)
         return;
-    op2p_client_stop(c);
+    fastp2p_client_stop(c);
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && c->apps[i].fd >= 0)
             op_close(c->apps[i].fd);
     OPENSSL_cleanse(c, sizeof(*c));
     free(c);
 }
-op2p_state op2p_client_state(const op2p_client *c) {
-    return c ? c->state : OP2P_STOPPED;
+fastp2p_state fastp2p_client_state(const fastp2p_client *c) {
+    return c ? c->state : FASTP2P_STOPPED;
 }
-const char *op2p_client_last_error(const op2p_client *c) {
+const char *fastp2p_client_last_error(const fastp2p_client *c) {
     return c ? c->error : "invalid client";
 }

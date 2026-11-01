@@ -1,4 +1,0 @@
-OPENP2P_1 {
-    global: op2p_*;
-    local: *;
-};

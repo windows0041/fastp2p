@@ -1,16 +1,16 @@
-#ifndef OP2P_PLATFORM_H
-#define OP2P_PLATFORM_H
+#ifndef FASTP2P_PLATFORM_H
+#define FASTP2P_PLATFORM_H
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
 #if defined(__ANDROID__)
-#define OP2P_PLATFORM_OS "android-c"
+#define FASTP2P_PLATFORM_OS "android-c"
 #elif defined(_WIN32)
-#define OP2P_PLATFORM_OS "windows-c"
+#define FASTP2P_PLATFORM_OS "windows-c"
 #elif defined(__APPLE__)
-#define OP2P_PLATFORM_OS "darwin-c"
+#define FASTP2P_PLATFORM_OS "darwin-c"
 #else
-#define OP2P_PLATFORM_OS "linux-c"
+#define FASTP2P_PLATFORM_OS "linux-c"
 #endif
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

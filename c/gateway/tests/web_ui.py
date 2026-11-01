@@ -33,14 +33,14 @@ class Peer:
         self.name=name;self.apps=[];self.commands=[];self.lock=threading.Lock();self.stop=threading.Event();self.error=None
         self.sock=ssl.create_default_context(cafile=str(ca)).wrap_socket(socket.create_connection(('127.0.0.1',37183),timeout=3),server_hostname='127.0.0.1')
         key=base64.b64encode(secrets.token_bytes(16)).decode()
-        request=(f'GET /api/v1/login?node={name}&token={token}&version=3.25.11&nattype=1 HTTP/1.1\r\nHost: 127.0.0.1:37183\r\n'
+        request=(f'GET /api/v1/login?node={name}&token={token}&protocol=fastp2p1&version=1.0.0&nattype=1 HTTP/1.1\r\nHost: 127.0.0.1:37183\r\n'
             f'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
         self.sock.sendall(request.encode());self.buffer=bytearray()
         while b'\r\n\r\n' not in self.buffer:self.buffer.extend(self.sock.recv(4096))
         head,self.buffer=self.buffer.split(b'\r\n\r\n',1);assert b' 101 ' in head
         self.buffer=bytearray(self.buffer)
         self.sock.settimeout(None)
-        self.send(frame(6,0,{'os':system,'version':'3.25.11','lanIP':'192.0.2.8','hasIPv4':1}))
+        self.send(frame(6,0,{'os':system,'version':'1.0.0','lanIP':'192.0.2.8','hasIPv4':1}))
         self.reader=threading.Thread(target=self.read_loop,daemon=True);self.reader.start()
         self.heartbeat=threading.Thread(target=self.heartbeat_loop,daemon=True);self.heartbeat.start()
     def exact(self,n):
@@ -91,19 +91,19 @@ class Peer:
 def main():
     p=argparse.ArgumentParser();p.add_argument('--gateway',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--wsl',action='store_true');p.add_argument('--browser-executable')
-    p.add_argument('--client',help='Optional real C client; exercises legacy JSON compatibility')
+    p.add_argument('--client',help='Optional real C client; exercises advanced JSON configuration')
     args=p.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     peers=[];process=None;client=None;client_log=None;results={}
-    with tempfile.TemporaryDirectory(prefix='op2p-web-') as directory:
+    with tempfile.TemporaryDirectory(prefix='fastp2p-web-') as directory:
         root=Path(directory)
-        assert root.resolve().parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith('op2p-web-')
+        assert root.resolve().parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith('fastp2p-web-')
         create_certificates(root/'certs','127.0.0.1')
         username='web-admin';password=secrets.token_urlsafe(24);token=str(2**64-1)
-        env=os.environ.copy();env.update(OPENP2P_USER=username,OPENP2P_PASSWORD=password,OPENP2P_TOKEN=token)
+        env=os.environ.copy();env.update(FASTP2P_USER=username,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=token)
         if args.wsl:
             remote=subprocess.check_output(['wsl.exe','-d','Debian','-u','maoyu','--','wslpath','-a',root.as_posix()],text=True).strip()
             (root/'launch.sh').write_text('#!/bin/bash\nset -e\necho $$ > "$1/gateway.pid"\nshift\nexec "$@"\n',newline='\n')
-            env['WSLENV']=env.get('WSLENV','')+':OPENP2P_USER:OPENP2P_PASSWORD:OPENP2P_TOKEN'
+            env['WSLENV']=env.get('WSLENV','')+':FASTP2P_USER:FASTP2P_PASSWORD:FASTP2P_TOKEN'
             command=['wsl.exe','-d','Debian','-u','maoyu','--','bash',remote+'/launch.sh',remote,args.gateway,
                      '--cert',remote+'/certs/server.crt','--key',remote+'/certs/server.key']
         else:command=[str(Path(args.gateway).resolve()),'--cert',str(root/'certs/server.crt'),'--key',str(root/'certs/server.key')]
@@ -132,7 +132,7 @@ def main():
                 c=SimpleNamespace(name='web-c-node')
             else:
                 c=Peer('web-c-node','linux-c',token,root/'certs/ca.crt');peers.append(c)
-            go=Peer('web-go-node','<img src=x onerror=globalThis.__xss=1>',token,root/'certs/ca.crt');peers.append(go)
+            go=Peer('web-rich-node','<img src=x onerror=globalThis.__xss=1>',token,root/'certs/ca.crt');peers.append(go)
             go.apps=[{'appName':'<img src=x onerror=globalThis.__xss=1>','protocol':'tcp','srcPort':23456,'dstHost':'127.0.0.1','dstPort':22,'peerNode':c.name,'enabled':1,'isActive':1,'linkMode':'udppunch'}]
             with sync_playwright() as pw:
                 browser=pw.chromium.launch(headless=True,**({'executable_path':args.browser_executable} if args.browser_executable else {}))
@@ -148,7 +148,7 @@ def main():
                     page.locator('#username').fill(username);page.locator('#password').fill(password);page.locator('#login-submit').click()
                     expect(page.locator('#online-count')).to_have_text('2',timeout=15000)
                 login();results['login_and_authenticated_overview']=True
-                page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(token)
+                page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(__import__('re').compile(r'^FP1\.'))
                 assert page.locator('#install-token').get_attribute('type')=='password'
                 page.locator('#reveal-token').click();assert page.locator('#install-token').get_attribute('type')=='text'
                 page.locator('#close-token').click();expect(page.locator('#install-token')).to_have_value('')
@@ -183,7 +183,7 @@ def main():
                 page.screenshot(path=str(args.output/'desktop.png'),full_page=True)
                 page.locator('#rules').get_by_role('button',name='删除',exact=True).click();page.locator('#confirm-action').click()
                 expect(page.locator('#rules tr')).to_have_count(0)
-                results['Go_edit_switch_delete_and_XSS_escaping']=True
+                results['capability_fixture_edit_switch_delete_and_XSS_escaping']=True
                 page.set_viewport_size({'width':390,'height':844});page.locator('#nodes tr').filter(has_text=c.name).get_by_role('button').click()
                 expect(page.locator('#rules')).to_contain_text('浏览器测试转发')
                 if not page.evaluate('document.documentElement.scrollWidth <= innerWidth'):

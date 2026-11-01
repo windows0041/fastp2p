@@ -10,7 +10,7 @@
 #include <time.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
@@ -32,7 +32,7 @@ struct qchunk {
 struct opq {
     ngtcp2_crypto_conn_ref ref;
     ngtcp2_conn *conn;
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
     SSL_CTX *tls_context;
     SSL *tls;
     ngtcp2_crypto_ossl_ctx *native_tls;
@@ -66,7 +66,7 @@ static ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *ref) {
     return ((opq *)ref->user_data)->conn;
 }
 static int qrandom(uint8_t *data, size_t len) {
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
     return len > INT_MAX || RAND_bytes(data, (int)len) != 1 ? -1 : 0;
 #else
     return gnutls_rnd(GNUTLS_RND_RANDOM, data, len);
@@ -132,7 +132,7 @@ static int acknowledged(ngtcp2_conn *conn, int64_t sid, uint64_t offset, uint64_
         q->tail = NULL;
     return 0;
 }
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
 static int make_certificate(opq *q) {
     EVP_PKEY_CTX *generator = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
     EVP_PKEY *key = NULL;
@@ -152,7 +152,7 @@ static int make_certificate(opq *q) {
         !X509_set_pubkey(certificate, key))
         goto done;
     X509_NAME *name = X509_get_subject_name(certificate);
-    if (!X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"openp2p", -1,
+    if (!X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"fastp2p", -1,
                                     -1, 0) ||
         !X509_set_issuer_name(certificate, name) || !X509_sign(certificate, key, EVP_sha256()) ||
         SSL_CTX_use_certificate(q->tls_context, certificate) != 1 ||
@@ -170,7 +170,7 @@ static int select_alpn(SSL *ssl, const unsigned char **out, unsigned char *outle
                        const unsigned char *in, unsigned int inlen, void *argument) {
     (void)ssl;
     (void)argument;
-    static const unsigned char protocol[] = "\x09openp2pv1";
+    static const unsigned char protocol[] = "\x09" "fastp2pv1";
     unsigned char *selected = NULL;
     if (SSL_select_next_proto(&selected, outlen, protocol, sizeof(protocol) - 1, in, inlen) !=
         OPENSSL_NPN_NEGOTIATED)
@@ -192,7 +192,7 @@ static int make_certificate(opq *q) {
         gnutls_x509_crt_set_serial(crt, serial, sizeof(serial)) ||
         gnutls_x509_crt_set_activation_time(crt, time(NULL) - 60) ||
         gnutls_x509_crt_set_expiration_time(crt, time(NULL) + 86400) ||
-        gnutls_x509_crt_set_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, "openp2p", 7) ||
+        gnutls_x509_crt_set_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, "fastp2p", 7) ||
         gnutls_x509_crt_set_key(crt, key) ||
         gnutls_x509_crt_sign2(crt, crt, key, GNUTLS_DIG_SHA256, 0) ||
         gnutls_certificate_set_x509_key(q->cred, &crt, 1, key))
@@ -260,7 +260,7 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     }
     if (rv)
         return fail(q, "QUIC connection", rv);
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
     ngtcp2_conn_set_tls_native_handle(q->conn, q->native_tls);
 #else
     ngtcp2_conn_set_tls_native_handle(q->conn, q->tls);
@@ -283,7 +283,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
     q->ref.user_data = q;
     if (op_getsockname(fd, (struct sockaddr *)&q->local, &q->local_len))
         goto error;
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
     q->tls_context = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (!q->tls_context || !SSL_CTX_set_min_proto_version(q->tls_context, TLS1_3_VERSION))
         goto error;
@@ -307,7 +307,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
             goto error;
     } else {
         SSL_set_connect_state(q->tls);
-        static const unsigned char alpn[] = "\x09openp2pv1";
+        static const unsigned char alpn[] = "\x09" "fastp2pv1";
         if (SSL_set_alpn_protos(q->tls, alpn, sizeof(alpn) - 1) ||
             ngtcp2_crypto_ossl_configure_client_session(q->tls))
             goto error;
@@ -329,7 +329,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
     gnutls_session_set_ptr(q->tls, &q->ref);
     if (gnutls_credentials_set(q->tls, GNUTLS_CRD_CERTIFICATE, q->cred))
         goto error;
-    gnutls_datum_t alpn = {(unsigned char *)"openp2pv1", 9};
+    gnutls_datum_t alpn = {(unsigned char *)"fastp2pv1", 9};
     if (gnutls_alpn_set_protocols(q->tls, &alpn, 1, GNUTLS_ALPN_MANDATORY))
         goto error;
 #endif
@@ -373,7 +373,7 @@ int opq_step(opq *q) {
         if (!op_address_equal((struct sockaddr *)&peer, plen, (struct sockaddr *)&q->peer,
                               q->peer_len))
             continue;
-        /* Stray OpenP2P UDP punch markers may still arrive after handoff. */
+        /* Stray FastP2P UDP punch markers may still arrive after handoff. */
         if (!n || !(packet[0] & 0x40))
             continue;
         if (!q->conn) {
@@ -488,7 +488,7 @@ void opq_free(opq *q) {
         return;
     if (q->conn)
         ngtcp2_conn_del(q->conn);
-#ifdef OP2P_QUIC_OPENSSL
+#ifdef FASTP2P_QUIC_OPENSSL
     if (q->tls) {
         SSL_set_app_data(q->tls, NULL);
         SSL_free(q->tls);

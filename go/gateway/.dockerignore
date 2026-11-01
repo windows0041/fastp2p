@@ -1,7 +1,0 @@
-.git
-certs
-dist
-.env
-log
-*.log
-__debug_bin*

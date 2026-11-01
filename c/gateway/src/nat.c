@@ -14,6 +14,10 @@ static int bound(const char *ip, unsigned port, int udp) {
         return -1;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (udp && setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one))) {
+        close(fd);
+        return -1;
+    }
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
     if (inet_pton(AF_INET, ip, &a.sin_addr) != 1 || bind(fd, (struct sockaddr *)&a, sizeof(a)) ||
         (!udp && listen(fd, 64))) {
@@ -62,12 +66,26 @@ static void udp_step(struct nat_state *s, int fd) {
     for (int attempt = 0; attempt < 128; ++attempt) {
         unsigned char packet[4096];
         struct sockaddr_in peer;
-        socklen_t plen = sizeof(peer);
-        ssize_t n = recvfrom(fd, packet, sizeof(packet), 0, (struct sockaddr *)&peer, &plen);
+        union { struct cmsghdr alignment; unsigned char bytes[CMSG_SPACE(sizeof(struct in_pktinfo))]; } control;
+        struct iovec input = {.iov_base = packet, .iov_len = sizeof(packet)};
+        struct msghdr message = {.msg_name = &peer, .msg_namelen = sizeof(peer),
+            .msg_iov = &input, .msg_iovlen = 1, .msg_control = control.bytes,
+            .msg_controllen = sizeof(control.bytes)};
+        ssize_t n = recvmsg(fd, &message, 0);
         if (n < 0)
             break;
+        struct in_addr local = {0};
+        for (struct cmsghdr *part = CMSG_FIRSTHDR(&message); part; part = CMSG_NXTHDR(&message, part))
+            if (part->cmsg_level == IPPROTO_IP && part->cmsg_type == IP_PKTINFO &&
+                part->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                struct in_pktinfo info;
+                memcpy(&info, CMSG_DATA(part), sizeof(info));
+                local = info.ipi_addr;
+            }
         /* Bound aggregate work and amplification; only answer the observed IP. */
-        if (++s->packets > 10000 || n < 8 || plen != sizeof(peer) || peer.sin_family != AF_INET ||
+        if (++s->packets > 10000 || n < 8 || !local.s_addr ||
+            (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+            message.msg_namelen != sizeof(peer) || peer.sin_family != AF_INET ||
             gw_u32(packet) != (uint32_t)(n - 8) || gw_u16(packet + 4) != 2 ||
             gw_u16(packet + 6) > 1)
             continue;
@@ -105,7 +123,18 @@ static void udp_step(struct nat_state *s, int fd) {
         gw_put16(response + 4, 2);
         gw_put16(response + 6, (uint16_t)sub);
         memcpy(response + 8, text, length);
-        sendto(fd, response, length + 8, MSG_NOSIGNAL, (struct sockaddr *)&peer, sizeof(peer));
+        /* Preserve the destination address as reply source on wildcard listeners. */
+        memset(&control, 0, sizeof(control));
+        struct iovec output = {.iov_base = response, .iov_len = length + 8};
+        message = (struct msghdr){.msg_name = &peer, .msg_namelen = sizeof(peer),
+            .msg_iov = &output, .msg_iovlen = 1, .msg_control = control.bytes,
+            .msg_controllen = sizeof(control.bytes)};
+        struct cmsghdr *part = CMSG_FIRSTHDR(&message);
+        part->cmsg_level = IPPROTO_IP; part->cmsg_type = IP_PKTINFO;
+        part->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+        struct in_pktinfo info = {.ipi_spec_dst = local};
+        memcpy(CMSG_DATA(part), &info, sizeof(info));
+        sendmsg(fd, &message, MSG_NOSIGNAL);
         json_object_put(j);
     }
 }

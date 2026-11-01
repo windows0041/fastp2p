@@ -1,9 +1,9 @@
-name: C clients
+name: fastp2p C clients
 on:
   push:
-    tags: ['c-client-v*']
+    tags: ['fastp2p-client-v*']
     branches: ['**']
-    paths: ['c/client/**', '.github/workflows/c-platforms.yml', 'scripts/publish-release.py']
+    paths: ['c/client/**', 'c/common/**', 'scripts/tls/**', '.github/workflows/c-platforms.yml', 'scripts/publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -27,14 +27,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.20.14'
-          cache-dependency-path: go/client/go.sum
       - uses: actions/cache/restore@v4
         id: dependencies
         with:
-          path: ~/openp2p-dev/cross
+          path: ~/fastp2p-dev/cross
           key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
           restore-keys: c-deps-${{ matrix.target }}-
       - name: Build pinned dependencies
@@ -42,11 +38,11 @@ jobs:
       - uses: actions/cache/save@v4
         if: steps.dependencies.outputs.cache-hit != 'true'
         with:
-          path: ~/openp2p-dev/cross
+          path: ~/fastp2p-dev/cross
           key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
       - name: Build CLI and C SDK
         run: |
-          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
           cmake --build build/c --parallel 3
           cmake --build build/c --target example-embed
           cmake --install build/c
@@ -57,30 +53,25 @@ jobs:
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
           ctest --test-dir build/c --output-on-failure
-          dist/${{ matrix.target }}/bin/openp2p-c --version
-      - name: QUIC interoperability with Go
-        working-directory: go/client
-        run: |
-          go build -mod=readonly -o ../../build/c/quic-go ../../c/client/tests/quic-go/main.go
-          python3 ../../c/client/tests/quic_interop.py --build ../../build/c
-      - name: Gateway and application forwarding
+          dist/${{ matrix.target }}/bin/fastp2p --version
+      - name: Native C QUIC and token enrollment
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
-          (cd go/gateway && go build -mod=readonly -o ../../build/c/gateway .)
-          (cd go/client && go build -mod=readonly -o ../../build/c/go-client ./cmd)
-          python3 c/client/tests/desktop_integration.py --build build/c
+          python3 c/client/tests/quic_native.py --binary build/c/quic-interop
+          python3 c/client/tests/enrollment_integration.py --client build/c/fastp2p --gateway c/client/tests/gateway_fixture.py
       - name: Package SDK
         run: |
           python3 c/client/scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
-          tar -C dist -czf dist/openp2p-c-${{ matrix.target }}.tar.gz ${{ matrix.target }}
+          tar -C dist -czf dist/fastp2p-${{ matrix.target }}.tar.gz ${{ matrix.target }}
+          cp build/c/fastp2p dist/fastp2p-${{ matrix.target }}
       - name: Native SOCKS5 TCP, UDP, authentication and reconnect
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
-          python3 c/client/tests/socks_integration.py --client build/c/openp2p-c --gateway build/c/gateway --logs build/c/socks
+          python3 c/client/tests/socks_integration.py --client build/c/fastp2p --gateway c/client/tests/gateway_fixture.py --logs build/c/socks
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-${{ matrix.target }}
-          path: dist/openp2p-c-*.tar.gz
+          name: fastp2p-${{ matrix.target }}
+          path: dist/fastp2p-*
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -98,10 +89,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.20.14'
-          cache-dependency-path: go/client/go.sum
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -114,41 +101,43 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1 || { tail -60 sdk-install.log; exit 1; }
       - uses: actions/cache@v4
         with:
-          path: ~/openp2p-dev/cross
+          path: ~/fastp2p-dev/cross
           key: c-deps-cross-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
           restore-keys: c-deps-cross-
       - name: Windows CLI and SDK
         run: |
           python3 c/client/scripts/build-deps.py windows-x86_64
-          cmake -S c/client -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/c/client/cmake/windows-x86_64.cmake" -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/windows-x86_64"
+          cmake -S c/client -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/c/client/cmake/windows-x86_64.cmake" -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/windows-x86_64"
           cmake --build build/windows --parallel 4
           cmake --install build/windows --prefix "$PWD/dist/windows-x86_64"
-          (cd go/client && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/quic-go.exe ../../c/client/tests/quic-go/main.go)
-          (cd go/client && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/go-client.exe ./cmd)
-          (cd go/gateway && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/gateway.exe .)
           python3 c/client/scripts/sdk-metadata.py --sdk dist/windows-x86_64
+          cp build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-validation
           path: |
             build/windows/*.exe
-            build/windows/openp2p.dll
+            build/windows/fastp2p.dll
             dist/windows-x86_64/
-      - name: Android APK and lint
+      - name: Android signed headless APK
+        env:
+          FASTP2P_ANDROID_KEYSTORE_BASE64: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_BASE64 }}
+          FASTP2P_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_PASSWORD }}
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
-          export OP2P_CMAKE_DIR="$(python3 -c 'import cmake,pathlib; print(pathlib.Path(cmake.CMAKE_BIN_DIR).parent)')"
+          export FASTP2P_CMAKE_DIR="$(python3 -c 'import cmake,pathlib; print(pathlib.Path(cmake.CMAKE_BIN_DIR).parent)')"
+          test -n "$FASTP2P_ANDROID_KEYSTORE_BASE64" && test -n "$FASTP2P_ANDROID_KEYSTORE_PASSWORD"
+          export FASTP2P_ANDROID_KEYSTORE="$RUNNER_TEMP/fastp2p-android.p12"
+          printf '%s' "$FASTP2P_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$FASTP2P_ANDROID_KEYSTORE"
+          chmod 600 "$FASTP2P_ANDROID_KEYSTORE"
           bash c/client/scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
-          (cd c/client/android && bash gradlew --no-daemon :app:lintDebug)
-          python3 c/client/tests/android_artifact.py --apk c/client/android/app/build/outputs/apk/debug/app-debug.apk --ndk "$ANDROID_NDK_HOME"
+          python3 c/client/tests/android_artifact.py --apk c/client/android/app/build/outputs/apk/release/app-release.apk --ndk "$ANDROID_NDK_HOME"
           mkdir -p dist/android
-          cp c/client/android/app/build/outputs/apk/debug/app-debug.apk dist/android/openp2p-c-android-debug.apk
-          cp -R c/client/android/app/build/intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib dist/android/lib
-          python3 c/client/scripts/sdk-metadata.py --sdk dist/android
+          cp c/client/android/app/build/outputs/apk/release/app-release.apk dist/android/fastp2p-android.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-android
-          path: dist/android/
+          name: fastp2p-android
+          path: dist/android/fastp2p-android.apk
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -156,7 +145,7 @@ jobs:
           path: |
             android-build.log
             sdk-install.log
-            c/client/android/app/build/reports/lint-results-debug.*
+            c/client/android/app/build/reports/lint-results-release.*
   windows:
     needs: cross
     runs-on: windows-2022
@@ -173,11 +162,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & build/windows/openp2p-c.exe --version
+          & build/windows/fastp2p.exe --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-api.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python c/client/tests/identity_cli.py --client build/windows/openp2p-c.exe
+          python c/client/tests/identity_cli.py --client build/windows/fastp2p.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-platform.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -186,34 +175,38 @@ jobs:
           & build/windows/test-socks.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
-          python c/client/tests/tls_negative.py --client build/windows/openp2p-c.exe
+          python c/client/tests/tls_negative.py --client build/windows/fastp2p.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python c/client/tests/quic_interop.py --build build/windows
+          python c/client/tests/quic_native.py --binary build/windows/quic-interop.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python c/client/tests/desktop_integration.py --build build/windows
+          python c/client/tests/enrollment_integration.py --client build/windows/fastp2p.exe --gateway c/client/tests/gateway_fixture.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python c/client/tests/socks_integration.py --client build/windows/openp2p-c.exe --gateway build/windows/gateway.exe --logs build/windows/socks
+          python c/client/tests/socks_integration.py --client build/windows/fastp2p.exe --gateway c/client/tests/gateway_fixture.py --logs build/windows/socks
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: MSVC consumer of the C DLL
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          lib /nologo /machine:x64 /def:c\client\platform\windows\openp2p.def /out:dist\windows-x86_64\lib\openp2p.lib
+          lib /nologo /machine:x64 /def:c\client\platform\windows\fastp2p.def /out:dist\windows-x86_64\lib\fastp2p.lib
           if errorlevel 1 exit /b 1
           cmake -S c/client/tests/sdk-consumer -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CD%/dist/windows-x86_64"
           if errorlevel 1 exit /b 1
           cmake --build build/msvc
           if errorlevel 1 exit /b 1
-          copy /y dist\windows-x86_64\bin\openp2p.dll build\msvc\openp2p.dll
+          copy /y dist\windows-x86_64\bin\fastp2p.dll build\msvc\fastp2p.dll
           build\msvc\sdk-consumer.exe
           if errorlevel 1 exit /b 1
-      - name: Package Windows SDK
+      - name: Package Windows CLI and SDK
         shell: pwsh
-        run: Compress-Archive -Path dist/windows-x86_64 -DestinationPath dist/openp2p-c-windows-x86_64.zip
+        run: |
+          Compress-Archive -Path dist/windows-x86_64 -DestinationPath dist/fastp2p-windows-x86_64.zip
+          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-windows-x86_64
-          path: dist/openp2p-c-windows-x86_64.zip
+          name: fastp2p-windows-x86_64
+          path: |
+            dist/fastp2p-windows-x86_64.zip
+            dist/fastp2p-windows-x86_64.exe
   linux:
     runs-on: ubuntu-24.04
     container:
@@ -226,44 +219,42 @@ jobs:
           apt-get update -qq
           apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.20.14'
-          cache-dependency-path: go/client/go.sum
       - uses: actions/cache@v4
         with:
-          path: ~/openp2p-dev/cross
+          path: ~/fastp2p-dev/cross
           key: gateway-client-deps-debian12-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
       - name: Build C client and C gateway with sanitizers
         run: |
           python3 c/client/scripts/build-deps.py linux-x86_64
-          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64"
           cmake --build build/c --parallel 3
           ctest --test-dir build/c --output-on-failure
-          cmake -S c/gateway -B build/c-gateway -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON
+          cmake -S c/gateway -B build/c-gateway -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE=ON
           cmake --build build/c-gateway --parallel 3
-          mkdir -p build/go
-          (cd go/client && go build -buildvcs=false -mod=readonly -o ../../build/go/openp2p ./cmd)
-      - name: SOCKS5 end to end and original Go/C forwarding regression
+      - name: C SOCKS5, QUIC and token enrollment
         run: |
           bash c/client/scripts/check-socks.sh
-          bash c/gateway/scripts/integration.sh
+          python3 c/client/tests/quic_native.py --binary build/c/quic-interop
+          python3 c/client/tests/enrollment_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway
       - name: Package native C client SDK
         run: |
-          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/linux-debian12-x86_64"
+          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/linux-debian12-x86_64"
           cmake --build build/client-release --parallel 3
           cmake --install build/client-release
           python3 c/client/scripts/sdk-metadata.py --sdk dist/linux-debian12-x86_64
-          tar -C dist -czf dist/openp2p-c-linux-debian12-x86_64.tar.gz linux-debian12-x86_64
+          tar -C dist -czf dist/fastp2p-linux-debian12-x86_64.tar.gz linux-debian12-x86_64
+          cp build/client-release/fastp2p dist/fastp2p-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-linux-debian12-x86_64
-          path: dist/openp2p-c-linux-debian12-x86_64.tar.gz
+          name: fastp2p-linux-debian12-x86_64
+          path: |
+            dist/fastp2p-linux-debian12-x86_64.tar.gz
+            dist/fastp2p-linux-x86_64
       - name: Gather sanitized SOCKS5 summaries
         if: always()
         run: |
           mkdir -p build/socks-reports
-          find /tmp -path '/tmp/openp2p-socks-tests.*/result.json' -exec cp --parents '{}' build/socks-reports/ \;
+          find /tmp -path '/tmp/fastp2p-socks-tests.*/result.json' -exec cp --parents '{}' build/socks-reports/ \;
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -271,7 +262,7 @@ jobs:
           path: build/socks-reports/
   release:
     needs: [macos, cross, linux, windows]
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/c-client-v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -281,9 +272,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          pattern: openp2p-c-*
+          pattern: fastp2p-*
           path: release-input
-      - name: Publish verified client SDKs
+      - name: Publish verified clients and C SDKs
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/publish-release.py --kind client --input release-input --output release-output

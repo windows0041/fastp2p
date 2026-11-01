@@ -17,11 +17,11 @@ def create_certificates(directory, hostname):
         subprocess.run([executable, *arguments], cwd=directory, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     run('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
-        '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '2', '-sha256', '-subj', '/CN=OpenP2P Test CA',
+        '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '2', '-sha256', '-subj', '/CN=FastP2P Test CA',
         '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
         '-addext', 'subjectKeyIdentifier=hash', '-addext', 'authorityKeyIdentifier=keyid:always')
     run('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
-        '-keyout', 'server.key', '-out', 'server.csr', '-subj', '/CN=OpenP2P Test Gateway')
+        '-keyout', 'server.key', '-out', 'server.csr', '-subj', '/CN=FastP2P Test Gateway')
     try:
         san = 'IP:' + str(ipaddress.ip_address(hostname))
     except ValueError:

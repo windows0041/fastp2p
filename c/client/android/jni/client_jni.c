@@ -1,4 +1,4 @@
-#include "openp2p.h"
+#include "fastp2p.h"
 #include <jni.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -9,11 +9,11 @@ typedef struct {
     JavaVM *vm;
     jobject listener;
     jmethodID callback;
-    op2p_client *client;
+    fastp2p_client *client;
     int callback_failed;
 } binding;
 
-static void notify(op2p_client *client, const op2p_event *event, void *user) {
+static void notify(fastp2p_client *client, const fastp2p_event *event, void *user) {
     (void)client;
     binding *b = user;
     JNIEnv *env = NULL;
@@ -38,7 +38,7 @@ static void notify(op2p_client *client, const op2p_event *event, void *user) {
         (*env)->DeleteLocalRef(env, message);
 }
 
-JNIEXPORT jlong JNICALL Java_cc_itq_openp2p_cclient_NativeClient_create(JNIEnv *env, jclass type,
+JNIEXPORT jlong JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_create(JNIEnv *env, jclass type,
                                                                         jbyteArray json,
                                                                         jstring token, jstring ca,
                                                                         jobject listener) {
@@ -70,9 +70,9 @@ JNIEXPORT jlong JNICALL Java_cc_itq_openp2p_cclient_NativeClient_create(JNIEnv *
     (*env)->DeleteLocalRef(env, cls);
     const char *secret = (*env)->GetStringUTFChars(env, token, NULL);
     const char *certificate = ca ? (*env)->GetStringUTFChars(env, ca, NULL) : NULL;
-    int result = OP2P_EINVAL;
+    int result = FASTP2P_EINVAL;
     if (b->listener && b->callback && secret && (!ca || certificate))
-        result = op2p_client_create_json(text, secret, certificate, notify, b, &b->client);
+        result = fastp2p_client_create_json(text, secret, certificate, notify, b, &b->client);
     if (secret)
         (*env)->ReleaseStringUTFChars(env, token, secret);
     if (certificate)
@@ -87,36 +87,36 @@ JNIEXPORT jlong JNICALL Java_cc_itq_openp2p_cclient_NativeClient_create(JNIEnv *
     return (jlong)(intptr_t)b;
 }
 
-JNIEXPORT jint JNICALL Java_cc_itq_openp2p_cclient_NativeClient_start(JNIEnv *env, jclass cls,
+JNIEXPORT jint JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_start(JNIEnv *env, jclass cls,
                                                                       jlong handle) {
     (void)env;
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
-    return b ? op2p_client_start(b->client) : OP2P_EINVAL;
+    return b ? fastp2p_client_start(b->client) : FASTP2P_EINVAL;
 }
-JNIEXPORT jint JNICALL Java_cc_itq_openp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
+JNIEXPORT jint JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
                                                                      jlong handle) {
     (void)env;
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
     if (!b)
-        return OP2P_EINVAL;
-    int rv = op2p_client_step(b->client, 10);
-    return b->callback_failed ? OP2P_EIO : rv;
+        return FASTP2P_EINVAL;
+    int rv = fastp2p_client_step(b->client, 10);
+    return b->callback_failed ? FASTP2P_EIO : rv;
 }
-JNIEXPORT void JNICALL Java_cc_itq_openp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
                                                                         jlong handle) {
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
     if (!b)
         return;
-    op2p_client_stop(b->client);
-    op2p_client_destroy(b->client);
+    fastp2p_client_stop(b->client);
+    fastp2p_client_destroy(b->client);
     (*env)->DeleteGlobalRef(env, b->listener);
     free(b);
 }
-JNIEXPORT jstring JNICALL Java_cc_itq_openp2p_cclient_NativeClient_version(JNIEnv *env,
+JNIEXPORT jstring JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_version(JNIEnv *env,
                                                                            jclass cls) {
     (void)cls;
-    return (*env)->NewStringUTF(env, op2p_version());
+    return (*env)->NewStringUTF(env, fastp2p_version());
 }

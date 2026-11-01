@@ -22,13 +22,15 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 KINDS = {
-    'gateway': ('c-gateway', 'c/gateway/CMakeLists.txt', [
-        'openp2p-c-gateway-debian12-x86_64.tar.gz',
-        'openp2p-c-gateway-debian13-x86_64.tar.gz',
-        'openp2p-c-gateway-docker-amd64.tar.gz']),
-    'client': ('c-client', 'c/client/CMakeLists.txt', [
-        'openp2p-c-linux-debian12-x86_64.tar.gz', 'openp2p-c-windows-x86_64.zip',
-        'openp2p-c-macos-arm64.tar.gz', 'openp2p-c-macos-x86_64.tar.gz'])
+    'gateway': ('fastp2p-gateway', 'c/gateway/CMakeLists.txt', [
+        'fastp2p-gateway-debian12-x86_64.tar.gz',
+        'fastp2p-gateway-debian13-x86_64.tar.gz',
+        'fastp2p-gateway-docker-amd64.tar.gz']),
+    'client': ('fastp2p-client', 'c/client/CMakeLists.txt', [
+        'fastp2p-linux-debian12-x86_64.tar.gz', 'fastp2p-windows-x86_64.zip',
+        'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
+        'fastp2p-linux-x86_64', 'fastp2p-windows-x86_64.exe',
+        'fastp2p-macos-arm64', 'fastp2p-macos-x86_64', 'fastp2p-android.apk'])
 }
 
 def prepare(kind, incoming, output):
@@ -40,25 +42,6 @@ def prepare(kind, incoming, output):
             raise RuntimeError('Expected exactly one nonempty CI artifact: ' + name)
         target = output/name
         shutil.copyfile(matches[0], target)
-        result.append(target)
-    if kind == 'client':
-        android = incoming/'openp2p-c-android'
-        if not (android/'openp2p-c-android-debug.apk').is_file():
-            raise RuntimeError('Missing Android SDK artifact')
-        android_files = sorted(p for p in android.rglob('*') if p.is_file())
-        if not android_files or any(p.is_symlink() for p in android.rglob('*')):
-            raise RuntimeError('Invalid Android SDK layout')
-        target = output/'openp2p-c-android-sdk.zip'
-        with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-            for file in android_files:
-                relative = file.relative_to(android)
-                # Runtime data and signing keys must never enter a release.
-                if file.suffix.lower() in {'.key', '.jks', '.p12', '.pfx', '.crt', '.pem'} or file.name.endswith('.env'):
-                    raise RuntimeError('Unexpected private/runtime material in Android SDK')
-                info = zipfile.ZipInfo('android/' + relative.as_posix(), date_time=(1980,1,1,0,0,0))
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = 0o100644 << 16
-                archive.writestr(info, file.read_bytes())
         result.append(target)
     checksum = output/'SHA256SUMS.txt'
     checksum.write_text(''.join(digest(p) + '  ' + p.name + '\n'
@@ -76,7 +59,7 @@ class GitHub:
         if data is not None and not isinstance(data, bytes): data = json.dumps(data).encode()
         request = urllib.request.Request(url, data=data, method=method, headers={
             'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
-            'Content-Type': content_type, 'User-Agent': 'OpenP2P-release-builder'})
+            'Content-Type': content_type, 'User-Agent': 'FastP2P-release-builder'})
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs): return None
         with urllib.request.build_opener(NoRedirect).open(request, timeout=180) as response:
@@ -100,15 +83,15 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
     api = GitHub(repository, token)
     if stable:
         tag_sha = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
-        paths = (['c/gateway/src','c/gateway/web','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
-                 ['c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/jni','c/client/android/app/build.gradle'])
+        paths = (['c/common','c/gateway/src','c/gateway/web','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
+                 ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/jni','c/client/android/app/build.gradle'])
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
     notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 Debian 12/13 x86_64 原生包和 amd64 Docker 镜像。' if kind == 'gateway' else
-             'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。包含 Linux Debian 12、Windows、macOS 两种架构和 Android SDK。')
+             'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。包含 Linux Debian 12、Windows、macOS 两种架构和签名 Android APK。Windows EXE、Linux/macOS 可执行文件可直接下载。')
     body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。运行配置、账号、证书和私钥不在发行包中。'
     metadata = {'tag_name': tag, 'target_commitish': sha,
-                'name': ('C Gateway ' if kind == 'gateway' else 'C Client ') + version + ('' if stable else ' · development ' + run_id),
+                'name': ('fastp2p Gateway ' if kind == 'gateway' else 'fastp2p Client ') + version + ('' if stable else ' · development ' + run_id),
                 'body': body, 'draft': True, 'prerelease': not stable}
     try:
         release = api.request('/releases/tags/' + urllib.parse.quote(tag, safe=''))

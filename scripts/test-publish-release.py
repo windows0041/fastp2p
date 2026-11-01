@@ -17,7 +17,7 @@ release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='op2p-release-test-');self.addCleanup(self.temp.cleanup)
+        self.temp=tempfile.TemporaryDirectory(prefix='fastp2p-release-test-');self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
         assert self.root.resolve().parent==Path(tempfile.gettempdir()).resolve()
         self.incoming=self.root/'incoming';self.incoming.mkdir();self.output=self.root/'output'
@@ -36,19 +36,14 @@ class ReleaseTests(unittest.TestCase):
         for line in files[-1].read_text().splitlines():
             digest,name=line.split('  ',1)
             self.assertEqual(digest,hashlib.sha256((self.output/name).read_bytes()).hexdigest())
-    def test_android_reproducible_and_no_keys(self):
-        self.artifacts('client');android=self.incoming/'openp2p-c-android';android.mkdir()
-        (android/'openp2p-c-android-debug.apk').write_bytes(b'fixture-apk')
-        (android/'openp2p.h').write_text('fixture-header')
-        release.prepare('client',self.incoming,self.output)
-        first=(self.output/'openp2p-c-android-sdk.zip').read_bytes()
-        import os
-        os.utime(android/'openp2p.h',(1800000000,1800000000))
-        release.prepare('client',self.incoming,self.output)
-        self.assertEqual(first,(self.output/'openp2p-c-android-sdk.zip').read_bytes())
-        with zipfile.ZipFile(io.BytesIO(first)) as archive:self.assertIn('android/openp2p.h',archive.namelist())
-        (android/'server.key').write_text('fixture-not-a-real-key')
-        with self.assertRaises(RuntimeError):release.prepare('client',self.incoming,self.output)
+    def test_direct_client_artifacts(self):
+        self.artifacts('client')
+        files=release.prepare('client',self.incoming,self.output)
+        self.assertIn('fastp2p-android.apk',{p.name for p in files})
+        self.assertIn('fastp2p-windows-x86_64.exe',{p.name for p in files})
+        self.assertIn('fastp2p-linux-x86_64',{p.name for p in files})
+        (self.incoming/'private.key').write_text('fixture')
+        self.assertNotIn('private.key',{p.name for p in release.prepare('client',self.incoming,self.output)})
     def publication(self,bad_digest=False):
         self.artifacts('gateway');files=release.prepare('gateway',self.incoming,self.output);calls=[]
         class FakeAPI:
@@ -63,7 +58,7 @@ class ReleaseTests(unittest.TestCase):
                 if method=='POST':return {'id':2,'size':len(data),'digest':'sha256:'+('invalid' if bad_digest else hashlib.sha256(data).hexdigest())}
                 if method=='PATCH':return {'html_url':'https://github.com/test/repo/releases/tag/fixture'}
                 raise AssertionError((path,method))
-        with patch.object(release,'GitHub',FakeAPI),patch.object(release.subprocess,'check_output',return_value='project(openp2p_c_gateway VERSION 0.2.0 LANGUAGES C)'),contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(release,'GitHub',FakeAPI),patch.object(release.subprocess,'check_output',return_value='project(fastp2p_c_gateway VERSION 0.2.0 LANGUAGES C)'),contextlib.redirect_stdout(io.StringIO()):
             if bad_digest:
                 with self.assertRaises(RuntimeError):release.publish('gateway',files,'test/repo','a'*40,'main','branch','123','fixture-token')
             else:release.publish('gateway',files,'test/repo','a'*40,'main','branch','123','fixture-token')

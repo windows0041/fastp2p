@@ -7,7 +7,7 @@ import shutil
 
 p=argparse.ArgumentParser()
 p.add_argument('--sdk',required=True)
-p.add_argument('--work',default=str(Path.home()/'openp2p-dev/cross'))
+p.add_argument('--work',default=str(Path.home()/'fastp2p-dev/cross'))
 args=p.parse_args()
 project=Path(__file__).resolve().parents[1]
 sdk=Path(args.sdk).resolve();sdk.mkdir(parents=True,exist_ok=True)
@@ -16,7 +16,7 @@ for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY
 (sdk/'examples').mkdir(exist_ok=True)
 (sdk/'include').mkdir(exist_ok=True)
 shutil.copyfile(project.parent/'NODE-STORAGE-ZH.md',sdk/'NODE-STORAGE-ZH.md')
-shutil.copyfile(project/'include/openp2p.h',sdk/'include/openp2p.h')
+shutil.copyfile(project/'include/fastp2p.h',sdk/'include/fastp2p.h')
 shutil.copyfile(project/'examples/embed.c',sdk/'examples/embed.c')
 notices=sdk/'licenses';notices.mkdir(exist_ok=True)
 manifest=json.loads((project/'deps.lock.json').read_text())

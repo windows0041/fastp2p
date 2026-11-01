@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 int main(void) {
-    char path[] = "/tmp/op2p-store-XXXXXX";
+    char path[] = "/tmp/fastp2p-store-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0); close(fd);
     sqlite3 *db;
@@ -62,6 +62,14 @@ int main(void) {
     list = gw_store_list(db, "same-host", 5, 5);
     assert(list && gw_integer(list, "total") == 100 && json_object_array_length(gw_get(list, "nodes")) == 5);
     json_object_put(list);
+    assert(!sqlite3_exec(db, "PRAGMA application_id=1330655824", NULL, NULL, NULL));
+    sqlite3_close(db);
+    assert(!gw_store_open(&db, path));
+    sqlite3_stmt *statement;
+    assert(!sqlite3_prepare_v2(db, "PRAGMA application_id", -1, &statement, NULL));
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1179660880);
+    sqlite3_finalize(statement);
+    assert(!gw_store_count(db, &total) && total == 105);
     sqlite3_close(db); unlink(path);
     puts("SQLite identity uniqueness, numeric padding, offline persistence, search and pagination passed");
     return 0;

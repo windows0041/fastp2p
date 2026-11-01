@@ -1,5 +1,6 @@
 #include "gateway.h"
 #include "web_assets.h"
+#include "enrollment.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -484,7 +485,14 @@ static void handle_http(struct connection *c) {
         char number[32];
         snprintf(number, sizeof(number), "%" PRIu64, g.token);
         gw_js(j, "token", jwt);
-        gw_js(j, "nodeToken", number);
+        char *install = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token, g.enrollment_ca);
+        if (!install) {
+            free(jwt); json_object_put(j);
+            http_error(c, 503, 1, "installation profile unavailable");
+            return;
+        }
+        gw_js(j, "installToken", install);
+        OPENSSL_cleanse(install, strlen(install)); free(install);
         gw_ju(j, "error", 0);
         http_json(c, 200, j);
         json_object_put(j);
@@ -700,8 +708,11 @@ static int login_status(struct lws *wsi) {
     if (lws_get_vhost(wsi) != g.ws_vhost)
         return 404;
     if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) < 0 ||
-        (strcmp(uri, "/api/v1/login") && strcmp(uri, "/openp2p/v1/login")))
+        (strcmp(uri, "/api/v1/login") && strcmp(uri, "/fastp2p/v1/login")))
         return 404;
+    char protocol[32];
+    if (query(wsi, "protocol=", protocol, sizeof(protocol)) || strcmp(protocol, "fastp2p1"))
+        return 426;
     if (query(wsi, "node=", node, sizeof(node)) || !gw_node_valid(node))
         return 400;
     if (query(wsi, "token=", token, sizeof(token)) || gw_decimal(token, &value) || value != g.token)
@@ -796,6 +807,7 @@ static int establish(struct lws *wsi, struct connection *c) {
     json_object *login = json_object_new_object();
     gw_js(login, "user", g.user);
     gw_js(login, "node", c->node);
+    gw_js(login, "protocol", "fastp2p1");
     gw_ju(login, "token", g.token);
     gw_ju(login, "ts", gw_wall_ns() / 1000000000);
     gw_ju(login, "error", 0);
@@ -928,7 +940,7 @@ static const struct lws_protocols protocols[] = {
      .per_session_data_size = sizeof(struct connection),
      .rx_buffer_size = 16384,
      .tx_packet_size = 16384},
-    {.name = "openp2p",
+    {.name = "fastp2p",
      .callback = callback,
      .per_session_data_size = sizeof(struct connection),
      .rx_buffer_size = 16384,
@@ -1011,10 +1023,10 @@ static int sdwan_valid(json_object *j) {
     return strcmp(mode, "central") || central;
 }
 static void usage(void) {
-    puts("openp2p-gateway-c --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
+    puts("fastp2p-gateway --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
          "  [--port 27183] [--apiport 10008] [--sdwan-config FILE] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
-         "Set OPENP2P_USER and OPENP2P_PASSWORD; OPENP2P_TOKEN optionally "
+         "Set FASTP2P_USER and FASTP2P_PASSWORD; FASTP2P_TOKEN optionally "
          "overrides the derived uint64.\n"
          "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183.");
 }
@@ -1023,14 +1035,16 @@ static int options(int argc, char **argv) {
     g.timeout = 40;
     g.ws_port = 27183;
     g.api_port = 10008;
-    g.database = getenv("OPENP2P_DATABASE");
+    g.database = getenv("FASTP2P_DATABASE");
+    g.public_host = getenv("FASTP2P_PUBLIC_HOST");
+    g.enrollment_ca_file = getenv("FASTP2P_CA_FILE");
     if (!g.database)
         g.database = "nodes.sqlite3";
     snprintf(g.bind, sizeof(g.bind), "127.0.0.1");
-    g.cert = getenv("OPENP2P_TLS_CERT");
+    g.cert = getenv("FASTP2P_TLS_CERT");
     if (!g.cert)
         g.cert = "api.crt";
-    g.key = getenv("OPENP2P_TLS_KEY");
+    g.key = getenv("FASTP2P_TLS_KEY");
     if (!g.key)
         g.key = "api.key";
     const char *sdwan = NULL;
@@ -1045,6 +1059,8 @@ static int options(int argc, char **argv) {
                                          {"run-seconds", required_argument, 0, 'r'},
                                          {"sdwan-config", required_argument, 0, 's'},
                                          {"database", required_argument, 0, 'd'},
+                                         {"public-host", required_argument, 0, 'H'},
+                                         {"enrollment-ca", required_argument, 0, 'C'},
                                          {"version", no_argument, 0, 'v'},
                                          {"help", no_argument, 0, 'h'},
                                          {0}};
@@ -1074,8 +1090,10 @@ static int options(int argc, char **argv) {
         case 'd':
             g.database = optarg;
             break;
+        case 'H': g.public_host = optarg; break;
+        case 'C': g.enrollment_ca_file = optarg; break;
         case 'v':
-            printf("openp2p-gateway-c %s\n", GW_VERSION);
+            printf("fastp2p-gateway %s\n", GW_VERSION);
             return 1;
         case 'h':
             usage();
@@ -1116,20 +1134,20 @@ static int options(int argc, char **argv) {
     struct in_addr address;
     if (inet_pton(AF_INET, g.bind, &address) != 1 || inet_pton(AF_INET, g.api_bind, &address) != 1)
         return -1;
-    g.user = getenv("OPENP2P_USER");
-    g.password = getenv("OPENP2P_PASSWORD");
+    g.user = getenv("FASTP2P_USER");
+    g.password = getenv("FASTP2P_PASSWORD");
     if (!g.user || !*g.user || strlen(g.user) > 256 || !g.password || !*g.password ||
         strlen(g.password) > 1024)
         return -1;
     char credentials[1281];
     snprintf(credentials, sizeof(credentials), "%s%s", g.user, g.password);
     g.token = gw_node_id(credentials);
-    const char *token = getenv("OPENP2P_TOKEN");
+    const char *token = getenv("FASTP2P_TOKEN");
     if (token && (gw_decimal(token, &g.token) || !g.token))
         return -1;
     if (!g.token)
         return -1;
-    snprintf(g.secret, sizeof(g.secret), "%s%s@openp2p.cn", g.user, g.password);
+    snprintf(g.secret, sizeof(g.secret), "%s%s@fastp2p", g.user, g.password);
     OPENSSL_cleanse(credentials, sizeof(credentials));
     if (sdwan) {
         FILE *file = fopen(sdwan, "rb");
@@ -1150,6 +1168,30 @@ static int options(int argc, char **argv) {
             return -1;
     } else
         g.sdwan = json_object_new_object();
+    if (!g.public_host || !*g.public_host)
+        g.public_host = strcmp(g.bind, "0.0.0.0") ? g.bind : "127.0.0.1";
+    if (!fastp2p_enrollment_host_valid(g.public_host))
+        return -1;
+    char automatic_ca[4096];
+    if (!g.enrollment_ca_file) {
+        const char *slash = strrchr(g.cert, '/');
+        size_t length = slash ? (size_t)(slash - g.cert + 1) : 0;
+        if (length + 7 >= sizeof(automatic_ca)) return -1;
+        memcpy(automatic_ca, g.cert, length); memcpy(automatic_ca + length, "ca.crt", 7);
+        if (!access(automatic_ca, R_OK)) g.enrollment_ca_file = automatic_ca;
+    }
+    if (g.enrollment_ca_file) {
+        FILE *file = fopen(g.enrollment_ca_file, "rb");
+        if (!file) return -1;
+        size_t length = fread(g.enrollment_ca, 1, sizeof(g.enrollment_ca), file);
+        int bad = ferror(file) || !length || length >= sizeof(g.enrollment_ca);
+        fclose(file);
+        if (bad) return -1;
+        g.enrollment_ca[length] = 0;
+    }
+    char *profile = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token, g.enrollment_ca);
+    if (!profile) return -1;
+    OPENSSL_cleanse(profile, strlen(profile)); free(profile);
     return g.sdwan ? 0 : -1;
 }
 int main(int argc, char **argv) {
@@ -1209,11 +1251,11 @@ int main(int argc, char **argv) {
         SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_COMPRESSION;
     info.iface = g.bind;
     info.port = (int)g.ws_port;
-    info.vhost_name = "openp2p-wss";
+    info.vhost_name = "fastp2p-wss";
     g.ws_vhost = lws_create_vhost(g.context, &info);
     info.iface = g.api_bind;
     info.port = (int)g.api_port;
-    info.vhost_name = "openp2p-api";
+    info.vhost_name = "fastp2p-api";
     g.api_vhost = lws_create_vhost(g.context, &info);
     if (!g.ws_vhost || !g.api_vhost) {
         fputs("Cannot load TLS certificate/key or bind HTTPS/WSS ports\n", stderr);

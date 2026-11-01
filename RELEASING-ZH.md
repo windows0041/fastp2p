@@ -1,59 +1,13 @@
-# GitHub 构建与 Releases
+# fastp2p 构建与发布
 
-发行位置为本项目的 [Releases](https://github.com/windows0041/openp2p-test/releases)。C 网关和 C 客户端分别构建、测试、发布，不向其他仓库上传文件。
+主分支只构建 C 客户端与 C 网关，不安装 Go，不使用 Go 参考实现测试。
 
-## 自动发布规则
+`c-platforms.yml` 构建 Windows EXE、Linux 可执行文件、macOS 双架构可执行文件、Android 双 ABI 签名 APK，并额外打包桌面 C SDK。`c-gateway.yml` 构建 Debian 12/13 原生网关和 amd64 Docker 镜像。
 
-| 触发 | 结果 |
-| --- | --- |
-| 相关代码推送到普通开发分支 | 构建、测试，保留 Actions artifacts；不发布 Release |
-| 相关代码推送到 `main`，且所有测试成功 | 自动创建独立开发版 Release（prerelease），标签包含运行 ID 和提交摘要 |
-| 推送 `c-gateway-vX.Y.Z` | 网关矩阵、Docker、浏览器测试通过后，发布正式网关 Release |
-| 推送 `c-client-vX.Y.Z` | 客户端全部平台测试通过后，发布正式客户端 Release |
+所有平台通过后，main 生成开发 Release。稳定标签分别为 `fastp2p-client-v1.0.0` 和 `fastp2p-gateway-v1.0.0`，必须匹配对应 CMake VERSION。先将提交合入并推送 main，再推标签。
 
-正式标签版本必须与对应 CMake 项目版本一致，且标签的运行时代码必须与测试构建一致。标签发布示例：
+发布脚本只接受明确列出的产物，全部上传并核对 SHA-256 后才公开草稿。已公开资产不自动覆盖，每个 Release 附 SHA256SUMS.txt。客户端主产物直接提供 EXE、ELF、APK，无需下载 SDK。
 
-```bash
-git switch main
-git pull --ff-only
-git push origin main
-git tag -a c-gateway-v0.3.0 -m "C gateway 0.3.0"
-git push origin c-gateway-v0.3.0
-```
+Android release 使用 Actions Secrets `FASTP2P_ANDROID_KEYSTORE_BASE64`（PKCS12）和 `FASTP2P_ANDROID_KEYSTORE_PASSWORD`，别名 `fastp2p`。固定私钥离线备份并复用，在 runner 临时目录解密。实际安装 Token 和签名私钥不进入发布包。
 
-普通分支和版本标签均会触发原有工作流；不需要手工创建 Release。`workflow_dispatch` 仍可用于手动构建，是否发布取决于所选分支/标签。
-
-## 发行文件
-
-网关 Release：
-
-- `openp2p-c-gateway-debian12-x86_64.tar.gz`
-- `openp2p-c-gateway-debian13-x86_64.tar.gz`
-- `openp2p-c-gateway-docker-amd64.tar.gz`（`docker save` 镜像包）
-- `SHA256SUMS.txt`
-
-客户端 Release：
-
-- `openp2p-c-linux-debian12-x86_64.tar.gz`
-- `openp2p-c-windows-x86_64.zip`
-- `openp2p-c-macos-arm64.tar.gz`
-- `openp2p-c-macos-x86_64.tar.gz`
-- `openp2p-c-android-sdk.zip`（调试 APK、原生库、头文件与说明）
-- `SHA256SUMS.txt`
-
-Linux 原生包使用匹配发行版的运行环境。Docker 包导入示例：
-
-```bash
-sha256sum -c SHA256SUMS.txt --ignore-missing
-gzip -dc openp2p-c-gateway-docker-amd64.tar.gz | docker load
-```
-
-镜像不包含管理账号、安装 token、用户证书或私钥。运行参数见 [网关说明](c/gateway/README.md)。Android 调试包由构建机的调试密钥签名，与本机 APK 可能不同；在已安装应用上覆盖更新时需要使用相同签名。
-
-## 发布完整性
-
-发布作业依赖该产品的所有构建与测试作业成功，使用 GitHub 内置 `GITHUB_TOKEN`，仅发布作业获得 `contents: write`。无需在仓库中保存个人令牌。
-
-`scripts/publish-release.py` 只收集明确列出的发行包，拒绝缺失或重复文件，生成 SHA-256 校验文件。先创建草稿，逐项上传并核对 GitHub 返回的文件大小与 SHA-256，全部完成后才公开发布；失败时保留草稿供重试。已经发布的发行包不会被脚本覆盖或删除。
-
-开发版标签由工作流创建，不会递归触发新的构建。历史开发版和正式版不自动清理。
+桌面 EXE 和 macOS 程序尚未进行平台代码签名/公证；Android 使用项目固定 APK 签名。

@@ -1,9 +1,9 @@
-#ifndef OP2P_GATEWAY_PROTOCOL_H
-#define OP2P_GATEWAY_PROTOCOL_H
+#ifndef FASTP2P_GATEWAY_PROTOCOL_H
+#define FASTP2P_GATEWAY_PROTOCOL_H
 #include <json-c/json.h>
 #include <stddef.h>
 #include <stdint.h>
-#define GW_VERSION "0.3.0"
+#define GW_VERSION "1.0.0"
 #define GW_FRAME_LIMIT (1024u * 1024u)
 uint16_t gw_u16(const void *p);
 uint32_t gw_u32(const void *p);

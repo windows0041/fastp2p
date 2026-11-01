@@ -1,0 +1,4 @@
+FASTP2P_1 {
+    global: fastp2p_*;
+    local: *;
+};

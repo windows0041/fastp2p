@@ -10,10 +10,10 @@ import tempfile
 
 p=argparse.ArgumentParser();p.add_argument('--client',required=True);args=p.parse_args()
 client=Path(args.client).resolve()
-with tempfile.TemporaryDirectory(prefix='op2p-identity-') as temporary, socket.socket() as listener:
+with tempfile.TemporaryDirectory(prefix='fastp2p-identity-') as temporary, socket.socket() as listener:
     root=Path(temporary).resolve();assert root.parent==Path(tempfile.gettempdir()).resolve()
     listener.bind(('127.0.0.1',0));listener.listen()
-    environment=os.environ.copy();environment['OPENP2P_TOKEN']='1'
+    environment=os.environ.copy();environment['FASTP2P_TOKEN']='1'
     def run(*extra,expected=1):
         result=subprocess.run([str(client),'--serverhost','127.0.0.1','--port',str(listener.getsockname()[1]),
                                 '--run-seconds','1',*map(str,extra)],env=environment,capture_output=True,timeout=20)

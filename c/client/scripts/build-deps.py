@@ -14,7 +14,7 @@ import urllib.request
 
 parser=argparse.ArgumentParser()
 parser.add_argument('target',choices=['linux-x86_64','windows-x86_64','android-arm64-v8a','android-x86_64','macos-arm64','macos-x86_64'])
-parser.add_argument('--work',default=str(Path.home()/'openp2p-dev/cross'))
+parser.add_argument('--work',default=str(Path.home()/'fastp2p-dev/cross'))
 parser.add_argument('--ndk',default=os.environ.get('ANDROID_NDK_HOME',''))
 parser.add_argument('--jobs',type=int,default=min(4,os.cpu_count() or 2))
 args=parser.parse_args()
@@ -26,7 +26,7 @@ sources=work/'sources'
 build=work/'build'/args.target
 prefix=work/'prefix'/args.target
 for p in (cache,sources,build,prefix): p.mkdir(parents=True,exist_ok=True)
-stamp=prefix/'openp2p-dependencies.json'
+stamp=prefix/'fastp2p-dependencies.json'
 fingerprint={'sources':manifest,'recipe_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
 if stamp.exists() and json.loads(stamp.read_text())==fingerprint:
     print('Dependencies already built:',prefix)

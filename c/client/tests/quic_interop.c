@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
         op_close(fd);
         return 1;
     }
-    /* One real OpenP2P frame containing a tunnel ID, echoed verbatim. */
+    /* One real FastP2P frame containing a tunnel ID, echoed verbatim. */
     uint8_t expected[] = {8, 0, 0, 0, 4, 0, 2, 0, 255, 254, 253, 252, 251, 250, 249, 248};
     if (!server && opq_write(q, expected, sizeof(expected)))
         return 1;
@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
         op_poll(&pollfd, 1, 2);
     }
     if (success)
-        puts("QUIC_INTEROP_OK ALPN=openp2pv1 frame_bytes=16");
+        puts("QUIC_INTEROP_OK ALPN=fastp2pv1 frame_bytes=16");
     opq_free(q);
     op_close(fd);
     return success ? 0 : 1;

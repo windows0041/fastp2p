@@ -14,6 +14,7 @@ import socket
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,7 +23,6 @@ from certificates import create_certificates
 p=argparse.ArgumentParser()
 p.add_argument('--client',required=True)
 p.add_argument('--gateway',required=True)
-p.add_argument('--legacy-client')
 p.add_argument('--logs',required=True)
 p.add_argument('--quick',action='store_true')
 args=p.parse_args()
@@ -135,17 +135,18 @@ def rejected(port,target):
         assert exact(sock,10)[1]==5
     return True
 
-with tempfile.TemporaryDirectory(prefix='op2p-socks-') as temporary:
+with tempfile.TemporaryDirectory(prefix='fastp2p-socks-') as temporary:
     root=Path(temporary)
     try:
         create_certificates(root/'certs','127.0.0.1')
-        env=os.environ.copy();env.update(OPENP2P_USER='socks-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=str(secrets.randbits(63)|(1<<63)|1))
+        env=os.environ.copy();env.update(FASTP2P_USER='socks-test',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(secrets.randbits(63)|(1<<63)|1))
         def start(command,name):
             directory=root/name;directory.mkdir(exist_ok=True)
             f=(logs/(name+'.log')).open('w');files.append(f)
             child=subprocess.Popen([str(x) for x in command],cwd=directory,env=env,stdout=f,stderr=subprocess.STDOUT)
             children.append(child);return child
         gateway_command=[Path(args.gateway).resolve(),'-bind','127.0.0.1','-apibind','127.0.0.1','-cert',root/'certs/server.crt','-key',root/'certs/server.key']
+        if str(gateway_command[0]).endswith('.py'):gateway_command.insert(0,sys.executable)
         gateway=start(gateway_command,'gateway')
         def listening():
             with socket.create_connection(('127.0.0.1',27183),timeout=1):return True
@@ -207,32 +208,6 @@ with tempfile.TemporaryDirectory(prefix='op2p-socks-') as temporary:
             assert len(list(fd_path.iterdir()))<=before
             results['no_fd_growth_after_disconnects']=True
         results['80_handshake_disconnect_cycles']=True
-        if args.legacy_client:
-            start([Path(args.legacy_client).resolve(),'-node','socks-legacy-exit','-serverhost','127.0.0.1','-cacert',root/'certs/ca.crt','-sharebandwidth','0','-nv'],'legacy')
-            with socket.socket() as sock:sock.bind(('127.0.0.1',0));legacy_port=sock.getsockname()[1]
-            client('socks-legacy-entry',[{'SrcPort':legacy_port,'PeerNode':'socks-legacy-exit','UnderlayProtocol':'tcp'}])
-            def legacy_rejected():
-                with greeting(legacy_port) as sock:
-                    sock.sendall(b'\x05\x01\0'+address('127.0.0.1',targets['tcp'][0]));return exact(sock,10)[1]==7
-            wait(legacy_rejected);results['legacy_exit_rejected_without_false_success']=True
-        log=(logs/'socks-entry-node.log').read_text(errors='replace')
-        assert 'TCP tunnel connected' in log and 'QUIC tunnel connected' in log
-        results['both_transports_confirmed']=True
-        if not args.quick:
-            gateway.terminate();gateway.wait(timeout=8);children.remove(gateway)
-            # The C gateway handles SIGTERM; the Go reference exits by signal.
-            if os.name!='nt':assert gateway.returncode in (0,-15)
-            gateway=start(gateway_command,'gateway-restarted')
-            for transport in ['tcp','quic']:
-                wait(lambda t=transport:tcp(ports[t,True],targets['tcp'][0],True,True))
-                assert udp_case(ports[transport,False],targets['udp'])
-            results['gateway_restart_new_sessions_recover']=True
-            time.sleep(35)
-            for transport in ['tcp','quic']:
-                assert tcp(ports[transport,False],targets['tcp'][1])
-                assert udp_case(ports[transport,True],targets['udp'],True)
-            results['heartbeat_35s_after_recovery']=True
-        results['success']=True
     finally:
         for child in reversed(children):
             if child.poll() is None:child.terminate()

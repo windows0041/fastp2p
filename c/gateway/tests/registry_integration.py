@@ -29,10 +29,10 @@ gateway,client=Path(args.gateway).resolve(),Path(args.client).resolve()
 for namespace in ['net','uts']:
     assert Path('/proc/self/ns/'+namespace).readlink()!=Path('/proc/1/ns/'+namespace).readlink(), 'Use isolated net and UTS namespaces'
 result={};children=[];handles=[];process=None;echo=None
-with tempfile.TemporaryDirectory(prefix='openp2p-c-registry-') as temporary:
+with tempfile.TemporaryDirectory(prefix='fastp2p-registry-') as temporary:
     root=Path(temporary);assert root.resolve().parent==Path(tempfile.gettempdir()).resolve()
     create_certificates(root/'certs','127.0.0.1')
-    environment=os.environ.copy();environment.update(OPENP2P_USER='registry-admin',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=str(2**64-1))
+    environment=os.environ.copy();environment.update(FASTP2P_USER='registry-admin',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(2**64-1))
     context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'));jwt=None
     def start(command,name):
         log=(root/(name+'.log')).open('w');handles.append(log)
@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix='openp2p-c-registry-') as temporary:
     try:
         socket.sethostname(b'pc')
         process=boot('gateway');wait(lambda:api('/healthz')['status']=='ok')
-        jwt=api('/api/v1/user/login',{'user':environment['OPENP2P_USER'],'password':environment['OPENP2P_PASSWORD']})['token']
+        jwt=api('/api/v1/user/login',{'user':environment['FASTP2P_USER'],'password':environment['FASTP2P_PASSWORD']})['token']
         one=node('one');two=node('two');ready(2)
         original=mapping();assert len(original)==2
         assert all(name.startswith('pc') and len(name)==8 and name[2:].isdigit() for name in original.values())

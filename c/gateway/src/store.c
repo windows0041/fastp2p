@@ -5,7 +5,8 @@
 #include <string.h>
 #include <time.h>
 
-#define APP_ID 0x4f503250
+#define APP_ID 0x46503250
+#define PREVIOUS_APP_ID 0x4f503250
 static int sql(sqlite3 *db, const char *text) {
     return sqlite3_exec(db, text, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
@@ -28,7 +29,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
     sqlite3_int64 app = 0, version = 0, tables = 0;
     if (scalar(db, "PRAGMA application_id", &app) || scalar(db, "PRAGMA user_version", &version) ||
         scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &tables) ||
-        (app != APP_ID && (app != 0 || tables != 0)) || version > 1)
+        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 1)
         goto fail;
     /* One event-loop writer; rollback journaling also supports simple offline backups. */
     if (sql(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;") ||
@@ -42,7 +43,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, last_offline INTEGER NOT NULL DEFAULT 0,"
                 "online INTEGER NOT NULL DEFAULT 0 CHECK(online IN(0,1)));"
                 "CREATE INDEX IF NOT EXISTS nodes_order ON nodes(online DESC, name);"
-                "PRAGMA application_id=1330655824; PRAGMA user_version=1;"
+                "PRAGMA application_id=1179660880; PRAGMA user_version=1;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
     *out = db;

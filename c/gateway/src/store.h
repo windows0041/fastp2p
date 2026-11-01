@@ -1,5 +1,5 @@
-#ifndef OP2P_STORE_H
-#define OP2P_STORE_H
+#ifndef FASTP2P_STORE_H
+#define FASTP2P_STORE_H
 #include <sqlite3.h>
 #include <json-c/json.h>
 #include <stdint.h>

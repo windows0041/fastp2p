@@ -54,9 +54,24 @@ static int open_file(const char *path, int create) {
     return open(path, O_CLOEXEC | O_NOFOLLOW | (create ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY), 0600);
 #endif
 }
-int op_cli_identity(op2p_client *client, const char *file, const char *config,
+int fastp2p_private_parents(const char *original) {
+    char path[4096];
+    if (!original || strlen(original) >= sizeof(path)) return -1;
+    strcpy(path, original);
+    for (char *p = path + 1; *p; ++p) {
+        if (*p != '/' && *p != '\\') continue;
+#ifdef _WIN32
+        if (p == path + 2 && path[1] == ':') continue;
+#endif
+        char separator = *p; *p = 0;
+        int rv = directory(path); *p = separator;
+        if (rv) return -1;
+    }
+    return 0;
+}
+int op_cli_identity(fastp2p_client *client, const char *file, const char *config,
                      const char *host, unsigned port) {
-    const char *identity = op2p_client_device_id(client);
+    const char *identity = fastp2p_client_device_id(client);
     if (!*identity)
         return 0;
     char path[4096];
@@ -70,32 +85,20 @@ int op_cli_identity(op2p_client *client, const char *file, const char *config,
         const char *home = getenv("LOCALAPPDATA");
         if (!home || !*home)
             return -1;
-        length = snprintf(path, sizeof(path), "%s/openp2p-c/%s-%u.identity", home, host, port);
+        length = snprintf(path, sizeof(path), "%s/fastp2p/%s-%u.identity", home, host, port);
 #else
         const char *state = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
         if (state && *state)
-            length = snprintf(path, sizeof(path), "%s/openp2p-c/%s-%u.identity", state, host, port);
+            length = snprintf(path, sizeof(path), "%s/fastp2p/%s-%u.identity", state, host, port);
         else if (home && *home)
-            length = snprintf(path, sizeof(path), "%s/.local/state/openp2p-c/%s-%u.identity", home, host, port);
+            length = snprintf(path, sizeof(path), "%s/.local/state/fastp2p/%s-%u.identity", home, host, port);
         else
             return -1;
 #endif
     }
     if (length < 1 || (size_t)length >= sizeof(path))
         return -1;
-    for (char *p = path + 1; *p; ++p) {
-        if (*p != '/' && *p != '\\')
-            continue;
-#ifdef _WIN32
-        if (p == path + 2 && path[1] == ':')
-            continue;
-#endif
-        char separator = *p; *p = 0;
-        int rv = directory(path);
-        *p = separator;
-        if (rv)
-            return -1;
-    }
+    if (fastp2p_private_parents(path)) return -1;
     int fd = open_file(path, 1);
     if (fd >= 0) {
         char data[33];
@@ -127,7 +130,7 @@ int op_cli_identity(op2p_client *client, const char *file, const char *config,
         close(fd);
         if (count == 32 || (count == 33 && data[32] == '\n')) {
             data[32] = 0;
-            return op2p_client_set_identity(client, data);
+            return fastp2p_client_set_identity(client, data);
         }
         if (count != 0)
             return -1;

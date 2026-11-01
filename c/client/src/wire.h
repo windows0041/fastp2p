@@ -1,5 +1,5 @@
-#ifndef OP2P_WIRE_H
-#define OP2P_WIRE_H
+#ifndef FASTP2P_WIRE_H
+#define FASTP2P_WIRE_H
 #include <stddef.h>
 #include <stdint.h>
 #include <json-c/json.h>

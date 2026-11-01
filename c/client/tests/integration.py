@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C/Go/C interoperability against the real Go gateway, in an isolated netns.
+"""Six C clients against the C gateway, in an isolated netns.
 
 Requires root + `unshare --net` and a loopback interface brought up by the caller.
 Runtime credentials and logs stay outside the checkout.
@@ -22,7 +22,6 @@ import urllib.request
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--gateway', required=True)
-parser.add_argument('--go-client', required=True)
 parser.add_argument('--c-client', required=True)
 parser.add_argument('--cert-dir', required=True)
 parser.add_argument('--logs', required=True)
@@ -40,8 +39,8 @@ results = {}
 gateway_host = '10.203.0.1'
 password = secrets.token_urlsafe(24)
 install_token = secrets.randbits(63) | (1 << 63) | 1
-credentials = {'OPENP2P_USER': 'c-integration-user', 'OPENP2P_PASSWORD': password,
-               'OPENP2P_TOKEN': str(install_token)}
+credentials = {'FASTP2P_USER': 'c-integration-user', 'FASTP2P_PASSWORD': password,
+               'FASTP2P_TOKEN': str(install_token)}
 jwt = None
 
 def api(path, data=None, auth=True):
@@ -83,12 +82,12 @@ class TCPEcho(socketserver.BaseRequestHandler):
     def handle(self):
         try:
             first = bytearray()
-            while len(first) < 9:
-                data = self.request.recv(9 - len(first))
+            while len(first) < len(b'FASTP2P-FIN\n'):
+                data = self.request.recv(len(b'FASTP2P-FIN\n') - len(first))
                 if not data:
                     return
                 first.extend(data)
-            if first == b'OP2P-FIN\n':
+            if first == b'FASTP2P-FIN\n':
                 self.request.sendall(bytes(range(256)) * 128)
                 return
             self.request.sendall(first)
@@ -128,7 +127,7 @@ def udp_roundtrip(port, host='127.0.0.1'):
 def tcp_final_response(port, host='127.0.0.1'):
     with socket.create_connection((host, port), timeout=2) as sock:
         sock.settimeout(5)
-        sock.sendall(b'OP2P-FIN\n')
+        sock.sendall(b'FASTP2P-FIN\n')
         response = bytearray()
         while True:
             data = sock.recv(65536)
@@ -138,7 +137,7 @@ def tcp_final_response(port, host='127.0.0.1'):
     return response == bytes(range(256)) * 128
 
 try:
-    with tempfile.TemporaryDirectory(prefix='openp2p-c-integration-') as runtime:
+    with tempfile.TemporaryDirectory(prefix='fastp2p-integration-') as runtime:
         runtime = Path(runtime)
         runtime.chmod(0o700)
         subprocess.run(['ip', 'link', 'add', 'c-gateway', 'type', 'dummy'], check=True)
@@ -148,7 +147,7 @@ try:
             '-cert', certs / 'server.crt', '-key', certs / 'server.key']
         gateway = start(gateway_args, 'gateway', runtime, credentials)
         wait(lambda: api('/healthz', auth=False))
-        jwt = api('/api/v1/user/login', {'user': credentials['OPENP2P_USER'], 'password': password}, False)['token']
+        jwt = api('/api/v1/user/login', {'user': credentials['FASTP2P_USER'], 'password': password}, False)['token']
         for proto, cls, handler in [('tcp', socketserver.ThreadingTCPServer, TCPEcho),
                                     ('udp', socketserver.ThreadingUDPServer, UDPEcho)]:
             server = cls(('127.0.0.1', 0), handler)
@@ -167,7 +166,7 @@ try:
                 next_port += 1
                 items.append({'AppName': label + '-' + proto, 'Protocol': proto,
                     'SrcPort': next_port, 'PeerNode': peer, 'DstHost': '127.0.0.1',
-                    'DstPort': results[proto + '_echo_port'], 'Whitelist': '127.0.0.1' if host == '127.0.0.1' else '',
+                    'DstPort': results[proto + '_echo_port'], 'BindIP': host,
                     'UnderlayProtocol': transport, 'PunchPriority': 3 if transport == 'tcp' else 4,
                     'Enabled': 1})
                 cases.append((label + '-' + proto, proto, next_port, host))
@@ -183,22 +182,13 @@ try:
             config = directory / 'config.json'
             config.write_text(json.dumps(cfg))
             config.chmod(0o600)
-            if language == 'c':
-                process = start([Path(args.c_client).resolve(), '--config', config], name, directory)
-                c_processes.append((process, name))
-                return process
-            binary = directory / 'openp2p'
-            shutil.copy2(args.go_client, binary)
             prefix = []
-            if app_rules:
-                # A distinct network namespace/IP prevents the Go client from
-                # silently preferring its same-public-IP intranet TCP shortcut.
+            if language == 'remote':
                 index = 1 if name.endswith('TCP') else 2
                 anchor = start(['unshare', '--net', '--', 'sleep', '300'], name + '-netns', directory)
                 deadline = time.monotonic() + 3
                 while Path(f'/proc/{anchor.pid}/ns/net').readlink() == Path('/proc/self/ns/net').readlink():
-                    if time.monotonic() > deadline:
-                        raise TimeoutError('Could not initialize test network namespace')
+                    if time.monotonic() > deadline: raise TimeoutError('Could not initialize test network namespace')
                     time.sleep(.01)
                 outer, inner = 'cp' + str(index), 'ci' + str(index)
                 subprocess.run(['ip', 'link', 'add', outer, 'type', 'veth', 'peer', 'name', inner], check=True)
@@ -211,19 +201,18 @@ try:
                     ['ip', 'link', 'set', inner, 'up'],
                     ['ip', 'route', 'add', 'default', 'via', f'10.203.{index}.1']):
                     subprocess.run(prefix + command, check=True)
-            return start(prefix + [binary, '-node', name, '-serverhost', gateway_host,
-                '-cacert', certs / 'ca.crt', '-publicipport', str(31000 + len(nodes)),
-                '-sharebandwidth', '0', '-loglevel', '0', '-nv'], name, directory,
-                {'OPENP2P_TOKEN': str(install_token)})
+            process = start(prefix + [Path(args.c_client).resolve(), '--config', config], name, directory)
+            c_processes.append((process, name))
+            return process
 
-        client('openp2pC2CTestGo0', 'go', [])
-        client('ctarget-selfhost', 'c', [])
+        client('fast-target-a', 'c', [])
+        client('fast-target-b', 'c', [])
         for transport in ('tcp', 'quic'):
-            client('csource-' + transport + '-selfhost', 'c',
-                rules('openp2pC2CTestGo0', transport, 'C-Go-' + transport) +
-                rules('ctarget-selfhost', transport, 'C-C-' + transport))
-            client('openp2pC2CTestGo' + ('TCP' if transport == 'tcp' else 'QUIC'), 'go',
-                rules('ctarget-selfhost', transport, 'Go-C-' + transport,
+            client('fast-source-' + transport, 'c',
+                rules('fast-target-a', transport, 'A-B-' + transport) +
+                rules('fast-target-b', transport, 'A-C-' + transport))
+            client('fast-remote-' + ('TCP' if transport == 'tcp' else 'QUIC'), 'remote',
+                rules('fast-target-b', transport, 'B-C-' + transport,
                       '10.203.1.2' if transport == 'tcp' else '10.203.2.2'))
 
         def online():
@@ -232,20 +221,17 @@ try:
         wait(online)
         results['all_six_clients_authenticated'] = True
         results['uint64_token_above_int64_max'] = True
-        print('Six C/Go clients authenticated', flush=True)
+        print('Six fastp2p C clients authenticated', flush=True)
         for name, proto, port, host in cases:
             wait(lambda p=port, pr=proto, h=host: tcp_roundtrip(p,h) if pr == 'tcp' else udp_roundtrip(p,h), timeout=65)
             results[name] = {'success': True, 'bytes': 262144 if proto == 'tcp' else 1000}
             print(name + ' passed', flush=True)
 
-        # Both transports must actually occur in C source and Go source logs.
+        # Verify real tunnel selection in both local and routed C clients.
         for transport in ('tcp', 'quic'):
-            content = (logs / ('csource-' + transport + '-selfhost.log')).read_text()
-            assert ('TCP tunnel connected' if transport == 'tcp' else 'QUIC tunnel connected') in content
-            go_name = 'openp2pC2CTestGo' + ('TCP' if transport == 'tcp' else 'QUIC')
-            go_log = '\n'.join(p.read_text(errors='replace') for p in (runtime / go_name).rglob('*.log'))
-            (logs / (go_name + '-internal.log')).write_text(go_log)
-            assert ('TCP4 Punch ok' if transport == 'tcp' else 'quic connection ok') in go_log
+            expected = 'TCP tunnel connected' if transport == 'tcp' else 'QUIC tunnel connected'
+            for name in ['fast-source-' + transport, 'fast-remote-' + ('TCP' if transport == 'tcp' else 'QUIC')]:
+                assert expected in (logs / (name + '.log')).read_text()
         results['transports_confirmed_in_logs'] = True
         for name, proto, port, host in cases:
             if proto == 'tcp':
@@ -269,12 +255,11 @@ try:
             gateway = start(gateway_args, 'gateway-restarted', runtime, credentials)
             jwt = None
             wait(lambda: api('/healthz', auth=False))
-            jwt = api('/api/v1/user/login', {'user': credentials['OPENP2P_USER'], 'password': password}, False)['token']
-            wait(lambda: {'ctarget-selfhost', 'csource-tcp-selfhost', 'csource-quic-selfhost'} <=
+            jwt = api('/api/v1/user/login', {'user': credentials['FASTP2P_USER'], 'password': password}, False)['token']
+            wait(lambda: set(nodes) <=
                  {n['name'] for n in (api('/api/v1/devices').get('nodes') or [])})
             for name, proto, port, host in cases:
-                if name.startswith('C-C-'):
-                    wait(lambda p=port, pr=proto: tcp_roundtrip(p) if pr == 'tcp' else udp_roundtrip(p))
+                wait(lambda p=port, pr=proto, h=host: tcp_roundtrip(p,h) if pr == 'tcp' else udp_roundtrip(p,h))
             results['gateway_restart_reconnected_c_clients'] = True
         results['success'] = True
 finally:

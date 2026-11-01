@@ -1,5 +1,5 @@
-#ifndef OP2P_SOCKS_H
-#define OP2P_SOCKS_H
+#ifndef FASTP2P_SOCKS_H
+#define FASTP2P_SOCKS_H
 #include <stddef.h>
 #include <stdint.h>
 enum { SOCKS_GREETING = 1, SOCKS_AUTH, SOCKS_REQUEST, SOCKS_TARGET };

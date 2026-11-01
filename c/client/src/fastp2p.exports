@@ -1,0 +1,15 @@
+_fastp2p_abi_version
+_fastp2p_version
+_fastp2p_client_create
+_fastp2p_client_create_json
+_fastp2p_client_set_identity
+_fastp2p_client_device_id
+_fastp2p_client_node
+_fastp2p_client_add_forward
+_fastp2p_client_add_socks5
+_fastp2p_client_start
+_fastp2p_client_step
+_fastp2p_client_stop
+_fastp2p_client_destroy
+_fastp2p_client_state
+_fastp2p_client_last_error

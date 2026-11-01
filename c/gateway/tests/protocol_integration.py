@@ -76,7 +76,7 @@ class WS:
         self.socket=context.wrap_socket(raw,server_hostname='127.0.0.1');self.buffer=bytearray();self.name=name
         key=base64.b64encode(secrets.token_bytes(16)).decode()
         extra='&'+urlencode({'autonode':1,'deviceid':device,'hostname':hostname}) if device is not None else ''
-        request=(f'GET {path}?node={name}&token={credential}&version=3.25.11&nattype=1{extra} HTTP/1.1\r\n'
+        request=(f'GET {path}?node={name}&token={credential}&protocol=fastp2p1&version=1.0.0&nattype=1{extra} HTTP/1.1\r\n'
             f'Host: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
             f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
         self.socket.sendall(request.encode())
@@ -130,7 +130,7 @@ class WS:
             if (m,s)==(main,sub):return frame[8:]
         raise AssertionError('Expected frame not received')
     def report(self):
-        self.send(message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'3.25.11','hasIPv4':1,'publicIPPort':31000}))
+        self.send(message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'1.0.0','hasIPv4':1,'publicIPPort':31000}))
         assert json.loads(self.until(6,7))=={}
     def query(self,peer,credential=token):
         self.send(message(7,0,{'peerNode':peer.name,'token':credential}))
@@ -149,13 +149,13 @@ class WS:
         self.socket.close()
 
 try:
-    with tempfile.TemporaryDirectory(prefix='op2p-c-gateway-protocol-') as temp, (logs/'gateway.log').open('w') as output:
+    with tempfile.TemporaryDirectory(prefix='fastp2p-c-gateway-protocol-') as temp, (logs/'gateway.log').open('w') as output:
         directory=Path(temp)
         config={'enable':1,'gateway':'10.80.0.254/24','mode':'central','centralNode':'member-node-a',
             'tunnelNum':2,'mtu':1420,'Nodes':[{'name':'member-node-a','ip':'10.80.0.1','enable':1},
                                          {'name':'member-node-b','ip':'10.80.0.2','enable':1}]}
         (directory/'sdwan.json').write_text(json.dumps(config))
-        env=os.environ.copy();env.update(OPENP2P_USER=user,OPENP2P_PASSWORD=password,OPENP2P_TOKEN=str(token))
+        env=os.environ.copy();env.update(FASTP2P_USER=user,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=str(token))
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
             '--bind','127.0.0.1','--sdwan-config',str(directory/'sdwan.json')],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
         wait(lambda:api('/healthz')[0]==200)
@@ -165,11 +165,11 @@ try:
         empty=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
         empty.request('POST','/api/v1/user/login',b'');response=empty.getresponse()
         assert response.status==400;response.read();empty.close()
-        status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and login['nodeToken']==str(token)
+        status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and login['installToken'].startswith('FP1.')
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)
-        assert status==200 and overview['version']=='0.3.0' and overview['capacity']==256
+        assert status==200 and overview['version']=='1.0.0' and overview['capacity']==256
         assert overview['nodeStorage']=='sqlite' and overview['totalNodes']==0
         assert 'nodeToken' not in overview and password not in json.dumps(overview)
         for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:
@@ -184,13 +184,13 @@ try:
         conn.request('GET','/');response=conn.getresponse();assert response.status==404;response.read();conn.close()
         assert api('/server.key',jwt=jwt)[0]==404
         results['embedded_web_assets_security_headers_and_protected_status']=True
-        expected=hmac.new((user+password+'@openp2p.cn').encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
+        expected=hmac.new((user+password+'@fastp2p').encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
         assert hmac.compare_digest(base64.urlsafe_b64encode(expected).decode().rstrip('='),sig)
         assert json.loads(base64.urlsafe_b64decode(body+'='*(-len(body)%4)))['installToken']==str(token)
         assert api('/api/v1/devices',jwt=jwt)[0]==200 and api('/api/v1/devices',jwt='Bearer '+jwt)[0]==200
         assert api('/api/v1/devices',jwt=jwt[:-4]+'AAAA')[0]==401
         limited=WS('web-c-capability')
-        limited.send(message(6,0,{'os':'linux-c','version':'3.25.11'}));limited.until(6,7)
+        limited.send(message(6,0,{'os':'linux-c','version':'1.0.0'}));limited.until(6,7)
         nodes=api('/api/v1/devices',jwt=jwt)[1]['nodes']
         capability=next(n['capabilities'] for n in nodes if n['name']==limited.name)
         assert capability['addForward'] and not capability['editForward'] and not capability['switchForward']
@@ -202,9 +202,9 @@ try:
         def signed(claims,algorithm='HS256'):
             encode=lambda obj:base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip('=')
             data=encode({'alg':algorithm})+'.'+encode(claims)
-            sig=hmac.new((user+password+'@openp2p.cn').encode(),data.encode(),hashlib.sha256).digest()
+            sig=hmac.new((user+password+'@fastp2p').encode(),data.encode(),hashlib.sha256).digest()
             return data+'.'+base64.urlsafe_b64encode(sig).decode().rstrip('=')
-        claims={'user':user,'installToken':str(token),'iss':'openp2p.cn','exp':int(time.time())-1}
+        claims={'user':user,'installToken':str(token),'iss':'fastp2p.cn','exp':int(time.time())-1}
         assert api('/api/v1/devices',jwt=signed(claims))[0]==401
         claims['exp']=int(time.time())+100
         assert api('/api/v1/devices',jwt=signed(claims,'none'))[0]==401
@@ -250,7 +250,7 @@ try:
         assert b.query(r,totp)['online']==1
         results['query_TOTP_pair_grants_no_transitivity_and_spoof_rejection']=True
         # Receive fragmented WS input, emit fragmented output, and preserve a large uint64.
-        payload=message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'3.25.11'})
+        payload=message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'1.0.0'})
         a.send(payload[:9],fin=False);a.send(payload[9:],opcode=0);a.until(6,7)
         large={'appID':token,'appKey':token,'padding':'x'*96000}
         assert a.push(b,13,large)['error']==0

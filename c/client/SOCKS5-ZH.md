@@ -1,8 +1,8 @@
 # SOCKS5 代理
 
-C 客户端 0.3.0 增加本地 SOCKS5 入口，经已有 P2P TCP 打洞或 QUIC 隧道，使用指定 C 节点作为出口。支持 TCP CONNECT、UDP ASSOCIATE 和可选用户名密码认证；域名交给出口解析，不在入口发起目标连接或查询目标 DNS。
+fastp2p C 客户端提供本地 SOCKS5 入口，经 P2P TCP 打洞或 QUIC 隧道，使用指定 C 节点作为出口。支持 TCP CONNECT、UDP ASSOCIATE 和可选用户名密码认证；域名由出口解析。
 
-入口和出口均需 C 客户端 **0.3.0 或更新版本**，使用同一个自建网关和安装 token。Go / C 网关均可协调连接，现有 Go 节点的固定端口转发继续兼容。旧 Go / C 出口缺少请求级连接确认：TCP 请求返回“不支持命令”，UDP 目标流被关闭并报告错误，不会把其他连接的确认当作成功。
+入口、出口与网关均需 fastp2p **1.0.0 或更新版本**，使用同一自建网关。旧协议客户端不再兼容。
 
 ## 使用
 
@@ -15,14 +15,14 @@ C 客户端 0.3.0 增加本地 SOCKS5 入口，经已有 P2P TCP 打洞或 QUIC 
 }
 ```
 
-在出口安全设置 `OPENP2P_TOKEN`，运行 `openp2p-c --config exit.json`。入口复制 [config.socks5.example.json](config.socks5.example.json)，填写 CA、网关和出口节点名，设置相同 token 后启动：
+在出口安全设置 `FASTP2P_TOKEN`，运行 `fastp2p --config exit.json`。入口复制 [config.socks5.example.json](config.socks5.example.json)，填写 CA、网关和出口节点名，设置相同 token 后启动：
 
 ```bash
-openp2p-c --config entry.json
+fastp2p --config entry.json
 curl --proxy socks5h://127.0.0.1:1080 https://example.com/
 ```
 
-Windows 使用 `openp2p-c.exe`、`curl.exe`。浏览器或其他应用配置 SOCKS5 地址 `127.0.0.1:1080`，启用通过代理解析 DNS。`socks5h` 表示把域名传给代理；目标地址始终由出口连接，因此 `127.0.0.1` 指出口节点本机。
+Windows 使用 `fastp2p.exe`、`curl.exe`。浏览器或其他应用配置 SOCKS5 地址 `127.0.0.1:1080`，启用通过代理解析 DNS。`socks5h` 表示把域名传给代理；目标地址始终由出口连接，因此 `127.0.0.1` 指出口节点本机。
 
 `UnderlayProtocol` 为 `tcp` 或 `quic`，省略时为 QUIC。这是 P2P 隧道类型，与代理中的 TCP/UDP 应用独立；UDP ASSOCIATE 也可使用 TCP 打洞隧道。入口默认只监听本机回环，`BindIP` 可显式指定其他 IPv4 地址。
 
@@ -38,7 +38,7 @@ Windows 使用 `openp2p-c.exe`、`curl.exe`。浏览器或其他应用配置 SOC
   "SrcPort":1080,
   "PeerNode":"c-socks5-exit",
   "Username":"my-user",
-  "PasswordEnv":"OPENP2P_SOCKS_PASSWORD",
+  "PasswordEnv":"FASTP2P_SOCKS_PASSWORD",
   "UnderlayProtocol":"quic"
 }
 ```
@@ -49,16 +49,16 @@ Android 应用新增“SOCKS5 代理”JSON 数组入口，使用同样字段。
 
 ## C 接口
 
-ABI 保持 1，已有结构和函数签名不变，新增函数 `op2p_client_add_socks5`，字符串在调用时复制：
+ABI 保持 1，已有结构和函数签名不变，新增函数 `fastp2p_client_add_socks5`，字符串在调用时复制：
 
 ```c
-op2p_socks5 proxy = {
+fastp2p_socks5 proxy = {
     .struct_size = sizeof(proxy),
     .local_port = 1080,
     .peer_node = "c-socks5-exit",
-    .transport = OP2P_TRANSPORT_QUIC,
+    .transport = FASTP2P_TRANSPORT_QUIC,
 };
-int result = op2p_client_add_socks5(client, &proxy, NULL);
+int result = fastp2p_client_add_socks5(client, &proxy, NULL);
 ```
 
 在创建实例后添加代理，随后沿用 `start` / `step` / `stop` / `destroy`。监听器、活动连接及 UDP 关联均由实例拥有；停止时关闭，重新启动时恢复监听。JSON 工厂、CLI 和 Android JNI 使用相同的配置解析。
@@ -83,6 +83,6 @@ int result = op2p_client_add_socks5(client, &proxy, NULL);
 sudo bash c/client/scripts/check-socks.sh
 ```
 
-该脚本在独立 network namespace 中验证 TCP/QUIC、域名和 IPv4、可选认证、并发目标和错误关联、分片/合并握手、提前发送的数据、UDP 多目标与来源限制、连接回收、拒绝旧出口、网关重启及恢复后 35 秒心跳。测试证书、随机凭据和原始日志保存在私有 `/tmp/openp2p-socks-tests.*` 目录，不修改公网部署。
+该脚本在独立 network namespace 中验证 TCP/QUIC、域名和 IPv4、可选认证、并发目标和错误关联、分片/合并握手、提前发送的数据、UDP 多目标与来源限制、连接回收、拒绝旧出口、网关重启及恢复后 35 秒心跳。测试证书、随机凭据和原始日志保存在私有 `/tmp/fastp2p-socks-tests.*` 目录，不修改公网部署。
 
 原生 Windows / macOS 的同类验证由 `tests/socks_integration.py` 和 CI 执行，使用临时本地网关。实际通过的环境见 [验证记录](VALIDATION-ZH.md)。

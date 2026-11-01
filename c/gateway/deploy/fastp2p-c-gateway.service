@@ -1,0 +1,26 @@
+[Unit]
+Description=FastP2P C self-hosted gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fastp2p
+Group=fastp2p
+EnvironmentFile=/etc/fastp2p/gateway.env
+ExecStart=/opt/fastp2p/bin/fastp2p-gateway --bind 0.0.0.0 --apibind 127.0.0.1 --database /var/lib/fastp2p/nodes.sqlite3
+StateDirectory=fastp2p
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+LimitNOFILE=4096
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

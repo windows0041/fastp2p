@@ -12,16 +12,14 @@ for argument in "$@"; do
 done
 suffix=c
 if [[ "$sanitize" == ON ]]; then suffix=c-asan; fi
-output="${OPENP2P_C_BUILD_DIR:-$repository/build/$suffix}"
+output="${FASTP2P_C_BUILD_DIR:-$repository/build/$suffix}"
 mkdir -p "$output"
 output=$(cd -- "$output" && pwd)
 cmake -S "$repository/c/client" -B "$output" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE="$sanitize"
+  -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE="$sanitize"
 cmake --build "$output"
 cmake --build "$output" --target example-embed
 ctest --test-dir "$output" --output-on-failure
 if (( interop )); then
-  (cd "$repository/go/client" && go build -mod=readonly -o "$output/quic-go" \
-    "$repository/c/client/tests/quic-go/main.go")
-  python3 "$repository/c/client/tests/quic_interop.py" --build "$output"
+  python3 "$repository/c/client/tests/quic_native.py" --binary "$output/quic-interop"
 fi

@@ -7,18 +7,18 @@ case "${1:-}" in
   --sanitize) sanitize=ON ;;
   *) echo 'Usage: bash c/gateway/scripts/check.sh [--sanitize]' >&2; exit 2 ;;
 esac
-build="${OPENP2P_C_GATEWAY_BUILD_DIR:-$repository/build/c-gateway}"
-cmake -S "$repository/c/gateway" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE="$sanitize"
+build="${FASTP2P_C_GATEWAY_BUILD_DIR:-$repository/build/c-gateway}"
+cmake -S "$repository/c/gateway" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE="$sanitize"
 cmake --build "$build" --parallel 4
 ctest --test-dir "$build" --output-on-failure
 [[ $(id -u) == 0 ]] || { echo 'Protocol network tests need root and an isolated network namespace.' >&2; exit 1; }
-runtime=$(mktemp -d /tmp/openp2p-c-gateway-protocol.XXXXXXXX)
+runtime=$(mktemp -d /tmp/fastp2p-gateway-protocol.XXXXXXXX)
 chmod 700 "$runtime"
 echo "Private protocol logs: $runtime"
-bash "$repository/go/gateway/scripts/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 > "$runtime/certificate-generation.log" 2>&1
+bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 > "$runtime/certificate-generation.log" 2>&1
 exec unshare --net bash -c '
   set -euo pipefail
   ip link set lo up
   exec python3 "$@"
-' _ "$repository/c/gateway/tests/protocol_integration.py" --gateway "$build/openp2p-gateway-c" \
+' _ "$repository/c/gateway/tests/protocol_integration.py" --gateway "$build/fastp2p-gateway" \
   --cert-dir "$runtime/certs" --logs "$runtime/logs"

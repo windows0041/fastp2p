@@ -84,7 +84,7 @@ char *gw_jwt_issue(const char *user, uint64_t token, const char *secret, uint64_
         return NULL;
     gw_js(j, "user", user);
     gw_js(j, "installToken", number);
-    gw_js(j, "iss", "openp2p.cn");
+    gw_js(j, "iss", "fastp2p.cn");
     gw_ju(j, "iat", now);
     gw_ju(j, "exp", now + 86400);
     const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
@@ -132,7 +132,7 @@ int gw_jwt_verify(const char *text, const char *user, uint64_t token, const char
     uint64_t installation = 0;
     ok = head && claims && !strcmp(gw_string(head, "alg"), "HS256") &&
          gw_secret_equal(gw_string(claims, "user"), user) &&
-         !strcmp(gw_string(claims, "iss"), "openp2p.cn") &&
+         !strcmp(gw_string(claims, "iss"), "fastp2p.cn") &&
          !gw_decimal(gw_string(claims, "installToken"), &installation) && installation == token &&
          gw_integer(claims, "exp") > now && gw_integer(claims, "nbf") <= now &&
          gw_integer(claims, "iat") <= now + 30;

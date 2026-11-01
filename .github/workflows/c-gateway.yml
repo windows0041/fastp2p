@@ -1,9 +1,9 @@
-name: C gateway
+name: fastp2p C gateway
 on:
   push:
-    tags: ['c-gateway-v*']
+    tags: ['fastp2p-gateway-v*']
     branches: ['**']
-    paths: ['c/gateway/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml', 'scripts/publish-release.py']
+    paths: ['c/gateway/**', 'c/common/**', 'scripts/tls/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml', 'scripts/publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -31,26 +31,20 @@ jobs:
           apt-get update -qq
           apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.20.14'
-          cache-dependency-path: go/client/go.sum
       - uses: actions/cache@v4
         with:
-          path: ~/openp2p-dev/cross
+          path: ~/fastp2p-dev/cross
           key: gateway-client-deps-debian${{ matrix.debian }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
-      - name: Build reference clients
+      - name: Build C clients
         run: |
-          mkdir -p build/go
-          (cd go/client && go build -buildvcs=false -mod=readonly -o ../../build/go/openp2p ./cmd)
           python3 c/client/scripts/build-deps.py linux-x86_64
-          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE=ON -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64"
           cmake --build build/c --parallel 3
-      - name: C gateway protocol, authentication and lifecycle with sanitizers
+      - name: fastp2p C gateway protocol, authentication and lifecycle with sanitizers
         run: |
           python3 scripts/test-publish-release.py
           bash c/gateway/scripts/check.sh --sanitize
-      - name: Six Go/C clients, TCP punch, QUIC and reconnect
+      - name: Six C clients, TCP punch, QUIC and reconnect
         run: bash c/gateway/scripts/integration.sh
       - name: SQLite recovery and real hostname-based C clients
         run: bash c/gateway/scripts/check-registry.sh
@@ -58,7 +52,7 @@ jobs:
         run: |
           python3 -m pip install playwright==1.56.0
           python3 -m playwright install --with-deps chromium > browser-install.log 2>&1 || { tail -40 browser-install.log; exit 1; }
-          python3 c/gateway/tests/web_ui.py --gateway build/c-gateway/openp2p-gateway-c --client build/c/openp2p-c --output build/web-ui
+          python3 c/gateway/tests/web_ui.py --gateway build/c-gateway/fastp2p-gateway --client build/c/fastp2p --output build/web-ui
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -76,17 +70,17 @@ jobs:
           cp c/NODE-STORAGE-ZH.md dist/c-gateway-debian${{ matrix.debian }}-x86_64/
           cp -R c/gateway/deploy dist/c-gateway-debian${{ matrix.debian }}-x86_64/
           mkdir -p dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts
-          cp go/gateway/scripts/generate-cert.sh dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts/
-          tar -C dist -czf dist/openp2p-c-gateway-debian${{ matrix.debian }}-x86_64.tar.gz c-gateway-debian${{ matrix.debian }}-x86_64
+          cp scripts/tls/generate-cert.sh dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts/
+          tar -C dist -czf dist/fastp2p-gateway-debian${{ matrix.debian }}-x86_64.tar.gz c-gateway-debian${{ matrix.debian }}-x86_64
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-gateway-debian${{ matrix.debian }}-x86_64
-          path: dist/openp2p-c-gateway-*.tar.gz
+          name: fastp2p-gateway-debian${{ matrix.debian }}-x86_64
+          path: dist/fastp2p-gateway-*.tar.gz
       - name: Gather sanitized test summaries
         if: always()
         run: |
           mkdir -p build/reports
-          find /tmp -path '/tmp/openp2p-c-gateway-*/logs/result.json' -exec cp --parents '{}' build/reports/ \;
+          find /tmp -path '/tmp/fastp2p-gateway-*/logs/result.json' -exec cp --parents '{}' build/reports/ \;
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -98,19 +92,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Build gateway image
-        run: docker build -t openp2p-c-gateway:test c/gateway
+        run: docker build -f c/gateway/Dockerfile -t fastp2p-gateway:test .
       - name: Check native entrypoint
-        run: docker run --rm openp2p-c-gateway:test --version
+        run: docker run --rm fastp2p-gateway:test --version
       - name: Boot with private TLS certificate
         run: |
-          bash go/gateway/scripts/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
+          bash scripts/tls/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
           mkdir -p "$RUNNER_TEMP/c-gateway-state"
           docker run -d --name c-gateway-test --user "$(id -u):$(id -g)" \
-            -e OPENP2P_USER=ci-test-admin -e OPENP2P_PASSWORD=ci-only-fixture-password -e OPENP2P_TOKEN=18446744073709551615 \
-            -v "$RUNNER_TEMP/c-gateway-tls/server.crt:/etc/openp2p/tls/server.crt:ro" \
-            -v "$RUNNER_TEMP/c-gateway-tls/server.key:/etc/openp2p/tls/server.key:ro" \
-            -v "$RUNNER_TEMP/c-gateway-state:/var/lib/openp2p" \
-            -p 127.0.0.1:10008:10008 openp2p-c-gateway:test
+            -e FASTP2P_USER=ci-test-admin -e FASTP2P_PASSWORD=ci-only-fixture-password -e FASTP2P_TOKEN=18446744073709551615 \
+            -v "$RUNNER_TEMP/c-gateway-tls/server.crt:/etc/fastp2p/tls/server.crt:ro" \
+            -v "$RUNNER_TEMP/c-gateway-tls/server.key:/etc/fastp2p/tls/server.key:ro" \
+            -v "$RUNNER_TEMP/c-gateway-tls/ca.crt:/etc/fastp2p/tls/ca.crt:ro" \
+            -v "$RUNNER_TEMP/c-gateway-state:/var/lib/fastp2p" \
+            -p 127.0.0.1:10008:10008 fastp2p-gateway:test
           for attempt in $(seq 1 40); do
             if curl -fsS --cacert "$RUNNER_TEMP/c-gateway-tls/ca.crt" https://127.0.0.1:10008/healthz; then exit 0; fi
             sleep 0.25
@@ -122,17 +117,17 @@ jobs:
         run: docker rm -f c-gateway-test || true
       - name: Package Docker image
         run: |
-          version=$(sed -n 's/.*project(openp2p_c_gateway VERSION \([0-9.]*\).*/\1/p' c/gateway/CMakeLists.txt)
-          docker tag openp2p-c-gateway:test "openp2p-c-gateway:$version"
+          version=$(sed -n 's/.*project(fastp2p_c_gateway VERSION \([0-9.]*\).*/\1/p' c/gateway/CMakeLists.txt)
+          docker tag fastp2p-gateway:test "fastp2p-gateway:$version"
           mkdir -p dist
-          docker save "openp2p-c-gateway:$version" | gzip -n > dist/openp2p-c-gateway-docker-amd64.tar.gz
+          docker save "fastp2p-gateway:$version" | gzip -n > dist/fastp2p-gateway-docker-amd64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: openp2p-c-gateway-docker-amd64
-          path: dist/openp2p-c-gateway-docker-amd64.tar.gz
+          name: fastp2p-gateway-docker-amd64
+          path: dist/fastp2p-gateway-docker-amd64.tar.gz
   release:
     needs: [gateway, docker]
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/c-gateway-v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-gateway-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -142,7 +137,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          pattern: openp2p-c-gateway-*
+          pattern: fastp2p-gateway-*
           path: release-input
       - name: Publish verified gateway packages
         env:

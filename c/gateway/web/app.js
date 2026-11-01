@@ -195,7 +195,7 @@
     $('rule-transport').value = app && (Number(app.punchPriority) & 2) ? 'tcp' : 'quic';
     $('rule-whitelist').value = app ? app.whitelist || '' : '127.0.0.1';
     $('whitelist-field').hidden = !state.selected.capabilities?.editForward;
-    text('rule-help', state.selected.capabilities?.editForward ? '规则保存在 Go 客户端；UDP 优先模式可能按客户端策略选择其他链路。' : 'C 客户端新增规则仅在本次进程中生效，入口绑定 127.0.0.1。需要持久化时同步修改客户端配置。');
+    text('rule-help', state.selected.capabilities?.editForward ? '规则保存行为由客户端能力决定。' : 'C 客户端新增规则仅在本次进程中生效，入口绑定 127.0.0.1。需要持久化时同步修改客户端配置。');
     $('peer-names').replaceChildren(...state.nodes.filter(n => n.name !== state.selected.name).map(n => {
       const option = element('option'); option.value = n.name; return option;
     }));
@@ -205,8 +205,8 @@
     event.preventDefault(); $('login-submit').disabled = true; $('login-error').hidden = true;
     try {
       const login = await api('/api/v1/user/login', {user: $('username').value, password: $('password').value});
-      if (typeof login.token !== 'string' || typeof login.nodeToken !== 'string') throw new Error('无法读取登录凭据。');
-      state.token = login.token; state.installToken = login.nodeToken; $('password').value = '';
+      if (typeof login.token !== 'string' || typeof login.installToken !== 'string') throw new Error('无法读取登录凭据。');
+      state.token = login.token; state.installToken = login.installToken; $('password').value = '';
       $('login-screen').hidden = true; $('console').hidden = false; message(''); await refresh();
     } catch (error) { text('login-error', error.message); $('login-error').hidden = false; }
     finally { $('login-submit').disabled = false; }
@@ -241,7 +241,7 @@
     finally { $('confirm-action').disabled = false; state.confirm = null; }
   });
   $('token-button').addEventListener('click', () => {
-    $('install-token').value = state.installToken; $('install-token').type = 'password'; text('reveal-token', '显示'); $('token-dialog').showModal();
+    $('install-token').value = state.installToken; $('install-token').type = 'password'; $('android-install').href = 'intent://install?token=' + encodeURIComponent(state.installToken) + '#Intent;scheme=fastp2p;package=cc.itq.fastp2p.cclient;end'; text('reveal-token', '显示'); $('token-dialog').showModal();
   });
   $('reveal-token').addEventListener('click', () => {
     const hidden = $('install-token').type === 'password'; $('install-token').type = hidden ? 'text' : 'password'; text('reveal-token', hidden ? '隐藏' : '显示');
@@ -250,7 +250,7 @@
     try { await navigator.clipboard.writeText(state.installToken); text('copy-token', '已复制'); }
     catch { $('install-token').type = 'text'; $('install-token').select(); text('copy-token', '请手动复制'); }
   });
-  $('token-dialog').addEventListener('close', () => { $('install-token').value = ''; text('copy-token', '复制 Token'); });
+  $('token-dialog').addEventListener('close', () => { $('install-token').value = ''; $('android-install').removeAttribute('href'); text('copy-token', '复制 Token'); });
   $('close-token').addEventListener('click', () => $('token-dialog').close());
   $('logout').addEventListener('click', () => logout()); $('refresh').addEventListener('click', refresh);
   $('overview-nav').addEventListener('click', () => window.scrollTo({top: 0, behavior: 'smooth'}));

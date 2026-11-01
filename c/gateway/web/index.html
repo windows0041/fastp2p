@@ -2,13 +2,13 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="light"><title>OpenP2P · 网关控制台</title>
+  <meta name="color-scheme" content="light"><title>FastP2P · 网关控制台</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <section id="login-screen" class="login-screen">
-    <div class="login-story"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="40" height="40"><span>OpenP2P<small>SELF-HOSTED GATEWAY</small></span></a>
+    <div class="login-story"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="40" height="40"><span>FastP2P<small>SELF-HOSTED GATEWAY</small></span></a>
       <div class="story-copy"><span class="eyebrow">让连接，回到自己手中</span><h1>你的节点。<br>你的网络。</h1><p>从一个网关，连接分散的设备。<br>查看节点、管理转发，掌握每一条连接。</p>
       <div class="network-art" aria-hidden="true"><span class="orbit orbit-one"></span><span class="orbit orbit-two"></span><span class="art-hub">P2P</span><i class="satellite one"></i><i class="satellite two"></i><i class="satellite three"></i><i class="satellite four"></i></div></div>
       <div class="story-footer"><span class="dot"></span> HTTPS / WSS · TCP / QUIC</div>
@@ -20,14 +20,14 @@
       <p id="login-error" class="form-error" role="alert" hidden></p>
       <button id="login-submit" class="button primary login-submit" type="submit">登录控制台 <span aria-hidden="true">→</span></button>
       <p class="login-note">关闭或刷新页面后，需要重新登录。</p>
-    </form><p class="login-bottom">OpenP2P C Gateway · 自建网络管理</p></div>
+    </form><p class="login-bottom">FastP2P C Gateway · 自建网络管理</p></div>
   </section>
 
   <div id="console" class="console" hidden>
-    <aside class="sidebar"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="36" height="36"><span>OpenP2P<small>网关控制台</small></span></a>
+    <aside class="sidebar"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="36" height="36"><span>FastP2P<small>网关控制台</small></span></a>
       <div class="nav-label">工作空间</div><nav aria-label="主导航">
         <button class="nav-item active" id="overview-nav" type="button"><span aria-hidden="true">◫</span> 网络总览 <span id="nav-count" class="nav-count">0</span></button>
-        <a class="nav-item" href="https://github.com/windows0041/openp2p-test/releases" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">↓</span> 版本与下载 <span class="external" aria-hidden="true">↗</span></a>
+        <a class="nav-item" href="https://github.com/windows0041/fastp2p/releases" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">↓</span> 版本与下载 <span class="external" aria-hidden="true">↗</span></a>
       </nav><div class="sidebar-foot"><span class="dot"></span><span>自己的网关，自己的连接<small id="sidebar-version">C Gateway</small></span></div>
     </aside>
     <div class="workspace"><header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong>网络总览</strong></div><div class="account"><span id="account-name"></span><button id="token-button" class="button quiet" type="button">安装 Token</button><button id="logout" class="button quiet" type="button">退出</button></div></header>
@@ -48,7 +48,7 @@
           <p id="rule-message" class="inline-message" role="status">尚未选择节点。</p>
           <div class="table-scroll"><table class="rules-table"><thead><tr><th>规则名称</th><th>入口</th><th>对端 / 目标</th><th>链路</th><th>状态</th><th>操作</th></tr></thead><tbody id="rules"></tbody></table></div>
         </section>
-        <footer class="main-footer"><span>OpenP2P C Gateway</span><span>数据在客户端之间传输，网关负责连接协调。</span></footer>
+        <footer class="main-footer"><span>FastP2P C Gateway</span><span>数据在客户端之间传输，网关负责连接协调。</span></footer>
       </main>
     </div>
   </div>
@@ -61,6 +61,6 @@
     <p id="rule-help" class="muted form-help"></p><p id="rule-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-rule" class="button" type="button">取消</button><button id="save-rule" class="button primary" type="submit">发送到客户端</button></div>
   </form></dialog>
   <dialog id="confirm-dialog"><form id="confirm-form"><div class="dialog-heading"><h2 id="confirm-title">确认操作</h2></div><p id="confirm-description"></p><div class="dialog-actions"><button id="cancel-confirm" class="button" type="button">取消</button><button id="confirm-action" class="button danger" type="submit">确认</button></div></form></dialog>
-  <dialog id="token-dialog"><div class="dialog-heading"><h2>客户端安装 Token</h2><button id="close-token" class="icon-button" type="button" aria-label="关闭">×</button></div><p class="muted">用于同账号客户端接入。只交给你信任的设备。</p><label for="install-token">十进制 uint64</label><input id="install-token" type="password" readonly autocomplete="off"><div class="dialog-actions"><button id="reveal-token" class="button" type="button">显示</button><button id="copy-token" class="button primary" type="button">复制 Token</button></div></dialog>
+  <dialog id="token-dialog"><div class="dialog-heading"><h2>客户端安装 Token</h2><button id="close-token" class="icon-button" type="button" aria-label="关闭">×</button></div><p class="muted">安装时使用，已包含网关地址和证书信任信息。只交给你信任的设备。</p><label for="install-token">FP1 安装 Token</label><input id="install-token" type="password" readonly autocomplete="off"><div class="dialog-actions"><a id="android-install" class="button" rel="noreferrer">安卓接入</a><button id="reveal-token" class="button" type="button">显示</button><button id="copy-token" class="button primary" type="button">复制 Token</button></div></dialog>
 </body>
 </html>

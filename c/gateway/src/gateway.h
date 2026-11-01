@@ -1,5 +1,5 @@
-#ifndef OP2P_GATEWAY_H
-#define OP2P_GATEWAY_H
+#ifndef FASTP2P_GATEWAY_H
+#define FASTP2P_GATEWAY_H
 #include "protocol.h"
 #include "store.h"
 #include <libwebsockets.h>
@@ -64,6 +64,8 @@ struct gateway {
     json_object *sdwan;
     sqlite3 *db;
     const char *database;
+    const char *public_host, *enrollment_ca_file;
+    char enrollment_ca[16385];
     struct nat_state nat;
 };
 int gw_nat_start(struct nat_state *state, const char *bind);
