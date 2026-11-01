@@ -12,6 +12,7 @@ parser.add_argument('--build', required=True)
 args = parser.parse_args()
 build = Path(args.build).resolve()
 suffix = '.exe' if os.name == 'nt' else ''
+subprocess.run([str(build/('quic-interop'+suffix)), '--dependencies'], check=True)
 
 def port():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:

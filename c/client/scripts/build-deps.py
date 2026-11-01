@@ -65,7 +65,8 @@ environment=os.environ.copy()
 environment['PKG_CONFIG_LIBDIR']=str(prefix/'lib/pkgconfig')
 environment['PKG_CONFIG_PATH']=str(prefix/'lib/pkgconfig')
 cmake_common=['-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DCMAKE_INSTALL_PREFIX='+str(prefix),
-    '-DCMAKE_INSTALL_LIBDIR=lib','-DCMAKE_POSITION_INDEPENDENT_CODE=ON','-DBUILD_SHARED_LIBS=OFF','-DBUILD_TESTING=OFF']
+    '-DCMAKE_INSTALL_LIBDIR=lib','-DCMAKE_POSITION_INDEPENDENT_CODE=ON','-DBUILD_SHARED_LIBS=OFF','-DBUILD_TESTING=OFF',
+    '-DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON']
 environment['CFLAGS']='-O2 -fPIC'
 openssl_target='linux-x86_64'
 openssl_extra=[]

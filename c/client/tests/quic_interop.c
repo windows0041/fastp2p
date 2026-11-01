@@ -4,8 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/version.h>
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--dependencies")) {
+        const ngtcp2_info *info = ngtcp2_version(0);
+        printf("ngtcp2 header=%s runtime=%s settings_version=%d settings_size=%zu\n",
+               NGTCP2_VERSION, info->version_str, NGTCP2_SETTINGS_VERSION, sizeof(ngtcp2_settings));
+        return info->version_num == NGTCP2_VERSION_NUM ? 0 : 1;
+    }
     if (argc != 5) {
         fprintf(stderr, "usage: quic-interop client|server IP PORT LOCAL_PORT\n");
         return 2;

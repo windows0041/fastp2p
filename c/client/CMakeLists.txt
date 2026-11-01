@@ -3,6 +3,8 @@ project(openp2p_c VERSION 0.2.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
+# Pinned dependency headers must precede ambient Homebrew/CPATH headers.
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 include(CTest)
 include(cmake/Dependencies.cmake)
 option(OPENP2P_BUILD_SHARED "Build the public shared C library" ON)

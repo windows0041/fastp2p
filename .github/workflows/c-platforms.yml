@@ -44,7 +44,7 @@ jobs:
           key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
       - name: Build CLI and C SDK
         run: |
-          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
           cmake --build build/c --parallel 3
           cmake --build build/c --target example-embed
           cmake --install build/c
@@ -82,6 +82,7 @@ jobs:
           path: |
             build/c/Testing/Temporary/LastTest.log
             build/c/desktop-result.json
+            build/c/compile_commands.json
   cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
