@@ -44,6 +44,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('fastp2p-linux-x86_64',{p.name for p in files})
         (self.incoming/'private.key').write_text('fixture')
         self.assertNotIn('private.key',{p.name for p in release.prepare('client',self.incoming,self.output)})
+    def test_artifact_directory_can_share_binary_name(self):
+        for name in release.KINDS['client'][2]:
+            directory=self.incoming/name;directory.mkdir()
+            (directory/name).write_bytes(b'fixture')
+        self.assertEqual(len(release.prepare('client',self.incoming,self.output)),10)
     def publication(self,bad_digest=False):
         self.artifacts('gateway');files=release.prepare('gateway',self.incoming,self.output);calls=[]
         class FakeAPI:

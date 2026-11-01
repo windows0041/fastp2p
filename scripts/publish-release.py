@@ -37,7 +37,7 @@ def prepare(kind, incoming, output):
     output.mkdir(parents=True, exist_ok=True)
     result = []
     for name in KINDS[kind][2]:
-        matches = list(incoming.rglob(name))
+        matches = [p for p in incoming.rglob(name) if p.is_file()]
         if len(matches) != 1 or matches[0].is_symlink() or matches[0].stat().st_size == 0:
             raise RuntimeError('Expected exactly one nonempty CI artifact: ' + name)
         target = output/name
