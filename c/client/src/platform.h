@@ -47,6 +47,7 @@ typedef intptr_t op_socket;
 #define MSG_NOSIGNAL 0
 #endif
 int op_platform_init(void);
+int op_hostname(char *out, size_t capacity);
 void op_once_run(op_once *once, void (*function)(void));
 uint64_t op_monotonic_ns(void);
 uint64_t op_wall_ns(void);

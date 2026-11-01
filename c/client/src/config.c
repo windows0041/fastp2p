@@ -32,6 +32,19 @@ int op2p_client_create_json(const char *text, const char *token_text, const char
         return OP2P_EINVAL;
     }
     json_object *network = op_get(root, "network");
+    if (network && !json_object_is_type(network, json_type_object)) {
+        json_object_put(root);
+        return OP2P_EINVAL;
+    }
+    const char *network_strings[] = {"Node", "ServerHost", "DeviceID"};
+    for (size_t i = 0; i < sizeof(network_strings) / sizeof(network_strings[0]); ++i) {
+        json_object *value = op_get(network, network_strings[i]);
+        if (value && (!json_object_is_type(value, json_type_string) ||
+                      (size_t)json_object_get_string_len(value) != strlen(json_object_get_string(value)))) {
+            json_object_put(root);
+            return OP2P_EINVAL;
+        }
+    }
     uint64_t token = op_integer(network, "Token"), port = op_integer(network, "ServerPort"),
              public_port = op_integer(network, "PublicIPPort");
     int rv = OP2P_OK;
@@ -45,17 +58,25 @@ int op2p_client_create_json(const char *text, const char *token_text, const char
     }
     const char *host = op_string(network, "ServerHost");
     const char *ca_file = ca ? ca : op_string(root, "CACertFile");
+    json_object *automatic = op_get(network, "AutoNode");
+    if (automatic && !json_object_is_type(automatic, json_type_boolean)) {
+        json_object_put(root);
+        return OP2P_EINVAL;
+    }
     op2p_config cfg = {.struct_size = sizeof(cfg),
                        .abi_version = OP2P_ABI_VERSION,
                        .gateway_host = *host ? host : "127.0.0.1",
                        .gateway_port = (uint16_t)port,
-                       .node = op_string(network, "Node"),
+                       .node = automatic && json_object_get_boolean(automatic) ? NULL : op_string(network, "Node"),
                        .token = token,
                        .ca_file = *ca_file ? ca_file : NULL,
                        .public_port = (uint16_t)public_port,
                        .on_event = callback,
                        .user = user};
     rv = op2p_client_create(&cfg, out);
+    const char *device = op_string(network, "DeviceID");
+    if (!rv && *device)
+        rv = op2p_client_set_identity(*out, device);
     json_object *apps = op_get(root, "apps");
     if (!rv && apps && !json_object_is_type(apps, json_type_array))
         rv = OP2P_EINVAL;

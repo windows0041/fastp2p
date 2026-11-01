@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <sys/stat.h>
 
 static struct gateway g;
 static volatile sig_atomic_t stopping;
@@ -20,6 +21,8 @@ static void signal_stop(int signal) {
 }
 static void http_reply(struct connection *c, int status, const void *data, size_t len);
 static void http_error(struct connection *c, int status, unsigned code, const char *detail);
+static int query(struct lws *wsi, const char *name, char *out, size_t capacity);
+static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit, unsigned fallback);
 
 static struct connection *find_node(uint64_t id) {
     for (unsigned i = 0; i < g.max_nodes; ++i)
@@ -37,6 +40,8 @@ static void unregister_node(struct connection *c) {
     if (!c || !c->registered)
         return;
     if (c->slot >= 0 && c->slot < GW_MAX_NODES && g.nodes[c->slot] == c) {
+        if (gw_store_save(g.db, c, 0))
+            fputs("Cannot persist disconnected node\n", stderr);
         g.nodes[c->slot] = NULL;
         memset(g.grants[c->slot], 0, sizeof(g.grants[c->slot]));
         for (unsigned i = 0; i < g.max_nodes; ++i)
@@ -176,6 +181,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         copy_field(c->lan, sizeof(c->lan), j, "lanIP");
         copy_field(c->ipv6, sizeof(c->ipv6), j, "IPv6");
         copy_field(c->version, sizeof(c->version), j, "version");
+        copy_field(c->hostname, sizeof(c->hostname), j, "hostname");
         c->has_ipv4 = (unsigned)(gw_integer(j, "hasIPv4") != 0);
         c->has_upnp = (unsigned)(gw_integer(j, "hasUPNPorNATPMP") != 0);
         uint64_t port = gw_integer(j, "publicIPPort");
@@ -185,6 +191,10 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         }
         c->public_port = (unsigned)port;
         c->major = major_version(c->version);
+        if (gw_store_save(g.db, c, 1)) {
+            json_object_put(j);
+            return -1;
+        }
         json_object *ack = json_object_new_object();
         send_json(c, 6, 7, ack);
         json_object_put(ack);
@@ -378,6 +388,18 @@ static void http_error(struct connection *c, int status, unsigned code, const ch
     http_json(c, status, j);
     json_object_put(j);
 }
+static void capabilities(json_object *node) {
+    const char *os = gw_string(node, "os");
+    size_t length = strlen(os);
+    int c_client = length >= 2 && !strcmp(os + length - 2, "-c");
+    int active = gw_integer(node, "isActive") != 0;
+    json_object *caps = json_object_new_object();
+    json_object_object_add(caps, "readApps", json_object_new_boolean(active));
+    json_object_object_add(caps, "addForward", json_object_new_boolean(active));
+    json_object_object_add(caps, "editForward", json_object_new_boolean(active && !c_client));
+    json_object_object_add(caps, "switchForward", json_object_new_boolean(active && !c_client));
+    json_object_object_add(node, "capabilities", caps);
+}
 static json_object *devices(void) {
     json_object *root = json_object_new_object(), *nodes = json_object_new_array();
     json_object_object_add(root, "nodes", nodes);
@@ -400,15 +422,9 @@ static json_object *devices(void) {
         gw_js(j, "mac", n->mac);
         gw_js(j, "os", n->os);
         gw_js(j, "version", n->version);
-        size_t os_len = strlen(n->os);
-        int c_client = os_len >= 2 && !strcmp(n->os + os_len - 2, "-c");
-        json_object *capabilities = json_object_new_object();
-        json_object_object_add(capabilities, "readApps", json_object_new_boolean(1));
-        json_object_object_add(capabilities, "addForward", json_object_new_boolean(1));
-        json_object_object_add(capabilities, "editForward", json_object_new_boolean(!c_client));
-        json_object_object_add(capabilities, "switchForward", json_object_new_boolean(!c_client));
-        json_object_object_add(j, "capabilities", capabilities);
         gw_ju(j, "isActive", 1);
+        gw_js(j, "hostname", n->hostname);
+        capabilities(j);
         json_object_object_add(j, "isUpdate", json_object_new_boolean(1));
         time_t timestamp = (time_t)(n->active_wall / 1000000000);
         struct tm utc;
@@ -488,6 +504,14 @@ static void handle_http(struct connection *c) {
         gw_js(j, "implementation", "c");
         gw_js(j, "version", GW_VERSION);
         gw_js(j, "user", g.user);
+        uint64_t total = 0;
+        if (gw_store_count(g.db, &total)) {
+            json_object_put(j);
+            http_error(c, 503, 1, "node storage unavailable");
+            return;
+        }
+        gw_ju(j, "totalNodes", total);
+        gw_js(j, "nodeStorage", "sqlite");
         gw_ju(j, "online", count);
         gw_ju(j, "capacity", g.max_nodes);
         gw_ju(j, "uptimeSeconds", (gw_mono_ms() - g.started_ms) / 1000);
@@ -502,6 +526,33 @@ static void handle_http(struct connection *c) {
     }
     if (!c->post && !strcmp(c->uri, "/api/v1/devices")) {
         json_object *j = devices();
+        http_json(c, 200, j);
+        json_object_put(j);
+        return;
+    }
+    if (!c->post && !strcmp(c->uri, "/api/v1/nodes")) {
+        char search[256];
+        if (query(c->wsi, "search=", search, sizeof(search)))
+            search[0] = 0;
+        unsigned limit = query_integer(c->wsi, "limit=", 256, 100);
+        unsigned offset = query_integer(c->wsi, "offset=", 2147483647u, 0);
+        if (!limit) {
+            http_error(c, 400, 1, "invalid page size");
+            return;
+        }
+        json_object *j = gw_store_list(g.db, search, limit, offset);
+        if (!j) {
+            http_error(c, 503, 1, "node storage unavailable");
+            return;
+        }
+        json_object *nodes = gw_get(j, "nodes");
+        for (size_t i = 0; i < json_object_array_length(nodes); ++i) {
+            json_object *node = json_object_array_get_idx(nodes, i);
+            uint64_t id = 0;
+            struct connection *live = !gw_decimal(gw_string(node, "id"), &id) ? find_node(id) : NULL;
+            gw_ju(node, "isActive", live && !strcmp(live->node, gw_string(node, "name")) ? 1 : 0);
+            capabilities(node);
+        }
         http_json(c, 200, j);
         json_object_put(j);
         return;
@@ -655,7 +706,33 @@ static int login_status(struct lws *wsi) {
         return 400;
     if (query(wsi, "token=", token, sizeof(token)) || gw_decimal(token, &value) || value != g.token)
         return 401;
+    int automatic = query_integer(wsi, "autonode=", 1, 0) != 0;
+    int automatic_known = 0;
+    if (automatic) {
+        char device[33], hostname[256];
+        if (query(wsi, "deviceid=", device, sizeof(device)) || !gw_device_valid(device) ||
+            query(wsi, "hostname=", hostname, sizeof(hostname)) || !*hostname)
+            return 400;
+        size_t length = strlen(hostname);
+        if (length > 31)
+            return 400;
+        char padded[32];
+        strcpy(padded, hostname);
+        while (length < 8) padded[length++] = '0';
+        padded[length] = 0;
+        if (!gw_node_valid(padded))
+            return 400;
+        automatic_known = gw_store_resolve(g.db, device, node);
+        if (automatic_known < 0)
+            return 503;
+    } else {
+        int status = gw_store_manual_status(g.db, node);
+        if (status)
+            return status > 0 ? 409 : 503;
+    }
     struct connection *existing = find_node(gw_node_id(node));
+    if (automatic && !automatic_known)
+        existing = NULL;
     if (existing && strcmp(existing->node, node))
         return 409;
     if (!existing) {
@@ -674,6 +751,15 @@ static int establish(struct lws *wsi, struct connection *c) {
     c->wsi = wsi;
     c->slot = -1;
     if (query(wsi, "node=", c->node, sizeof(c->node)))
+        return -1;
+    char requested[32], device[33];
+    strcpy(requested, c->node);
+    int automatic = query_integer(wsi, "autonode=", 1, 0) != 0;
+    device[0] = 0;
+    if (automatic && (query(wsi, "deviceid=", device, sizeof(device)) ||
+                      query(wsi, "hostname=", c->hostname, sizeof(c->hostname))))
+        return -1;
+    if (gw_store_claim(g.db, requested, c->hostname, device, automatic, c->node))
         return -1;
     c->id = gw_node_id(c->node);
     struct connection *previous = find_node(c->id);
@@ -700,7 +786,13 @@ static int establish(struct lws *wsi, struct connection *c) {
     c->registered = 1;
     c->last_rx = gw_mono_ms();
     c->active_wall = gw_wall_ns();
+    c->last_seen_wall = c->active_wall;
+    c->next_store = c->last_rx + 30000;
     g.nodes[slot] = c;
+    if (gw_store_save(g.db, c, 1)) {
+        unregister_node(c);
+        return -1;
+    }
     json_object *login = json_object_new_object();
     gw_js(login, "user", g.user);
     gw_js(login, "node", c->node);
@@ -728,6 +820,8 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
     case LWS_CALLBACK_ESTABLISHED:
         return establish(wsi, c);
     case LWS_CALLBACK_RECEIVE: {
+        if (c && c->registered)
+            c->last_seen_wall = gw_wall_ns();
         int result = c && c->registered && !c->closing ? receive_ws(c, in, len) : -1;
         if (result && c) {
             c->closing = 1;
@@ -848,6 +942,11 @@ static void tick(lws_sorted_usec_list_t *sul) {
         struct connection *c = g.nodes[i];
         if (!c)
             continue;
+        if (now >= c->next_store) {
+            c->next_store = now + 30000;
+            if (gw_store_save(g.db, c, 1))
+                fputs("Cannot persist node heartbeat\n", stderr);
+        }
         if (now - c->last_rx > (uint64_t)g.timeout * 1000)
             close_node(c);
         if (c->pending_http && now > c->pending_http->deadline) {
@@ -913,7 +1012,7 @@ static int sdwan_valid(json_object *j) {
 }
 static void usage(void) {
     puts("openp2p-gateway-c --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
-         "  [--port 27183] [--apiport 10008] [--sdwan-config FILE]\n"
+         "  [--port 27183] [--apiport 10008] [--sdwan-config FILE] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
          "Set OPENP2P_USER and OPENP2P_PASSWORD; OPENP2P_TOKEN optionally "
          "overrides the derived uint64.\n"
@@ -924,6 +1023,9 @@ static int options(int argc, char **argv) {
     g.timeout = 40;
     g.ws_port = 27183;
     g.api_port = 10008;
+    g.database = getenv("OPENP2P_DATABASE");
+    if (!g.database)
+        g.database = "nodes.sqlite3";
     snprintf(g.bind, sizeof(g.bind), "127.0.0.1");
     g.cert = getenv("OPENP2P_TLS_CERT");
     if (!g.cert)
@@ -942,6 +1044,7 @@ static int options(int argc, char **argv) {
                                          {"heartbeat-timeout", required_argument, 0, 't'},
                                          {"run-seconds", required_argument, 0, 'r'},
                                          {"sdwan-config", required_argument, 0, 's'},
+                                         {"database", required_argument, 0, 'd'},
                                          {"version", no_argument, 0, 'v'},
                                          {"help", no_argument, 0, 'h'},
                                          {0}};
@@ -967,6 +1070,9 @@ static int options(int argc, char **argv) {
             break;
         case 's':
             sdwan = optarg;
+            break;
+        case 'd':
+            g.database = optarg;
             break;
         case 'v':
             printf("openp2p-gateway-c %s\n", GW_VERSION);
@@ -1003,7 +1109,7 @@ static int options(int argc, char **argv) {
             return -1;
         }
     }
-    if (optind != argc || g.ws_port == g.api_port)
+    if (optind != argc || g.ws_port == g.api_port || !*g.database)
         return -1;
     if (!*g.api_bind)
         strcpy(g.api_bind, g.bind);
@@ -1063,9 +1169,16 @@ int main(int argc, char **argv) {
     signal(SIGTERM, signal_stop);
     signal(SIGPIPE, SIG_IGN);
     lws_set_log_level(LLL_ERR | LLL_WARN, NULL);
+    umask(0077);
+    if (gw_store_open(&g.db, g.database)) {
+        fputs("Cannot open node SQLite database\n", stderr);
+        json_object_put(g.sdwan);
+        return 1;
+    }
     if (gw_nat_start(&g.nat, g.bind)) {
         fputs("Cannot bind NAT ports\n", stderr);
         json_object_put(g.sdwan);
+        sqlite3_close(g.db);
         return 1;
     }
     struct lws_context_creation_info info;
@@ -1121,6 +1234,7 @@ int main(int argc, char **argv) {
     lws_sul_cancel(&g.tick);
     lws_context_destroy(g.context);
     gw_nat_stop(&g.nat);
+    sqlite3_close(g.db);
     json_object_put(g.sdwan);
     OPENSSL_cleanse(g.secret, sizeof(g.secret));
     return result;
@@ -1128,6 +1242,7 @@ failed:
     if (g.context)
         lws_context_destroy(g.context);
     gw_nat_stop(&g.nat);
+    sqlite3_close(g.db);
     json_object_put(g.sdwan);
     OPENSSL_cleanse(g.secret, sizeof(g.secret));
     return 1;

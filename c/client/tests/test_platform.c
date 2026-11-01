@@ -5,6 +5,9 @@
 
 int main(void) {
     assert(!op_platform_init());
+    char hostname[256];
+    assert(!op_hostname(hostname, sizeof(hostname)) && *hostname);
+    assert(op_hostname(hostname, 1));
     struct sockaddr_in a, b;
     memset(&a, 0, sizeof(a));
     memset(&b, 0xff, sizeof(b));

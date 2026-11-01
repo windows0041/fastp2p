@@ -1,6 +1,7 @@
 #ifndef OP2P_GATEWAY_H
 #define OP2P_GATEWAY_H
 #include "protocol.h"
+#include "store.h"
 #include <libwebsockets.h>
 #include <netinet/in.h>
 #define GW_MAX_NODES 256
@@ -18,6 +19,8 @@ struct connection {
     int slot, registered, closing;
     char node[32], ip[64], ipv6[128], os[128], mac[128], lan[64], version[64];
     uint64_t id, last_rx, relay_time, active_wall;
+    uint64_t last_seen_wall, next_store;
+    char hostname[256];
     unsigned nat, bandwidth, has_ipv4, has_upnp, public_port, major;
     struct packet *head, *tail;
     size_t queued, count;
@@ -59,6 +62,8 @@ struct gateway {
     uint64_t token;
     uint64_t started_ms;
     json_object *sdwan;
+    sqlite3 *db;
+    const char *database;
     struct nat_state nat;
 };
 int gw_nat_start(struct nat_state *state, const char *bind);

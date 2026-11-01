@@ -1,5 +1,9 @@
 # Sources and dependencies
 
+SQLite (public domain) stores the node registry using its C API. It is linked
+from the target Linux distribution; see https://www.sqlite.org/copyright.html
+and https://www.sqlite.org/c3ref/intro.html. No SQLite amalgamation is vendored.
+
 This independent C implementation follows the control protocol of the Go
 reference in `go/gateway`, based on https://github.com/openp2p-cn/gateway-lite.
 The upstream MIT license is preserved in LICENSE. Go is not linked or invoked

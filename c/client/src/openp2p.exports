@@ -2,6 +2,9 @@ _op2p_abi_version
 _op2p_version
 _op2p_client_create
 _op2p_client_create_json
+_op2p_client_set_identity
+_op2p_client_device_id
+_op2p_client_node
 _op2p_client_add_forward
 _op2p_client_add_socks5
 _op2p_client_start

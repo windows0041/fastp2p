@@ -2,7 +2,8 @@
 (() => {
   const $ = id => document.getElementById(id);
   const state = {token: '', installToken: '', nodes: [], selected: null, apps: [],
-    refreshing: false, loadingApps: false, selection: 0, editing: null, confirm: null};
+    refreshing: false, loadingApps: false, selection: 0, editing: null, confirm: null,
+    offset: 0, total: 0, registered: 0};
   function text(id, value) { $(id).textContent = String(value ?? '—'); }
   function element(tag, cls, value) {
     const node = document.createElement(tag);
@@ -20,6 +21,7 @@
   function logout(expired = false) {
     state.token = state.installToken = ''; state.nodes = []; state.apps = []; state.selected = null;
     state.selection++; $('console').hidden = true; $('login-screen').hidden = false;
+    state.offset = state.total = state.registered = 0; $('node-search').value = '';
     $('install-token').value = ''; $('password').value = ''; $('nodes').replaceChildren(); $('rules').replaceChildren();
     for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
     $('login-error').hidden = !expired;
@@ -61,39 +63,47 @@
   }
   function renderNodes() {
     const query = $('node-search').value.toLowerCase().trim();
-    const nodes = state.nodes.filter(n => [n.name, n.ip, n.lanip, n.os].some(v => String(v || '').toLowerCase().includes(query)));
+    const nodes = state.nodes.filter(n => [n.name, n.hostname, n.ip, n.lanip, n.os].some(v => String(v || '').toLowerCase().includes(query)));
     $('nodes').replaceChildren();
     for (const n of nodes) {
       const row = element('tr'); row.classList.toggle('selected', n.name === state.selected?.name);
       const cell = element('td'), info = element('div', 'node-cell'), label = element('div');
       info.append(element('span', 'node-avatar', String(n.os).endsWith('-c') ? 'C' : '◇'));
       label.append(element('span', 'node-title', n.name), element('span', 'node-subtitle', n.os || '未知系统'));
+      if (n.hostname) label.append(element('span', 'node-subtitle', '主机：' + n.hostname));
       info.append(label); cell.append(info); row.append(cell);
       for (const value of [n.ip || '—', n.lanip || '—']) row.append(element('td', 'mono', value));
       row.append(element('td', '', 'NAT ' + (n.natType || '—')), element('td', 'mono', n.version || '—'));
-      const status = element('td'); status.append(element('span', 'badge online', '● 在线')); row.append(status);
-      const action = element('td'), button = element('button', 'link-button', '查看规则 →');
+      const active = Number(n.isActive) === 1;
+      const status = element('td'); status.append(element('span', 'badge ' + (active ? 'online' : 'offline'), active ? '● 在线' : '○ 离线')); row.append(status);
+      const action = element('td'), button = element('button', 'link-button', active ? '查看规则 →' : '查看记录 →');
       button.type = 'button'; button.setAttribute('aria-label', '查看 ' + n.name + ' 的规则');
       button.addEventListener('click', event => { event.stopPropagation(); selectNode(n); });
       action.append(button); row.append(action); row.addEventListener('click', () => selectNode(n));
       $('nodes').append(row);
     }
-    text('table-count', state.nodes.length); text('nav-count', state.nodes.length);
-    text('search-count', query ? `匹配 ${nodes.length} / ${state.nodes.length} 个节点` : `共 ${state.nodes.length} 个在线节点`);
+    text('table-count', state.registered); text('nav-count', state.registered);
+    text('search-count', query ? `匹配 ${state.total} / ${state.registered} 个节点` : `共 ${state.registered} 个已登记节点`);
+    text('node-page', state.total ? `${state.offset + 1}–${state.offset + state.nodes.length} / ${state.total}` : '0 / 0');
+    $('previous-nodes').disabled = !state.offset;
+    $('next-nodes').disabled = state.offset + 100 >= state.total;
     $('nodes-empty').hidden = nodes.length > 0;
     const empty = $('nodes-empty');
-    empty.querySelector('h3').textContent = query ? '没有匹配的节点' : '还没有在线节点';
+    empty.querySelector('h3').textContent = query ? '没有匹配的节点' : '还没有登记节点';
     empty.querySelector('p').textContent = query ? '试试其他名称、IP 或系统关键字。' : '让客户端使用此网关的地址、CA 和安装 Token 连接。';
   }
   async function refresh() {
     if (!state.token || state.refreshing) return;
     state.refreshing = true; $('refresh').disabled = true;
-    const token = state.token;
+    $('previous-nodes').disabled = $('next-nodes').disabled = true;
+    const token = state.token, query = $('node-search').value.trim(), offset = state.offset;
     try {
-      const [status, devices] = await Promise.all([api('/api/v1/status'), api('/api/v1/devices')]);
-      if (state.token !== token) return;
+      const [status, devices] = await Promise.all([api('/api/v1/status'),
+        api(`/api/v1/nodes?limit=100&offset=${offset}&search=${encodeURIComponent(query)}`)]);
+      if (state.token !== token || offset !== state.offset || query !== $('node-search').value.trim()) return;
       text('gateway-label', '网关在线'); $('gateway-status').classList.remove('offline');
-      state.nodes = (Array.isArray(devices.nodes) ? devices.nodes : []).sort((a, b) => a.name.localeCompare(b.name));
+      state.nodes = Array.isArray(devices.nodes) ? devices.nodes : [];
+      state.total = Number(devices.total) || 0; state.registered = Number(status.totalNodes) || 0;
       text('online-count', status.online); text('capacity', '/ ' + status.capacity);
       text('uptime', uptime(status.uptimeSeconds)); text('queue', bytes(status.queuedBytes));
       text('queue-limit', '上限 ' + bytes(status.queueLimitBytes)); text('version', status.version);
@@ -101,24 +111,33 @@
       text('account-name', status.user); text('updated-at', '更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false}));
       if (state.selected) {
         const selected = state.nodes.find(n => n.name === state.selected.name);
-        if (!selected) selectNode(null); else state.selected = selected;
+        if (!selected) selectNode(null);
+        else if (selected.isActive !== state.selected.isActive) selectNode(selected);
+        else state.selected = selected;
       }
       renderNodes();
-    } catch (error) { if (state.token) {
+    } catch (error) { if (state.token === token) {
       message(error.message, true); text('gateway-label', '连接中断'); $('gateway-status').classList.add('offline');
     } }
-    finally { state.refreshing = false; $('refresh').disabled = false; }
+    finally {
+      state.refreshing = false; $('refresh').disabled = false;
+      $('previous-nodes').disabled = !state.offset;
+      $('next-nodes').disabled = state.offset + 100 >= state.total;
+      if (state.token && (token !== state.token || offset !== state.offset || query !== $('node-search').value.trim())) refresh();
+    }
   }
   function selectNode(node) {
     state.selected = node; state.apps = []; state.selection++; state.loadingApps = false;
-    $('rules').replaceChildren(); $('add-rule').disabled = !node;
-    $('refresh-apps').disabled = !node; renderNodes();
+    const active = node && Number(node.isActive) === 1;
+    $('rules').replaceChildren(); $('add-rule').disabled = !active;
+    $('refresh-apps').disabled = !active; renderNodes();
     text('selected-name', node ? node.name : '选择一个节点');
-    text('selected-description', node ? `${node.os || '未知系统'} · ${node.ip || '—'} · 版本 ${node.version || '—'}` : '在上方节点列表中打开设备，查看它的应用转发。');
-    if (node) loadApps(); else ruleMessage('尚未选择节点，或之前选择的节点已离线。');
+    text('selected-description', node ? `${node.hostname || node.os || '未知主机'} · ${node.ip || '—'} · 最近在线 ${node.lastSeen || '—'}` : '在上方节点列表中打开设备，查看它的应用转发。');
+    if (active) loadApps();
+    else ruleMessage(node ? `节点已离线，登记信息保留在 SQLite 中。首次在线：${node.firstSeen || '—'}；最近离线：${node.lastOffline || '—'}。` : '尚未选择节点。');
   }
   async function loadApps() {
-    if (!state.selected || state.loadingApps) return;
+    if (!state.selected || Number(state.selected.isActive) !== 1 || state.loadingApps) return;
     const node = state.selected, selection = state.selection;
     state.loadingApps = true; $('refresh-apps').disabled = true; ruleMessage('正在向客户端查询规则…');
     try {
@@ -235,7 +254,13 @@
   $('close-token').addEventListener('click', () => $('token-dialog').close());
   $('logout').addEventListener('click', () => logout()); $('refresh').addEventListener('click', refresh);
   $('overview-nav').addEventListener('click', () => window.scrollTo({top: 0, behavior: 'smooth'}));
-  $('node-search').addEventListener('input', renderNodes); $('refresh-apps').addEventListener('click', loadApps);
+  let searchTimer;
+  $('node-search').addEventListener('input', () => {
+    state.offset = 0; renderNodes(); clearTimeout(searchTimer); searchTimer = setTimeout(refresh, 200);
+  });
+  $('previous-nodes').addEventListener('click', () => { state.offset = Math.max(0, state.offset - 100); refresh(); });
+  $('next-nodes').addEventListener('click', () => { state.offset += 100; refresh(); });
+  $('refresh-apps').addEventListener('click', loadApps);
   $('add-rule').addEventListener('click', () => openRule());
   for (const id of ['close-rule-dialog', 'cancel-rule']) $(id).addEventListener('click', () => $('rule-dialog').close());
   $('cancel-confirm').addEventListener('click', () => $('confirm-dialog').close());

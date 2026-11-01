@@ -14,8 +14,8 @@
 正式标签版本必须与对应 CMake 项目版本一致，且标签的运行时代码必须与测试构建一致。标签发布示例：
 
 ```bash
-git tag -a c-gateway-v0.2.0 -m "C gateway 0.2.0"
-git push origin c-gateway-v0.2.0
+git tag -a c-gateway-v0.3.0 -m "C gateway 0.3.0"
+git push origin c-gateway-v0.3.0
 ```
 
 普通分支和版本标签均会触发原有工作流；不需要手工创建 Release。`workflow_dispatch` 仍可用于手动构建，是否发布取决于所选分支/标签。

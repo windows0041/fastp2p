@@ -29,7 +29,7 @@ jobs:
       - name: Install native dependencies
         run: |
           apt-get update -qq
-          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev zstd
+          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
@@ -52,6 +52,8 @@ jobs:
           bash c/gateway/scripts/check.sh --sanitize
       - name: Six Go/C clients, TCP punch, QUIC and reconnect
         run: bash c/gateway/scripts/integration.sh
+      - name: SQLite recovery and real hostname-based C clients
+        run: bash c/gateway/scripts/check-registry.sh
       - name: Browser console authentication and node operations
         run: |
           python3 -m pip install playwright==1.56.0
@@ -64,6 +66,7 @@ jobs:
           path: |
             build/web-ui/result.json
             build/web-ui/*.png
+            build/registry/result.json
       - name: Package native gateway
         run: |
           cmake -S c/gateway -B build/c-gateway-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PWD/dist/c-gateway-debian${{ matrix.debian }}-x86_64"
@@ -100,10 +103,12 @@ jobs:
       - name: Boot with private TLS certificate
         run: |
           bash go/gateway/scripts/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
+          mkdir -p "$RUNNER_TEMP/c-gateway-state"
           docker run -d --name c-gateway-test --user "$(id -u):$(id -g)" \
             -e OPENP2P_USER=ci-test-admin -e OPENP2P_PASSWORD=ci-only-fixture-password -e OPENP2P_TOKEN=18446744073709551615 \
             -v "$RUNNER_TEMP/c-gateway-tls/server.crt:/etc/openp2p/tls/server.crt:ro" \
             -v "$RUNNER_TEMP/c-gateway-tls/server.key:/etc/openp2p/tls/server.key:ro" \
+            -v "$RUNNER_TEMP/c-gateway-state:/var/lib/openp2p" \
             -p 127.0.0.1:10008:10008 openp2p-c-gateway:test
           for attempt in $(seq 1 40); do
             if curl -fsS --cacert "$RUNNER_TEMP/c-gateway-tls/ca.crt" https://127.0.0.1:10008/healthz; then exit 0; fi

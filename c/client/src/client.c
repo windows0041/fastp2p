@@ -74,7 +74,8 @@ typedef struct {
 } pending;
 struct op2p_client {
     char host[256], ca[4096], node[32], ip[INET_ADDRSTRLEN], local_ip[INET_ADDRSTRLEN];
-    char error[192], path[640];
+    char error[192], path[2048], hostname[256], device_id[33];
+    int automatic_node;
     uint16_t port, public_port;
     uint64_t token, node_id, reconnect_at, last_rx, heartbeat_at, heartbeat_sent;
     int64_t clock_delta;
@@ -130,6 +131,45 @@ static int valid_node(const char *s) {
               *s == '_' || *s == '-'))
             return 0;
     return 1;
+}
+static size_t node_base(char out[32], const char *hostname) {
+    size_t used = 0;
+    for (const unsigned char *p = (const unsigned char *)hostname; *p && used < 31; ++p) {
+        unsigned value = *p;
+        out[used++] = ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+                       (value >= '0' && value <= '9') || value == '_' || value == '-') ? (char)value : '-';
+    }
+    if (!used) {
+        memcpy(out, "node", 4);
+        used = 4;
+    }
+    out[used] = 0;
+    return used;
+}
+static void automatic_candidate(op2p_client *c) {
+    size_t used = node_base(c->node, c->hostname), i = 0;
+    while (used < 8) {
+        unsigned char digit = (unsigned char)c->device_id[i++];
+        c->node[used++] = (char)('0' + (digit >= 'a' ? digit - 'a' + 10 : digit - '0') % 10);
+    }
+    c->node[used] = 0;
+    c->node_id = op_node_id(c->node);
+}
+int op2p_client_set_identity(op2p_client *c, const char *identity) {
+    if (!c || !c->automatic_node || c->running || c->in_callback || !identity || strlen(identity) != 32)
+        return OP2P_EINVAL;
+    for (const char *p = identity; *p; ++p)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
+            return OP2P_EINVAL;
+    memcpy(c->device_id, identity, 33);
+    automatic_candidate(c);
+    return OP2P_OK;
+}
+const char *op2p_client_device_id(const op2p_client *c) {
+    return c ? c->device_id : "";
+}
+const char *op2p_client_node(const op2p_client *c) {
+    return c ? c->node : "";
 }
 static int copy_string(char *dst, size_t cap, const char *src) {
     if (!src || strlen(src) >= cap)
@@ -351,6 +391,8 @@ static void close_tunnel(op2p_client *c, int index, const char *reason) {
         emit(c, OP2P_EVENT_ERROR, id, OP2P_EIO, reason);
 }
 static int new_tunnel(op2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
+    if (!strcmp(peer, c->node))
+        return -1;
     for (int i = 0; i < NT; ++i)
         if (!c->tunnels[i].state) {
             tunnel *t = &c->tunnels[i];
@@ -912,6 +954,20 @@ static void control_message(op2p_client *c, uint16_t main, uint16_t sub, const u
             emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "gateway rejected login");
             c->stopping = 1;
         } else {
+            if (c->automatic_node) {
+                const char *assigned = op_string(j, "node");
+                if (!valid_node(assigned)) {
+                    emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "gateway returned an invalid node name");
+                    c->stopping = 1;
+                    json_object_put(j);
+                    return;
+                }
+                strcpy(c->node, assigned);
+                c->node_id = op_node_id(c->node);
+                char message[64];
+                snprintf(message, sizeof(message), "node name: %s", c->node);
+                emit(c, OP2P_EVENT_STATE, c->node_id, 0, message);
+            }
             c->login_ok = 1;
             if (c->report_ok)
                 set_state(c, OP2P_ONLINE, "gateway authenticated");
@@ -1744,6 +1800,13 @@ static void connect_gateway(op2p_client *c) {
              "wss://%s:%u/api/v1/login?node=%s&token=%" PRIu64
              "&version=%s&nattype=%d&sharebandwidth=0",
              c->host, c->port, c->node, c->token, COMPAT_VERSION, c->nat_type);
+    if (c->automatic_node) {
+        char hostname[32];
+        node_base(hostname, c->hostname);
+        size_t used = strlen(c->path);
+        snprintf(c->path + used, sizeof(c->path) - used, "&autonode=1&deviceid=%s&hostname=%s",
+                 c->device_id, hostname);
+    }
     char address[INET_ADDRSTRLEN], resolve[320];
     inet_ntop(AF_INET, &c->gateway.sin_addr, address, sizeof(address));
     snprintf(resolve, sizeof(resolve), "%s:%u:%s", c->host, c->port, address);
@@ -1805,6 +1868,7 @@ static void service_gateway(op2p_client *c) {
             strcpy(c->local_ip, ip);
         json_object *j = json_object_new_object();
         op_js(j, "os", OP2P_PLATFORM_OS);
+        op_js(j, "hostname", c->hostname);
         op_js(j, "version", COMPAT_VERSION);
         op_js(j, "lanIP", c->local_ip);
         op_ju(j, "publicIPPort", c->public_port);
@@ -1937,13 +2001,13 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
     if (op_platform_init())
         return OP2P_EIO;
     if (!cfg || cfg->struct_size < sizeof(*cfg) || cfg->abi_version != OP2P_ABI_VERSION ||
-        !valid_node(cfg->node) || !cfg->token || !cfg->gateway_host || !*cfg->gateway_host)
+        (cfg->node && *cfg->node && !valid_node(cfg->node)) || !cfg->token || !cfg->gateway_host || !*cfg->gateway_host)
         return OP2P_EINVAL;
     op2p_client *c = calloc(1, sizeof(*c));
     if (!c)
         return OP2P_ENOMEM;
     if (copy_string(c->host, sizeof(c->host), cfg->gateway_host) ||
-        copy_string(c->node, sizeof(c->node), cfg->node) ||
+        (cfg->node && copy_string(c->node, sizeof(c->node), cfg->node)) ||
         (cfg->ca_file && copy_string(c->ca, sizeof(c->ca), cfg->ca_file))) {
         free(c);
         return OP2P_EINVAL;
@@ -1957,6 +2021,19 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
     c->port = cfg->gateway_port ? cfg->gateway_port : 27183;
     c->public_port = cfg->public_port;
     c->token = cfg->token;
+    if (op_hostname(c->hostname, sizeof(c->hostname)))
+        strcpy(c->hostname, "node");
+    c->automatic_node = !cfg->node || !*cfg->node;
+    if (c->automatic_node) {
+        unsigned char bytes[16];
+        if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+            free(c);
+            return OP2P_EIO;
+        }
+        for (unsigned i = 0; i < sizeof(bytes); ++i)
+            snprintf(c->device_id + i * 2, 3, "%02x", bytes[i]);
+        automatic_candidate(c);
+    }
     c->node_id = op_node_id(c->node);
     c->callback = cfg->on_event;
     c->user = cfg->user;
@@ -1976,7 +2053,7 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
 }
 int op2p_client_add_forward(op2p_client *c, const op2p_forward *f, uint64_t *id) {
     if (!c || !f || f->struct_size < sizeof(*f) || c->in_callback || !valid_node(f->peer_node) ||
-        !strcmp(f->peer_node, c->node) || !f->local_port || !f->destination_port ||
+        ((!c->automatic_node || c->login_ok) && !strcmp(f->peer_node, c->node)) || !f->local_port || !f->destination_port ||
         !f->destination_host || !*f->destination_host || !f->protocol ||
         (strcmp(f->protocol, "tcp") && strcmp(f->protocol, "udp")) ||
         (f->transport != OP2P_TRANSPORT_TCP && f->transport != OP2P_TRANSPORT_QUIC))

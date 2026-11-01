@@ -99,6 +99,23 @@ static int nonblocking(op_socket fd) {
     return 0;
 }
 #endif
+int op_hostname(char *out, size_t capacity) {
+    if (!out || capacity < 2 || capacity > INT_MAX)
+        return -1;
+#ifdef _WIN32
+    WCHAR name[256];
+    DWORD size = sizeof(name) / sizeof(name[0]);
+    if (!GetComputerNameExW(ComputerNameDnsHostname, name, &size) ||
+        !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, name, -1, out, (int)capacity,
+                             NULL, NULL))
+        return -1;
+#else
+    if (gethostname(out, capacity - 1))
+        return -1;
+    out[capacity - 1] = 0;
+#endif
+    return *out ? 0 : -1;
+}
 uint64_t op_monotonic_ns(void) {
 #ifdef _WIN32
     LARGE_INTEGER counter, frequency;

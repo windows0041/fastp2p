@@ -54,6 +54,15 @@ int main(void) {
     cfg.struct_size = 1;
     assert(op2p_client_create(&cfg, &c) == OP2P_EINVAL);
     cfg.struct_size = sizeof(cfg);
+    cfg.node = NULL;
+    assert(op2p_client_create(&cfg, &c) == OP2P_OK);
+    assert(strlen(op2p_client_node(c)) >= 8 && strlen(op2p_client_node(c)) <= 31);
+    assert(strlen(op2p_client_device_id(c)) == 32);
+    assert(op2p_client_set_identity(c, "not-valid") == OP2P_EINVAL);
+    assert(op2p_client_set_identity(c, "1234567890abcdef1234567890abcdef") == OP2P_OK);
+    assert(!strcmp(op2p_client_device_id(c), "1234567890abcdef1234567890abcdef"));
+    op2p_client_destroy(c);
+    cfg.node = "c-api-selftest";
     assert(op2p_client_create(&cfg, &c) == OP2P_OK);
     assert(op2p_client_state(c) == OP2P_STOPPED);
     assert(op2p_client_step(c, 0) == OP2P_ESTATE);
@@ -92,7 +101,10 @@ int main(void) {
     assert(op2p_client_create_json(json, "18446744073709551616", NULL, NULL, NULL, &c) ==
                OP2P_EINVAL &&
            !c);
-    assert(op2p_client_create_json("{}", "1", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
+    assert(op2p_client_create_json("{}", "1", NULL, NULL, NULL, &c) == OP2P_OK);
+    assert(strlen(op2p_client_node(c)) >= 8 && strlen(op2p_client_device_id(c)) == 32);
+    op2p_client_destroy(c);
+    assert(op2p_client_create_json("{\"network\":{\"Node\":\"short\"}}", "1", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
     assert(op2p_client_create_json("{", NULL, NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
     assert(op2p_client_create(&cfg, &c) == OP2P_OK);
     op2p_socks5 p = {.struct_size = sizeof(p),

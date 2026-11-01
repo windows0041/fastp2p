@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define OP2P_ABI_VERSION 1u
-#define OP2P_VERSION "0.3.0"
+#define OP2P_VERSION "0.4.0"
 #if defined(_WIN32) && !defined(OP2P_STATIC)
 #if defined(OP2P_BUILDING_LIBRARY)
 #define OP2P_API __declspec(dllexport)
@@ -51,13 +51,22 @@ typedef struct {
     uint32_t abi_version;
     const char *gateway_host;
     uint16_t gateway_port; /* zero = 27183 */
-    const char *node;      /* 8..31 ASCII letters, digits, underscore or hyphen */
+    const char *node;      /* 8..31 ASCII; NULL/empty = hostname-based automatic name */
     uint64_t token;
     const char *ca_file;  /* NULL = system roots; chain + hostname always verified */
     uint16_t public_port; /* Optional direct TCP listener, zero = ephemeral */
     op2p_event_fn on_event;
     void *user;
 } op2p_config;
+
+/* Automatic identity: persist the returned 32 lowercase hex digits in the host
+ * application's private configuration, then set them before start on later runs.
+ * A new C gateway assigns a unique name and returns it during authentication.
+ * No file-system writes are performed by the C library itself. */
+OP2P_API int op2p_client_set_identity(op2p_client *, const char *device_id);
+/* Borrowed strings, valid until destroy; node contents can change on login. */
+OP2P_API const char *op2p_client_device_id(const op2p_client *);
+OP2P_API const char *op2p_client_node(const op2p_client *);
 typedef struct {
     size_t struct_size;
     const char *name;

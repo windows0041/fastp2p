@@ -65,7 +65,7 @@ public final class MainActivity extends Activity {
         status = label(layout, "未连接", 20); status.setTextColor(Color.rgb(0, 105, 90));
         gateway = input(layout, "网关地址", "例如 gz.itq.cc.cd", false);
         port = input(layout, "WSS 端口", "27183", true);
-        node = input(layout, "节点名称", "8–31 位字母、数字、下划线或横线", false);
+        node = input(layout, "节点名称", "留空：按主机名自动分配唯一名称；自定义为 8–31 位", false);
         token = input(layout, "Token", "网关分配的十进制 Token", true);
         token.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         token.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
@@ -98,12 +98,7 @@ public final class MainActivity extends Activity {
             JSONObject net = config.optJSONObject("network");
             gateway.setText(net == null ? "gz.itq.cc.cd" : net.optString("ServerHost", "gz.itq.cc.cd"));
             port.setText(String.valueOf(net == null ? 27183 : net.optInt("ServerPort", 27183)));
-            String defaultNode = p.getString("defaultNode", "");
-            if (defaultNode.isEmpty()) {
-                defaultNode = "android-c-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-                p.edit().putString("defaultNode", defaultNode).apply();
-            }
-            node.setText(net == null ? defaultNode : net.optString("Node", defaultNode));
+            node.setText(net == null ? "" : net.optString("Node", ""));
             JSONArray apps = config.optJSONArray("apps");
             rules.setText(apps == null ? "[]" : apps.toString(2));
             JSONArray socks = config.optJSONArray("socks5");
@@ -121,9 +116,19 @@ public final class MainActivity extends Activity {
             String host = gateway.getText().toString().trim();
             String name = node.getText().toString().trim();
             int wssPort = Integer.parseInt(port.getText().toString());
-            if (!host.matches("[A-Za-z0-9.-]+") || !name.matches("[A-Za-z0-9_-]{8,31}") || wssPort < 1 || wssPort > 65535)
+            if (!host.matches("[A-Za-z0-9.-]+") || (!name.isEmpty() && !name.matches("[A-Za-z0-9_-]{8,31}")) || wssPort < 1 || wssPort > 65535)
                 throw new IllegalArgumentException();
             JSONObject net = new JSONObject().put("Node", name).put("ServerHost", host).put("ServerPort", wssPort).put("Token", 0);
+            if (name.isEmpty()) {
+                SharedPreferences preferences = SecretStore.preferences(this);
+                String identity = preferences.getString("automaticDeviceID", "");
+                if (identity.isEmpty()) {
+                    identity = java.util.UUID.randomUUID().toString().replace("-", "");
+                    if (!preferences.edit().putString("automaticDeviceID", identity).commit())
+                        throw new IllegalStateException();
+                }
+                net.put("AutoNode", true).put("DeviceID", identity);
+            }
             JSONObject config = new JSONObject().put("network", net).put("apps", new JSONArray(rules.getText().toString()))
                 .put("socks5", new JSONArray(proxies.getText().toString()));
             SecretStore.saveToken(this, token.getText().toString().trim());

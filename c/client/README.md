@@ -1,6 +1,6 @@
 # C 客户端
 
-C 客户端 0.3.0 提供 Linux、Windows、macOS 的命令行程序与 C 动态库，以及 Android 原生应用和 JNI 绑定。运行时不依赖 Go，固定转发兼容本仓库 Go 客户端 3.25.11 和自建网关，公开接口版本保持 ABI 1。新增 SOCKS5 入口使用 C 0.3.0+ 节点作为出口。平台安装、交叉编译及 SDK 集成见 [平台说明](PLATFORMS-ZH.md)。
+C 客户端 0.4.0 提供 Linux、Windows、macOS 的命令行程序与 C 动态库，以及 Android 原生应用和 JNI 绑定。运行时不依赖 Go，固定转发兼容本仓库 Go 客户端 3.25.11 和自建网关，公开接口版本保持 ABI 1。新增 SOCKS5 入口使用 C 0.3.0+ 节点作为出口。平台安装、交叉编译及 SDK 集成见 [平台说明](PLATFORMS-ZH.md)。
 
 ## 已实现
 
@@ -64,6 +64,12 @@ build/c/openp2p-c --config "$HOME/openp2p-dev/c-client/config.json"
 配置中的 `Protocol` 指应用类型，`UnderlayProtocol` 指隧道类型，两者独立。例如 UDP 应用可以通过 TCP 打洞隧道传送。`UnderlayProtocol` 为 `tcp` 或 `quic`；省略时兼容读取 `PunchPriority` 的 TCPOnly 位，否则选择 QUIC。此处没有自动回退。
 
 `BindIP` 默认 `127.0.0.1`。需要开放转发入口时显式设置绑定地址。私有 CA 文件只含公钥证书，不需要客户端持有服务端私钥或 CA 私钥。
+
+## 默认节点名称
+
+省略配置的 `network.Node` 和 `--node`，会读取主机名并由 C 网关 0.3.0+ 分配唯一名称。短于 8 位补随机数字，重名加数字后缀，CLI 自动保存设备标识供重连复用；Android 节点名留空时使用相同逻辑。已有固定名称保留。可用 `--identity-file FILE` 区分多个实例，身份文件不可跨机器复制。
+
+库接口、身份文件位置与数据库规则见 [节点存储和命名](../NODE-STORAGE-ZH.md)。
 
 ## C 库接口
 

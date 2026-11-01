@@ -1,4 +1,5 @@
 #include "openp2p.h"
+#include "identity_file.h"
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -62,15 +63,19 @@ static int integer(const char *s, uint64_t *value) {
 static void usage(void) {
     puts("openp2p-c --config FILE [--serverhost HOST] [--node NAME] [--cacert FILE]\n"
          "          [--port WSS_PORT] [--publicipport PORT] [--run-seconds N]\n"
+         "          [--identity-file FILE] (omitting --node uses this host's name)\n"
          "OPENP2P_TOKEN overrides network.Token in the JSON configuration.\n"
          "--version prints the C library and ABI version.");
 }
 int main(int argc, char **argv) {
     const char *config_file = NULL, *host = NULL, *node = NULL, *ca = NULL;
+    const char *identity_file = NULL;
+    int explicit_node = 0;
     uint64_t port = 0, public_port = 0, run_seconds = 0;
     static const struct option options[] = {{"config", required_argument, 0, 'c'},
                                             {"serverhost", required_argument, 0, 's'},
                                             {"node", required_argument, 0, 'n'},
+                                            {"identity-file", required_argument, 0, 'i'},
                                             {"cacert", required_argument, 0, 'a'},
                                             {"port", required_argument, 0, 'p'},
                                             {"publicipport", required_argument, 0, 'P'},
@@ -89,6 +94,10 @@ int main(int argc, char **argv) {
             break;
         case 'n':
             node = optarg;
+            explicit_node = 1;
+            break;
+        case 'i':
+            identity_file = optarg;
             break;
         case 'a':
             ca = optarg;
@@ -159,6 +168,8 @@ int main(int argc, char **argv) {
         json_object_object_add(network, "ServerHost", json_object_new_string(host));
     if (node)
         json_object_object_add(network, "Node", json_object_new_string(node));
+    if (explicit_node)
+        json_object_object_add(network, "AutoNode", json_object_new_boolean(!*node));
     if (port)
         json_object_object_add(network, "ServerPort", json_object_new_uint64(port));
     if (public_port)
@@ -169,6 +180,17 @@ int main(int argc, char **argv) {
                                      env, ca, event, NULL, &client);
     if (rv) {
         fputs("Invalid client configuration (network, forward or SOCKS5 rule)\n", stderr);
+        json_object_put(root);
+        return 2;
+    }
+    const char *configured_identity = string(network, "DeviceID");
+    const char *effective_host = string(network, "ServerHost");
+    if ((!configured_identity || !*configured_identity) &&
+        op_cli_identity(client, identity_file, config_file,
+                        effective_host && *effective_host ? effective_host : "127.0.0.1",
+                        port ? (unsigned)port : 27183)) {
+        fputs("Cannot read or save automatic node identity; check --identity-file and directory permissions\n", stderr);
+        op2p_client_destroy(client);
         json_object_put(root);
         return 2;
     }

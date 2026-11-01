@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlencode
 
 p = argparse.ArgumentParser()
 p.add_argument('--gateway', required=True)
@@ -70,11 +71,12 @@ def wait(check, timeout=10):
     raise TimeoutError('Protocol integration step timed out')
 
 class WS:
-    def __init__(self,name,credential=token,source='127.0.0.1',port=27183,path='/api/v1/login',expected=101):
+    def __init__(self,name,credential=token,source='127.0.0.1',port=27183,path='/api/v1/login',expected=101,device=None,hostname=None):
         raw=socket.create_connection(('127.0.0.1',port),timeout=3,source_address=(source,0))
         self.socket=context.wrap_socket(raw,server_hostname='127.0.0.1');self.buffer=bytearray();self.name=name
         key=base64.b64encode(secrets.token_bytes(16)).decode()
-        request=(f'GET {path}?node={name}&token={credential}&version=3.25.11&nattype=1 HTTP/1.1\r\n'
+        extra='&'+urlencode({'autonode':1,'deviceid':device,'hostname':hostname}) if device is not None else ''
+        request=(f'GET {path}?node={name}&token={credential}&version=3.25.11&nattype=1{extra} HTTP/1.1\r\n'
             f'Host: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
             f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
         self.socket.sendall(request.encode())
@@ -88,7 +90,9 @@ class WS:
         accept=base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
         assert accept.lower() in header.lower()
         clients.append(self)
-        login=json.loads(self.until(0,0));assert login['token']==token and login['node']==name
+        login=json.loads(self.until(0,0));assert login['token']==token
+        if device is None:assert login['node']==name
+        self.name=login['node']
     def exact(self,n):
         while len(self.buffer)<n:
             data=self.socket.recv(max(4096,n-len(self.buffer)))
@@ -165,7 +169,8 @@ try:
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)
-        assert status==200 and overview['version']=='0.2.0' and overview['capacity']==256
+        assert status==200 and overview['version']=='0.3.0' and overview['capacity']==256
+        assert overview['nodeStorage']=='sqlite' and overview['totalNodes']==0
         assert 'nodeToken' not in overview and password not in json.dumps(overview)
         for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:
             conn=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
@@ -304,15 +309,39 @@ try:
         conn.request('POST','/api/v1/user/login',b'{}',{'Content-Length':'70000'})
         response=conn.getresponse();assert response.status==413;response.read();conn.close()
         results['HTTP_methods_and_oversized_body_rejected']=True
+        WS('auto-fixture',credential=0,device='1'*32,hostname='fixture-host',expected=401)
+        WS('auto-fixture',device='invalid',hostname='fixture-host',expected=400)
+        auto_a=WS('auto-fixture',device='1'*32,hostname='fixture-host')
+        auto_b=WS('auto-fixture',device='2'*32,hostname='fixture-host')
+        assert auto_a.name=='fixture-host' and auto_b.name.startswith('fixture-host-') and auto_a.name!=auto_b.name
+        WS(auto_a.name,expected=409)
+        auto_name=auto_b.name;auto_b.close()
+        wait(lambda:auto_name not in names())
+        rows=api('/api/v1/nodes?search=fixture-host',jwt=jwt)[1]
+        assert rows['total']==2 and any(n['name']==auto_name and not n['isActive'] for n in rows['nodes'])
+        auto_b=WS('auto-fixture',device='2'*32,hostname='renamed-host');assert auto_b.name==auto_name
+        results['automatic_identity_names_unique_reserved_and_stable']=True
+        results['SQLite_offline_records_and_authenticated_search']=True
         process.terminate();process.wait(timeout=6);assert process.returncode==0
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
             '--bind','127.0.0.1','--max-clients','2','--heartbeat-timeout','5'],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
         wait(lambda:api('/healthz')[0]==200)
+        rows=api('/api/v1/nodes?search=fixture-host',jwt=jwt)[1]
+        assert rows['total']==2 and all(not n['isActive'] for n in rows['nodes'])
+        results['SQLite_records_survive_gateway_restart_without_false_online_state']=True
         first=WS('capacity-node-a');second=WS('capacity-node-b');WS('capacity-node-c',expected=503)
         first.socket.settimeout(8);assert first.closed()
         second.socket.settimeout(8);assert second.closed()
         wait(lambda:not api('/api/v1/devices',jwt=jwt)[1]['nodes'])
         results['configured_capacity_and_idle_heartbeat_timeout']=True
+        cap_a=WS('auto-fixture',device='a'*32,hostname='capacity-auto')
+        cap_b=WS('auto-fixture',device='b'*32,hostname='capacity-auto')
+        WS(cap_a.name,device='c'*32,hostname='capacity-auto',expected=503)
+        cap_name=cap_b.name
+        cap_replacement=WS('auto-fixture',device='b'*32,hostname='changed-host')
+        assert cap_replacement.name==cap_name and cap_b.closed()
+        assert len(api('/api/v1/devices',jwt=jwt)[1]['nodes'])==2
+        results['automatic_reconnect_at_capacity_keeps_the_same_name']=True
         results['success']=True
 finally:
     for c in clients:

@@ -177,6 +177,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-api.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/identity_cli.py --client build/windows/openp2p-c.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-platform.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
@@ -222,7 +224,7 @@ jobs:
       - name: Native Debian 12 build dependencies
         run: |
           apt-get update -qq
-          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev zstd
+          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:

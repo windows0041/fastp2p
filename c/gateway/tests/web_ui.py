@@ -107,7 +107,8 @@ def main():
             command=['wsl.exe','-d','Debian','-u','maoyu','--','bash',remote+'/launch.sh',remote,args.gateway,
                      '--cert',remote+'/certs/server.crt','--key',remote+'/certs/server.key']
         else:command=[str(Path(args.gateway).resolve()),'--cert',str(root/'certs/server.crt'),'--key',str(root/'certs/server.key')]
-        command+=['--bind','127.0.0.1','--apibind','127.0.0.1','--port','37183','--apiport','31008','--run-seconds','600']
+        command+=['--database',remote+'/nodes.sqlite3' if args.wsl else str(root/'nodes.sqlite3'),
+                  '--bind','127.0.0.1','--apibind','127.0.0.1','--port','37183','--apiport','31008','--run-seconds','600']
         log=(root/'gateway.log').open('w')
         try:
             process=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT)
@@ -191,12 +192,26 @@ def main():
                     raise AssertionError('Mobile page overflows viewport')
                 page.screenshot(path=str(args.output/'mobile.png'),full_page=True);results['responsive_mobile_layout']=True
                 page.set_viewport_size({'width':1440,'height':1040})
-                page.route('**/api/v1/devices',lambda route:route.fulfill(status=401,content_type='application/json',body='{"error":1}'))
+                page.route('**/api/v1/nodes?*',lambda route:route.fulfill(status=401,content_type='application/json',body='{"error":1}'))
                 page.locator('#refresh').click();expect(page.locator('#login-screen')).to_be_visible()
-                expect(page.locator('#login-error')).to_contain_text('过期');page.unroute('**/api/v1/devices');login()
+                expect(page.locator('#login-error')).to_contain_text('过期');page.unroute('**/api/v1/nodes?*');login()
                 results['expired_session_returns_to_login']=True
                 go.close();peers.remove(go);page.locator('#refresh').click();expect(page.locator('#online-count')).to_have_text('1')
-                results['offline_node_removed']=True
+                row=page.locator('#nodes tr').filter(has_text=go.name)
+                expect(row).to_contain_text('离线');row.get_by_role('button').click()
+                expect(page.locator('#rule-message')).to_contain_text('登记信息保留在 SQLite')
+                expect(page.locator('#add-rule')).to_be_disabled()
+                results['offline_node_retained_and_read_only']=True
+                for i in range(110):
+                    archived=Peer('zz-history-'+str(i).zfill(3),'fixture',token,root/'certs/ca.crt')
+                    archived.close()
+                page.locator('#refresh').click();expect(page.locator('#nav-count')).to_have_text('112')
+                expect(page.locator('#nodes tr')).to_have_count(100)
+                page.locator('#next-nodes').click();expect(page.locator('#nodes tr')).to_have_count(12)
+                page.locator('#previous-nodes').click();expect(page.locator('#nodes tr')).to_have_count(100)
+                page.locator('#node-search').fill('zz-history-109');expect(page.locator('#nodes tr')).to_have_count(1)
+                expect(page.locator('#nodes')).to_contain_text('zz-history-109')
+                results['offline_history_pagination_and_search_across_pages']=True
                 page.locator('#logout').click();expect(page.locator('#login-screen')).to_be_visible()
                 assert not errors,errors
                 context.close();browser.close()
