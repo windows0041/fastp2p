@@ -20,6 +20,8 @@
 #define NP 16
 #define NPK 32
 #define NRL 32
+/* Sessions this node is willing to relay for at once. */
+#define RELAY_SESSION_LIMIT 4
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define WIRE_VERSION FASTP2P_VERSION
@@ -1544,12 +1546,26 @@ static void relay_receive(fastp2p_client *c, int ti, const uint8_t *data, size_t
             link = i;
             break;
         }
-    if (link < 0)
+    if (link < 0) {
+        /* Cap how many sessions this node relays.  A client that also runs its
+         * own applications has one event loop, and past this point its own
+         * tunnels start missing heartbeats.  Refusing the join makes the
+         * endpoint exclude this node and ask for a different relay. */
+        int active = 0;
+        for (int i = 0; i < NRL; ++i)
+            if (c->relays[i].used)
+                ++active;
+        if (active >= RELAY_SESSION_LIMIT) {
+            emit(c, FASTP2P_EVENT_ERROR, t->id, FASTP2P_ELIMIT, "relay busy");
+            close_tunnel(c, ti, "relay busy");
+            return;
+        }
         for (int i = 0; i < NRL; ++i)
             if (!c->relays[i].used) {
                 link = i;
                 break;
             }
+    }
     if (link < 0) {
         close_tunnel(c, ti, "relay table full");
         return;
