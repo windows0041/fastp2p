@@ -1,6 +1,6 @@
 # C 客户端平台与集成
 
-C 核心版本 0.2.0，公开 C ABI 1，协议兼容仓库中的 Go 3.25.11 客户端及自建 Go 网关。各平台复用同一份 C 核心，无 Go 运行时。平台验证结果见 [VALIDATION-ZH.md](VALIDATION-ZH.md)。
+C 核心版本 0.3.0，公开 C ABI 1，固定转发协议兼容仓库中的 Go 3.25.11 客户端及自建网关。各平台复用同一份 C 核心，无 Go 运行时。新增 [SOCKS5](SOCKS5-ZH.md) 使用 C 0.3.0+ 出口；平台验证结果见 [VALIDATION-ZH.md](VALIDATION-ZH.md)。
 
 | 平台 | 架构与最低版本 | 入口 |
 | --- | --- | --- |

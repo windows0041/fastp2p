@@ -63,7 +63,7 @@ public final class OpenP2PService extends Service {
         long handle = 0;
         String failure = null;
         try {
-            String config = SecretStore.preferences(this).getString("config", "{}");
+            String config = SecretStore.config(this);
             String token = SecretStore.token(this);
             String ca = SecretStore.preferences(this).getString("ca", "");
             ca = TrustStore.resolve(this, ca);

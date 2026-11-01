@@ -6,6 +6,7 @@
     "ServerPort": 27183
   },
   "CACertFile": "/absolute/path/to/ca.crt",
+  "socks5": [],
   "apps": [
     {
       "AppName": "ssh-over-tcp-punch",

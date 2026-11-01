@@ -18,3 +18,5 @@
 2026-11-01 实现 `c/gateway` Linux 网关 0.1.0，以本仓库 Go 网关为协议参考，提供独立 C 服务端、私有证书 HTTPS/WSS、鉴权、NAT 探测、连接与中继协调、SD-WAN 配置分发及管理接口。系统依赖 libwebsockets、OpenSSL、json-c，运行时不调用 Go。使用 Go/C 客户端验证 TCP 打洞、QUIC、TCP/UDP 应用和重连，增加协议安全、生命周期和资源上限测试。保留网关上游 MIT 声明，来源见 `c/gateway/THIRD_PARTY.md`；Go 基线和 C 客户端保持独立。
 
 提供过的 `openp2p-gateway-edge:3.24.37` 镜像用于分析参考，未作为源码或二进制纳入本仓库；公开 `gateway-lite` 并非其完整对应源码。
+
+2026-11-01 C 客户端 0.3.0 增加 SOCKS5 TCP CONNECT / UDP ASSOCIATE、出口 DNS、可选认证和请求级连接确认，公开接口增加 `op2p_client_add_socks5` 并保持 ABI 1。CLI、JSON 工厂和 Android 共用配置，Android 增加代理配置并加密保存完整配置。普通 Go/C 转发协议保持兼容；新 SOCKS5 功能需要 C 0.3.0+ 出口。协议实现参考 RFC 1928 / 1929，未新增第三方库。

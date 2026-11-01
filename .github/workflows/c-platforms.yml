@@ -71,6 +71,10 @@ jobs:
         run: |
           python3 c/client/scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
           tar -C dist -czf dist/openp2p-c-${{ matrix.target }}.tar.gz ${{ matrix.target }}
+      - name: Native SOCKS5 TCP, UDP, authentication and reconnect
+        run: |
+          export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
+          python3 c/client/tests/socks_integration.py --client build/c/openp2p-c --gateway build/c/gateway --logs build/c/socks
       - uses: actions/upload-artifact@v4
         with:
           name: openp2p-c-${{ matrix.target }}
@@ -82,6 +86,7 @@ jobs:
           path: |
             build/c/Testing/Temporary/LastTest.log
             build/c/desktop-result.json
+            build/c/socks/result.json
             build/c/compile_commands.json
   cross:
     runs-on: ubuntu-24.04
@@ -174,12 +179,16 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-socks.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
           python c/client/tests/tls_negative.py --client build/windows/openp2p-c.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python c/client/tests/quic_interop.py --build build/windows
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python c/client/tests/desktop_integration.py --build build/windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/socks_integration.py --client build/windows/openp2p-c.exe --gateway build/windows/gateway.exe --logs build/windows/socks
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: MSVC consumer of the C DLL
         shell: cmd
@@ -201,3 +210,58 @@ jobs:
         with:
           name: openp2p-c-windows-x86_64
           path: dist/openp2p-c-windows-x86_64.zip
+  linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.13-slim-bookworm
+      options: --privileged
+    timeout-minutes: 35
+    steps:
+      - name: Native Debian 12 build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev zstd
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.20.14'
+          cache-dependency-path: go/client/go.sum
+      - uses: actions/cache@v4
+        with:
+          path: ~/openp2p-dev/cross
+          key: gateway-client-deps-debian12-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+      - name: Build C client and C gateway with sanitizers
+        run: |
+          python3 c/client/scripts/build-deps.py linux-x86_64
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
+          cmake --build build/c --parallel 3
+          ctest --test-dir build/c --output-on-failure
+          cmake -S c/gateway -B build/c-gateway -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON
+          cmake --build build/c-gateway --parallel 3
+          mkdir -p build/go
+          (cd go/client && go build -buildvcs=false -mod=readonly -o ../../build/go/openp2p ./cmd)
+      - name: SOCKS5 end to end and original Go/C forwarding regression
+        run: |
+          bash c/client/scripts/check-socks.sh
+          bash c/gateway/scripts/integration.sh
+      - name: Package native C client SDK
+        run: |
+          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/linux-debian12-x86_64"
+          cmake --build build/client-release --parallel 3
+          cmake --install build/client-release
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/linux-debian12-x86_64
+          tar -C dist -czf dist/openp2p-c-linux-debian12-x86_64.tar.gz linux-debian12-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-linux-debian12-x86_64
+          path: dist/openp2p-c-linux-debian12-x86_64.tar.gz
+      - name: Gather sanitized SOCKS5 summaries
+        if: always()
+        run: |
+          mkdir -p build/socks-reports
+          find /tmp -path '/tmp/openp2p-socks-tests.*/result.json' -exec cp --parents '{}' build/socks-reports/ \;
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: socks5-results-linux
+          path: build/socks-reports/

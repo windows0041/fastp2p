@@ -5,6 +5,7 @@ EXPORTS
     op2p_client_create
     op2p_client_create_json
     op2p_client_add_forward
+    op2p_client_add_socks5
     op2p_client_start
     op2p_client_step
     op2p_client_stop

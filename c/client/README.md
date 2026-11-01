@@ -1,6 +1,6 @@
 # C 客户端
 
-C 客户端 0.2.0 提供 Linux、Windows、macOS 的命令行程序与 C 动态库，以及 Android 原生应用和 JNI 绑定。运行时不依赖 Go，协议兼容本仓库 Go 客户端 3.25.11 和自建 Go 网关，公开接口版本保持 ABI 1。平台安装、交叉编译及 SDK 集成见 [平台说明](PLATFORMS-ZH.md)。
+C 客户端 0.3.0 提供 Linux、Windows、macOS 的命令行程序与 C 动态库，以及 Android 原生应用和 JNI 绑定。运行时不依赖 Go，固定转发兼容本仓库 Go 客户端 3.25.11 和自建网关，公开接口版本保持 ABI 1。新增 SOCKS5 入口使用 C 0.3.0+ 节点作为出口。平台安装、交叉编译及 SDK 集成见 [平台说明](PLATFORMS-ZH.md)。
 
 ## 已实现
 
@@ -9,6 +9,7 @@ C 客户端 0.2.0 提供 Linux、Windows、macOS 的命令行程序与 C 动态�
 - UDP NAT 探测、单字节 TCP NAT 探测、本地端口复用、TCP 打洞。
 - UDP 锥形 NAT 打洞后，在同一个 UDP socket 上建立 QUIC，使用 `openp2pv1` ALPN。
 - TCP / QUIC 隧道中的 TCP、UDP 应用转发，兼容现有应用密钥与数据帧。
+- SOCKS5 TCP CONNECT、UDP ASSOCIATE、出口 DNS 和可选用户名密码认证；见 [SOCKS5 配置和 C 接口](SOCKS5-ZH.md)。
 - 对端连接请求、应用密钥与内存应用同步、管理 API 查询转发状态及新增转发规则。
 - 有界消息队列、超时、连接释放、事件回调和调用者驱动的运行循环。
 
@@ -33,7 +34,7 @@ build/c/openp2p-c --version
 
 构建结果为 `build/c/openp2p-c`、`build/c/libopenp2p.so.1` 及其版本链接。开发检查包括协议输入、uint64 精度、加密、ABI、重复启停的文件描述符计数，以及证书拒绝测试。
 
-本实现要求 libcurl >= 8.14 且启用 `ws` / `wss`，ngtcp2 >= 1.11。Debian 12 默认依赖版本不满足该构建要求；本轮未向远端主机安装 C 版本。
+本实现要求 libcurl >= 8.14 且启用 `ws` / `wss`，ngtcp2 >= 1.11。Debian 12 默认依赖版本不满足要求；可使用锁定依赖构建或 Debian 12 原生 SDK，方法见平台说明。
 
 地址和未定义行为检查：
 

@@ -1,0 +1,18 @@
+{
+  "network": {
+    "Node": "c-socks5-entry",
+    "Token": 0,
+    "ServerHost": "gz.itq.cc.cd",
+    "ServerPort": 27183
+  },
+  "CACertFile": "/absolute/path/to/ca.crt",
+  "socks5": [
+    {
+      "Name": "proxy-via-my-exit",
+      "BindIP": "127.0.0.1",
+      "SrcPort": 1080,
+      "PeerNode": "c-socks5-exit",
+      "UnderlayProtocol": "quic"
+    }
+  ]
+}

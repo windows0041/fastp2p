@@ -12,7 +12,7 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
-/** Only the decimal token is encrypted; configurations and imported public CAs are private app files. */
+/** Token and configuration (including optional SOCKS5 passwords) use Android Keystore AES-GCM. */
 final class SecretStore {
     private static final String ALIAS = "openp2p-client-token-v1";
     static SharedPreferences preferences(Context c) { return c.getSharedPreferences("client", Context.MODE_PRIVATE); }
@@ -40,5 +40,20 @@ final class SecretStore {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(p.getString("iv", ""), Base64.NO_WRAP)));
         return new String(cipher.doFinal(Base64.decode(p.getString("secret", ""), Base64.NO_WRAP)), StandardCharsets.US_ASCII);
+    }
+    static void saveConfig(Context c, String config) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key());
+        byte[] ciphertext = cipher.doFinal(config.getBytes(StandardCharsets.UTF_8));
+        if (!preferences(c).edit().putString("configSecret", Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+                .putString("configIV", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)).remove("config").commit())
+            throw new IllegalStateException("无法保存配置");
+    }
+    static String config(Context c) throws Exception {
+        SharedPreferences p = preferences(c);
+        if (!p.contains("configSecret")) return p.getString("config", "{}");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(p.getString("configIV", ""), Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(p.getString("configSecret", ""), Base64.NO_WRAP)), StandardCharsets.UTF_8);
     }
 }

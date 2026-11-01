@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define OP2P_ABI_VERSION 1u
-#define OP2P_VERSION "0.2.0"
+#define OP2P_VERSION "0.3.0"
 #if defined(_WIN32) && !defined(OP2P_STATIC)
 #if defined(OP2P_BUILDING_LIBRARY)
 #define OP2P_API __declspec(dllexport)
@@ -70,6 +70,17 @@ typedef struct {
     op2p_transport transport; /* TCP punch or UDP punch + QUIC */
 } op2p_forward;
 
+typedef struct {
+    size_t struct_size;
+    const char *name;
+    const char *bind_ip; /* NULL = 127.0.0.1 */
+    uint16_t local_port;
+    const char *peer_node; /* Exit node must run C client >= 0.3.0. */
+    op2p_transport transport;
+    const char *username; /* NULL/empty and password empty = no authentication. */
+    const char *password; /* If supplied, both strings must be 1..255 bytes. */
+} op2p_socks5;
+
 /* All functions for an instance are called on one owning thread. No worker
  * threads are created. Strings are copied by create/add_forward. Event callbacks
  * may request stop, but must not reenter step, destroy, or change forwards.
@@ -78,8 +89,14 @@ OP2P_API int op2p_client_create(const op2p_config *config, op2p_client **out);
 /* Parse the same UTF-8 configuration as the CLI. Override strings may be NULL.
  * Token is decimal text to preserve all 64 bits through mobile language bindings. */
 OP2P_API int op2p_client_create_json(const char *json_utf8, const char *token_override,
-    const char *ca_override, op2p_event_fn on_event, void *user, op2p_client **out);
-OP2P_API int op2p_client_add_forward(op2p_client *client, const op2p_forward *forward, uint64_t *id);
+                                     const char *ca_override, op2p_event_fn on_event, void *user,
+                                     op2p_client **out);
+OP2P_API int op2p_client_add_forward(op2p_client *client, const op2p_forward *forward,
+                                     uint64_t *id);
+/* RFC 1928 CONNECT / UDP ASSOCIATE, RFC 1929 optional authentication.
+ * Targets: IPv4 or DNS names resolved at the exit. BIND/IPv6/UDP fragments rejected.
+ * Strings copied; listener lifetime matches add_forward. Existing ABI 1 is preserved. */
+OP2P_API int op2p_client_add_socks5(op2p_client *client, const op2p_socks5 *proxy, uint64_t *id);
 OP2P_API int op2p_client_start(op2p_client *client);
 /* Service once, waiting at most min(max_wait_ms, 10) milliseconds for WSS events.
  * Call repeatedly while running. Network/peer errors are reported via events;

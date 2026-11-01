@@ -26,7 +26,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
-    private EditText gateway, port, node, token, rules;
+    private EditText gateway, port, node, token, rules, proxies;
     private TextView status, events, caLabel;
     private Button connect;
     private final Handler handler = new Handler();
@@ -61,7 +61,7 @@ public final class MainActivity extends Activity {
         int padding = (int)(20 * getResources().getDisplayMetrics().density);
         layout.setPadding(padding, padding, padding, padding); scroll.addView(layout); setContentView(scroll);
         label(layout, "OpenP2P C", 28);
-        label(layout, "自己的网关 · TCP / UDP 端口转发", 15);
+        label(layout, "自己的网关 · 端口转发 / SOCKS5", 15);
         status = label(layout, "未连接", 20); status.setTextColor(Color.rgb(0, 105, 90));
         gateway = input(layout, "网关地址", "例如 gz.itq.cc.cd", false);
         port = input(layout, "WSS 端口", "27183", true);
@@ -79,6 +79,13 @@ public final class MainActivity extends Activity {
         rules.setGravity(android.view.Gravity.TOP); rules.setTypeface(android.graphics.Typeface.MONOSPACE);
         rules.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         layout.addView(rules);
+        label(layout, "SOCKS5 代理（JSON 数组）", 14);
+        label(layout, "例如 [{\"SrcPort\":1080,\"PeerNode\":\"my-exit-node\",\"UnderlayProtocol\":\"quic\"}]。出口需使用 C 0.3.0+。", 12);
+        proxies = new EditText(this); proxies.setMinLines(4); proxies.setTextSize(12);
+        proxies.setGravity(android.view.Gravity.TOP); proxies.setTypeface(android.graphics.Typeface.MONOSPACE);
+        proxies.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        proxies.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        layout.addView(proxies);
         connect = button(layout, "连接网关", v -> connect());
         label(layout, "连接事件", 16); events = label(layout, "", 12);
         label(layout, "C 核心 " + NativeClient.version() + " · 应用转发模式", 12);
@@ -87,7 +94,7 @@ public final class MainActivity extends Activity {
     private void load() {
         SharedPreferences p = SecretStore.preferences(this);
         try {
-            JSONObject config = new JSONObject(p.getString("config", "{}"));
+            JSONObject config = new JSONObject(SecretStore.config(this));
             JSONObject net = config.optJSONObject("network");
             gateway.setText(net == null ? "gz.itq.cc.cd" : net.optString("ServerHost", "gz.itq.cc.cd"));
             port.setText(String.valueOf(net == null ? 27183 : net.optInt("ServerPort", 27183)));
@@ -99,6 +106,8 @@ public final class MainActivity extends Activity {
             node.setText(net == null ? defaultNode : net.optString("Node", defaultNode));
             JSONArray apps = config.optJSONArray("apps");
             rules.setText(apps == null ? "[]" : apps.toString(2));
+            JSONArray socks = config.optJSONArray("socks5");
+            proxies.setText(socks == null ? "[]" : socks.toString(2));
             token.setText(SecretStore.token(this));
             caPath = p.getString("ca", "");
             caLabel.setText(caPath.isEmpty() ? "证书：系统信任库" : "证书：已导入私有 CA");
@@ -115,9 +124,11 @@ public final class MainActivity extends Activity {
             if (!host.matches("[A-Za-z0-9.-]+") || !name.matches("[A-Za-z0-9_-]{8,31}") || wssPort < 1 || wssPort > 65535)
                 throw new IllegalArgumentException();
             JSONObject net = new JSONObject().put("Node", name).put("ServerHost", host).put("ServerPort", wssPort).put("Token", 0);
-            JSONObject config = new JSONObject().put("network", net).put("apps", new JSONArray(rules.getText().toString()));
+            JSONObject config = new JSONObject().put("network", net).put("apps", new JSONArray(rules.getText().toString()))
+                .put("socks5", new JSONArray(proxies.getText().toString()));
             SecretStore.saveToken(this, token.getText().toString().trim());
-            if (!SecretStore.preferences(this).edit().putString("config", config.toString()).putString("ca", caPath).commit())
+            SecretStore.saveConfig(this, config.toString());
+            if (!SecretStore.preferences(this).edit().putString("ca", caPath).commit())
                 throw new IllegalStateException();
             if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
                 requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 11);

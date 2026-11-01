@@ -61,7 +61,8 @@ public final class LiveInstrumentation extends Instrumentation {
             file.delete();
             JSONObject config = input.getJSONObject("config");
             SecretStore.saveToken(context, input.getString("token"));
-            SecretStore.preferences(context).edit().putString("config", config.toString())
+            SecretStore.saveConfig(context, config.toString());
+            SecretStore.preferences(context).edit()
                 .putString("ca", new File(context.getFilesDir(), "gateway-ca.pem").getAbsolutePath()).commit();
             // Foreground launch exercises the actual app/service/JNI path.
             startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));

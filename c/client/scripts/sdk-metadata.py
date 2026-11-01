@@ -11,7 +11,7 @@ p.add_argument('--work',default=str(Path.home()/'openp2p-dev/cross'))
 args=p.parse_args()
 project=Path(__file__).resolve().parents[1]
 sdk=Path(args.sdk).resolve();sdk.mkdir(parents=True,exist_ok=True)
-for file in ['LICENSE','README.md','PLATFORMS-ZH.md','THIRD_PARTY.md','config.example.json','deps.lock.json']:
+for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY.md','config.example.json','config.socks5.example.json','deps.lock.json']:
     shutil.copyfile(project/file,sdk/file)
 (sdk/'examples').mkdir(exist_ok=True)
 (sdk/'include').mkdir(exist_ok=True)

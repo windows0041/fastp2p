@@ -84,6 +84,55 @@ int op2p_client_create_json(const char *text, const char *token_text, const char
                                            : OP2P_TRANSPORT_QUIC};
         rv = op2p_client_add_forward(*out, &f, NULL);
     }
+    json_object *proxies = op_get(root, "socks5");
+    if (!rv && proxies && !json_object_is_type(proxies, json_type_array))
+        rv = OP2P_EINVAL;
+    for (size_t i = 0; !rv && proxies && i < json_object_array_length(proxies); ++i) {
+        json_object *p = json_object_array_get_idx(proxies, i);
+        if (!json_object_is_type(p, json_type_object)) {
+            rv = OP2P_EINVAL;
+            break;
+        }
+        const char *string_fields[] = {"Name",     "PeerNode", "BindIP",     "UnderlayProtocol",
+                                       "Username", "Password", "PasswordEnv"};
+        for (size_t q = 0; q < sizeof(string_fields) / sizeof(string_fields[0]); ++q) {
+            json_object *v = op_get(p, string_fields[q]);
+            if (v && (!json_object_is_type(v, json_type_string) ||
+                      (size_t)json_object_get_string_len(v) != strlen(json_object_get_string(v)))) {
+                rv = OP2P_EINVAL;
+                break;
+            }
+        }
+        if (rv)
+            break;
+        if (op_get(p, "Enabled") && !json_object_get_boolean(op_get(p, "Enabled")))
+            continue;
+        const char *transport = op_string(p, "UnderlayProtocol"), *bind_ip = op_string(p, "BindIP");
+        uint64_t port = op_integer(p, "SrcPort");
+        if (!port || port > 65535 ||
+            (*transport && strcmp(transport, "tcp") && strcmp(transport, "quic"))) {
+            rv = OP2P_EINVAL;
+            break;
+        }
+        const char *password = op_string(p, "Password"), *variable = op_string(p, "PasswordEnv");
+        if (*variable) {
+            password = getenv(variable);
+            if (!password || !*password) {
+                rv = OP2P_EINVAL;
+                break;
+            }
+        }
+        op2p_socks5 proxy = {.struct_size = sizeof(proxy),
+                             .name = op_string(p, "Name"),
+                             .bind_ip = *bind_ip ? bind_ip : NULL,
+                             .local_port = (uint16_t)port,
+                             .peer_node = op_string(p, "PeerNode"),
+                             .transport = !strcmp(transport, "tcp") ? OP2P_TRANSPORT_TCP
+                                                                    : OP2P_TRANSPORT_QUIC,
+                             .username = op_string(p, "Username"),
+                             .password = password};
+        rv = op2p_client_add_socks5(*out, &proxy, NULL);
+    }
     json_object_put(root);
     if (rv && *out) {
         op2p_client_destroy(*out);

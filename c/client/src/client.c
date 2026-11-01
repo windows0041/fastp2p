@@ -2,6 +2,7 @@
 #include "openp2p.h"
 #include "wire.h"
 #include "quic.h"
+#include "socks.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -19,6 +20,7 @@
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define COMPAT_VERSION "3.25.11"
+enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
 enum tunnel_state {
     T_FREE,
     T_NAT_CONNECT,
@@ -45,10 +47,11 @@ typedef struct {
     opq *quic;
 } tunnel;
 typedef struct {
-    int used, local, udp, transport, tunnel_index, synced;
+    int used, local, udp, transport, tunnel_index, synced, socks;
     op_socket fd;
     uint64_t id, key, retry, ready_at;
     char name[64], peer[32], destination[256], bind_ip[INET_ADDRSTRLEN];
+    char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
 } app;
 typedef struct {
@@ -56,7 +59,12 @@ typedef struct {
     op_socket fd;
     uint64_t id, activity, deadline;
     struct sockaddr_in source;
-    op_buffer tx, early;
+    op_buffer tx, early, socks_rx;
+    int socks_state, socks_exit;
+    op_socket socks_udp;
+    uint64_t socks_parent;
+    op_socks socks;
+    struct sockaddr_in socks_peer;
 } overlay;
 typedef struct {
     op_socket fd;
@@ -97,6 +105,10 @@ static void close_tunnel(op2p_client *, int, const char *);
 static void close_overlay(op2p_client *, int, int);
 static void tunnel_message(op2p_client *, int, uint16_t, const uint8_t *, size_t);
 static void synchronize_app(op2p_client *, int);
+static void socks_failure(op2p_client *, int, unsigned);
+static void overlay_ack(op2p_client *, int, unsigned);
+static void socks_udp_reply(op2p_client *, int, const uint8_t *, size_t);
+static void socks_acknowledged(op2p_client *, int, json_object *);
 static uint64_t mono(void) {
     return op_monotonic_ns();
 }
@@ -272,18 +284,33 @@ static void close_overlay(op2p_client *c, int index, int notify) {
     overlay *o = &c->overlays[index];
     if (!o->used)
         return;
-    if (notify && c->tunnels[o->tunnel_index].state == T_ACTIVE) {
+    if (c->running && !c->stopping && (o->socks_state == S_TUNNEL || o->socks_state == S_ACK)) {
+        socks_failure(c, index, 1);
+        return;
+    }
+    if (notify && o->tunnel_index >= 0 && c->tunnels[o->tunnel_index].state == T_ACTIVE) {
         json_object *j = json_object_new_object();
         op_ju(j, "id", o->id);
         tjson(&c->tunnels[o->tunnel_index], 8, j);
         json_object_put(j);
     }
+    if (o->socks_state == S_UDP) {
+        uint64_t parent = o->id;
+        for (int i = 0; i < NO; ++i)
+            if (c->overlays[i].used && c->overlays[i].socks_parent == parent)
+                close_overlay(c, i, 1);
+    }
+    if (o->socks_udp >= 0)
+        op_close(o->socks_udp);
     if (o->fd >= 0 && !o->local_udp)
         op_close(o->fd);
     op_buffer_clear(&o->tx);
     op_buffer_clear(&o->early);
+    if (o->socks_rx.data)
+        OPENSSL_cleanse(o->socks_rx.data, o->socks_rx.len);
+    op_buffer_clear(&o->socks_rx);
     memset(o, 0, sizeof(*o));
-    o->fd = -1;
+    o->fd = o->socks_udp = -1;
 }
 static void close_tunnel(op2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
@@ -509,7 +536,8 @@ static int overlay_slot(op2p_client *c) {
         if (!c->overlays[i].used) {
             overlay *o = &c->overlays[i];
             memset(o, 0, sizeof(*o));
-            o->fd = -1;
+            o->fd = o->socks_udp = -1;
+            o->app_index = o->tunnel_index = -1;
             o->used = 1;
             o->activity = mono();
             o->deadline = o->activity + 5 * NS;
@@ -536,13 +564,282 @@ static void request_overlay(op2p_client *c, int oi) {
     op_ju(j, "id", o->id);
     op_ju(j, "token", c->token);
     op_ju(j, "appID", a->id);
-    op_js(j, "dstIP", a->destination);
-    op_ju(j, "dstPort", a->dst_port);
-    op_js(j, "protocol", a->udp ? "udp" : "tcp");
+    op_js(j, "dstIP", a->socks ? o->socks.host : a->destination);
+    op_ju(j, "dstPort", a->socks ? o->socks.port : a->dst_port);
+    op_js(j, "protocol", o->udp ? "udp" : "tcp");
+    if (a->socks)
+        op_ju(j, "socks5", 1);
     tjson(&c->tunnels[o->tunnel_index], 6, j);
     json_object_put(j);
     o->waiting = 1;
-    o->deadline = mono() + 5 * NS;
+    o->deadline = mono() + (a->socks ? 15 : 5) * NS;
+}
+static void socks_failure(op2p_client *c, int oi, unsigned status) {
+    overlay *o = &c->overlays[oi];
+    if (o->socks_state == S_FLOW) {
+        close_overlay(c, oi, 1);
+        return;
+    }
+    if (o->socks_state == S_ACK && o->tunnel_index >= 0 &&
+        c->tunnels[o->tunnel_index].state == T_ACTIVE) {
+        json_object *j = json_object_new_object();
+        op_ju(j, "id", o->id);
+        tjson(&c->tunnels[o->tunnel_index], 8, j);
+        json_object_put(j);
+    }
+    uint8_t reply[10];
+    op_socks_reply(reply, status, NULL, 0);
+    if (op_buffer_add(&o->tx, reply, sizeof(reply), OP_QUEUE_LIMIT)) {
+        o->socks_state = S_CLOSING;
+        close_overlay(c, oi, 0);
+        return;
+    }
+    o->socks_state = S_CLOSING;
+    o->deadline = mono() + NS;
+}
+static void overlay_ack(op2p_client *c, int oi, unsigned status) {
+    overlay *o = &c->overlays[oi];
+    uint8_t prefix[8];
+    op_put64(prefix, c->apps[o->app_index].id);
+    if (!o->socks_exit) {
+        uint8_t ack[12];
+        memcpy(ack, prefix, 8);
+        memcpy(ack + 8, "null", 4);
+        if (!status)
+            tframe(&c->tunnels[o->tunnel_index], 7, ack, sizeof(ack));
+        return;
+    }
+    struct sockaddr_in local = {0};
+    op_socklen length = sizeof(local);
+    if (o->fd >= 0)
+        op_getsockname(o->fd, (struct sockaddr *)&local, &length);
+    char ip[INET_ADDRSTRLEN], remote[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+    inet_ntop(AF_INET, &o->source.sin_addr, remote, sizeof(remote));
+    json_object *j = json_object_new_object();
+    op_ju(j, "id", o->id);
+    op_ju(j, "reply", status);
+    op_js(j, "boundIP", ip);
+    op_ju(j, "boundPort", ntohs(local.sin_port));
+    op_js(j, "remoteIP", remote);
+    const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
+    op_buffer b = {0};
+    if (!op_buffer_add(&b, prefix, 8, 1024) && !op_buffer_add(&b, text, strlen(text), 1024))
+        tframe(&c->tunnels[o->tunnel_index], 7, b.data, b.len);
+    op_buffer_clear(&b);
+    json_object_put(j);
+}
+static void socks_acknowledged(op2p_client *c, int oi, json_object *ack) {
+    overlay *o = &c->overlays[oi];
+    if (!ack || !json_object_is_type(ack, json_type_object)) {
+        emit(c, OP2P_EVENT_ERROR, 0, OP2P_EIO, "SOCKS5 exit requires C client 0.3.0 or newer");
+        socks_failure(c, oi, 7);
+        return;
+    }
+    if (op_integer(ack, "id") != o->id)
+        return;
+    uint64_t status = op_integer(ack, "reply"), port = op_integer(ack, "boundPort");
+    struct in_addr address;
+    if (!op_get(ack, "reply") || status > 8 || port > 65535 ||
+        inet_pton(AF_INET, op_string(ack, "boundIP"), &address) != 1) {
+        socks_failure(c, oi, 1);
+        return;
+    }
+    if (status) {
+        socks_failure(c, oi, (unsigned)status);
+        return;
+    }
+    o->waiting = 0;
+    if (o->socks_state == S_FLOW) {
+        if (inet_pton(AF_INET, op_string(ack, "remoteIP"), &o->socks_peer.sin_addr) != 1)
+            close_overlay(c, oi, 1);
+        return;
+    }
+    uint8_t reply[10];
+    op_socks_reply(reply, 0, (const uint8_t *)&address, (uint16_t)port);
+    if (op_buffer_add(&o->tx, reply, sizeof(reply), OP_QUEUE_LIMIT)) {
+        close_overlay(c, oi, 1);
+        return;
+    }
+    o->socks_state = S_STREAM;
+}
+static overlay *socks_parent(op2p_client *c, uint64_t id) {
+    for (int i = 0; i < NO; ++i)
+        if (c->overlays[i].used && c->overlays[i].id == id && c->overlays[i].socks_state == S_UDP)
+            return &c->overlays[i];
+    return NULL;
+}
+static void socks_udp_reply(op2p_client *c, int oi, const uint8_t *data, size_t len) {
+    overlay *o = &c->overlays[oi], *parent = socks_parent(c, o->socks_parent);
+    if (!parent || o->waiting || len > 4096)
+        return;
+    uint8_t packet[4106] = {0, 0, 0, 1};
+    memcpy(packet + 4, &o->socks_peer.sin_addr, 4);
+    packet[8] = (uint8_t)(o->socks.port >> 8);
+    packet[9] = (uint8_t)o->socks.port;
+    memcpy(packet + 10, data, len);
+    op_sendto(parent->socks_udp, packet, len + 10, MSG_DONTWAIT,
+              (struct sockaddr *)&parent->socks_peer, sizeof(parent->socks_peer));
+}
+static void tick_socks_udp(op2p_client *c, int index) {
+    overlay *parent = &c->overlays[index];
+    app *a = &c->apps[parent->app_index];
+    for (int k = 0; k < 8; ++k) {
+        uint8_t packet[4360];
+        struct sockaddr_in from;
+        op_socklen flen = sizeof(from);
+        op_ssize n = op_recvfrom(parent->socks_udp, packet, sizeof(packet), MSG_DONTWAIT,
+                                 (struct sockaddr *)&from, &flen);
+        if (n < 0)
+            break;
+        if (flen != sizeof(from) || from.sin_addr.s_addr != parent->source.sin_addr.s_addr ||
+            (parent->socks_peer.sin_port && from.sin_port != parent->socks_peer.sin_port) ||
+            n < 4 || packet[0] || packet[1] || packet[2])
+            continue;
+        char host[256];
+        uint16_t port;
+        int header = op_socks_address(packet + 3, (size_t)n - 3, host, &port);
+        if (header <= 0 || !port || (size_t)n - 3 - (size_t)header > 4096 || a->tunnel_index < 0 ||
+            !a->synced || mono() < a->ready_at)
+            continue;
+        parent->socks_peer = from;
+        int oi = -1, flows = 0;
+        for (int i = 0; i < NO; ++i)
+            if (c->overlays[i].used && c->overlays[i].socks_parent == parent->id) {
+                ++flows;
+                if (c->overlays[i].socks.port == port && !strcmp(c->overlays[i].socks.host, host))
+                    oi = i;
+            }
+        if (oi < 0) {
+            if (flows >= 32 || (oi = overlay_slot(c)) < 0)
+                continue;
+            overlay *o = &c->overlays[oi];
+            o->fd = parent->socks_udp;
+            o->udp = o->local_udp = o->connected = 1;
+            o->socks_state = S_FLOW;
+            o->socks_parent = parent->id;
+            o->id = random_id();
+            o->app_index = parent->app_index;
+            o->tunnel_index = a->tunnel_index;
+            strcpy(o->socks.host, host);
+            o->socks.port = port;
+            request_overlay(c, oi);
+        }
+        overlay *o = &c->overlays[oi];
+        size_t length = (size_t)n - 3 - (size_t)header;
+        const uint8_t *data = packet + 3 + header;
+        if (o->waiting) {
+            uint8_t early[4098];
+            op_put16(early, (uint16_t)length);
+            memcpy(early + 2, data, length);
+            if (op_buffer_add(&o->early, early, length + 2, 65536))
+                close_overlay(c, oi, 1);
+        } else if (overlay_data(c, oi, data, length))
+            close_overlay(c, oi, 1);
+    }
+}
+static void tick_socks(op2p_client *c, uint64_t now) {
+    for (int i = 0; i < NO; ++i) {
+        overlay *o = &c->overlays[i];
+        if (!o->used || !o->socks_state || o->socks_state == S_STREAM || o->socks_state == S_FLOW)
+            continue;
+        if (flush(o->fd, &o->tx)) {
+            close_overlay(c, i, 0);
+            continue;
+        }
+        if (o->socks_state == S_CLOSING) {
+            if (!op_buffer_size(&o->tx) || now > o->deadline)
+                close_overlay(c, i, 0);
+            continue;
+        }
+        app *a = &c->apps[o->app_index];
+        if (o->socks_state == S_UDP) {
+            uint8_t byte;
+            op_ssize n = op_recv(o->fd, &byte, 1, MSG_DONTWAIT);
+            if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                close_overlay(c, i, 1);
+                continue;
+            }
+            tick_socks_udp(c, i);
+            continue;
+        }
+        if (now > o->deadline) {
+            socks_failure(c, i, 4);
+            continue;
+        }
+        if (o->socks_state == S_TUNNEL) {
+            if (a->tunnel_index >= 0 && a->synced && now >= a->ready_at) {
+                o->tunnel_index = a->tunnel_index;
+                o->socks_state = S_ACK;
+                request_overlay(c, i);
+            }
+            continue;
+        }
+        if (o->socks_state == S_ACK)
+            continue;
+        if (read_socket(o->fd, &o->socks_rx, 65536)) {
+            close_overlay(c, i, 0);
+            continue;
+        }
+        for (int step = 0; step < 3 && o->socks_state == S_HANDSHAKE; ++step) {
+            uint8_t reply[10];
+            size_t used, length;
+            int rv = op_socks_step(&o->socks,
+                                   o->socks_rx.data ? o->socks_rx.data + o->socks_rx.offset : NULL,
+                                   op_buffer_size(&o->socks_rx), &used, a->socks_user,
+                                   a->socks_password, reply, &length);
+            if (length && op_buffer_add(&o->tx, reply, length, OP_QUEUE_LIMIT)) {
+                close_overlay(c, i, 0);
+                break;
+            }
+            if (used) {
+                OPENSSL_cleanse(o->socks_rx.data + o->socks_rx.offset, used);
+                op_buffer_consume(&o->socks_rx, used);
+            }
+            if (rv < 0) {
+                o->socks_state = S_CLOSING;
+                o->deadline = now + NS;
+                break;
+            }
+            if (!rv)
+                break;
+            if (rv != 2)
+                continue;
+            if (o->socks.command == 1) {
+                o->socks_state = S_TUNNEL;
+                o->deadline = now + 45 * NS;
+                break;
+            }
+            struct in_addr requested;
+            if (inet_pton(AF_INET, o->socks.host, &requested) != 1 ||
+                (requested.s_addr && requested.s_addr != o->source.sin_addr.s_addr)) {
+                socks_failure(c, i, 2);
+                break;
+            }
+            struct sockaddr_in local;
+            op_socklen flen = sizeof(local);
+            if (op_getsockname(o->fd, (struct sockaddr *)&local, &flen)) {
+                socks_failure(c, i, 1);
+                break;
+            }
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+            o->socks_udp = socket_bound(1, ip, 0, 0);
+            if (o->socks_udp < 0) {
+                socks_failure(c, i, 1);
+                break;
+            }
+            o->socks_peer = o->source;
+            o->socks_peer.sin_port = htons(o->socks.port);
+            op_socks_reply(reply, 0, (const uint8_t *)&local.sin_addr, socket_port(o->socks_udp));
+            if (op_buffer_add(&o->tx, reply, 10, OP_QUEUE_LIMIT)) {
+                close_overlay(c, i, 0);
+                break;
+            }
+            op_buffer_clear(&o->socks_rx);
+            o->socks_state = S_UDP;
+        }
+    }
 }
 static void report_apps(op2p_client *c) {
     json_object *root = json_object_new_object(), *list = json_object_new_array();
@@ -552,7 +849,7 @@ static void report_apps(op2p_client *c) {
             continue;
         json_object *j = json_object_new_object();
         op_js(j, "appName", a->name);
-        op_js(j, "protocol", a->udp ? "udp" : "tcp");
+        op_js(j, "protocol", a->socks ? "socks5" : (a->udp ? "udp" : "tcp"));
         op_js(j, "peerNode", a->peer);
         op_js(j, "dstHost", a->destination);
         op_ju(j, "dstPort", a->dst_port);
@@ -767,7 +1064,9 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
                 return;
             }
             o->activity = mono();
-            if (o->udp) {
+            if (o->socks_parent) {
+                socks_udp_reply(c, i, plain, n);
+            } else if (o->udp) {
                 op_ssize sent = o->local_udp
                                     ? op_sendto(o->fd, plain, n, MSG_DONTWAIT,
                                                 (struct sockaddr *)&o->source, sizeof(o->source))
@@ -782,12 +1081,21 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
     }
     if (sub == 7 && len >= 8) {
         uint64_t aid = op_u64(data);
+        json_object *ack = op_json(data + 8, len - 8);
         /* The Go wire ACK identifies the application, not the overlay. Release
          * all pending connections for that application on this tunnel. */
         for (int i = 0; i < NO; ++i)
             if (c->overlays[i].used && c->overlays[i].tunnel_index == ti &&
-                c->apps[c->overlays[i].app_index].id == aid)
-                c->overlays[i].waiting = 0;
+                c->apps[c->overlays[i].app_index].id == aid) {
+                overlay *o = &c->overlays[i];
+                if (c->apps[o->app_index].socks) {
+                    if (o->socks_state == S_ACK || (o->socks_state == S_FLOW && o->waiting))
+                        socks_acknowledged(c, i, ack);
+                } else
+                    o->waiting = 0;
+            }
+        if (ack)
+            json_object_put(ack);
         return;
     }
     json_object *j = op_json(data, len);
@@ -799,6 +1107,10 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
             if (c->overlays[i].used && c->overlays[i].id == id &&
                 c->overlays[i].tunnel_index == ti) {
                 overlay *o = &c->overlays[i];
+                if (o->socks_state == S_ACK) {
+                    socks_failure(c, i, 5);
+                    continue;
+                }
                 if (!o->udp && op_buffer_size(&o->tx)) {
                     /* A disconnect can follow the final data frame in the same
                      * read. Preserve those bytes until the local TCP write drains. */
@@ -832,17 +1144,22 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
                 o->app_index = ai;
                 o->tunnel_index = ti;
                 o->udp = !strcmp(proto, "udp");
-                if (resolve4(host, (uint16_t)port, &peer) ||
-                    (o->fd = socket_bound(o->udp, NULL, 0, 0)) < 0 ||
+                o->socks_exit = op_integer(j, "socks5") == 1;
+                if (resolve4(host, (uint16_t)port, &peer)) {
+                    overlay_ack(c, oi, 4);
+                    close_overlay(c, oi, 0);
+                    json_object_put(j);
+                    return;
+                }
+                o->source = peer;
+                if ((o->fd = socket_bound(o->udp, NULL, 0, 0)) < 0 ||
                     (op_connect(o->fd, (struct sockaddr *)&peer, sizeof(peer)) &&
-                     errno != EINPROGRESS))
+                     errno != EINPROGRESS)) {
+                    overlay_ack(c, oi, 5);
                     close_overlay(c, oi, 1);
-                else if (o->udp) {
+                } else if (o->udp) {
                     o->connected = 1;
-                    uint8_t ack[12];
-                    op_put64(ack, aid);
-                    memcpy(ack + 8, "null", 4);
-                    tframe(t, 7, ack, sizeof(ack));
+                    overlay_ack(c, oi, 0);
                 }
             }
         }
@@ -1167,6 +1484,8 @@ static void tick_overlays(op2p_client *c, uint64_t now) {
         overlay *o = &c->overlays[i];
         if (!o->used)
             continue;
+        if (o->socks_state && o->socks_state != S_STREAM && o->socks_state != S_FLOW)
+            continue;
         if (c->tunnels[o->tunnel_index].state != T_ACTIVE ||
             ((!o->connected || o->waiting || o->peer_closed) && now > o->deadline) ||
             (o->udp && now >= o->activity && now - o->activity > 300 * NS)) {
@@ -1176,19 +1495,30 @@ static void tick_overlays(op2p_client *c, uint64_t now) {
         if (!o->connected) {
             int rv = connect_ready(o->fd);
             if (rv < 0) {
+                overlay_ack(c, i, 5);
                 close_overlay(c, i, 1);
                 continue;
             }
             if (!rv)
                 continue;
             o->connected = 1;
-            uint8_t ack[12];
-            op_put64(ack, c->apps[o->app_index].id);
-            memcpy(ack + 8, "null", 4);
-            tframe(&c->tunnels[o->tunnel_index], 7, ack, sizeof(ack));
+            overlay_ack(c, i, 0);
         }
         if (o->waiting)
             continue;
+        if (o->socks_state == S_STREAM && op_buffer_size(&o->socks_rx)) {
+            size_t length = op_buffer_size(&o->socks_rx);
+            if (length > 4096)
+                length = 4096;
+            if (overlay_data(c, i, o->socks_rx.data + o->socks_rx.offset, length)) {
+                close_overlay(c, i, 1);
+                continue;
+            }
+            op_buffer_consume(&o->socks_rx, length);
+            if (op_buffer_size(&o->socks_rx))
+                continue;
+            op_buffer_clear(&o->socks_rx);
+        }
         while (op_buffer_size(&o->early) >= 2) {
             size_t len = op_u16(o->early.data + o->early.offset);
             if (op_buffer_size(&o->early) < len + 2 ||
@@ -1242,6 +1572,29 @@ static void tick_apps(op2p_client *c, uint64_t now) {
         app *a = &c->apps[i];
         if (!a->used || !a->local)
             continue;
+        if (a->socks) {
+            for (int k = 0; k < 4; ++k) {
+                struct sockaddr_in from;
+                op_socklen length = sizeof(from);
+                op_socket fd = op_accept(a->fd, (struct sockaddr *)&from, &length);
+                if (fd < 0)
+                    break;
+                int oi = overlay_slot(c);
+                if (oi < 0) {
+                    op_close(fd);
+                    break;
+                }
+                overlay *o = &c->overlays[oi];
+                o->fd = fd;
+                o->connected = 1;
+                o->id = random_id();
+                o->app_index = i;
+                o->source = from;
+                o->socks_state = S_HANDSHAKE;
+                o->socks.state = SOCKS_GREETING;
+                o->deadline = now + 10 * NS;
+            }
+        }
         if (a->tunnel_index < 0 && now >= a->retry && c->state == OP2P_ONLINE) {
             int ti = active_tunnel(c, a->peer, a->transport);
             if (ti >= 0) {
@@ -1272,6 +1625,8 @@ static void tick_apps(op2p_client *c, uint64_t now) {
             }
         }
         if (a->tunnel_index < 0 || !a->synced || now < a->ready_at)
+            continue;
+        if (a->socks)
             continue;
         if (!a->udp) {
             for (int k = 0; k < 4; ++k) {
@@ -1665,6 +2020,39 @@ int op2p_client_add_forward(op2p_client *c, const op2p_forward *f, uint64_t *id)
         }
     return OP2P_ELIMIT;
 }
+int op2p_client_add_socks5(op2p_client *c, const op2p_socks5 *p, uint64_t *id) {
+    if (!p || p->struct_size < sizeof(*p))
+        return OP2P_EINVAL;
+    const char *user = p->username ? p->username : "", *password = p->password ? p->password : "";
+    if (strlen(user) > 255 || strlen(password) > 255 || (!*user != !*password))
+        return OP2P_EINVAL;
+    op2p_forward f = {.struct_size = sizeof(f),
+                      .name = p->name ? p->name : "socks5",
+                      .bind_ip = p->bind_ip,
+                      .local_port = p->local_port,
+                      .peer_node = p->peer_node,
+                      .destination_host = "127.0.0.1",
+                      .destination_port = 1,
+                      .protocol = "tcp",
+                      .transport = p->transport};
+    uint64_t aid;
+    int rv = op2p_client_add_forward(c, &f, &aid);
+    if (rv)
+        return rv;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used && c->apps[i].id == aid) {
+            app *a = &c->apps[i];
+            a->socks = 1;
+            a->destination[0] = 0;
+            a->dst_port = 0;
+            strcpy(a->socks_user, user);
+            strcpy(a->socks_password, password);
+            break;
+        }
+    if (id)
+        *id = aid;
+    return OP2P_OK;
+}
 int op2p_client_start(op2p_client *c) {
     if (!c || c->in_callback || c->running || c->multi)
         return OP2P_ESTATE;
@@ -1736,6 +2124,7 @@ int op2p_client_step(op2p_client *c, unsigned wait_ms) {
     for (int i = 0; i < NT; ++i)
         tick_tunnel(c, i, now);
     tick_apps(c, now);
+    tick_socks(c, now);
     tick_overlays(c, now);
     if (wait_ms > 10)
         wait_ms = 10;
@@ -1769,6 +2158,9 @@ int op2p_client_stop(op2p_client *c) {
     c->running = 0;
     for (int i = 0; i < NT; ++i)
         close_tunnel(c, i, NULL);
+    for (int i = 0; i < NO; ++i)
+        if (c->overlays[i].used)
+            close_overlay(c, i, 0);
     for (int i = 0; i < NP; ++i) {
         if (c->pending[i].fd >= 0)
             op_close(c->pending[i].fd);

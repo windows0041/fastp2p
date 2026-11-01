@@ -63,7 +63,7 @@ bash go/gateway/scripts/local-client.sh my-node-a
 
 ## C 版本
 
-C 客户端 0.2.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp2p.dll`、macOS `libopenp2p.1.dylib` 及桌面 `openp2p-c`。Android 应用包含 arm64-v8a / x86_64 的同一套 C 核心，支持 CA 导入、加密保存 token、前台连接服务和应用转发，运行时不依赖 Go。
+C 客户端 0.3.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp2p.dll`、macOS `libopenp2p.1.dylib` 及桌面 `openp2p-c`。新增 [SOCKS5 代理](c/client/SOCKS5-ZH.md)，经 TCP 打洞 / QUIC 使用指定 C 节点作为出口，支持 TCP、UDP、出口 DNS 和可选认证。Android 应用包含 arm64-v8a / x86_64 的同一套 C 核心，支持 CA 导入、加密保存 token 与配置、前台连接服务、应用转发和 SOCKS5，运行时不依赖 Go。
 
 各平台实现私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发。构建和使用见 [C 客户端说明](c/client/README.md) 与 [平台和 SDK 说明](c/client/PLATFORMS-ZH.md)，实际测试覆盖见 [客户端验证记录](c/client/VALIDATION-ZH.md)。C 客户端的 SD-WAN/TUN 和中继数据面尚未实现。
 

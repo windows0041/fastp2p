@@ -89,9 +89,28 @@ int main(void) {
     const char *json = "{\"network\":{\"Node\":\"json-api-test\",\"Token\":18446744073709551615}}";
     assert(op2p_client_create_json(json, NULL, NULL, NULL, NULL, &c) == OP2P_OK);
     op2p_client_destroy(c);
-    assert(op2p_client_create_json(json, "18446744073709551616", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
+    assert(op2p_client_create_json(json, "18446744073709551616", NULL, NULL, NULL, &c) ==
+               OP2P_EINVAL &&
+           !c);
     assert(op2p_client_create_json("{}", "1", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
     assert(op2p_client_create_json("{", NULL, NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
+    assert(op2p_client_create(&cfg, &c) == OP2P_OK);
+    op2p_socks5 p = {.struct_size = sizeof(p),
+                     .peer_node = "exit-client",
+                     .local_port = 0,
+                     .transport = OP2P_TRANSPORT_QUIC};
+    assert(op2p_client_add_socks5(c, &p, NULL) == OP2P_EINVAL);
+    p.local_port = 1080;
+    p.username = "user";
+    assert(op2p_client_add_socks5(c, &p, NULL) == OP2P_EINVAL);
+    p.username = NULL;
+    p.transport = 0;
+    assert(op2p_client_add_socks5(c, &p, NULL) == OP2P_EINVAL);
+    op2p_client_destroy(c);
+    assert(op2p_client_create_json(
+               "{\"network\":{\"Node\":\"json-api-test\",\"Token\":1},\"socks5\":{}}", NULL, NULL,
+               NULL, NULL, &c) == OP2P_EINVAL &&
+           !c);
     puts("ABI validation, callback stop and repeated lifecycle FD checks passed");
     return 0;
 }

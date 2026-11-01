@@ -150,53 +150,27 @@ int main(int argc, char **argv) {
         json_object_put(root);
         return 2;
     }
-    op2p_config cfg = {.struct_size = sizeof(cfg),
-                       .abi_version = OP2P_ABI_VERSION,
-                       .gateway_host = host ? host : "127.0.0.1",
-                       .gateway_port = (uint16_t)port,
-                       .node = node,
-                       .token = token,
-                       .ca_file = ca,
-                       .public_port = (uint16_t)public_port,
-                       .on_event = event};
+    /* CLI and JNI use the same factory, including SOCKS5 and Enabled semantics. */
+    if (!network || !json_object_is_type(network, json_type_object)) {
+        network = json_object_new_object();
+        json_object_object_add(root, "network", network);
+    }
+    if (host)
+        json_object_object_add(network, "ServerHost", json_object_new_string(host));
+    if (node)
+        json_object_object_add(network, "Node", json_object_new_string(node));
+    if (port)
+        json_object_object_add(network, "ServerPort", json_object_new_uint64(port));
+    if (public_port)
+        json_object_object_add(network, "PublicIPPort", json_object_new_uint64(public_port));
+    /* Override strings may refer to root; copy CA before replacing any field. */
     op2p_client *client = NULL;
-    int rv = op2p_client_create(&cfg, &client);
+    int rv = op2p_client_create_json(json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN),
+                                     env, ca, event, NULL, &client);
     if (rv) {
-        fputs("Invalid client configuration (node, gateway, token or ABI)\n", stderr);
+        fputs("Invalid client configuration (network, forward or SOCKS5 rule)\n", stderr);
         json_object_put(root);
         return 2;
-    }
-    json_object *apps = field(root, "apps");
-    if (apps && !json_object_is_type(apps, json_type_array)) {
-        rv = OP2P_EINVAL;
-        goto done;
-    }
-    for (size_t i = 0; apps && i < json_object_array_length(apps); ++i) {
-        json_object *j = json_object_array_get_idx(apps, i);
-        uint64_t local = number(j, "SrcPort"), dst = number(j, "DstPort");
-        if (!local || local > 65535 || !dst || dst > 65535) {
-            rv = OP2P_EINVAL;
-            goto done;
-        }
-        const char *transport = string(j, "UnderlayProtocol");
-        if (transport && strcmp(transport, "tcp") && strcmp(transport, "quic")) {
-            rv = OP2P_EINVAL;
-            goto done;
-        }
-        op2p_forward f = {.struct_size = sizeof(f),
-                          .name = string(j, "AppName"),
-                          .bind_ip = string(j, "BindIP"),
-                          .local_port = (uint16_t)local,
-                          .peer_node = string(j, "PeerNode"),
-                          .destination_host = string(j, "DstHost"),
-                          .destination_port = (uint16_t)dst,
-                          .protocol = string(j, "Protocol"),
-                          .transport = (transport ? !strcmp(transport, "tcp")
-                                                  : (number(j, "PunchPriority") & 2) != 0)
-                                           ? OP2P_TRANSPORT_TCP
-                                           : OP2P_TRANSPORT_QUIC};
-        if ((rv = op2p_client_add_forward(client, &f, NULL)))
-            goto done;
     }
     signal(SIGINT, signal_stop);
     signal(SIGTERM, signal_stop);
