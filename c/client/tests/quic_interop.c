@@ -1,34 +1,33 @@
+#include "platform.h"
 #include "quic.h"
-#include <arpa/inet.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr, "usage: quic-interop client|server IP PORT LOCAL_PORT\n");
         return 2;
     }
+    if(op_platform_init()) return 2;
     int server = !strcmp(argv[1], "server");
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    op_socket fd = op_socket_open(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in local = {.sin_family = AF_INET,
                                 .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
                                 .sin_port = htons((uint16_t)atoi(argv[4]))};
     struct sockaddr_in peer = {.sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(argv[3]))};
     if (fd < 0 || inet_pton(AF_INET, argv[2], &peer.sin_addr) != 1 ||
-        bind(fd, (struct sockaddr *)&local, sizeof(local)))
+        op_bind(fd, (struct sockaddr *)&local, sizeof(local)))
         return 2;
-    socklen_t length = sizeof(local);
-    getsockname(fd, (struct sockaddr *)&local, &length);
+    op_socklen length = sizeof(local);
+    op_getsockname(fd, (struct sockaddr *)&local, &length);
     printf("UDP_PORT=%u\n", ntohs(local.sin_port));
     fflush(stdout);
     opq *q = opq_new(fd, (struct sockaddr *)&peer, sizeof(peer), server);
     if (!q) {
         fprintf(stderr, "QUIC initialization failed\n");
-        close(fd);
+        op_close(fd);
         return 1;
     }
     /* One real OpenP2P frame containing a tunnel ID, echoed verbatim. */
@@ -53,18 +52,18 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < 100; ++i) {
                     if (opq_step(q))
                         break;
-                    usleep(1000);
+                    op_sleep_ms(1);
                 }
             }
             success = 1;
             break;
         }
-        struct pollfd pollfd = {.fd = fd, .events = POLLIN};
-        poll(&pollfd, 1, 2);
+        op_pollfd pollfd = {.fd = fd, .events = POLLIN};
+        op_poll(&pollfd, 1, 2);
     }
     if (success)
         puts("QUIC_INTEROP_OK ALPN=openp2pv1 frame_bytes=16");
     opq_free(q);
-    close(fd);
+    op_close(fd);
     return success ? 0 : 1;
 }

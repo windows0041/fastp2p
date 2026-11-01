@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Build pinned C dependencies out of tree for a native or cross target."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import tarfile
+import urllib.request
+
+parser=argparse.ArgumentParser()
+parser.add_argument('target',choices=['linux-x86_64','windows-x86_64','android-arm64-v8a','android-x86_64','macos-arm64','macos-x86_64'])
+parser.add_argument('--work',default=str(Path.home()/'openp2p-dev/cross'))
+parser.add_argument('--ndk',default=os.environ.get('ANDROID_NDK_HOME',''))
+parser.add_argument('--jobs',type=int,default=min(4,os.cpu_count() or 2))
+args=parser.parse_args()
+project=Path(__file__).resolve().parents[1]
+manifest=json.loads((project/'deps.lock.json').read_text())
+work=Path(args.work).resolve()
+cache=work/'downloads'
+sources=work/'sources'
+build=work/'build'/args.target
+prefix=work/'prefix'/args.target
+for p in (cache,sources,build,prefix): p.mkdir(parents=True,exist_ok=True)
+stamp=prefix/'openp2p-dependencies.json'
+if stamp.exists() and json.loads(stamp.read_text())==manifest:
+    print('Dependencies already built:',prefix)
+    raise SystemExit(0)
+paths={}
+for name,item in manifest.items():
+    archive=cache/item['file']
+    if not archive.exists():
+        print('Downloading',name,item['version'],flush=True)
+        urllib.request.urlretrieve(item['url'],archive)
+    if hashlib.sha256(archive.read_bytes()).hexdigest()!=item['sha256']:
+        raise SystemExit('Dependency checksum mismatch: '+name)
+    destination=sources/(name+'-'+item['version'])
+    if not destination.exists():
+        with tarfile.open(archive) as tar:
+            members=tar.getmembers()
+            top=members[0].name.split('/')[0]
+            tar.extractall(sources,filter='data')
+        extracted=sources/top
+        if extracted!=destination: extracted.rename(destination)
+    paths[name]=destination
+
+environment=os.environ.copy()
+environment['PKG_CONFIG_LIBDIR']=str(prefix/'lib/pkgconfig')
+environment['PKG_CONFIG_PATH']=str(prefix/'lib/pkgconfig')
+cmake_common=['-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DCMAKE_INSTALL_PREFIX='+str(prefix),
+    '-DCMAKE_INSTALL_LIBDIR=lib','-DCMAKE_POSITION_INDEPENDENT_CODE=ON','-DBUILD_SHARED_LIBS=OFF','-DBUILD_TESTING=OFF']
+environment['CFLAGS']='-O2 -fPIC'
+openssl_target='linux-x86_64'
+openssl_extra=[]
+if args.target=='windows-x86_64':
+    cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(project/'cmake/windows-x86_64.cmake')]
+    openssl_target='mingw64'
+    environment['CC']='x86_64-w64-mingw32-gcc'
+    environment['AR']='x86_64-w64-mingw32-ar'
+    environment['RANLIB']='x86_64-w64-mingw32-ranlib'
+    environment['CFLAGS']='-O2 -D_WIN32_WINNT=0x0A00'
+elif args.target.startswith('android-'):
+    ndk=Path(args.ndk).resolve()
+    if not (ndk/'build/cmake/android.toolchain.cmake').exists(): raise SystemExit('Provide --ndk or ANDROID_NDK_HOME')
+    abi=args.target.removeprefix('android-')
+    toolbin=ndk/'toolchains/llvm/prebuilt/linux-x86_64/bin'
+    environment['ANDROID_NDK_ROOT']=str(ndk)
+    environment['PATH']=str(toolbin)+os.pathsep+environment['PATH']
+    environment['AR']=str(toolbin/'llvm-ar')
+    environment['RANLIB']=str(toolbin/'llvm-ranlib')
+    environment['CC']=str(toolbin/('aarch64-linux-android26-clang' if abi=='arm64-v8a' else 'x86_64-linux-android26-clang'))
+    openssl_target='android-arm64' if abi=='arm64-v8a' else 'android-x86_64'
+    openssl_extra=['-D__ANDROID_API__=26']
+    cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(ndk/'build/cmake/android.toolchain.cmake'),
+                   '-DANDROID_ABI='+abi,'-DANDROID_PLATFORM=android-26','-DANDROID_STL=none']
+elif args.target.startswith('macos-'):
+    if sys.platform!='darwin': raise SystemExit('macOS dependencies require an Apple SDK on macOS')
+    arch=args.target.removeprefix('macos-')
+    environment['CC']='clang'
+    environment['CFLAGS']='-O2 -fPIC -arch '+arch+' -mmacosx-version-min=13.0'
+    openssl_target='darwin64-arm64-cc' if arch=='arm64' else 'darwin64-x86_64-cc'
+    cmake_common+=['-DCMAKE_OSX_ARCHITECTURES='+arch,'-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0']
+
+def run(command,directory,label):
+    print(args.target+': '+label,flush=True)
+    log=build/(label.replace(' ','-')+'.log')
+    with log.open('w') as output:
+        result=subprocess.run([str(x) for x in command],cwd=directory,env=environment,stdout=output,stderr=subprocess.STDOUT)
+    if result.returncode:
+        print('\n'.join(log.read_text(errors='replace').splitlines()[-45:]),flush=True)
+        raise SystemExit('Build failed; log: '+str(log))
+
+openssl_build=build/'openssl'
+openssl_build.mkdir(exist_ok=True)
+run(['perl',paths['openssl']/'Configure',openssl_target,'no-shared','no-tests','no-apps','no-module',
+     '--prefix='+str(prefix),'--libdir=lib',*openssl_extra],openssl_build,'openssl-configure')
+run(['make','-j'+str(args.jobs)],openssl_build,'openssl-build')
+run(['make','install_sw'],openssl_build,'openssl-install')
+ssl=['-DOPENSSL_ROOT_DIR='+str(prefix),'-DOPENSSL_INCLUDE_DIR='+str(prefix/'include'),
+     '-DOPENSSL_SSL_LIBRARY='+str(prefix/'lib/libssl.a'),'-DOPENSSL_CRYPTO_LIBRARY='+str(prefix/'lib/libcrypto.a'),
+     '-DOPENSSL_USE_STATIC_LIBS=TRUE']
+
+def cmake(name,options):
+    directory=build/name
+    run(['cmake','-S',paths[name],'-B',directory,'-U_OPENSSL_*','-UHAVE_SSL_*',*cmake_common,*options],build,name+'-configure')
+    run(['cmake','--build',directory,'--parallel',str(args.jobs)],build,name+'-build')
+    run(['cmake','--install',directory],build,name+'-install')
+
+cmake('ngtcp2',ssl+['-DENABLE_LIB_ONLY=ON','-DENABLE_SHARED_LIB=OFF','-DENABLE_STATIC_LIB=ON',
+                  '-DENABLE_GNUTLS=OFF','-DENABLE_OPENSSL=ON'])
+cmake('json-c',['-DDISABLE_WERROR=ON','-DBUILD_APPS=OFF','-DENABLE_THREADING=OFF'])
+curl=['-DBUILD_CURL_EXE=OFF','-DBUILD_EXAMPLES=OFF','-DBUILD_LIBCURL_DOCS=OFF','-DBUILD_MISC_DOCS=OFF',
+      '-DHTTP_ONLY=ON','-DCURL_USE_LIBPSL=OFF','-DCURL_BROTLI=OFF','-DCURL_ZSTD=OFF','-DCURL_ZLIB=OFF',
+      '-DCURL_USE_LIBSSH2=OFF','-DCURL_USE_LIBSSH=OFF','-DUSE_NGHTTP2=OFF','-DUSE_NGTCP2=OFF',
+      '-DENABLE_THREADED_RESOLVER=OFF','-DENABLE_ARES=OFF','-DENABLE_WEBSOCKETS=ON']
+if args.target=='windows-x86_64':
+    curl+=['-DCURL_USE_SCHANNEL=ON','-DCURL_USE_OPENSSL=OFF']
+else:
+    curl+=ssl+['-DCURL_USE_OPENSSL=ON']
+    if args.target.startswith('macos-'): curl+=['-DCURL_USE_SECTRUST=ON']
+    if args.target.startswith('android-'): curl+=['-DCURL_CA_PATH=/system/etc/security/cacerts']
+cmake('curl',curl)
+stamp.write_text(json.dumps(manifest,indent=2)+'\n')
+print('Dependency prefix:',prefix,flush=True)

@@ -9,13 +9,13 @@ import ssl
 import subprocess
 import tempfile
 import threading
+from certificates import create_certificates
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--client', required=True)
-parser.add_argument('--cert-script', required=True)
+parser.add_argument('--cert-script', help='Deprecated: certificates are generated portably with OpenSSL')
 args = parser.parse_args()
 client = str(Path(args.client).resolve())
-script = str(Path(args.cert_script).resolve())
 results = {}
 with tempfile.TemporaryDirectory(prefix='openp2p-c-tls-') as runtime:
     runtime = Path(runtime)
@@ -23,8 +23,7 @@ with tempfile.TemporaryDirectory(prefix='openp2p-c-tls-') as runtime:
                                    ('untrusted_ca', '127.0.0.1', False),
                                    ('trusted_wrong_host', 'wrong.invalid', True)]:
         directory = runtime / case
-        subprocess.run(['bash', script, str(directory), hostname], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        create_certificates(directory, hostname)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(directory / 'server.crt', directory / 'server.key')
         listener = socket.socket()

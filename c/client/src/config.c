@@ -1,0 +1,51 @@
+#include "openp2p.h"
+#include "wire.h"
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int decimal_token(const char *s,uint64_t *value) {
+    if(!s || !*s) return OP2P_EINVAL;
+    for(const char *p=s;*p;++p) if(*p<'0' || *p>'9') return OP2P_EINVAL;
+    errno=0; char *end=NULL; unsigned long long v=strtoull(s,&end,10);
+    if(errno || *end || !v) return OP2P_EINVAL;
+    *value=(uint64_t)v; return OP2P_OK;
+}
+int op2p_client_create_json(const char *text,const char *token_text,const char *ca,
+    op2p_event_fn callback,void *user,op2p_client **out) {
+    if(!out) return OP2P_EINVAL;
+    *out=NULL;
+    if(!text) return OP2P_EINVAL;
+    json_object *root=op_json(text,strlen(text));
+    if(!root || !json_object_is_type(root,json_type_object)) { if(root) json_object_put(root); return OP2P_EINVAL; }
+    json_object *network=op_get(root,"network");
+    uint64_t token=op_integer(network,"Token"),port=op_integer(network,"ServerPort"),public_port=op_integer(network,"PublicIPPort");
+    int rv=OP2P_OK;
+    if(token_text) rv=decimal_token(token_text,&token);
+    else if(json_object_is_type(op_get(network,"Token"),json_type_string)) rv=decimal_token(op_string(network,"Token"),&token);
+    if(rv || port>65535 || public_port>65535) { json_object_put(root); return OP2P_EINVAL; }
+    const char *host=op_string(network,"ServerHost");
+    const char *ca_file=ca?ca:op_string(root,"CACertFile");
+    op2p_config cfg={.struct_size=sizeof(cfg),.abi_version=OP2P_ABI_VERSION,
+        .gateway_host=*host?host:"127.0.0.1",.gateway_port=(uint16_t)port,.node=op_string(network,"Node"),
+        .token=token,.ca_file=*ca_file?ca_file:NULL,.public_port=(uint16_t)public_port,.on_event=callback,.user=user};
+    rv=op2p_client_create(&cfg,out);
+    json_object *apps=op_get(root,"apps");
+    if(!rv && apps && !json_object_is_type(apps,json_type_array)) rv=OP2P_EINVAL;
+    for(size_t i=0;!rv && apps && i<json_object_array_length(apps);++i) {
+        json_object *a=json_object_array_get_idx(apps,i);
+        if(op_get(a,"Enabled") && !op_integer(a,"Enabled")) continue;
+        uint64_t local=op_integer(a,"SrcPort"),dst=op_integer(a,"DstPort");
+        const char *transport=op_string(a,"UnderlayProtocol"), *bind_ip=op_string(a,"BindIP");
+        if(!local || local>65535 || !dst || dst>65535 ||
+            (*transport && strcmp(transport,"tcp") && strcmp(transport,"quic"))) { rv=OP2P_EINVAL; break; }
+        op2p_forward f={.struct_size=sizeof(f),.name=op_string(a,"AppName"),.bind_ip=*bind_ip?bind_ip:NULL,
+            .local_port=(uint16_t)local,.peer_node=op_string(a,"PeerNode"),.destination_host=op_string(a,"DstHost"),
+            .destination_port=(uint16_t)dst,.protocol=op_string(a,"Protocol"),
+            .transport=(*transport?!strcmp(transport,"tcp"):(op_integer(a,"PunchPriority")&2)!=0)?OP2P_TRANSPORT_TCP:OP2P_TRANSPORT_QUIC};
+        rv=op2p_client_add_forward(*out,&f,NULL);
+    }
+    json_object_put(root);
+    if(rv && *out) { op2p_client_destroy(*out); *out=NULL; }
+    return rv;
+}

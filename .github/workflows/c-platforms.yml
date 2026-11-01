@@ -1,0 +1,70 @@
+name: C clients
+on:
+  push:
+    paths: ['c/client/**', '.github/workflows/c-platforms.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-arm64
+          - runner: macos-15-intel
+            target: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.20.14'
+          cache-dependency-path: go/client/go.sum
+      - uses: actions/cache@v4
+        with:
+          path: ~/openp2p-dev/cross
+          key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+      - name: Build pinned dependencies
+        run: python3 c/client/scripts/build-deps.py ${{ matrix.target }}
+      - name: Build CLI and C SDK
+        run: |
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake --build build/c --parallel 3
+          cmake --build build/c --target example-embed
+          cmake --install build/c
+      - name: ABI, lifecycle and TLS validation
+        run: |
+          export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
+          ctest --test-dir build/c --output-on-failure
+          dist/${{ matrix.target }}/bin/openp2p-c --version
+      - name: QUIC interoperability with Go
+        working-directory: go/client
+        run: |
+          go build -mod=readonly -o ../../build/c/quic-go ../../c/client/tests/quic-go/main.go
+          python3 ../../c/client/tests/quic_interop.py --build ../../build/c
+      - name: Gateway and application forwarding
+        run: |
+          (cd go/gateway && go build -mod=readonly -o ../../build/c/gateway .)
+          (cd go/client && go build -mod=readonly -o ../../build/c/go-client ./cmd)
+          python3 c/client/tests/desktop_integration.py --build build/c
+      - name: Package SDK
+        run: |
+          cp c/client/config.example.json c/client/README.md c/client/LICENSE c/client/THIRD_PARTY.md dist/${{ matrix.target }}/
+          tar -C dist -czf dist/openp2p-c-${{ matrix.target }}.tar.gz ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-${{ matrix.target }}
+          path: dist/openp2p-c-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            build/c/Testing/Temporary/LastTest.log
+            build/c/desktop-result.json

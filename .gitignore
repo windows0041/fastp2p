@@ -39,6 +39,11 @@ CMakeCache.txt
 *.tar.gz
 __debug_bin*
 __pycache__/
+.gradle/
+.cxx/
+local.properties
+*.apk
+*.aab
 .vscode/
 .idea/
 go.work

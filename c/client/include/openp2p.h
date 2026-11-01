@@ -7,7 +7,18 @@ extern "C" {
 #endif
 
 #define OP2P_ABI_VERSION 1u
-#define OP2P_VERSION "0.1.0"
+#define OP2P_VERSION "0.2.0"
+#if defined(_WIN32) && !defined(OP2P_STATIC)
+#if defined(OP2P_BUILDING_LIBRARY)
+#define OP2P_API __declspec(dllexport)
+#else
+#define OP2P_API __declspec(dllimport)
+#endif
+#elif defined(__GNUC__)
+#define OP2P_API __attribute__((visibility("default")))
+#else
+#define OP2P_API
+#endif
 typedef struct op2p_client op2p_client;
 typedef enum {
     OP2P_OK = 0,
@@ -63,19 +74,23 @@ typedef struct {
  * threads are created. Strings are copied by create/add_forward. Event callbacks
  * may request stop, but must not reenter step, destroy, or change forwards.
  * struct_size + abi_version permit extending the API without exposing internals. */
-int op2p_client_create(const op2p_config *config, op2p_client **out);
-int op2p_client_add_forward(op2p_client *client, const op2p_forward *forward, uint64_t *id);
-int op2p_client_start(op2p_client *client);
+OP2P_API int op2p_client_create(const op2p_config *config, op2p_client **out);
+/* Parse the same UTF-8 configuration as the CLI. Override strings may be NULL.
+ * Token is decimal text to preserve all 64 bits through mobile language bindings. */
+OP2P_API int op2p_client_create_json(const char *json_utf8, const char *token_override,
+    const char *ca_override, op2p_event_fn on_event, void *user, op2p_client **out);
+OP2P_API int op2p_client_add_forward(op2p_client *client, const op2p_forward *forward, uint64_t *id);
+OP2P_API int op2p_client_start(op2p_client *client);
 /* Service once, waiting at most min(max_wait_ms, 10) milliseconds for WSS events.
  * Call repeatedly while running. Network/peer errors are reported via events;
  * reconnect is automatic. A zero wait is nonblocking. */
-int op2p_client_step(op2p_client *client, unsigned max_wait_ms);
-int op2p_client_stop(op2p_client *client);
-void op2p_client_destroy(op2p_client *client);
-op2p_state op2p_client_state(const op2p_client *client);
-const char *op2p_client_last_error(const op2p_client *client);
-uint32_t op2p_abi_version(void);
-const char *op2p_version(void);
+OP2P_API int op2p_client_step(op2p_client *client, unsigned max_wait_ms);
+OP2P_API int op2p_client_stop(op2p_client *client);
+OP2P_API void op2p_client_destroy(op2p_client *client);
+OP2P_API op2p_state op2p_client_state(const op2p_client *client);
+OP2P_API const char *op2p_client_last_error(const op2p_client *client);
+OP2P_API uint32_t op2p_abi_version(void);
+OP2P_API const char *op2p_version(void);
 #ifdef __cplusplus
 }
 #endif

@@ -2,6 +2,7 @@
 """Exercise both C/Go roles with the actual OpenP2P ALPN and stream frame."""
 import argparse
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -10,6 +11,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--build', required=True)
 args = parser.parse_args()
 build = Path(args.build).resolve()
+suffix = '.exe' if os.name == 'nt' else ''
 
 def port():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -21,9 +23,9 @@ for c_server in (False, True):
     cp, gp = port(), port()
     while gp == cp:
         gp = port()
-    c = [str(build / 'quic-interop'), 'server' if c_server else 'client',
+    c = [str(build / ('quic-interop'+suffix)), 'server' if c_server else 'client',
          '127.0.0.1', str(gp), str(cp)]
-    go = [str(build / 'quic-go'), 'client' if c_server else 'server',
+    go = [str(build / ('quic-go'+suffix)), 'client' if c_server else 'server',
           f'127.0.0.1:{gp}', f'127.0.0.1:{cp}']
     first, second = (c, go) if c_server else (go, c)
     process = subprocess.Popen(first, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

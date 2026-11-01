@@ -1,10 +1,12 @@
 #include "openp2p.h"
-#include <arpa/inet.h>
 #include <assert.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dirent.h>
+#endif
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 static int callback_count;
 static void stop_from_callback(op2p_client *c, const op2p_event *e, void *user) {
@@ -16,7 +18,16 @@ static void stop_from_callback(op2p_client *c, const op2p_event *e, void *user) 
     }
 }
 static int fd_count(void) {
+#ifdef _WIN32
+    DWORD n;
+    assert(GetProcessHandleCount(GetCurrentProcess(), &n));
+    return (int)n;
+#else
+#ifdef __APPLE__
+    DIR *d = opendir("/dev/fd");
+#else
     DIR *d = opendir("/proc/self/fd");
+#endif
     assert(d);
     int n = 0;
     struct dirent *entry;
@@ -25,6 +36,7 @@ static int fd_count(void) {
             ++n;
     closedir(d);
     return n;
+#endif
 }
 int main(void) {
     assert(op2p_abi_version() == 1 && !strcmp(op2p_version(), OP2P_VERSION));
@@ -73,23 +85,13 @@ int main(void) {
     int after = fd_count();
     fprintf(stderr, "callback_count=%d fds_before=%d fds_after=%d\n", callback_count, before,
             after);
-    if (after != before) {
-        for (int fd = 3; fd < 80; ++fd) {
-            char path[64], target[256];
-            snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-            ssize_t count = readlink(path, target, sizeof(target) - 1);
-            if (count > 0) {
-                target[count] = 0;
-                fprintf(stderr, "fd=%d target=%s\n", fd, target);
-            }
-            struct sockaddr_storage a;
-            socklen_t n = sizeof(a);
-            if (!getsockname(fd, (struct sockaddr *)&a, &n))
-                fprintf(stderr, "fd=%d family=%d port=%u\n", fd, a.ss_family,
-                        a.ss_family == AF_INET ? ntohs(((struct sockaddr_in *)&a)->sin_port) : 0);
-        }
-    }
     assert(callback_count == 40 && after == before);
+    const char *json = "{\"network\":{\"Node\":\"json-api-test\",\"Token\":18446744073709551615}}";
+    assert(op2p_client_create_json(json, NULL, NULL, NULL, NULL, &c) == OP2P_OK);
+    op2p_client_destroy(c);
+    assert(op2p_client_create_json(json, "18446744073709551616", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
+    assert(op2p_client_create_json("{}", "1", NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
+    assert(op2p_client_create_json("{", NULL, NULL, NULL, NULL, &c) == OP2P_EINVAL && !c);
     puts("ABI validation, callback stop and repeated lifecycle FD checks passed");
     return 0;
 }

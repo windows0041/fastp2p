@@ -1,18 +1,26 @@
+#include "platform.h"
 /* ngtcp2 / GnuTLS integration follows ngtcp2's MIT-licensed public examples.
  * See THIRD_PARTY.md for their copyright and license. */
 #include "quic.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#ifdef OP2P_QUIC_OPENSSL
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#include <openssl/ssl.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#else
 #include <gnutls/crypto.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#endif
 
 #define QLIMIT (4u * 1024u * 1024u)
 struct qchunk {
@@ -24,12 +32,19 @@ struct qchunk {
 struct opq {
     ngtcp2_crypto_conn_ref ref;
     ngtcp2_conn *conn;
+#ifdef OP2P_QUIC_OPENSSL
+    SSL_CTX *tls_context;
+    SSL *tls;
+    ngtcp2_crypto_ossl_ctx *native_tls;
+#else
     gnutls_session_t tls;
     gnutls_certificate_credentials_t cred;
-    int fd, server, failed, ready;
+#endif
+    op_socket fd;
+    int server, failed, ready;
     int64_t stream;
     struct sockaddr_storage local, peer;
-    socklen_t local_len, peer_len;
+    op_socklen local_len, peer_len;
     struct qchunk *head, *tail;
     uint64_t next_offset;
     size_t pending, rxlen, rxcap;
@@ -38,11 +53,7 @@ struct opq {
     size_t blocked_len;
     char error[160];
 };
-static uint64_t now_ns(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
-}
+static uint64_t now_ns(void) { return op_monotonic_ns(); }
 static int fail(opq *q, const char *message, int code) {
     snprintf(q->error, sizeof(q->error), "%s: %s", message,
              code ? ngtcp2_strerror(code) : strerror(errno));
@@ -52,18 +63,24 @@ static int fail(opq *q, const char *message, int code) {
 static ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *ref) {
     return ((opq *)ref->user_data)->conn;
 }
+static int qrandom(uint8_t *data,size_t len) {
+#ifdef OP2P_QUIC_OPENSSL
+    return len>INT_MAX || RAND_bytes(data,(int)len)!=1 ? -1:0;
+#else
+    return gnutls_rnd(GNUTLS_RND_RANDOM,data,len);
+#endif
+}
 static void random_bytes(uint8_t *dst, size_t len, const ngtcp2_rand_ctx *ctx) {
     (void)ctx;
     /* GnuTLS uses the OS CSPRNG; an unavailable RNG is fatal, never predictable. */
-    if (gnutls_rnd(GNUTLS_RND_RANDOM, dst, len))
+    if (qrandom(dst, len))
         abort();
 }
 static int new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token, size_t len, void *user) {
     (void)conn;
     (void)user;
     cid->datalen = len;
-    if (gnutls_rnd(GNUTLS_RND_RANDOM, cid->data, len) ||
-        gnutls_rnd(GNUTLS_RND_RANDOM, token, NGTCP2_STATELESS_RESET_TOKENLEN))
+    if (qrandom(cid->data, len) || qrandom(token, NGTCP2_STATELESS_RESET_TOKENLEN))
         return NGTCP2_ERR_CALLBACK_FAILURE;
     return 0;
 }
@@ -113,6 +130,38 @@ static int acknowledged(ngtcp2_conn *conn, int64_t sid, uint64_t offset, uint64_
         q->tail = NULL;
     return 0;
 }
+#ifdef OP2P_QUIC_OPENSSL
+static int make_certificate(opq *q) {
+    EVP_PKEY_CTX *generator=EVP_PKEY_CTX_new_id(EVP_PKEY_RSA,NULL);
+    EVP_PKEY *key=NULL; X509 *certificate=X509_new(); BIGNUM *serial=NULL;
+    uint8_t bytes[16]; int result=-1;
+    if(!generator || !certificate || qrandom(bytes,sizeof(bytes))) goto done;
+    serial=BN_bin2bn(bytes,sizeof(bytes),NULL);
+    if(!serial || EVP_PKEY_keygen_init(generator)<=0 ||
+       EVP_PKEY_CTX_set_rsa_keygen_bits(generator,2048)<=0 || EVP_PKEY_keygen(generator,&key)<=0 ||
+       !X509_set_version(certificate,2) || !BN_to_ASN1_INTEGER(serial,X509_get_serialNumber(certificate)) ||
+       !X509_gmtime_adj(X509_getm_notBefore(certificate),-60) ||
+       !X509_gmtime_adj(X509_getm_notAfter(certificate),86400) ||
+       !X509_set_pubkey(certificate,key)) goto done;
+    X509_NAME *name=X509_get_subject_name(certificate);
+    if(!X509_NAME_add_entry_by_txt(name,"CN",MBSTRING_ASC,(const unsigned char *)"openp2p",-1,-1,0) ||
+       !X509_set_issuer_name(certificate,name) || !X509_sign(certificate,key,EVP_sha256()) ||
+       SSL_CTX_use_certificate(q->tls_context,certificate)!=1 || SSL_CTX_use_PrivateKey(q->tls_context,key)!=1) goto done;
+    result=0;
+done:
+    BN_free(serial); X509_free(certificate); EVP_PKEY_free(key); EVP_PKEY_CTX_free(generator);
+    return result;
+}
+static int select_alpn(SSL *ssl,const unsigned char **out,unsigned char *outlen,
+                        const unsigned char *in,unsigned int inlen,void *argument) {
+    (void)ssl; (void)argument;
+    static const unsigned char protocol[]="\x09openp2pv1";
+    unsigned char *selected=NULL;
+    if(SSL_select_next_proto(&selected,outlen,protocol,sizeof(protocol)-1,in,inlen)!=OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    *out=selected; return SSL_TLSEXT_ERR_OK;
+}
+#else
 static int make_certificate(opq *q) {
     gnutls_x509_privkey_t key = NULL;
     gnutls_x509_crt_t crt = NULL;
@@ -139,6 +188,7 @@ end:
         gnutls_x509_privkey_deinit(key);
     return rv;
 }
+#endif
 static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     ngtcp2_callbacks cb = {
         .client_initial = ngtcp2_crypto_client_initial_cb,
@@ -175,7 +225,7 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     params.initial_max_data = QLIMIT;
     params.max_idle_timeout = 60 * NGTCP2_SECONDS;
     scid.datalen = 16;
-    if (gnutls_rnd(GNUTLS_RND_RANDOM, scid.data, scid.datalen))
+    if (qrandom(scid.data, scid.datalen))
         return -1;
     int rv;
     if (q->server) {
@@ -186,18 +236,22 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
                                     &params, NULL, q);
     } else {
         dcid.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
-        if (gnutls_rnd(GNUTLS_RND_RANDOM, dcid.data, dcid.datalen))
+        if (qrandom(dcid.data, dcid.datalen))
             return -1;
         rv = ngtcp2_conn_client_new(&q->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &cb,
                                     &settings, &params, NULL, q);
     }
     if (rv)
         return fail(q, "QUIC connection", rv);
+#ifdef OP2P_QUIC_OPENSSL
+    ngtcp2_conn_set_tls_native_handle(q->conn, q->native_tls);
+#else
     ngtcp2_conn_set_tls_native_handle(q->conn, q->tls);
+#endif
     return 0;
 }
-opq *opq_new(int fd, const struct sockaddr *peer, socklen_t peer_len, int server) {
-    if (peer_len > sizeof(struct sockaddr_storage))
+opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server) {
+    if ((size_t)peer_len > sizeof(struct sockaddr_storage))
         return NULL;
     opq *q = calloc(1, sizeof(*q));
     if (!q)
@@ -210,9 +264,29 @@ opq *opq_new(int fd, const struct sockaddr *peer, socklen_t peer_len, int server
     q->local_len = sizeof(q->local);
     q->ref.get_conn = get_conn;
     q->ref.user_data = q;
-    if (getsockname(fd, (struct sockaddr *)&q->local, &q->local_len) ||
-        gnutls_certificate_allocate_credentials(&q->cred))
+    if (op_getsockname(fd, (struct sockaddr *)&q->local, &q->local_len))
         goto error;
+#ifdef OP2P_QUIC_OPENSSL
+    q->tls_context=SSL_CTX_new(server?TLS_server_method():TLS_client_method());
+    if(!q->tls_context || !SSL_CTX_set_min_proto_version(q->tls_context,TLS1_3_VERSION)) goto error;
+    /* Existing Go peers use temporary self-signed 1024-bit certificates.
+     * This compatibility policy is confined to P2P; WSS verifies CA and SAN. */
+    SSL_CTX_set_verify(q->tls_context,SSL_VERIFY_NONE,NULL);
+    if(!server) SSL_CTX_set_security_level(q->tls_context,1);
+    if(server) { if(make_certificate(q)) goto error; SSL_CTX_set_alpn_select_cb(q->tls_context,select_alpn,NULL); }
+    q->tls=SSL_new(q->tls_context);
+    if(!q->tls || ngtcp2_crypto_ossl_ctx_new(&q->native_tls,q->tls)) goto error;
+    SSL_set_app_data(q->tls,&q->ref);
+    if(server) {
+        SSL_set_accept_state(q->tls);
+        if(ngtcp2_crypto_ossl_configure_server_session(q->tls)) goto error;
+    } else {
+        SSL_set_connect_state(q->tls);
+        static const unsigned char alpn[]="\x09openp2pv1";
+        if(SSL_set_alpn_protos(q->tls,alpn,sizeof(alpn)-1) || ngtcp2_crypto_ossl_configure_client_session(q->tls)) goto error;
+    }
+#else
+    if(gnutls_certificate_allocate_credentials(&q->cred)) goto error;
     if (server && make_certificate(q))
         goto error;
     if (gnutls_init(&q->tls,
@@ -230,6 +304,7 @@ opq *opq_new(int fd, const struct sockaddr *peer, socklen_t peer_len, int server
     gnutls_datum_t alpn = {(unsigned char *)"openp2pv1", 9};
     if (gnutls_alpn_set_protocols(q->tls, &alpn, 1, GNUTLS_ALPN_MANDATORY))
         goto error;
+#endif
     if (!server && init_conn(q, NULL))
         goto error;
     return q;
@@ -238,13 +313,13 @@ error:
     return NULL;
 }
 static int send_packet(opq *q, const uint8_t *data, size_t len) {
-    ssize_t n;
+    op_ssize n;
     do {
-        n = sendto(q->fd, data, len, MSG_DONTWAIT, (struct sockaddr *)&q->peer, q->peer_len);
+        n = op_sendto(q->fd, data, len, MSG_DONTWAIT, (struct sockaddr *)&q->peer, q->peer_len);
     } while (n < 0 && errno == EINTR);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         return 1;
-    if (n != (ssize_t)len)
+    if (n != (op_ssize)len)
         return fail(q, "QUIC send", 0);
     return 0;
 }
@@ -254,9 +329,9 @@ int opq_step(opq *q) {
     uint8_t packet[65536];
     for (int i = 0; i < 64; ++i) {
         struct sockaddr_storage peer;
-        socklen_t plen = sizeof(peer);
-        ssize_t n =
-            recvfrom(q->fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&peer, &plen);
+        op_socklen plen = sizeof(peer);
+        op_ssize n =
+            op_recvfrom(q->fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&peer, &plen);
         if (n < 0) {
             if (errno == EINTR) {
                 --i;
@@ -383,10 +458,14 @@ void opq_free(opq *q) {
         return;
     if (q->conn)
         ngtcp2_conn_del(q->conn);
-    if (q->tls)
-        gnutls_deinit(q->tls);
-    if (q->cred)
-        gnutls_certificate_free_credentials(q->cred);
+#ifdef OP2P_QUIC_OPENSSL
+    if(q->tls) { SSL_set_app_data(q->tls,NULL); SSL_free(q->tls); }
+    if(q->native_tls) ngtcp2_crypto_ossl_ctx_del(q->native_tls);
+    if(q->tls_context) SSL_CTX_free(q->tls_context);
+#else
+    if (q->tls) gnutls_deinit(q->tls);
+    if (q->cred) gnutls_certificate_free_credentials(q->cred);
+#endif
     while (q->head) {
         struct qchunk *p = q->head;
         q->head = p->next;
