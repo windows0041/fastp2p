@@ -5,6 +5,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: c-gateway-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   gateway:
     strategy:
@@ -22,9 +25,6 @@ jobs:
           apt-get update -qq
           apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev zstd
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
       - uses: actions/setup-go@v6
         with:
           go-version: '1.20.14'
