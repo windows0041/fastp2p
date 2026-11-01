@@ -1,5 +1,5 @@
 #include "platform.h"
-/* ngtcp2 / GnuTLS integration follows ngtcp2's MIT-licensed public examples.
+/* ngtcp2 integration follows ngtcp2's MIT-licensed public examples.
  * See THIRD_PARTY.md for their copyright and license. */
 #include "quic.h"
 #include <errno.h>
@@ -10,17 +10,10 @@
 #include <time.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#ifdef FASTP2P_QUIC_OPENSSL
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
-#include <openssl/rsa.h>
-#else
-#include <gnutls/crypto.h>
-#include <gnutls/gnutls.h>
-#include <gnutls/x509.h>
-#include <ngtcp2/ngtcp2_crypto_gnutls.h>
-#endif
+#include <openssl/x509.h>
 
 #define QLIMIT (4u * 1024u * 1024u)
 struct qchunk {
@@ -32,14 +25,9 @@ struct qchunk {
 struct opq {
     ngtcp2_crypto_conn_ref ref;
     ngtcp2_conn *conn;
-#ifdef FASTP2P_QUIC_OPENSSL
     SSL_CTX *tls_context;
     SSL *tls;
     ngtcp2_crypto_ossl_ctx *native_tls;
-#else
-    gnutls_session_t tls;
-    gnutls_certificate_credentials_t cred;
-#endif
     op_socket fd;
     int server, failed, ready;
     int64_t stream;
@@ -66,11 +54,7 @@ static ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *ref) {
     return ((opq *)ref->user_data)->conn;
 }
 static int qrandom(uint8_t *data, size_t len) {
-#ifdef FASTP2P_QUIC_OPENSSL
     return len > INT_MAX || RAND_bytes(data, (int)len) != 1 ? -1 : 0;
-#else
-    return gnutls_rnd(GNUTLS_RND_RANDOM, data, len);
-#endif
 }
 static void random_bytes(uint8_t *dst, size_t len, const ngtcp2_rand_ctx *ctx) {
     (void)ctx;
@@ -110,10 +94,10 @@ static int receive_stream(ngtcp2_conn *conn, uint32_t flags, int64_t sid, uint64
     if (len)
         memcpy(q->rx + q->rxlen, data, len);
     q->rxlen += len;
-    ngtcp2_conn_extend_max_stream_offset(conn, sid, len);
-    ngtcp2_conn_extend_max_offset(conn, len);
-    /* FIN means the only transport stream is closed. Drain already received
-     * bytes first; idle/peer closure is handled by the enclosing tunnel. */
+    /* Flow-control credit is returned from opq_read once the tunnel has taken
+     * the bytes, so a slow consumer backpressures the peer instead of tripping
+     * the buffer limit and tearing the tunnel down. */
+    (void)conn;
     return 0;
 }
 static int acknowledged(ngtcp2_conn *conn, int64_t sid, uint64_t offset, uint64_t len, void *user,
@@ -132,39 +116,69 @@ static int acknowledged(ngtcp2_conn *conn, int64_t sid, uint64_t offset, uint64_
         q->tail = NULL;
     return 0;
 }
-#ifdef FASTP2P_QUIC_OPENSSL
-static int make_certificate(opq *q) {
-    EVP_PKEY_CTX *generator = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-    EVP_PKEY *key = NULL;
-    X509 *certificate = X509_new();
+/* One self-signed identity per process.  The key is EC P-256 so generating it
+ * costs microseconds rather than the ~100 ms an RSA-2048 keygen takes, and it
+ * satisfies the default OpenSSL security level.  The certificate is only a
+ * transport credential: a self-signed certificate cannot be validated by a CA,
+ * so peers confirm the exact certificate they saw through the sealed tunnel
+ * (TUN_CERT_BIND) instead of trusting the TLS layer for identity. */
+typedef struct {
+    int ready, failed;
+    uint8_t digest[32];
+    EVP_PKEY *key;
+    X509 *cert;
+} fp_identity;
+static fp_identity identity;
+static op_once identity_once = OP_ONCE_INIT;
+static void identity_init(void) {
+    EVP_PKEY_CTX *generator = NULL;
     BIGNUM *serial = NULL;
     uint8_t bytes[16];
-    int result = -1;
-    if (!generator || !certificate || qrandom(bytes, sizeof(bytes)))
+    unsigned length = 0;
+    if (qrandom(bytes, sizeof(bytes)))
+        goto done;
+    generator = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    identity.cert = X509_new();
+    if (!generator || !identity.cert || EVP_PKEY_keygen_init(generator) <= 0 ||
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(generator, NID_X9_62_prime256v1) <= 0 ||
+        EVP_PKEY_keygen(generator, &identity.key) <= 0 || !X509_set_version(identity.cert, 2))
         goto done;
     serial = BN_bin2bn(bytes, sizeof(bytes), NULL);
-    if (!serial || EVP_PKEY_keygen_init(generator) <= 0 ||
-        EVP_PKEY_CTX_set_rsa_keygen_bits(generator, 2048) <= 0 ||
-        EVP_PKEY_keygen(generator, &key) <= 0 || !X509_set_version(certificate, 2) ||
-        !BN_to_ASN1_INTEGER(serial, X509_get_serialNumber(certificate)) ||
-        !X509_gmtime_adj(X509_getm_notBefore(certificate), -60) ||
-        !X509_gmtime_adj(X509_getm_notAfter(certificate), 86400) ||
-        !X509_set_pubkey(certificate, key))
+    if (!serial || !BN_to_ASN1_INTEGER(serial, X509_get_serialNumber(identity.cert)) ||
+        !X509_gmtime_adj(X509_getm_notBefore(identity.cert), -60) ||
+        !X509_gmtime_adj(X509_getm_notAfter(identity.cert), 7 * 86400) ||
+        !X509_set_pubkey(identity.cert, identity.key))
         goto done;
-    X509_NAME *name = X509_get_subject_name(certificate);
+    X509_NAME *name = X509_get_subject_name(identity.cert);
     if (!X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"fastp2p", -1,
                                     -1, 0) ||
-        !X509_set_issuer_name(certificate, name) || !X509_sign(certificate, key, EVP_sha256()) ||
-        SSL_CTX_use_certificate(q->tls_context, certificate) != 1 ||
-        SSL_CTX_use_PrivateKey(q->tls_context, key) != 1)
+        !X509_set_issuer_name(identity.cert, name) ||
+        !X509_sign(identity.cert, identity.key, EVP_sha256()) ||
+        !X509_digest(identity.cert, EVP_sha256(), identity.digest, &length) || length != 32)
         goto done;
-    result = 0;
+    identity.ready = 1;
 done:
     BN_free(serial);
-    X509_free(certificate);
-    EVP_PKEY_free(key);
     EVP_PKEY_CTX_free(generator);
-    return result;
+    if (!identity.ready) {
+        X509_free(identity.cert);
+        EVP_PKEY_free(identity.key);
+        identity.cert = NULL;
+        identity.key = NULL;
+        identity.failed = 1;
+    }
+}
+static fp_identity *get_identity(void) {
+    op_once_run(&identity_once, identity_init);
+    return identity.ready ? &identity : NULL;
+}
+/* Any certificate is accepted here: identity is confirmed end to end after the
+ * handshake, and a CA chain says nothing about a peer that generated its key at
+ * start-up.  TLS still proves the peer holds the key it presented. */
+static int accept_any_certificate(int preverify_ok, X509_STORE_CTX *ctx) {
+    (void)preverify_ok;
+    (void)ctx;
+    return 1;
 }
 static int select_alpn(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                        const unsigned char *in, unsigned int inlen, void *argument) {
@@ -178,34 +192,6 @@ static int select_alpn(SSL *ssl, const unsigned char **out, unsigned char *outle
     *out = selected;
     return SSL_TLSEXT_ERR_OK;
 }
-#else
-static int make_certificate(opq *q) {
-    gnutls_x509_privkey_t key = NULL;
-    gnutls_x509_crt_t crt = NULL;
-    uint8_t serial[16];
-    int rv = -1;
-    if (gnutls_x509_privkey_init(&key) || gnutls_x509_crt_init(&crt))
-        goto end;
-    if (gnutls_x509_privkey_generate(key, GNUTLS_PK_RSA, 2048, 0) ||
-        gnutls_rnd(GNUTLS_RND_RANDOM, serial, sizeof(serial)) ||
-        gnutls_x509_crt_set_version(crt, 3) ||
-        gnutls_x509_crt_set_serial(crt, serial, sizeof(serial)) ||
-        gnutls_x509_crt_set_activation_time(crt, time(NULL) - 60) ||
-        gnutls_x509_crt_set_expiration_time(crt, time(NULL) + 86400) ||
-        gnutls_x509_crt_set_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, "fastp2p", 7) ||
-        gnutls_x509_crt_set_key(crt, key) ||
-        gnutls_x509_crt_sign2(crt, crt, key, GNUTLS_DIG_SHA256, 0) ||
-        gnutls_certificate_set_x509_key(q->cred, &crt, 1, key))
-        goto end;
-    rv = 0;
-end:
-    if (crt)
-        gnutls_x509_crt_deinit(crt);
-    if (key)
-        gnutls_x509_privkey_deinit(key);
-    return rv;
-}
-#endif
 static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     ngtcp2_callbacks cb = {
         .client_initial = ngtcp2_crypto_client_initial_cb,
@@ -260,11 +246,7 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     }
     if (rv)
         return fail(q, "QUIC connection", rv);
-#ifdef FASTP2P_QUIC_OPENSSL
     ngtcp2_conn_set_tls_native_handle(q->conn, q->native_tls);
-#else
-    ngtcp2_conn_set_tls_native_handle(q->conn, q->tls);
-#endif
     return 0;
 }
 opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server) {
@@ -283,20 +265,21 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
     q->ref.user_data = q;
     if (op_getsockname(fd, (struct sockaddr *)&q->local, &q->local_len))
         goto error;
-#ifdef FASTP2P_QUIC_OPENSSL
+    fp_identity *id = get_identity();
+    if (!id)
+        goto error;
     q->tls_context = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (!q->tls_context || !SSL_CTX_set_min_proto_version(q->tls_context, TLS1_3_VERSION))
         goto error;
-    /* Existing Go peers use temporary self-signed 1024-bit certificates.
-     * This compatibility policy is confined to P2P; WSS verifies CA and SAN. */
-    SSL_CTX_set_verify(q->tls_context, SSL_VERIFY_NONE, NULL);
-    if (!server)
-        SSL_CTX_set_security_level(q->tls_context, 1);
-    if (server) {
-        if (make_certificate(q))
-            goto error;
+    /* Both sides present the process identity and accept any certificate here;
+     * the peer's exact certificate is confirmed after the handshake through the
+     * sealed tunnel, which is authenticated by the gateway-delivered secret. */
+    SSL_CTX_set_verify(q->tls_context, SSL_VERIFY_PEER, accept_any_certificate);
+    if (SSL_CTX_use_certificate(q->tls_context, id->cert) != 1 ||
+        SSL_CTX_use_PrivateKey(q->tls_context, id->key) != 1)
+        goto error;
+    if (server)
         SSL_CTX_set_alpn_select_cb(q->tls_context, select_alpn, NULL);
-    }
     q->tls = SSL_new(q->tls_context);
     if (!q->tls || ngtcp2_crypto_ossl_ctx_new(&q->native_tls, q->tls))
         goto error;
@@ -312,27 +295,6 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
             ngtcp2_crypto_ossl_configure_client_session(q->tls))
             goto error;
     }
-#else
-    if (gnutls_certificate_allocate_credentials(&q->cred))
-        goto error;
-    if (server && make_certificate(q))
-        goto error;
-    if (gnutls_init(&q->tls,
-                    (server ? GNUTLS_SERVER : GNUTLS_CLIENT) | GNUTLS_NO_END_OF_EARLY_DATA))
-        goto error;
-    if ((server ? ngtcp2_crypto_gnutls_configure_server_session(q->tls)
-                : ngtcp2_crypto_gnutls_configure_client_session(q->tls)))
-        goto error;
-    if (gnutls_priority_set_direct(
-            q->tls, "NORMAL:-VERS-ALL:+VERS-TLS1.3:%DISABLE_TLS13_COMPAT_MODE", NULL))
-        goto error;
-    gnutls_session_set_ptr(q->tls, &q->ref);
-    if (gnutls_credentials_set(q->tls, GNUTLS_CRD_CERTIFICATE, q->cred))
-        goto error;
-    gnutls_datum_t alpn = {(unsigned char *)"fastp2pv2", 9};
-    if (gnutls_alpn_set_protocols(q->tls, &alpn, 1, GNUTLS_ALPN_MANDATORY))
-        goto error;
-#endif
     if (!server && init_conn(q, NULL))
         goto error;
     return q;
@@ -471,6 +433,10 @@ size_t opq_read(opq *q, void *data, size_t cap) {
         memcpy(data, q->rx, n);
         memmove(q->rx, q->rx + n, q->rxlen - n);
         q->rxlen -= n;
+        if (q->conn && q->stream >= 0) {
+            ngtcp2_conn_extend_max_stream_offset(q->conn, q->stream, n);
+            ngtcp2_conn_extend_max_offset(q->conn, n);
+        }
     }
     return n;
 }
@@ -480,6 +446,24 @@ size_t opq_pending(const opq *q) {
 int opq_ready(const opq *q) {
     return q && q->ready;
 }
+int opq_peer_digest(opq *q, uint8_t out[32]) {
+    if (!q || !q->tls || q->failed)
+        return -1;
+    X509 *certificate = SSL_get1_peer_certificate(q->tls);
+    if (!certificate)
+        return -1;
+    unsigned length = 0;
+    int rv = X509_digest(certificate, EVP_sha256(), out, &length) && length == 32 ? 0 : -1;
+    X509_free(certificate);
+    return rv;
+}
+int opq_identity_digest(uint8_t out[32]) {
+    fp_identity *id = get_identity();
+    if (!id)
+        return -1;
+    memcpy(out, id->digest, 32);
+    return 0;
+}
 const char *opq_error(const opq *q) {
     return q ? q->error : "QUIC initialization failed";
 }
@@ -488,7 +472,6 @@ void opq_free(opq *q) {
         return;
     if (q->conn)
         ngtcp2_conn_del(q->conn);
-#ifdef FASTP2P_QUIC_OPENSSL
     if (q->tls) {
         SSL_set_app_data(q->tls, NULL);
         SSL_free(q->tls);
@@ -497,12 +480,6 @@ void opq_free(opq *q) {
         ngtcp2_crypto_ossl_ctx_del(q->native_tls);
     if (q->tls_context)
         SSL_CTX_free(q->tls_context);
-#else
-    if (q->tls)
-        gnutls_deinit(q->tls);
-    if (q->cred)
-        gnutls_certificate_free_credentials(q->cred);
-#endif
     while (q->head) {
         struct qchunk *p = q->head;
         q->head = p->next;

@@ -37,7 +37,8 @@ enum {
     TUN_CLOSE = 8,
     TUN_DATA = 9,
     TUN_RELAY_JOIN = 10,
-    TUN_RELAY_READY = 11
+    TUN_RELAY_READY = 11,
+    TUN_CERT_BIND = 12
 };
 /* Control-plane push sub-codes between two clients. */
 enum {
@@ -85,6 +86,7 @@ typedef struct {
     int relay_link;
     int relay_ready;
     char relay_peer[32];
+    int cert_sent, cert_checked;
 } tunnel;
 typedef struct {
     int used, local, udp, transport, tunnel_index, synced, socks;
@@ -122,7 +124,7 @@ typedef struct {
 /* A session secret received from the initiating peer before its tunnel is
  * usable.  Pending entries expire so a failed punch cannot leak state. */
 typedef struct {
-    int used;
+    int used, transport;
     uint64_t session, peer_id, deadline;
     uint8_t secret[FP_SESSION_SECRET];
     char relay[32];
@@ -702,7 +704,7 @@ static void bind_pending_key(fastp2p_client *c, int index) {
         return;
     for (int i = 0; i < NPK; ++i) {
         pending_key *k = &c->keys[i];
-        if (!k->used || k->peer_id != t->peer_id || k->relay[0])
+        if (!k->used || k->peer_id != t->peer_id || k->transport != t->transport || k->relay[0])
             continue;
         t->session = k->session;
         memcpy(t->secret, k->secret, sizeof(t->secret));
@@ -805,6 +807,7 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
     k->used = 1;
     k->session = session;
     k->peer_id = peer_id;
+    k->transport = transport;
     k->deadline = mono() + 30 * NS;
     memcpy(k->secret, secret, FP_SESSION_SECRET);
     if (relay && *relay) {
@@ -827,6 +830,7 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
     }
     for (int i = 0; i < NT; ++i)
         if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].peer_id == peer_id &&
+            c->tunnels[i].transport == transport &&
             !c->tunnels[i].keyed) {
             bind_pending_key(c, i);
             return;
@@ -1521,6 +1525,18 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
             push_session_ack(c, t->relay_peer, t->session);
         return;
     }
+    if (sub == TUN_CERT_BIND) {
+        uint8_t digest[32], own[32];
+        size_t n = 0;
+        if (topen(c, ti, sub, data, len, digest, sizeof(digest), &n) || n != 32)
+            return;
+        if (opq_identity_digest(own) || !fp_equal(own, digest, sizeof(digest))) {
+            close_tunnel(c, ti, "peer saw a different QUIC certificate");
+            return;
+        }
+        t->cert_checked = 1;
+        return;
+    }
     if (sub == TUN_KEEPALIVE) {
         uint8_t id[8];
         op_put64(id, c->node_id);
@@ -1859,6 +1875,16 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (opq_step(t->quic)) {
             close_tunnel(c, ti, opq_error(t->quic));
             return;
+        }
+        /* Confirm the exact certificate the QUIC peer presented.  A direct
+         * tunnel is the only case where both endpoints hold the session keys;
+         * on a relay hop the QUIC peer is the relay, which forwards frames
+         * without being able to open them. */
+        if (!t->cert_sent && t->keyed && (t->key_acked || !t->session_owner) &&
+            t->relay_link < 0 && !t->relay_wait) {
+            uint8_t digest[32];
+            if (!opq_peer_digest(t->quic, digest) && !tseal(c, t, TUN_CERT_BIND, digest, 32))
+                t->cert_sent = 1;
         }
         if (op_buffer_size(&t->tx) && opq_pending(t->quic) < OP_QUEUE_LIMIT / 2) {
             size_t n = op_buffer_size(&t->tx);
