@@ -27,7 +27,7 @@ bash scripts/tls/generate-cert.sh /private/tls gateway.example.com 127.0.0.1
 build/c-gateway/fastp2p-gateway --bind 0.0.0.0 --apibind 127.0.0.1
 ```
 
-默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。中继候选排除两个端点本身、对称 NAT 节点和协议主版本不同的节点，并按最久未使用优先分配。
+默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。中继候选排除两个端点本身、对称 NAT 节点和协议主版本不同的节点，并按最久未使用优先分配；客户端最多同时中继 4 条会话，超限即拒绝加入，端点随即改用其他候选。
 
 SQLite 使用回滚日志和同步写入，文件权限 0600；通过 SQLite 在线备份接口备份。旧 C 数据库可以保留记录升级 application_id；回退旧程序前应恢复升级前数据库快照。
 
