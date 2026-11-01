@@ -469,7 +469,7 @@ static void handle_http(struct connection *c) {
             return;
         }
         int valid = gw_secret_equal(gw_string(j, "user"), g.user) &&
-                    gw_secret_equal(gw_string(j, "password"), g.password);
+                    gw_admin_verify(&g.admin, gw_string(j, "password"));
         if (j)
             json_object_put(j);
         if (!valid) {
@@ -499,8 +499,59 @@ static void handle_http(struct connection *c) {
         free(jwt);
         return;
     }
-    if (!c->authorized) {
+    if (!c->authorized || c->auth_generation != g.auth_generation) {
         http_error(c, 401, 1, "unauthorized");
+        return;
+    }
+    if (c->post && !strcmp(c->uri, "/api/v1/user/account")) {
+        json_object *j = gw_json(c->request, c->request_length);
+        if (!j || !json_object_is_type(j, json_type_object)) {
+            if (j) json_object_put(j);
+            http_error(c, 400, 1, "invalid JSON"); return;
+        }
+        if (!json_object_is_type(gw_get(j, "user"), json_type_string) ||
+            !json_object_is_type(gw_get(j, "currentPassword"), json_type_string) ||
+            !json_object_is_type(gw_get(j, "newPassword"), json_type_string)) {
+            json_object_put(j); http_error(c, 400, 1, "invalid account settings"); return;
+        }
+        const char *user = gw_string(j, "user"), *password = gw_string(j, "newPassword");
+        if (strlen(user) != (size_t)json_object_get_string_len(gw_get(j, "user")) ||
+            strlen(password) != (size_t)json_object_get_string_len(gw_get(j, "newPassword")) ||
+            strlen(gw_string(j, "currentPassword")) != (size_t)json_object_get_string_len(gw_get(j, "currentPassword"))) {
+            json_object_put(j); http_error(c, 400, 1, "invalid account settings"); return;
+        }
+        struct gw_admin next;
+        if (!gw_admin_verify(&g.admin, gw_string(j, "currentPassword"))) {
+            json_object_put(j); http_error(c, 403, 1, "current password incorrect"); return;
+        }
+        if (strlen(password) < 8 || gw_admin_make(&next, user, password)) {
+            json_object_put(j); http_error(c, 400, 1, "invalid account settings"); return;
+        }
+        json_object_put(j);
+        if (gw_store_admin_write(g.db, &next)) {
+            OPENSSL_cleanse(&next, sizeof(next));
+            http_error(c, 503, 1, "account storage unavailable"); return;
+        }
+        g.admin = next; OPENSSL_cleanse(&next, sizeof(next));
+        g.user = g.admin.user;
+        snprintf(g.secret, sizeof(g.secret), "%s", g.admin.secret);
+        ++g.auth_generation;
+        http_error(c, 200, 0, "account updated; sign in again"); return;
+    }
+    if (c->deleting) {
+        const char *prefix = "/api/v1/nodes/";
+        const char *name = c->uri + strlen(prefix);
+        if (strncmp(c->uri, prefix, strlen(prefix)) || !gw_node_valid(name)) {
+            http_error(c, 404, 1, "not found"); return;
+        }
+        if (find_node(gw_node_id(name))) {
+            http_error(c, 409, 1, "node is online"); return;
+        }
+        int result = gw_store_delete_offline(g.db, name);
+        if (result == 0) http_error(c, 200, 0, "offline node deleted");
+        else if (result == 1) http_error(c, 404, 1, "node not found");
+        else if (result == 2) http_error(c, 409, 1, "node is online");
+        else http_error(c, 503, 1, "node storage unavailable");
         return;
     }
     if (!c->post && !strcmp(c->uri, "/api/v1/status")) {
@@ -874,15 +925,18 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
         char *method_uri = NULL;
         int method_length = 0;
         int method = lws_http_get_uri_and_method(wsi, &method_uri, &method_length);
-        if (method != LWSHUMETH_GET && method != LWSHUMETH_POST) {
+        if (method != LWSHUMETH_GET && method != LWSHUMETH_POST &&
+            !(method == LWSHUMETH_DELETE && !strncmp(c->uri, "/api/v1/nodes/", 14))) {
             http_error(c, 405, 1, "method not allowed");
             return 0;
         }
         c->post = method == LWSHUMETH_POST;
+        c->deleting = method == LWSHUMETH_DELETE;
         char auth[8192];
         int n = lws_hdr_copy(wsi, auth, sizeof(auth), WSI_TOKEN_HTTP_AUTHORIZATION);
         c->authorized =
             n > 0 && gw_jwt_verify(auth, g.user, g.token, g.secret, gw_wall_ns() / 1000000000);
+        c->auth_generation = g.auth_generation;
         if (c->post) {
             if (strcmp(c->uri, "/api/v1/user/login") && !c->authorized) {
                 http_error(c, 401, 1, "unauthorized");
@@ -1026,6 +1080,7 @@ static void usage(void) {
     puts("fastp2p-gateway --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
          "  [--port 27183] [--apiport 10008] [--sdwan-config FILE] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
+         "  [--reset-admin] (stop the gateway before resetting its account)\n"
          "Set FASTP2P_USER and FASTP2P_PASSWORD; FASTP2P_TOKEN optionally "
          "overrides the derived uint64.\n"
          "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183.");
@@ -1061,6 +1116,7 @@ static int options(int argc, char **argv) {
                                          {"database", required_argument, 0, 'd'},
                                          {"public-host", required_argument, 0, 'H'},
                                          {"enrollment-ca", required_argument, 0, 'C'},
+                                         {"reset-admin", no_argument, 0, 'R'},
                                          {"version", no_argument, 0, 'v'},
                                          {"help", no_argument, 0, 'h'},
                                          {0}};
@@ -1092,6 +1148,7 @@ static int options(int argc, char **argv) {
             break;
         case 'H': g.public_host = optarg; break;
         case 'C': g.enrollment_ca_file = optarg; break;
+        case 'R': g.reset_admin = 1; break;
         case 'v':
             printf("fastp2p-gateway %s\n", GW_VERSION);
             return 1;
@@ -1147,7 +1204,6 @@ static int options(int argc, char **argv) {
         return -1;
     if (!g.token)
         return -1;
-    snprintf(g.secret, sizeof(g.secret), "%s%s@fastp2p", g.user, g.password);
     OPENSSL_cleanse(credentials, sizeof(credentials));
     if (sdwan) {
         FILE *file = fopen(sdwan, "rb");
@@ -1216,6 +1272,21 @@ int main(int argc, char **argv) {
         fputs("Cannot open node SQLite database\n", stderr);
         json_object_put(g.sdwan);
         return 1;
+    }
+    int admin_status = gw_store_admin_read(g.db, &g.admin);
+    if (admin_status == 1 || g.reset_admin) {
+        admin_status = gw_admin_make(&g.admin, g.user, g.password) ? -1 : gw_store_admin_write(g.db, &g.admin);
+    }
+    if (admin_status) {
+        fputs("Cannot initialize gateway account\n", stderr);
+        json_object_put(g.sdwan); sqlite3_close(g.db); return 1;
+    }
+    g.user = g.admin.user;
+    snprintf(g.secret, sizeof(g.secret), "%s", g.admin.secret);
+    g.auth_generation = 1;
+    if (g.reset_admin) {
+        puts("Gateway account reset from FASTP2P_USER and FASTP2P_PASSWORD");
+        json_object_put(g.sdwan); sqlite3_close(g.db); return 0;
     }
     if (gw_nat_start(&g.nat, g.bind)) {
         fputs("Cannot bind NAT ports\n", stderr);

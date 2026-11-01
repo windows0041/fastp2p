@@ -28,7 +28,8 @@ struct connection {
     size_t rx_length, rx_capacity;
     /* HTTP transactions share the protocol allocation, never the WS role. */
     char uri[256];
-    int post, authorized, status, headers_sent, handled;
+    int post, deleting, authorized, status, headers_sent, handled;
+    uint64_t auth_generation;
     unsigned char *request, *response;
     const char *response_type;
     size_t request_length, response_length, response_offset;
@@ -59,7 +60,10 @@ struct gateway {
     char bind[64], api_bind[64];
     const char *cert, *key, *user, *password;
     char secret[2048];
+    struct gw_admin admin;
+    uint64_t auth_generation;
     uint64_t token;
+    int reset_admin;
     uint64_t started_ms;
     json_object *sdwan;
     sqlite3 *db;

@@ -15,6 +15,7 @@ from pathlib import Path
 import secrets
 import socket
 import ssl
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -169,7 +170,7 @@ try:
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)
-        assert status==200 and overview['version']=='1.0.0' and overview['capacity']==256
+        assert status==200 and overview['version']=='1.0.1' and overview['capacity']==256
         assert overview['nodeStorage']=='sqlite' and overview['totalNodes']==0
         assert 'nodeToken' not in overview and password not in json.dumps(overview)
         for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:
@@ -184,7 +185,8 @@ try:
         conn.request('GET','/');response=conn.getresponse();assert response.status==404;response.read();conn.close()
         assert api('/server.key',jwt=jwt)[0]==404
         results['embedded_web_assets_security_headers_and_protected_status']=True
-        expected=hmac.new((user+password+'@fastp2p').encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
+        with sqlite3.connect(directory/'nodes.sqlite3') as database: signing_secret=database.execute('SELECT jwt_secret FROM admin WHERE id=1').fetchone()[0]
+        expected=hmac.new(signing_secret.encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
         assert hmac.compare_digest(base64.urlsafe_b64encode(expected).decode().rstrip('='),sig)
         assert json.loads(base64.urlsafe_b64decode(body+'='*(-len(body)%4)))['installToken']==str(token)
         assert api('/api/v1/devices',jwt=jwt)[0]==200 and api('/api/v1/devices',jwt='Bearer '+jwt)[0]==200
@@ -202,7 +204,7 @@ try:
         def signed(claims,algorithm='HS256'):
             encode=lambda obj:base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip('=')
             data=encode({'alg':algorithm})+'.'+encode(claims)
-            sig=hmac.new((user+password+'@fastp2p').encode(),data.encode(),hashlib.sha256).digest()
+            sig=hmac.new(signing_secret.encode(),data.encode(),hashlib.sha256).digest()
             return data+'.'+base64.urlsafe_b64encode(sig).decode().rstrip('=')
         claims={'user':user,'installToken':str(token),'iss':'fastp2p.cn','exp':int(time.time())-1}
         assert api('/api/v1/devices',jwt=signed(claims))[0]==401

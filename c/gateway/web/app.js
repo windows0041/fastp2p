@@ -27,13 +27,13 @@
     $('login-error').hidden = !expired;
     if (expired) text('login-error', '会话已过期，请重新登录。');
   }
-  async function api(path, data) {
+  async function api(path, data, method) {
     const token = state.token, controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
       const headers = {'Content-Type': 'application/json'};
       if (token) headers.Authorization = 'Bearer ' + token;
-      const response = await fetch(path, {method: data === undefined ? 'GET' : 'POST', headers,
+      const response = await fetch(path, {method: method || (data === undefined ? 'GET' : 'POST'), headers,
         body: data === undefined ? undefined : JSON.stringify(data), signal: controller.signal,
         credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer'});
       const raw = await response.text();
@@ -46,7 +46,10 @@
       if (!response.ok || body.error) {
         const known = {409: '此节点正在处理另一个查询，请稍后刷新。', 503: '节点暂时无法响应，请稍后重试。',
           504: '客户端响应超时，请检查节点是否仍在线。', 501: '此客户端暂不支持该操作。'};
-        throw new Error(known[response.status] || (body.detail === 'device offline' ? '节点已离线。' : '网关未能完成请求。'));
+        const details = {'device offline':'节点已离线。','node is online':'节点已上线，不能删除。',
+          'node not found':'节点记录已不存在。','current password incorrect':'当前密码不正确。',
+          'invalid account settings':'请填写有效账号和至少 8 位的新密码。'};
+        throw new Error(details[body.detail] || known[response.status] || '网关未能完成请求。');
       }
       return body;
     } catch (error) {
@@ -79,7 +82,21 @@
       const action = element('td'), button = element('button', 'link-button', active ? '查看规则 →' : '查看记录 →');
       button.type = 'button'; button.setAttribute('aria-label', '查看 ' + n.name + ' 的规则');
       button.addEventListener('click', event => { event.stopPropagation(); selectNode(n); });
-      action.append(button); row.append(action); row.addEventListener('click', () => selectNode(n));
+      action.append(button);
+      if (!active) {
+        const remove = element('button', 'link-button remove', '删除'); remove.type = 'button';
+        remove.setAttribute('aria-label', '删除离线节点 ' + n.name);
+        remove.addEventListener('click', event => {
+          event.stopPropagation();
+          confirm('删除离线节点', `删除 ${n.name} 的登记记录和名称保留。设备持有接入 Token 时，再次上线会重新登记。`, async () => {
+            await api('/api/v1/nodes/' + encodeURIComponent(n.name), undefined, 'DELETE');
+            if (state.selected?.name === n.name) selectNode(null);
+            state.offset = 0; await refresh();
+            return '离线节点已删除。';
+          });
+        }); action.append(remove);
+      }
+      row.append(action); row.addEventListener('click', () => selectNode(n));
       $('nodes').append(row);
     }
     text('table-count', state.registered); text('nav-count', state.registered);
@@ -211,6 +228,24 @@
     } catch (error) { text('login-error', error.message); $('login-error').hidden = false; }
     finally { $('login-submit').disabled = false; }
   });
+  $('account-button').addEventListener('click', () => {
+    $('account-form').reset(); $('account-error').hidden = true;
+    $('account-user').value = $('account-name').textContent;
+    $('account-dialog').showModal();
+  });
+  $('account-form').addEventListener('submit', async event => {
+    event.preventDefault(); $('save-account').disabled = true; $('account-error').hidden = true;
+    const user = $('account-user').value.trim();
+    try {
+      await api('/api/v1/user/account', {user, currentPassword: $('current-password').value,
+        newPassword: $('new-password').value});
+      $('account-dialog').close(); logout(); $('username').value = user;
+      text('login-error', '账号已更新，请使用新账号和密码登录。'); $('login-error').hidden = false;
+    } catch (error) { text('account-error', error.message); $('account-error').hidden = false; }
+    finally { $('save-account').disabled = false; }
+  });
+  $('account-dialog').addEventListener('close', () => $('account-form').reset());
+  $('cancel-account').addEventListener('click', () => $('account-dialog').close());
   $('rule-form').addEventListener('submit', async event => {
     event.preventDefault(); if (!state.selected) return;
     $('save-rule').disabled = true; $('rule-error').hidden = true;
@@ -235,7 +270,7 @@
   });
   $('confirm-form').addEventListener('submit', async event => {
     event.preventDefault(); $('confirm-action').disabled = true;
-    try { await state.confirm?.(); $('confirm-dialog').close(); message('指令已发送到客户端。');
+    try { const result = await state.confirm?.(); $('confirm-dialog').close(); message(result || '操作已完成。');
       await new Promise(resolve => setTimeout(resolve, 600)); await loadApps();
     } catch (error) { message(error.message, true); $('confirm-dialog').close(); }
     finally { $('confirm-action').disabled = false; state.confirm = null; }

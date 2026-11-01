@@ -30,7 +30,7 @@
         <a class="nav-item" href="https://github.com/windows0041/fastp2p/releases" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">↓</span> 版本与下载 <span class="external" aria-hidden="true">↗</span></a>
       </nav><div class="sidebar-foot"><span class="dot"></span><span>自己的网关，自己的连接<small id="sidebar-version">C Gateway</small></span></div>
     </aside>
-    <div class="workspace"><header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong>网络总览</strong></div><div class="account"><span id="account-name"></span><button id="token-button" class="button quiet" type="button">安装 Token</button><button id="logout" class="button quiet" type="button">退出</button></div></header>
+    <div class="workspace"><header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong>网络总览</strong></div><div class="account"><span id="account-name"></span><button id="account-button" class="button quiet" type="button">账号设置</button><button id="token-button" class="button quiet" type="button">安装 Token</button><button id="logout" class="button quiet" type="button">退出</button></div></header>
       <main><section class="page-heading"><div><span class="eyebrow">NETWORK OVERVIEW</span><h1>网络总览</h1><p class="muted">在线状态与离线记录，一目了然。</p></div><div class="heading-actions"><span class="live-status" id="gateway-status"><span class="dot"></span><span id="gateway-label">网关在线</span></span><button id="refresh" class="button" type="button">↻ 刷新</button></div></section>
         <div id="notice" class="notice" role="status" hidden></div>
         <section class="metrics" aria-label="网关状态">
@@ -59,6 +59,13 @@
     <div class="form-grid"><div><label for="rule-destination">目标地址（在对端解析）</label><input id="rule-destination" maxlength="255" required value="127.0.0.1"></div><div><label for="rule-target">目标端口</label><input id="rule-target" type="number" min="1" max="65535" required placeholder="22"></div></div>
     <div class="form-grid"><div><label for="rule-transport">P2P 隧道</label><select id="rule-transport"><option value="quic">QUIC / UDP 优先</option><option value="tcp">TCP 打洞</option></select></div><div id="whitelist-field"><label for="rule-whitelist">入口限制（Whitelist）</label><input id="rule-whitelist" value="127.0.0.1" maxlength="255"></div></div>
     <p id="rule-help" class="muted form-help"></p><p id="rule-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-rule" class="button" type="button">取消</button><button id="save-rule" class="button primary" type="submit">发送到客户端</button></div>
+  </form></dialog>
+  <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><h2>账号设置</h2></div>
+    <p class="muted">修改后需要重新登录，客户端连接不受影响。</p>
+    <label for="account-user">管理账号</label><input id="account-user" autocomplete="username" maxlength="256" required>
+    <label for="current-password">当前密码</label><input id="current-password" type="password" autocomplete="current-password" maxlength="1024" required>
+    <label for="new-password">新密码</label><input id="new-password" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required>
+    <p id="account-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-account" class="button" type="button">取消</button><button id="save-account" class="button primary" type="submit">保存并重新登录</button></div>
   </form></dialog>
   <dialog id="confirm-dialog"><form id="confirm-form"><div class="dialog-heading"><h2 id="confirm-title">确认操作</h2></div><p id="confirm-description"></p><div class="dialog-actions"><button id="cancel-confirm" class="button" type="button">取消</button><button id="confirm-action" class="button danger" type="submit">确认</button></div></form></dialog>
   <dialog id="token-dialog"><div class="dialog-heading"><h2>客户端安装 Token</h2><button id="close-token" class="icon-button" type="button" aria-label="关闭">×</button></div><p class="muted">安装时使用，已包含网关地址和证书信任信息。只交给你信任的设备。</p><label for="install-token">FP1 安装 Token</label><input id="install-token" type="password" readonly autocomplete="off"><div class="dialog-actions"><a id="android-install" class="button" rel="noreferrer">安卓接入</a><button id="reveal-token" class="button" type="button">显示</button><button id="copy-token" class="button primary" type="button">复制 Token</button></div></dialog>

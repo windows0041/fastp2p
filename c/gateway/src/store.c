@@ -29,7 +29,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
     sqlite3_int64 app = 0, version = 0, tables = 0;
     if (scalar(db, "PRAGMA application_id", &app) || scalar(db, "PRAGMA user_version", &version) ||
         scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &tables) ||
-        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 1)
+        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 2)
         goto fail;
     /* One event-loop writer; rollback journaling also supports simple offline backups. */
     if (sql(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;") ||
@@ -43,7 +43,10 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, last_offline INTEGER NOT NULL DEFAULT 0,"
                 "online INTEGER NOT NULL DEFAULT 0 CHECK(online IN(0,1)));"
                 "CREATE INDEX IF NOT EXISTS nodes_order ON nodes(online DESC, name);"
-                "PRAGMA application_id=1179660880; PRAGMA user_version=1;"
+                "CREATE TABLE IF NOT EXISTS admin(id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL,"
+                "salt BLOB NOT NULL CHECK(length(salt)=16),password_hash BLOB NOT NULL CHECK(length(password_hash)=32),"
+                "iterations INTEGER NOT NULL,jwt_secret TEXT NOT NULL CHECK(length(jwt_secret)=64));"
+                "PRAGMA application_id=1179660880; PRAGMA user_version=2;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
     *out = db;
@@ -60,6 +63,21 @@ int gw_device_valid(const char *text) {
         if (!((*text >= '0' && *text <= '9') || (*text >= 'a' && *text <= 'f')))
             return 0;
     return 1;
+}
+int gw_store_delete_offline(sqlite3 *db, const char *name) {
+    sqlite3_stmt *s = NULL;
+    if (!gw_node_valid(name) || sqlite3_prepare_v2(db, "DELETE FROM nodes WHERE name=? AND online=0", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(s) == SQLITE_DONE, changed = sqlite3_changes(db);
+    sqlite3_finalize(s);
+    if (!ok) return -1;
+    if (changed) return 0;
+    if (sqlite3_prepare_v2(db, "SELECT online FROM nodes WHERE name=?", -1, &s, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
+    int row = sqlite3_step(s);
+    sqlite3_finalize(s);
+    return row == SQLITE_ROW ? 2 : row == SQLITE_DONE ? 1 : -1;
 }
 int gw_store_manual_status(sqlite3 *db, const char *name) {
     sqlite3_stmt *statement = NULL;

@@ -198,7 +198,7 @@ def main():
                 results['expired_session_returns_to_login']=True
                 go.close();peers.remove(go);page.locator('#refresh').click();expect(page.locator('#online-count')).to_have_text('1')
                 row=page.locator('#nodes tr').filter(has_text=go.name)
-                expect(row).to_contain_text('离线');row.get_by_role('button').click()
+                expect(row).to_contain_text('离线');row.get_by_role('button',name='查看 '+go.name+' 的规则',exact=True).click()
                 expect(page.locator('#rule-message')).to_contain_text('登记信息保留在 SQLite')
                 expect(page.locator('#add-rule')).to_be_disabled()
                 results['offline_node_retained_and_read_only']=True
@@ -212,6 +212,34 @@ def main():
                 page.locator('#node-search').fill('zz-history-109');expect(page.locator('#nodes tr')).to_have_count(1)
                 expect(page.locator('#nodes')).to_contain_text('zz-history-109')
                 results['offline_history_pagination_and_search_across_pages']=True
+                page.set_viewport_size({'width':390,'height':844})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                page.screenshot(path=str(args.output/'offline-mobile.png'),full_page=True)
+                page.set_viewport_size({'width':1440,'height':1040})
+                expect(page.locator('#nodes tr').get_by_role('button',name='删除离线节点 zz-history-109',exact=True)).to_be_visible()
+                page.get_by_role('button',name='删除离线节点 zz-history-109',exact=True).click()
+                expect(page.locator('#confirm-description')).to_contain_text('再次上线会重新登记')
+                page.locator('#cancel-confirm').click();expect(page.locator('#nodes tr')).to_have_count(1)
+                page.get_by_role('button',name='删除离线节点 zz-history-109',exact=True).click()
+                page.locator('#confirm-action').click();expect(page.locator('#nodes tr')).to_have_count(0)
+                expect(page.locator('#nav-count')).to_have_text('111')
+                page.locator('#node-search').fill(c.name);expect(page.locator('#nodes tr')).to_have_count(1)
+                expect(page.get_by_role('button',name='删除离线节点 '+c.name,exact=True)).to_have_count(0)
+                results['offline_node_delete_confirmation_refresh_and_online_guard']=True
+                page.locator('#account-button').click()
+                page.locator('#account-user').fill('custom-web-admin')
+                page.locator('#current-password').fill('incorrect')
+                new_password=secrets.token_urlsafe(24);page.locator('#new-password').fill(new_password)
+                page.locator('#save-account').click();expect(page.locator('#account-error')).to_contain_text('当前密码不正确')
+                page.locator('#current-password').fill(password);page.locator('#save-account').click()
+                expect(page.locator('#login-screen')).to_be_visible()
+                expect(page.locator('#current-password')).to_have_value('');expect(page.locator('#new-password')).to_have_value('')
+                page.locator('#username').fill(username);page.locator('#password').fill(password);page.locator('#login-submit').click()
+                expect(page.locator('#login-error')).to_contain_text('不正确')
+                page.locator('#username').fill('custom-web-admin');page.locator('#password').fill(new_password);page.locator('#login-submit').click()
+                expect(page.locator('#account-name')).to_have_text('custom-web-admin')
+                expect(page.locator('#online-count')).to_have_text('1')
+                results['custom_account_current_password_and_sign_in_again']=True
                 page.locator('#logout').click();expect(page.locator('#login-screen')).to_be_visible()
                 assert not errors,errors
                 context.close();browser.close()

@@ -4,6 +4,17 @@
 #include <json-c/json.h>
 #include <stdint.h>
 struct connection;
+struct gw_admin {
+    char user[257], secret[65];
+    unsigned char salt[16], hash[32];
+    unsigned iterations;
+};
+int gw_admin_make(struct gw_admin *admin, const char *user, const char *password);
+int gw_admin_verify(const struct gw_admin *admin, const char *password);
+int gw_store_admin_read(sqlite3 *db, struct gw_admin *admin);
+int gw_store_admin_write(sqlite3 *db, const struct gw_admin *admin);
+/* 0 deleted, 1 absent, 2 online, -1 storage failure. */
+int gw_store_delete_offline(sqlite3 *db, const char *name);
 int gw_store_open(sqlite3 **db, const char *path);
 /* 0 = claimed; 1 = conflicting explicit name; -1 = storage failure. */
 int gw_store_claim(sqlite3 *db, const char *requested, const char *hostname,
