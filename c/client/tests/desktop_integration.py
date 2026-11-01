@@ -13,6 +13,7 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -69,7 +70,14 @@ def roundtrip(proto, port):
 runtime=tempfile.TemporaryDirectory(prefix='op2p-desktop-')
 try:
     root=Path(runtime.name)
-    create_certificates(root/'certs','127.0.0.1')
+    gateway_host='127.0.0.1'
+    if sys.platform=='darwin':
+        # The Go reference binds P2P sockets to its primary interface. macOS
+        # refuses some connections from that interface to a loopback address.
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+            probe.connect(('192.0.2.1',9));gateway_host=probe.getsockname()[0]
+    results['phase']='gateway health'
+    create_certificates(root/'certs',gateway_host)
     token=str(secrets.randbits(63)|(1<<63)|1)
     environment=os.environ.copy()
     environment.update(OPENP2P_USER='desktop-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=token)
@@ -78,10 +86,10 @@ try:
         f=(root/(name+'.log')).open('w');files.append(f)
         p=subprocess.Popen([str(x) for x in command],cwd=directory,env=environment,stdout=f,stderr=subprocess.STDOUT)
         processes.append(p);return p
-    gateway=start([build/('gateway'+suffix),'-bind','127.0.0.1','-apibind','127.0.0.1',
+    gateway=start([build/('gateway'+suffix),'-bind',gateway_host,'-apibind',gateway_host,
         '-cert',root/'certs/server.crt','-key',root/'certs/server.key'],'gateway',root)
     def health():
-        with urllib.request.urlopen('https://127.0.0.1:10008/healthz',context=context,timeout=2) as r:
+        with urllib.request.urlopen('https://'+gateway_host+':10008/healthz',context=context,timeout=2) as r:
             return r.status==200
     wait(health)
     ports={}
@@ -90,11 +98,11 @@ try:
         threading.Thread(target=s.serve_forever,daemon=True).start();ports[proto]=s.server_address[1]
     def client(name,go=False,apps=None):
         d=root/name;d.mkdir()
-        config={'network':{'Node':name,'Token':0,'ServerHost':'127.0.0.1','ServerPort':27183,'ShareBandwidth':0},
+        config={'network':{'Node':name,'Token':0,'ServerHost':gateway_host,'ServerPort':27183,'ShareBandwidth':0},
             'CACertFile':str(root/'certs/ca.crt'),'apps':apps or [],'LogLevel':0}
         (d/'config.json').write_text(json.dumps(config))
         if go:
-            return start([build/('go-client'+suffix),'-node',name,'-serverhost','127.0.0.1',
+            return start([build/('go-client'+suffix),'-node',name,'-serverhost',gateway_host,
                 '-cacert',root/'certs/ca.crt','-sharebandwidth','0','-nv'],name,d)
         return start([build/('openp2p-c'+suffix),'--config',d/'config.json','--run-seconds','100'],name,d)
     client('desktop-go-target',True)
@@ -111,6 +119,7 @@ try:
                 cases.append((label,proto,port))
     client('desktop-c-source',apps=apps)
     for label,proto,port in cases:
+        results['phase']=label
         wait(lambda pr=proto,p=port:roundtrip(pr,p))
         results[label]=True;print(label+' passed',flush=True)
     log=(root/'desktop-c-source.log').read_text()
@@ -125,6 +134,10 @@ finally:
         except subprocess.TimeoutExpired:p.kill();p.wait()
     for s in servers:s.shutdown();s.server_close()
     for f in files:f.close()
+    if not results.get('success'):
+        for name in ['desktop-c-source','desktop-c-target']:
+            p=Path(runtime.name)/(name+'.log')
+            if p.exists():results[name+'-events']=p.read_text(errors='replace').splitlines()[-50:]
     runtime.cleanup()
     (build/'desktop-result.json').write_text(json.dumps(results,indent=2)+'\n')
     print(json.dumps(results,indent=2))

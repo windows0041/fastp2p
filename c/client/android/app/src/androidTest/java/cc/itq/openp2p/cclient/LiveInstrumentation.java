@@ -64,7 +64,7 @@ public final class LiveInstrumentation extends Instrumentation {
             SecretStore.preferences(context).edit().putString("config", config.toString())
                 .putString("ca", new File(context.getFilesDir(), "gateway-ca.pem").getAbsolutePath()).commit();
             // Foreground launch exercises the actual app/service/JNI path.
-            startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
             context.startForegroundService(new Intent(context, OpenP2PService.class));
             long deadline = System.currentTimeMillis() + 40000;
             while (OpenP2PService.state != 2 && System.currentTimeMillis() < deadline) Thread.sleep(100);
@@ -95,7 +95,7 @@ public final class LiveInstrumentation extends Instrumentation {
             require(!OpenP2PService.running && OpenP2PService.state == 0, "Native shutdown failed");
             result.putString("shutdown", "passed");
             Thread.sleep(1000);
-            startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
             context.startForegroundService(new Intent(context, OpenP2PService.class));
             deadline = System.currentTimeMillis() + 40000;
             while (OpenP2PService.state != 2 && System.currentTimeMillis() < deadline) Thread.sleep(100);

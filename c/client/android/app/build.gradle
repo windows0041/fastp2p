@@ -34,3 +34,21 @@ android {
     buildTypes { release { minifyEnabled false } }
     packaging { jniLibs { useLegacyPackaging false } }
 }
+
+// The APK is also a binary distribution of the statically bundled TLS/QUIC
+// dependencies; keep their complete notices inside the installable artifact.
+def noticeOutput = layout.buildDirectory.dir('generated/native-notices')
+def nativeNotices = tasks.register('copyNativeNotices', Copy) {
+    into noticeOutput
+    from('../LICENSE') { into 'licenses'; rename { 'openp2p-LICENSE' } }
+    from('../THIRD_PARTY.md') { into 'licenses' }
+    def versions = new groovy.json.JsonSlurper().parse(file('../../deps.lock.json'))
+    versions.each { name, entry ->
+        def license = name == 'openssl' ? 'LICENSE.txt' : 'COPYING'
+        from(new File(new File(depsBase).parentFile, "sources/${name}-${entry.version}/${license}")) {
+            into 'licenses'; rename { "${name}-${license}" }
+        }
+    }
+}
+android.sourceSets.main.assets.srcDir(noticeOutput)
+tasks.named('preBuild').configure { dependsOn nativeNotices }
