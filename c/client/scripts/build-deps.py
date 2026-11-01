@@ -9,6 +9,7 @@ import platform
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 parser=argparse.ArgumentParser()
@@ -35,7 +36,19 @@ for name,item in manifest.items():
     archive=cache/item['file']
     if not archive.exists():
         print('Downloading',name,item['version'],flush=True)
-        urllib.request.urlretrieve(item['url'],archive)
+        partial=cache/(item['file']+'.partial')
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(item['url'],timeout=60) as response, partial.open('wb') as output:
+                    while chunk:=response.read(1024*1024):output.write(chunk)
+                if hashlib.sha256(partial.read_bytes()).hexdigest()!=item['sha256']:
+                    raise SystemExit('Dependency checksum mismatch: '+name)
+                partial.replace(archive)
+                break
+            except OSError:
+                if attempt==2:raise
+                print('Retrying download:',name,flush=True)
+                time.sleep(2)
     if hashlib.sha256(archive.read_bytes()).hexdigest()!=item['sha256']:
         raise SystemExit('Dependency checksum mismatch: '+name)
     destination=sources/(name+'-'+item['version'])

@@ -34,7 +34,8 @@ def wait(action, timeout=60):
             raise RuntimeError('A child exited before validation completed')
         try:
             if action(): return
-        except (OSError, ValueError): pass
+        except (OSError, ValueError) as error:
+            results['last_wait_error']=str(error)[:300]
         time.sleep(.2)
     raise TimeoutError('Native gateway integration timed out')
 
@@ -135,6 +136,9 @@ finally:
     for s in servers:s.shutdown();s.server_close()
     for f in files:f.close()
     if not results.get('success'):
+        gateway_log=Path(runtime.name)/'gateway.log'
+        if gateway_log.exists() and results.get('phase')=='gateway health':
+            results['gateway-startup']=gateway_log.read_text(errors='replace').splitlines()[-35:]
         for name in ['desktop-c-source','desktop-c-target']:
             p=Path(runtime.name)/(name+'.log')
             if p.exists():results[name+'-events']=p.read_text(errors='replace').splitlines()[-50:]

@@ -18,7 +18,8 @@ def create_certificates(directory, hostname):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     run('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
         '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '2', '-sha256', '-subj', '/CN=OpenP2P Test CA',
-        '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign')
+        '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+        '-addext', 'subjectKeyIdentifier=hash', '-addext', 'authorityKeyIdentifier=keyid:always')
     run('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
         '-keyout', 'server.key', '-out', 'server.csr', '-subj', '/CN=OpenP2P Test Gateway')
     try:
@@ -26,6 +27,7 @@ def create_certificates(directory, hostname):
     except ValueError:
         san = 'DNS:' + hostname
     (directory/'server.ext').write_text('subjectAltName='+san+'\nbasicConstraints=critical,CA:FALSE\n'
-        'keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n')
+        'keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n'
+        'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
     run('x509', '-req', '-in', 'server.csr', '-CA', 'ca.crt', '-CAkey', 'ca.key', '-CAcreateserial',
         '-out', 'server.crt', '-days', '1', '-sha256', '-extfile', 'server.ext')

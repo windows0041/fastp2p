@@ -40,8 +40,8 @@ android {
 def noticeOutput = layout.buildDirectory.dir('generated/native-notices')
 def nativeNotices = tasks.register('copyNativeNotices', Copy) {
     into noticeOutput
-    from('../LICENSE') { into 'licenses'; rename { 'openp2p-LICENSE' } }
-    from('../THIRD_PARTY.md') { into 'licenses' }
+    from('../../LICENSE') { into 'licenses'; rename { 'openp2p-LICENSE' } }
+    from('../../THIRD_PARTY.md') { into 'licenses' }
     def versions = new groovy.json.JsonSlurper().parse(file('../../deps.lock.json'))
     versions.each { name, entry ->
         def license = name == 'openssl' ? 'LICENSE.txt' : 'COPYING'

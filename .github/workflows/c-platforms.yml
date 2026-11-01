@@ -29,13 +29,19 @@ jobs:
         with:
           go-version: '1.20.14'
           cache-dependency-path: go/client/go.sum
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: dependencies
         with:
           path: ~/openp2p-dev/cross
           key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
           restore-keys: c-deps-${{ matrix.target }}-
       - name: Build pinned dependencies
         run: python3 c/client/scripts/build-deps.py ${{ matrix.target }}
+      - uses: actions/cache/save@v4
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: ~/openp2p-dev/cross
+          key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
       - name: Build CLI and C SDK
         run: |
           cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
@@ -125,6 +131,7 @@ jobs:
           export OP2P_CMAKE_DIR="$(python3 -c 'import cmake,pathlib; print(pathlib.Path(cmake.CMAKE_BIN_DIR).parent)')"
           bash c/client/scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
           (cd c/client/android && bash gradlew --no-daemon :app:lintDebug)
+          python3 c/client/tests/android_artifact.py --apk c/client/android/app/build/outputs/apk/debug/app-debug.apk --ndk "$ANDROID_NDK_HOME"
           mkdir -p dist/android
           cp c/client/android/app/build/outputs/apk/debug/app-debug.apk dist/android/openp2p-c-android-debug.apk
           cp -R c/client/android/app/build/intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib dist/android/lib
