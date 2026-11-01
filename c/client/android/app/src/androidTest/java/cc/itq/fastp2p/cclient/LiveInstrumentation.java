@@ -15,7 +15,7 @@ public final class LiveInstrumentation extends Instrumentation {
         Context context = getTargetContext();
         try {
             String token = arguments.getString("token", "");
-            require(token.matches("[1-9][0-9]{15}") && NativeClient.version().contains("1.0.1"));
+            require(token.matches("[1-9][0-9]{15}") && NativeClient.version().contains("1.0.2"));
             Bootstrap bootstrap = Bootstrap.decode(context, token);
             require(!bootstrap.ca.isEmpty());
             Intent start = new Intent(context, InstallActivity.class).putExtra("token", token)

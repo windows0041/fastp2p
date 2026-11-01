@@ -177,8 +177,9 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
         user = getpwnam("fastp2p");
     }
     if (!user || strcmp(user->pw_dir, "/var/lib/fastp2p") || copy_binary("/usr/local/bin/fastp2p")) return -1;
-    if (chown("/etc/fastp2p", user->pw_uid, user->pw_gid) || chown(profile, user->pw_uid, user->pw_gid) ||
-        (ca && chown(ca, user->pw_uid, user->pw_gid))) return -1;
+    if (chown("/etc/fastp2p", 0, user->pw_gid) || chmod("/etc/fastp2p", 0750) ||
+        chown(profile, 0, user->pw_gid) || chmod(profile, 0640) ||
+        (ca && (chown(ca, 0, user->pw_gid) || chmod(ca, 0640)))) return -1;
     const char *unit = "[Unit]\nDescription=fastp2p client\nAfter=network-online.target\nWants=network-online.target\n[Service]\nUser=fastp2p\nGroup=fastp2p\nExecStart=/usr/local/bin/fastp2p run --config /etc/fastp2p/client.json\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nStateDirectory=fastp2p\nStateDirectoryMode=0700\n[Install]\nWantedBy=multi-user.target\n";
     FILE *file = fopen("/etc/systemd/system/fastp2p-client.service", "wb");
     if (!file) return -1;

@@ -55,10 +55,15 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
             assert b'Sanitizer' not in completed.stderr and b'runtime error:' not in completed.stderr
             return completed
         initial=install();assert b'gateway identity verified' in initial.stdout
+        trust=next(root.glob(profile.name+'.ca.*.pem'))
+        trust_stat=trust.stat()
+        def same_trust_file():
+            current=trust.stat()
+            return (current.st_ino,current.st_uid,current.st_gid,current.st_mode)==(trust_stat.st_ino,trust_stat.st_uid,trust_stat.st_gid,trust_stat.st_mode)
         original=profile.read_bytes()
         if os.name=='nt':assert original.startswith(b'FPD1') and payload['key'].encode() not in original
         else:assert profile.stat().st_mode & 0o077==0
-        install();result['verified_private_profile_and_repeat_install']=True
+        install();assert same_trust_file();result['verified_private_profile_and_repeat_install']=True
         completed=subprocess.run([str(Path(args.client).resolve()),'run','--config',str(profile),'--run-seconds','3'],
             env=client_environment,capture_output=True,timeout=20)
         assert completed.returncode==0 and b'gateway authenticated' in completed.stdout
@@ -66,13 +71,13 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
         before=profile.read_bytes()
         def replace(change):
             bad={**payload,**change};preset.write_text(json.dumps({k:bad[k] for k in ['host','port','ca']}));token_file.write_text(bad['key'])
-            install(1);assert profile.read_bytes()==before
+            install(1);assert profile.read_bytes()==before and same_trust_file()
         replace({'ca':(root/'untrusted/ca.crt').read_text()});result['wrong_CA_rejected_without_replacing_profile']=True
         replace({'host':'localhost'});result['wrong_hostname_rejected_without_replacing_profile']=True
         replace({'key':'9999999999999998'});result['wrong_access_key_rejected_without_replacing_profile']=True
         for malformed in ['FP1.invalid','123456789012345','12345678901234567','0000000000000000','abcdefghijklmnop']:
             token_file.write_text(malformed);install(2);assert profile.read_bytes()==before
-        result['malformed_token_rejected']=True;result['success']=True
+        result['malformed_token_rejected']=True;result['existing_CA_identity_and_permissions_preserved']=True;result['success']=True
     finally:
         if gateway and gateway.poll() is None:gateway.terminate();gateway.wait(timeout=8)
         log.close()

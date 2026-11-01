@@ -32,7 +32,7 @@ chmod +x fastp2p-linux-x86_64
 sudo ./fastp2p-linux-x86_64 install --token-file token.txt
 ```
 
-也支持 `install --token` 和 `FASTP2P_INSTALL_TOKEN`。非 root Linux 使用 `--no-service` 安装后手动 `run`。Windows 配置使用 DPAPI 加密；POSIX 配置权限为 0600。
+也支持 `install --token` 和 `FASTP2P_INSTALL_TOKEN`。非 root Linux 使用 `--no-service` 安装后手动 `run`。Windows 配置使用 DPAPI 加密；手动运行的 POSIX 配置权限为 0600。
 
 Android 安装 APK 后，在设备浏览器打开网关“安装 Token → 安卓接入”，或通过 ADB：
 
@@ -54,3 +54,5 @@ Android 无配置表单，保留系统要求的服务通知及停止入口。普
 [网关部署](c/gateway/README.md) · [客户端与 C SDK](c/client/README.md) · [SOCKS5](c/client/SOCKS5-ZH.md) · [发布](RELEASING-ZH.md) · [节点存储](c/NODE-STORAGE-ZH.md)
 
 新协议为 `fastp2p1`，QUIC ALPN 为 `fastp2pv1`，旧客户端需要统一升级。Go 源码保留于 Git 历史和旧标签，不参与主分支构建、测试和发布。上游来源及必要版权声明见 UPSTREAM.md、LICENSE 和 THIRD_PARTY.md。
+
+Linux 系统服务的配置和 CA 由 root 持有，fastp2p 组可读（0640），目录权限 0750；服务进程不能写入。重复接入不会重写相同的 CA 文件。

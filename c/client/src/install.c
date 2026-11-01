@@ -129,6 +129,26 @@ static int write_private(const char *path, const unsigned char *data, size_t len
 #endif
     return ok ? 0 : -1;
 }
+static int ensure_ca(const char *path, const char *ca) {
+#ifdef _WIN32
+    WCHAR name[4096]; if (wide(path, name)) return -1;
+    DWORD attributes = GetFileAttributesW(name);
+    int exists = attributes != INVALID_FILE_ATTRIBUTES;
+    if (!exists && GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND) return -1;
+#else
+    struct stat status;
+    int exists = !lstat(path, &status);
+    if (!exists && errno != ENOENT) return -1;
+#endif
+    if (exists) {
+        size_t length = 0;
+        unsigned char *data = read_file(path, 16384, &length);
+        int ok = data && length == strlen(ca) && !memcmp(data, ca, length);
+        free(data);
+        return ok ? 0 : -1;
+    }
+    return write_private(path, (const unsigned char *)ca, strlen(ca));
+}
 int fastp2p_profile_write(const char *path, const char *text) {
 #ifdef _WIN32
     DATA_BLOB input = {(DWORD)strlen(text), (BYTE *)text}, output = {0};
@@ -223,7 +243,7 @@ int fastp2p_install_command(int argc, char **argv) {
     if (RAND_bytes(bytes, sizeof(bytes)) != 1) { json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous); return 1; }
     for (unsigned i = 0; i < sizeof(bytes); ++i) snprintf(identity + 2*i, 3, "%02x", bytes[i]);
     if (old_network && strlen(field(old_network, "DeviceID")) == 32) strcpy(identity, field(old_network, "DeviceID"));
-    if (*ca && write_private(ca_path, (const unsigned char *)ca, strlen(ca))) goto fail;
+    if (*ca && ensure_ca(ca_path, ca)) goto fail;
     json_object *network = json_object_new_object();
     json_object_object_add(root, "network", network);
     json_object_object_add(root, "product", json_object_new_string("fastp2p"));
