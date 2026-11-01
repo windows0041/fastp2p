@@ -18,6 +18,8 @@ Windows 安装到 `%LOCALAPPDATA%/fastp2p`，DPAPI 加密配置，HKCU Run 随�
 
 高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则目前只在运行进程中生效，持久化请更新配置。
 
+设置 `FASTP2P_FORCE_RELAY=1` 可跳过打洞直接请求中继，用于验证中继链路；它只影响带该变量启动的进程，不写入配置。
+
 ## 构建与 SDK
 
 ```sh
