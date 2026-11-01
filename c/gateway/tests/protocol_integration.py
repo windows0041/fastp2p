@@ -256,6 +256,7 @@ try:
         a.send(message(5,0,{'peerNode':b.name}));relay=json.loads(a.until(5,1))
         assert relay['relay']==r.name and relay['error']==0
         r.send(message(5,0,{'peerNode':b.name}));assert json.loads(r.until(5,1))['relay']==a.name
+        a.send(message(5,0,{'peerNode':b.name,'exclude':[r.name]}));assert json.loads(a.until(5,1))['relay']==''
         results['relay_offer_selects_a_third_node_and_never_an_endpoint']=True
         responses=[]
         thread=threading.Thread(target=lambda:responses.append(api('/api/v1/device/'+a.name+'/apps',jwt=jwt)));thread.start()

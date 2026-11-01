@@ -71,6 +71,7 @@ typedef struct {
     int state, server, initiator, transport, notified;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next;
+    uint64_t active_at;
     char peer[32], ip[INET_ADDRSTRLEN], mode[16], probe[96];
     uint16_t local_port, mapped_port, remote_port;
     size_t probe_len;
@@ -97,6 +98,10 @@ typedef struct {
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
     uint64_t peer_nat;
+    /* Relays that already failed for this rule; the gateway is asked to skip
+     * them so one unreachable candidate cannot pin the link forever. */
+    char relay_failed[4][32];
+    int relay_failed_count;
     /* The session belongs to the rule so the secret survives a failed punch and
      * can be reused when the same link falls back to a relay. */
     uint64_t session;
@@ -447,6 +452,12 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
         reason = message;
     }
     uint64_t id = t->id;
+    char failed_relay[32];
+    failed_relay[0] = 0;
+    /* A relay hop that never carried traffic is remembered so the next offer
+     * skips it; a hop that worked for a minute is not held against the node. */
+    if (t->relay_wait && !t->active_at && t->peer[0])
+        copy_string(failed_relay, sizeof(failed_relay), t->peer);
     t->state = T_FREE;
     for (int i = 0; i < NO; ++i)
         if (c->overlays[i].used && c->overlays[i].tunnel_index == index)
@@ -456,6 +467,15 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             c->apps[i].tunnel_index = -1;
             c->apps[i].synced = 0;
             c->apps[i].retry = mono() + 2 * NS;
+            if (failed_relay[0] && c->apps[i].local) {
+                app *a = &c->apps[i];
+                int known = 0;
+                for (int k = 0; k < a->relay_failed_count; ++k)
+                    if (!strcmp(a->relay_failed[k], failed_relay))
+                        known = 1;
+                if (!known && a->relay_failed_count < 4)
+                    copy_string(a->relay_failed[a->relay_failed_count++], 32, failed_relay);
+            }
             if (!c->apps[i].local)
                 memset(&c->apps[i], 0, sizeof(c->apps[i]));
         }
@@ -693,7 +713,10 @@ static void session_ready(fastp2p_client *c, int index) {
             !c->apps[i].synced) {
             c->apps[i].synced = 1;
             c->apps[i].ready_at = mono() + 100 * MS;
-            c->apps[i].attempts = c->apps[i].relay_wanted = c->apps[i].relay_requested = 0;
+            c->apps[i].relay_requested = 0;
+            /* attempts is deliberately not reset here: a tunnel that completes
+             * the key exchange and then dies must not restart the direct-punch
+             * ladder, or a pair that cannot punch never reaches the relay. */
             emit(c, FASTP2P_EVENT_FORWARD, c->apps[i].id, 0,
                  relayed ? "forward attached to relay" : "forward attached to tunnel");
         }
@@ -839,7 +862,7 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
 static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
-    t->last_rx = t->last_hb = mono();
+    t->last_rx = t->last_hb = t->active_at = mono();
     if (t->listen_fd >= 0)
         op_close(t->listen_fd);
     if (t->alternate_fd >= 0)
@@ -1922,8 +1945,18 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             return;
         }
         if (now >= t->last_hb && now - t->last_hb >= 10 * NS) {
-            tframe(t, 4, NULL, 0);
+            tframe(t, TUN_KEEPALIVE, NULL, 0);
             t->last_hb = now;
+        }
+        /* A link that stays up for a minute has proven the path: clear the
+         * failure counters so a later drop retries the direct punch first. */
+        if (t->active_at && now >= t->active_at && now - t->active_at >= 60 * NS) {
+            for (int i = 0; i < NA; ++i)
+                if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == ti) {
+                    c->apps[i].attempts = 0;
+                    c->apps[i].relay_failed_count = 0;
+                }
+            t->active_at = 0;
         }
     }
 }
@@ -2124,6 +2157,12 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                         a->relay_requested = 1;
                         json_object *j = json_object_new_object();
                         op_js(j, "peerNode", a->peer);
+                        if (a->relay_failed_count) {
+                            json_object *skip = json_object_new_array();
+                            for (int k = 0; k < a->relay_failed_count; ++k)
+                                json_object_array_add(skip, json_object_new_string(a->relay_failed[k]));
+                            json_object_object_add(j, "exclude", skip);
+                        }
                         ws_json(c, 5, 0, j);
                         json_object_put(j);
                     } else {

@@ -235,12 +235,25 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
          * recently, so no single node carries every relayed session. */
         const char *name = gw_string(j, "peerNode");
         struct connection *peer = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
+        json_object *exclude = gw_get(j, "exclude");
         struct connection *relay = NULL;
         for (unsigned i = 0; i < g.max_nodes; ++i) {
             struct connection *n = g.nodes[i];
             if (!n || n->closing || n->slot == c->slot || n->nat == 2 || n->major != c->major)
                 continue;
             if (peer && n->slot == peer->slot)
+                continue;
+            /* A candidate that already failed for this rule is skipped so one
+             * unreachable node cannot pin the link to a dead relay. */
+            int rejected = 0;
+            if (exclude && json_object_is_type(exclude, json_type_array))
+                for (size_t k = 0; k < json_object_array_length(exclude); ++k) {
+                    json_object *item = json_object_array_get_idx(exclude, k);
+                    if (item && json_object_is_type(item, json_type_string) &&
+                        !strcmp(n->node, json_object_get_string(item)))
+                        rejected = 1;
+                }
+            if (rejected)
                 continue;
             if (!relay || n->relay_time < relay->relay_time)
                 relay = n;
