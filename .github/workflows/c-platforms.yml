@@ -7,7 +7,7 @@ permissions:
   contents: read
 concurrency:
   group: c-clients-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   macos:
     strategy:
@@ -63,6 +63,7 @@ jobs:
           python3 ../../c/client/tests/quic_interop.py --build ../../build/c
       - name: Gateway and application forwarding
         run: |
+          export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
           (cd go/gateway && go build -mod=readonly -o ../../build/c/gateway .)
           (cd go/client && go build -mod=readonly -o ../../build/c/go-client ./cmd)
           python3 c/client/tests/desktop_integration.py --build build/c

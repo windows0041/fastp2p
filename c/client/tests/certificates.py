@@ -31,3 +31,7 @@ def create_certificates(directory, hostname):
         'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
     run('x509', '-req', '-in', 'server.csr', '-CA', 'ca.crt', '-CAkey', 'ca.key', '-CAcreateserial',
         '-out', 'server.crt', '-days', '1', '-sha256', '-extfile', 'server.ext')
+    verified=subprocess.run([executable,'verify','-x509_strict','-CAfile','ca.crt','server.crt'],
+        cwd=directory,capture_output=True,text=True)
+    if verified.returncode:
+        raise RuntimeError('Invalid test certificate chain: '+verified.stdout+verified.stderr)

@@ -5,20 +5,17 @@ Use on a disposable CI runner: the gateway uses its standard local ports.
 QUIC is forced by the C initiator; quic_interop.py separately covers both TLS roles.
 """
 import argparse
-import http.client
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
 import socketserver
-import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.request
 from certificates import create_certificates
 
 parser = argparse.ArgumentParser()
@@ -78,27 +75,30 @@ try:
         # refuses some connections from that interface to a loopback address.
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
             probe.connect(('192.0.2.1',9));gateway_host=probe.getsockname()[0]
-    results['phase']='gateway health'
+    results['phase']='gateway WSS readiness'
     create_certificates(root/'certs',gateway_host)
     token=str(secrets.randbits(63)|(1<<63)|1)
     environment=os.environ.copy()
     environment.update(OPENP2P_USER='desktop-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=token)
     environment['NO_PROXY']=environment.get('NO_PROXY','')+','+gateway_host+',127.0.0.1,localhost'
     environment['no_proxy']=environment['NO_PROXY']
-    context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'))
     def start(command,name,directory):
         f=(root/(name+'.log')).open('w');files.append(f)
         p=subprocess.Popen([str(x) for x in command],cwd=directory,env=environment,stdout=f,stderr=subprocess.STDOUT)
         processes.append(p);return p
     gateway=start([build/('gateway'+suffix),'-bind',gateway_host,'-apibind',gateway_host,
         '-cert',root/'certs/server.crt','-key',root/'certs/server.key'],'gateway',root)
-    def health():
-        connection=http.client.HTTPSConnection(gateway_host,10008,context=context,timeout=2)
-        try:
-            connection.request('GET','/healthz')
-            return connection.getresponse().status==200
-        finally:connection.close()
-    wait(health)
+    def listening():
+        with socket.create_connection((gateway_host,27183),timeout=2):return True
+    wait(listening)
+    # Check readiness through the product protocol itself: strict private-CA
+    # WSS authentication, using the same native client as all subsequent cases.
+    probe=start([build/('openp2p-c'+suffix),'--node','desktop-c-probe','--serverhost',gateway_host,
+        '--cacert',root/'certs/ca.crt','--run-seconds','5'],'desktop-c-probe',root)
+    probe.wait(timeout=15)
+    assert probe.returncode==0,'Native WSS authentication probe failed'
+    processes.remove(probe)
+    results['native_WSS_authentication']=True
     ports={}
     for proto,cls,handler in [('tcp',socketserver.ThreadingTCPServer,TCP),('udp',socketserver.ThreadingUDPServer,UDP)]:
         s=cls(('127.0.0.1',0),handler);s.daemon_threads=True;servers.append(s)
@@ -145,9 +145,9 @@ finally:
     for f in files:f.close()
     if not results.get('success'):
         gateway_log=Path(runtime.name)/'gateway.log'
-        if gateway_log.exists() and results.get('phase')=='gateway health':
-            results['gateway-startup']=gateway_log.read_text(errors='replace').splitlines()[-35:]
-        for name in ['desktop-c-source','desktop-c-target']:
+        if gateway_log.exists() and results.get('phase')=='gateway WSS readiness':
+            results['gateway-startup']=gateway_log.read_text(errors='replace').splitlines()[-8:]
+        for name in ['desktop-c-probe','desktop-c-source','desktop-c-target']:
             p=Path(runtime.name)/(name+'.log')
             if p.exists():results[name+'-events']=p.read_text(errors='replace').splitlines()[-50:]
     runtime.cleanup()
