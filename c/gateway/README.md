@@ -141,7 +141,7 @@ sudo bash c/gateway/scripts/integration.sh
 
 systemd 模板：`deploy/openp2p-c-gateway.service`。准备专用 `openp2p` 用户，安装程序到 `/opt/openp2p-c/bin`，环境文件为 `/etc/openp2p-c/gateway.env`，TLS 文件放在该目录的 `tls/` 中，确保仅服务账号可读私钥。换证书后重启，客户端会重新鉴权。
 
-Go 与 C 网关使用相同 NAT 端口，切换时只启用一个，保留原服务供回退。`gz.itq.cc.cd` 已更新到 C 0.2.0，Web 访问、Release 校验、公网回归和回退方法见 [Web 更新记录](deploy/WEB-DEBUG-ZH.md)；首次替换与 Go 回退方法见 [原切换记录](deploy/REMOTE-DEBUG-ZH.md)。
+Go 与 C 网关使用相同 NAT 端口，切换时只启用一个，保留原服务供回退。`gz.itq.cc.cd` 已更新到 C 0.3.0，数据库位置、实际命名、Release 校验、公网回归和回退方法见 [SQLite 更新记录](deploy/SQLITE-DEBUG-ZH.md)；首次替换与 Go 回退方法见 [原切换记录](deploy/REMOTE-DEBUG-ZH.md)。
 
 ```bash
 docker build -t openp2p-c-gateway:0.3.0 c/gateway

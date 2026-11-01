@@ -69,6 +69,8 @@ C 客户端 0.4.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp
 
 Windows、Android 和 macOS 两种架构的 SDK / 调试包见 [0.2.0 验证与构建产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 已在连接的 Android 12 x86_64 设备上经自建公网网关与远端 Go 节点联调；arm64 已构建，尚未在 ARM 设备上运行。
 
+当前 [0.4.0 SDK 下载](https://github.com/windows0041/openp2p-test/releases/tag/c-client-v0.4.0) 增加主机名自动命名和稳定身份，网关 [0.3.0 下载](https://github.com/windows0041/openp2p-test/releases/tag/c-gateway-v0.3.0) 包含 SQLite 节点存储，服务器已更新，详见 [SQLite 部署记录](c/gateway/deploy/SQLITE-DEBUG-ZH.md)。
+
 此前 [0.3.0 SDK 下载](https://github.com/windows0041/openp2p-test/releases/tag/c-client-v0.3.0) 增加 Debian 12 原生 Linux 包，对应[五项 CI 作业](https://github.com/windows0041/openp2p-test/actions/runs/41284347086)全部通过。本机已启用 SOCKS5 `127.0.0.1:1080`（QUIC）和 `1081`（TCP 打洞），使用 xrwmaster C 节点作为出口；Android 同轮 SOCKS5 设备测试通过，详见 [代理部署记录](c/client/deploy/SOCKS5-DEBUG-ZH.md)。
 
 C 网关 0.3.0 增加 SQLite 节点存储和主机名唯一命名，保留离线节点与在线时间，支持全库分页搜索。配置与 C 接口见 [节点存储和命名](c/NODE-STORAGE-ZH.md)。内嵌 Web 控制台，支持登录、网关状态、节点搜索和转发管理。默认与管理 API 共用 `https://127.0.0.1:10008/`，远程可通过 SSH 转发访问。Go 节点支持增删改和开关；C 0.3 节点支持查询和新增，已有规则与 SOCKS5 在客户端配置中修改。

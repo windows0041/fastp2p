@@ -8,7 +8,9 @@ Linux/macOS/Windows 均执行真实 CLI 身份文件测试，覆盖自动生成�
 
 [网关 CI 41298212839](https://github.com/windows0041/openp2p-test/actions/runs/41298212839) 的 Debian 12/13 作业使用真实 C 0.4 客户端，验证短主机名数字补齐、重复主机名唯一分配、客户端重启、网关崩溃恢复和最终名称下的 TCP/QUIC 转发，均开启 ASan/UBSan。Android 共用同一自动命名核心和私有设备标识保存流程；本轮未增加 Android/macOS 的公网设备回归。
 
-配置及库接口见 [节点存储和命名](../NODE-STORAGE-ZH.md)。下文保留此前验证基线。
+[0.4.0 正式构建 41298680976](https://github.com/windows0041/openp2p-test/actions/runs/41298680976) 亦全部通过，[SDK 已发布](https://github.com/windows0041/openp2p-test/releases/tag/c-client-v0.4.0)。本机 WSL ASan C 0.4 客户端还经 gz 公网网关完成相同主机名的唯一分配、客户端重启复用及退出后保留离线信息；现有 Windows C 0.3 SOCKS5 服务和配置保留，未为本次节点存储修改生产客户端名称。
+
+配置及库接口见 [节点存储和命名](../NODE-STORAGE-ZH.md)，公网结果见 [部署记录](../gateway/deploy/SQLITE-DEBUG-ZH.md)。下文保留此前验证基线。
 
 # C 客户端验证记录
 

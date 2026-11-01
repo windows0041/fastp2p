@@ -14,6 +14,9 @@
 正式标签版本必须与对应 CMake 项目版本一致，且标签的运行时代码必须与测试构建一致。标签发布示例：
 
 ```bash
+git switch main
+git pull --ff-only
+git push origin main
 git tag -a c-gateway-v0.3.0 -m "C gateway 0.3.0"
 git push origin c-gateway-v0.3.0
 ```

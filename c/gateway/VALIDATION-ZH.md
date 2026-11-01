@@ -4,7 +4,7 @@
 
 WSL Debian 13 本地 ASan/UBSan 已通过节点数据库单元测试、严格鉴权/协议测试及真实 C 0.4 客户端注册联调。覆盖短主机名数字补位、同名设备分配、身份文件保存/复用、满容量重连、SIGKILL 后数据库恢复与在线标记重置，使用分配后的名称完成 TCP/QUIC 转发。原有六客户端 12 组转发、心跳与网关重启测试通过。
 
-桌面/390px 浏览器测试覆盖离线节点保留、离线操作禁用、112 个登记节点的分页及跨页搜索，并保留中文规则、Go 管理操作、XSS 和会话过期检查。CLI 身份文件测试覆盖权限、重复运行、损坏文件拒绝、符号链接拒绝和固定名称兼容。[网关 CI 41298212839](https://github.com/windows0041/openp2p-test/actions/runs/41298212839) 的 Debian 12/13、Docker 均通过；[客户端 CI 41298212833](https://github.com/windows0041/openp2p-test/actions/runs/41298212833) 的 Windows、macOS 两种架构、Linux 和 Android 五作业均通过。公网部署结果在完成后补记。
+桌面/390px 浏览器测试覆盖离线节点保留、离线操作禁用、112 个登记节点的分页及跨页搜索，并保留中文规则、Go 管理操作、XSS 和会话过期检查。CLI 身份文件测试覆盖权限、重复运行、损坏文件拒绝、符号链接拒绝和固定名称兼容。[网关 CI 41298212839](https://github.com/windows0041/openp2p-test/actions/runs/41298212839) 的 Debian 12/13、Docker 均通过；[客户端 CI 41298212833](https://github.com/windows0041/openp2p-test/actions/runs/41298212833) 的 Windows、macOS 两种架构、Linux 和 Android 五作业均通过。正式版本的 [网关构建 41298681017](https://github.com/windows0041/openp2p-test/actions/runs/41298681017) 及 [客户端构建 41298680976](https://github.com/windows0041/openp2p-test/actions/runs/41298680976) 均已完成并发布。服务器已运行 SQLite 版，数据库及在线备份完整性均为 ok，8 条登记记录中 6 个在线、2 个离线。同主机名的两份真实 WSL 客户端获得不同名称，重启复用原名。Web、Go 转发和 C SOCKS5 的公网回归通过，详见 [SQLite 更新记录](deploy/SQLITE-DEBUG-ZH.md)。
 
 配置与测试用法见 [节点存储和命名](../NODE-STORAGE-ZH.md)。
 
