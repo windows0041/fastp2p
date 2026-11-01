@@ -1,0 +1,16 @@
+build/
+dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+.env
+.env.*
+!.env.example
+certs/
+*.key
+*.crt
+*.pem
+*.csr
+*.srl
+*.log*
+__pycache__/

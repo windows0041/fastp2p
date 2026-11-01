@@ -1,0 +1,1055 @@
+#include "gateway.h"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <openssl/ssl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+
+static struct gateway g;
+static volatile sig_atomic_t stopping;
+static void signal_stop(int signal) {
+    (void)signal;
+    stopping = 1;
+}
+static void http_reply(struct connection *c, int status, const void *data, size_t len);
+static void http_error(struct connection *c, int status, unsigned code, const char *detail);
+
+static struct connection *find_node(uint64_t id) {
+    for (unsigned i = 0; i < g.max_nodes; ++i)
+        if (g.nodes[i] && g.nodes[i]->id == id && !g.nodes[i]->closing)
+            return g.nodes[i];
+    return NULL;
+}
+static void close_node(struct connection *c) {
+    if (!c || c->closing)
+        return;
+    c->closing = 1;
+    lws_set_timeout(c->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
+}
+static void unregister_node(struct connection *c) {
+    if (!c || !c->registered)
+        return;
+    if (c->slot >= 0 && c->slot < GW_MAX_NODES && g.nodes[c->slot] == c) {
+        g.nodes[c->slot] = NULL;
+        memset(g.grants[c->slot], 0, sizeof(g.grants[c->slot]));
+        for (unsigned i = 0; i < g.max_nodes; ++i)
+            g.grants[i][c->slot] = 0;
+    }
+    c->registered = 0;
+    if (c->pending_http) {
+        struct connection *http = c->pending_http;
+        c->pending_http = NULL;
+        http->request_node = NULL;
+        http_error(http, 503, 1, "device disconnected");
+    }
+}
+static int enqueue(struct connection *c, uint16_t main, uint16_t sub, const void *body,
+                   size_t length) {
+    if (!c || !c->registered || c->closing || length > GW_FRAME_LIMIT)
+        return -1;
+    size_t size = length + 8;
+    if (c->count >= 64 || size > GW_QUEUE_LIMIT - c->queued || size > GW_TOTAL_QUEUED - g.queued) {
+        close_node(c);
+        return -1;
+    }
+    struct packet *p = malloc(sizeof(*p) + LWS_PRE + size);
+    if (!p) {
+        close_node(c);
+        return -1;
+    }
+    *p = (struct packet){.length = size};
+    unsigned char *data = p->data + LWS_PRE;
+    gw_put32(data, (uint32_t)length);
+    gw_put16(data + 4, main);
+    gw_put16(data + 6, sub);
+    if (length)
+        memcpy(data + 8, body, length);
+    if (c->tail)
+        c->tail->next = p;
+    else
+        c->head = p;
+    c->tail = p;
+    ++c->count;
+    c->queued += size;
+    g.queued += size;
+    lws_callback_on_writable(c->wsi);
+    return 0;
+}
+static int send_json(struct connection *c, uint16_t main, uint16_t sub, json_object *j) {
+    const char *text = j ? json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN) : "null";
+    return enqueue(c, main, sub, text, strlen(text));
+}
+static void send_push_result(struct connection *c, unsigned error, const char *detail) {
+    json_object *j = json_object_new_object();
+    gw_ju(j, "error", error);
+    gw_js(j, "detail", detail);
+    send_json(c, 3, 0, j);
+    json_object_put(j);
+}
+static void grant(struct connection *from, struct connection *to) {
+    uint64_t until = gw_mono_ms() + 60000;
+    g.grants[from->slot][to->slot] = until;
+    g.grants[to->slot][from->slot] = until;
+}
+static unsigned major_version(const char *text) {
+    unsigned n = 0;
+    for (int i = 0; i < 4 && text[i] >= '0' && text[i] <= '9'; ++i)
+        n = n * 10 + (unsigned)(text[i] - '0');
+    return n;
+}
+static void copy_field(char *out, size_t size, json_object *j, const char *name) {
+    snprintf(out, size, "%s", gw_string(j, name));
+}
+static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const unsigned char *data,
+                    size_t len) {
+    if (main == 1) {
+        unsigned char ts[8];
+        gw_put64(ts, gw_wall_ns());
+        return enqueue(c, 1, 0, ts, 8);
+    }
+    if (main == 3) {
+        if (len < 16)
+            return -1;
+        uint64_t from = gw_u64(data), to = gw_u64(data + 8);
+        if (from != c->id) {
+            send_push_result(c, 1, "sender mismatch");
+            return 0;
+        }
+        if (!(sub <= 5 || sub == 8 || sub == 13 || sub == 18)) {
+            send_push_result(c, 1, "unsupported push");
+            return 0;
+        }
+        struct connection *target = find_node(to);
+        if (!target) {
+            send_push_result(c, 1, "peer offline");
+            return 0;
+        }
+        if (sub == 1) {
+            json_object *request = gw_json(data + 16, len - 16);
+            int valid =
+                request && !strcmp(gw_string(request, "from"), c->node) &&
+                (gw_token_valid(gw_integer(request, "token"), g.token, gw_wall_ns() / 1000000000) ||
+                 gw_integer(request, "fromToken") == g.token);
+            if (request)
+                json_object_put(request);
+            if (!valid) {
+                send_push_result(c, 1, "push denied");
+                return 0;
+            }
+            grant(c, target);
+        } else if (sub != 13 && sub != 18 && g.grants[c->slot][target->slot] <= gw_mono_ms()) {
+            send_push_result(c, 1, "push denied");
+            return 0;
+        }
+        int result = enqueue(target, 3, sub, data, len);
+        send_push_result(c, result ? 1 : 0, result ? "peer backpressure" : "push accepted");
+        return 0;
+    }
+    json_object *j = (main == 8 && sub == 0 && len == 4 && !memcmp(data, "null", 4))
+                         ? json_object_new_object()
+                         : gw_json(data, len);
+    if (!j || !json_object_is_type(j, json_type_object)) {
+        if (j)
+            json_object_put(j);
+        return -1;
+    }
+    if (main == 0) {
+        if (gw_integer(j, "error")) {
+            json_object_put(j);
+            return -1;
+        }
+    } else if (main == 6 && sub == 0) {
+        copy_field(c->os, sizeof(c->os), j, "os");
+        copy_field(c->mac, sizeof(c->mac), j, "mac");
+        copy_field(c->lan, sizeof(c->lan), j, "lanIP");
+        copy_field(c->ipv6, sizeof(c->ipv6), j, "IPv6");
+        copy_field(c->version, sizeof(c->version), j, "version");
+        c->has_ipv4 = (unsigned)(gw_integer(j, "hasIPv4") != 0);
+        c->has_upnp = (unsigned)(gw_integer(j, "hasUPNPorNATPMP") != 0);
+        uint64_t port = gw_integer(j, "publicIPPort");
+        if (port > 65535) {
+            json_object_put(j);
+            return -1;
+        }
+        c->public_port = (unsigned)port;
+        c->major = major_version(c->version);
+        json_object *ack = json_object_new_object();
+        send_json(c, 6, 7, ack);
+        json_object_put(ack);
+        json_object *online = json_object_new_object();
+        gw_js(online, "node", c->node);
+        for (unsigned i = 0; i < g.max_nodes; ++i)
+            if (g.nodes[i])
+                send_json(g.nodes[i], 3, 15, online);
+        json_object_put(online);
+    } else if (main == 6 && sub == 3 && c->pending_http) {
+        struct connection *http = c->pending_http;
+        c->pending_http = NULL;
+        http->request_node = NULL;
+        http_reply(http, 200, data, len);
+    } else if (main == 7 && sub == 0) {
+        json_object *response = json_object_new_object();
+        const char *name = gw_string(j, "peerNode");
+        struct connection *target = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
+        if (target && gw_token_valid(gw_integer(j, "token"), g.token, gw_wall_ns() / 1000000000)) {
+            grant(c, target);
+            gw_ju(response, "online", 1);
+            gw_js(response, "peerNode", target->node);
+            gw_js(response, "version", target->version);
+            gw_js(response, "IPv4", target->ip);
+            gw_js(response, "lanIP", target->lan);
+            gw_ju(response, "natType", target->nat);
+            gw_ju(response, "hasIPv4", target->has_ipv4);
+            gw_ju(response, "hasUPNPorNATPMP", target->has_upnp);
+            if (gw_integer(j, "token") == g.token)
+                gw_js(response, "IPv6", target->ipv6);
+        } else
+            gw_ju(response, "online", 0);
+        send_json(c, 7, 1, response);
+        json_object_put(response);
+    } else if (main == 8 && sub == 0) {
+        int member = 0;
+        json_object *nodes = gw_get(g.sdwan, "Nodes");
+        if (!nodes)
+            nodes = gw_get(g.sdwan, "nodes");
+        if (nodes && json_object_is_type(nodes, json_type_array))
+            for (size_t i = 0; i < json_object_array_length(nodes); ++i)
+                if (!strcmp(gw_string(json_object_array_get_idx(nodes, i), "name"), c->node))
+                    member = 1;
+        if (member && gw_integer(g.sdwan, "enable"))
+            send_json(c, 8, 1, g.sdwan);
+        else {
+            json_object *empty = json_object_new_object();
+            gw_ju(empty, "tunnelNum", 2);
+            gw_ju(empty, "mtu", 1420);
+            send_json(c, 8, 1, empty);
+            json_object_put(empty);
+        }
+    } else if (main == 5 && sub == 0) {
+        struct connection *peer = find_node(gw_node_id(gw_string(j, "peerNode"))), *relay = NULL;
+        if (peer)
+            for (unsigned i = 0; i < g.max_nodes; ++i) {
+                struct connection *n = g.nodes[i];
+                if (!n || n->closing || n->nat == 2 || n->major != c->major ||
+                    !strcmp(n->ip, c->ip) || !strcmp(n->ip, peer->ip))
+                    continue;
+                if (!relay || n->relay_time < relay->relay_time)
+                    relay = n;
+            }
+        json_object *response = json_object_new_object();
+        gw_js(response, "mode", "private");
+        gw_js(response, "relayName", relay ? relay->node : "");
+        gw_ju(response, "relayToken", relay ? gw_totp(g.token, gw_wall_ns() / 1000000000) : 0);
+        if (relay)
+            relay->relay_time = gw_mono_ms();
+        send_json(c, 5, 1, response);
+        json_object_put(response);
+    }
+    json_object_put(j);
+    return 0;
+}
+static int receive_ws(struct connection *c, const void *data, size_t len) {
+    if (!lws_frame_is_binary(c->wsi) || c->rx_length > GW_FRAME_LIMIT + 8 ||
+        len > GW_FRAME_LIMIT + 8 - c->rx_length)
+        return -1;
+    if (c->rx_length + len > c->rx_capacity) {
+        size_t capacity = c->rx_capacity ? c->rx_capacity * 2 : 16384;
+        if (capacity < c->rx_length + len)
+            capacity = c->rx_length + len;
+        if (capacity > GW_FRAME_LIMIT + 8)
+            capacity = GW_FRAME_LIMIT + 8;
+        if (capacity - c->rx_capacity > GW_TOTAL_QUEUED - g.rx_allocated)
+            return -1;
+        unsigned char *p = realloc(c->rx, capacity);
+        if (!p)
+            return -1;
+        g.rx_allocated += capacity - c->rx_capacity;
+        c->rx = p;
+        c->rx_capacity = capacity;
+    }
+    if (len)
+        memcpy(c->rx + c->rx_length, data, len);
+    c->rx_length += len;
+    c->last_rx = gw_mono_ms();
+    c->active_wall = gw_wall_ns();
+    if (!lws_is_final_fragment(c->wsi) || lws_remaining_packet_payload(c->wsi))
+        return 0;
+    size_t offset = 0;
+    while (offset < c->rx_length) {
+        if (c->rx_length - offset < 8)
+            return -1;
+        unsigned char *p = c->rx + offset;
+        size_t length = gw_u32(p);
+        uint16_t main = gw_u16(p + 4), sub = gw_u16(p + 6);
+        if (length > GW_FRAME_LIMIT || length > c->rx_length - offset - 8 || main > 8 ||
+            dispatch(c, main, sub, p + 8, length))
+            return -1;
+        offset += 8 + length;
+    }
+    c->rx_length = 0;
+    return 0;
+}
+static int write_ws(struct connection *c) {
+    if (c->closing)
+        return -1;
+    struct packet *p = c->head;
+    if (!p)
+        return 0;
+    size_t length = p->length - p->offset;
+    if (length > 16384)
+        length = 16384;
+    enum lws_write_protocol flags = p->offset ? LWS_WRITE_CONTINUATION : LWS_WRITE_BINARY;
+    if (p->offset + length < p->length)
+        flags = (enum lws_write_protocol)(flags | LWS_WRITE_NO_FIN);
+    int n = lws_write(c->wsi, p->data + LWS_PRE + p->offset, length, flags);
+    if (n < (int)length)
+        return -1;
+    p->offset += length;
+    if (p->offset == p->length) {
+        c->head = p->next;
+        if (!c->head)
+            c->tail = NULL;
+        c->queued -= p->length;
+        g.queued -= p->length;
+        --c->count;
+        free(p);
+    }
+    if (c->head)
+        lws_callback_on_writable(c->wsi);
+    return 0;
+}
+static void clear_http(struct connection *c) {
+    /* TLS rejection and pre-upgrade failures can close before user allocation. */
+    if (!c)
+        return;
+    if (c->request_node && c->request_node->pending_http == c)
+        c->request_node->pending_http = NULL;
+    c->request_node = NULL;
+    free(c->request);
+    if (c->response)
+        g.queued -= c->response_length;
+    free(c->response);
+    c->request = c->response = NULL;
+    c->request_length = c->response_length = c->response_offset = 0;
+    c->headers_sent = c->handled = 0;
+    c->deadline = 0;
+}
+static void http_reply(struct connection *c, int status, const void *data, size_t len) {
+    if (c->handled || len > GW_FRAME_LIMIT)
+        return;
+    if (len > GW_TOTAL_QUEUED - g.queued) {
+        lws_set_timeout(c->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
+        return;
+    }
+    c->response = malloc(LWS_PRE + len + 1);
+    if (!c->response) {
+        lws_set_timeout(c->wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
+        return;
+    }
+    if (len)
+        memcpy(c->response + LWS_PRE, data, len);
+    c->status = status;
+    c->response_length = len;
+    g.queued += len;
+    c->handled = 1;
+    lws_callback_on_writable(c->wsi);
+}
+static void http_json(struct connection *c, int status, json_object *j) {
+    const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
+    http_reply(c, status, text, strlen(text));
+}
+static void http_error(struct connection *c, int status, unsigned code, const char *detail) {
+    json_object *j = json_object_new_object();
+    gw_ju(j, "error", code);
+    gw_js(j, "detail", detail);
+    http_json(c, status, j);
+    json_object_put(j);
+}
+static json_object *devices(void) {
+    json_object *root = json_object_new_object(), *nodes = json_object_new_array();
+    json_object_object_add(root, "nodes", nodes);
+    for (unsigned i = 0; i < g.max_nodes; ++i) {
+        struct connection *n = g.nodes[i];
+        if (!n || n->closing)
+            continue;
+        json_object *j = json_object_new_object();
+        char number[32], date[64];
+        snprintf(number, sizeof(number), "%" PRIu64, n->id);
+        gw_js(j, "id", number);
+        gw_js(j, "name", n->node);
+        gw_js(j, "ip", n->ip);
+        gw_js(j, "ipv6", n->ipv6);
+        snprintf(number, sizeof(number), "%u", n->nat);
+        gw_js(j, "natType", number);
+        snprintf(number, sizeof(number), "%u", n->bandwidth);
+        gw_js(j, "bandwidth", number);
+        gw_js(j, "lanip", n->lan);
+        gw_js(j, "mac", n->mac);
+        gw_js(j, "os", n->os);
+        gw_js(j, "version", n->version);
+        gw_ju(j, "isActive", 1);
+        json_object_object_add(j, "isUpdate", json_object_new_boolean(1));
+        time_t timestamp = (time_t)(n->active_wall / 1000000000);
+        struct tm utc;
+        gmtime_r(&timestamp, &utc);
+        strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%SZ", &utc);
+        gw_js(j, "activetime", date);
+        json_object_array_add(nodes, j);
+    }
+    return root;
+}
+static void handle_http(struct connection *c) {
+    if (c->handled || c->request_node)
+        return;
+    if (lws_get_vhost(c->wsi) != g.api_vhost) {
+        http_error(c, 404, 1, "not found");
+        return;
+    }
+    if (!c->post && !strcmp(c->uri, "/healthz")) {
+        http_reply(c, 200,
+                   "{\"status\":\"ok\",\"implementation\":\"c\",\"version\":\"" GW_VERSION "\"}",
+                   strlen("{\"status\":\"ok\",\"implementation\":\"c\",\"version\":"
+                          "\"" GW_VERSION "\"}"));
+        return;
+    }
+    if (c->post && !strcmp(c->uri, "/api/v1/user/login")) {
+        json_object *j = gw_json(c->request, c->request_length);
+        int valid = j && gw_secret_equal(gw_string(j, "user"), g.user) &&
+                    gw_secret_equal(gw_string(j, "password"), g.password);
+        if (j)
+            json_object_put(j);
+        if (!valid) {
+            http_error(c, 401, 1, "invalid credentials");
+            return;
+        }
+        char *jwt = gw_jwt_issue(g.user, g.token, g.secret, gw_wall_ns() / 1000000000);
+        if (!jwt) {
+            http_error(c, 500, 1, "internal error");
+            return;
+        }
+        j = json_object_new_object();
+        char number[32];
+        snprintf(number, sizeof(number), "%" PRIu64, g.token);
+        gw_js(j, "token", jwt);
+        gw_js(j, "nodeToken", number);
+        gw_ju(j, "error", 0);
+        http_json(c, 200, j);
+        json_object_put(j);
+        free(jwt);
+        return;
+    }
+    if (!c->authorized) {
+        http_error(c, 401, 1, "unauthorized");
+        return;
+    }
+    if (!c->post && !strcmp(c->uri, "/api/v1/devices")) {
+        json_object *j = devices();
+        http_json(c, 200, j);
+        json_object_put(j);
+        return;
+    }
+    const char *prefix = "/api/v1/device/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(c->uri, prefix, prefix_len)) {
+        http_error(c, 404, 1, "not found");
+        return;
+    }
+    const char *start = c->uri + prefix_len, *end = strchr(start, '/');
+    char name[32];
+    if (!end || (size_t)(end - start) >= sizeof(name)) {
+        http_error(c, 404, 1, "not found");
+        return;
+    }
+    memcpy(name, start, (size_t)(end - start));
+    name[end - start] = 0;
+    struct connection *target = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
+    if (!target) {
+        http_error(c, 200, 1, "device offline");
+        return;
+    }
+    if (!c->post && !strcmp(end, "/apps")) {
+        if (target->pending_http) {
+            http_error(c, 409, 10, "request already pending");
+            return;
+        }
+        if (send_json(target, 3, 7, NULL)) {
+            http_error(c, 503, 1, "device unavailable");
+            return;
+        }
+        target->pending_http = c;
+        c->request_node = target;
+        c->deadline = gw_mono_ms() + 10000;
+        lws_set_timeout(c->wsi, PENDING_TIMEOUT_HTTP_CONTENT, 15);
+        return;
+    }
+    if (!c->post && !strcmp(end, "/restart")) {
+        if (send_json(target, 3, 11, NULL))
+            http_error(c, 503, 1, "device unavailable");
+        else
+            http_reply(c, 200, "{\"error\":0}", 11);
+        return;
+    }
+    if (c->post && (!strcmp(end, "/app") || !strcmp(end, "/switchapp"))) {
+        json_object *j = gw_json(c->request, c->request_length);
+        if (!j || !json_object_is_type(j, json_type_object)) {
+            if (j)
+                json_object_put(j);
+            http_error(c, 400, 1, "invalid JSON");
+            return;
+        }
+        int result = send_json(target, 3, !strcmp(end, "/app") ? 9 : 10, j);
+        json_object_put(j);
+        if (result)
+            http_error(c, 503, 1, "device unavailable");
+        else
+            http_reply(c, 200, "", 0);
+        return;
+    }
+    http_error(c, 404, 1, "not found");
+}
+
+static int write_http(struct connection *c) {
+    if (!c->handled)
+        return 0;
+    if (!c->headers_sent) {
+        unsigned char buffer[LWS_PRE + 1024], *start = buffer + LWS_PRE, *p = start,
+                                              *end = buffer + sizeof(buffer);
+        if (lws_add_http_common_headers(c->wsi, (unsigned)c->status,
+                                        "application/json; charset=utf-8",
+                                        (lws_filepos_t)c->response_length, &p, end) ||
+            lws_add_http_header_by_name(c->wsi, (unsigned char *)"cache-control:",
+                                        (unsigned char *)"no-store", 8, &p, end) ||
+            lws_add_http_header_by_name(c->wsi, (unsigned char *)"x-content-type-options:",
+                                        (unsigned char *)"nosniff", 7, &p, end) ||
+            lws_finalize_write_http_header(c->wsi, start, &p, end))
+            return -1;
+        c->headers_sent = 1;
+        if (!c->response_length)
+            return lws_http_transaction_completed(c->wsi) ? -1 : 0;
+        lws_callback_on_writable(c->wsi);
+        return 0;
+    }
+    size_t n = c->response_length - c->response_offset;
+    if (n > 16384)
+        n = 16384;
+    enum lws_write_protocol flags =
+        c->response_offset + n == c->response_length ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;
+    int written = lws_write(c->wsi, c->response + LWS_PRE + c->response_offset, n, flags);
+    if (written < (int)n)
+        return -1;
+    c->response_offset += n;
+    if (c->response_offset == c->response_length)
+        return lws_http_transaction_completed(c->wsi) ? -1 : 0;
+    lws_callback_on_writable(c->wsi);
+    return 0;
+}
+static int query(struct lws *wsi, const char *name, char *out, size_t capacity) {
+    char buffer[1024];
+    const char *p = lws_get_urlarg_by_name(wsi, name, buffer, sizeof(buffer));
+    if (!p) {
+        *out = 0;
+        return -1;
+    }
+    if (strlen(p) >= capacity)
+        return -1;
+    snprintf(out, capacity, "%s", p);
+    return 0;
+}
+static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit,
+                              unsigned fallback) {
+    char buffer[32];
+    uint64_t n;
+    return query(wsi, name, buffer, sizeof(buffer)) || gw_decimal(buffer, &n) || n > limit
+               ? fallback
+               : (unsigned)n;
+}
+static int login_status(struct lws *wsi) {
+    char uri[256], node[32], token[32];
+    uint64_t value;
+    if (lws_get_vhost(wsi) != g.ws_vhost)
+        return 404;
+    if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) < 0 ||
+        (strcmp(uri, "/api/v1/login") && strcmp(uri, "/openp2p/v1/login")))
+        return 404;
+    if (query(wsi, "node=", node, sizeof(node)) || !gw_node_valid(node))
+        return 400;
+    if (query(wsi, "token=", token, sizeof(token)) || gw_decimal(token, &value) || value != g.token)
+        return 401;
+    struct connection *existing = find_node(gw_node_id(node));
+    if (existing && strcmp(existing->node, node))
+        return 409;
+    if (!existing) {
+        unsigned i = 0;
+        while (i < g.max_nodes && g.nodes[i])
+            ++i;
+        if (i == g.max_nodes)
+            return 503;
+    }
+    return 0;
+}
+static int establish(struct lws *wsi, struct connection *c) {
+    if (login_status(wsi))
+        return -1;
+    memset(c, 0, sizeof(*c));
+    c->wsi = wsi;
+    c->slot = -1;
+    if (query(wsi, "node=", c->node, sizeof(c->node)))
+        return -1;
+    c->id = gw_node_id(c->node);
+    struct connection *previous = find_node(c->id);
+    if (previous) {
+        unregister_node(previous);
+        close_node(previous);
+    }
+    unsigned slot = 0;
+    while (slot < g.max_nodes && g.nodes[slot])
+        ++slot;
+    if (slot == g.max_nodes)
+        return -1;
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    if (getpeername(lws_get_socket_fd(wsi), (struct sockaddr *)&peer, &plen) ||
+        peer.sin_family != AF_INET || !inet_ntop(AF_INET, &peer.sin_addr, c->ip, sizeof(c->ip)))
+        return -1;
+    query(wsi, "version=", c->version, sizeof(c->version));
+    query(wsi, "ipv6=", c->ipv6, sizeof(c->ipv6));
+    c->major = major_version(c->version);
+    c->nat = query_integer(wsi, "nattype=", 314, 314);
+    c->bandwidth = query_integer(wsi, "sharebandwidth=", 1000000, 0);
+    c->slot = (int)slot;
+    c->registered = 1;
+    c->last_rx = gw_mono_ms();
+    c->active_wall = gw_wall_ns();
+    g.nodes[slot] = c;
+    json_object *login = json_object_new_object();
+    gw_js(login, "user", g.user);
+    gw_js(login, "node", c->node);
+    gw_ju(login, "token", g.token);
+    gw_ju(login, "ts", gw_wall_ns() / 1000000000);
+    gw_ju(login, "error", 0);
+    int result = send_json(c, 0, 0, login);
+    json_object_put(login);
+    return result;
+}
+static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
+                    size_t len) {
+    struct connection *c = user;
+    switch (reason) {
+    case LWS_CALLBACK_HTTP_CONFIRM_UPGRADE: {
+        int status = login_status(wsi);
+        if (status) {
+            lws_return_http_status(wsi, (unsigned)status, NULL);
+            return 1;
+        }
+        return 0;
+    }
+    case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
+        return login_status(wsi) ? 1 : 0;
+    case LWS_CALLBACK_ESTABLISHED:
+        return establish(wsi, c);
+    case LWS_CALLBACK_RECEIVE: {
+        int result = c && c->registered && !c->closing ? receive_ws(c, in, len) : -1;
+        if (result && c) {
+            c->closing = 1;
+            unregister_node(c);
+        }
+        return result;
+    }
+    case LWS_CALLBACK_SERVER_WRITEABLE:
+        return write_ws(c);
+    case LWS_CALLBACK_CLOSED:
+        if (!c)
+            break;
+        unregister_node(c);
+        while (c->head) {
+            struct packet *p = c->head;
+            c->head = p->next;
+            g.queued -= p->length;
+            free(p);
+        }
+        c->tail = NULL;
+        c->queued = c->count = 0;
+        g.rx_allocated -= c->rx_capacity;
+        free(c->rx);
+        c->rx = NULL;
+        c->rx_capacity = c->rx_length = 0;
+        break;
+    case LWS_CALLBACK_HTTP: {
+        if (!c)
+            return -1;
+        clear_http(c);
+        c->wsi = wsi;
+        if (len >= sizeof(c->uri)) {
+            http_error(c, 414, 1, "URI too long");
+            return 0;
+        }
+        memcpy(c->uri, in, len);
+        c->uri[len] = 0;
+        char *method_uri = NULL;
+        int method_length = 0;
+        int method = lws_http_get_uri_and_method(wsi, &method_uri, &method_length);
+        if (method != LWSHUMETH_GET && method != LWSHUMETH_POST) {
+            http_error(c, 405, 1, "method not allowed");
+            return 0;
+        }
+        c->post = method == LWSHUMETH_POST;
+        char auth[8192];
+        int n = lws_hdr_copy(wsi, auth, sizeof(auth), WSI_TOKEN_HTTP_AUTHORIZATION);
+        c->authorized =
+            n > 0 && gw_jwt_verify(auth, g.user, g.token, g.secret, gw_wall_ns() / 1000000000);
+        if (c->post) {
+            if (strcmp(c->uri, "/api/v1/user/login") && !c->authorized) {
+                http_error(c, 401, 1, "unauthorized");
+                return 0;
+            }
+            char length[32];
+            uint64_t size;
+            if (lws_hdr_copy(wsi, length, sizeof(length), WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0 &&
+                (gw_decimal(length, &size) || size > GW_HTTP_LIMIT)) {
+                http_error(c, 413, 1, "request too large");
+                return 0;
+            }
+            return 0;
+        }
+        handle_http(c);
+        return 0;
+    }
+    case LWS_CALLBACK_HTTP_BODY:
+        if (c->handled)
+            return 0;
+        if (len > GW_HTTP_LIMIT - c->request_length) {
+            http_error(c, 413, 1, "request too large");
+            return 0;
+        }
+        if (len) {
+            unsigned char *p = realloc(c->request, c->request_length + len);
+            if (!p)
+                return -1;
+            c->request = p;
+            memcpy(p + c->request_length, in, len);
+            c->request_length += len;
+        }
+        return 0;
+    case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+        handle_http(c);
+        return 0;
+    case LWS_CALLBACK_HTTP_WRITEABLE:
+        return write_http(c);
+    case LWS_CALLBACK_CLOSED_HTTP:
+    case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
+        clear_http(c);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+static const struct lws_protocols protocols[] = {
+    {.name = "http",
+     .callback = callback,
+     .per_session_data_size = sizeof(struct connection),
+     .rx_buffer_size = 16384,
+     .tx_packet_size = 16384},
+    {.name = "openp2p",
+     .callback = callback,
+     .per_session_data_size = sizeof(struct connection),
+     .rx_buffer_size = 16384,
+     .tx_packet_size = 16384},
+    {0}};
+static void tick(lws_sorted_usec_list_t *sul) {
+    (void)sul;
+    gw_nat_step(&g.nat);
+    uint64_t now = gw_mono_ms();
+    for (unsigned i = 0; i < g.max_nodes; ++i) {
+        struct connection *c = g.nodes[i];
+        if (!c)
+            continue;
+        if (now - c->last_rx > (uint64_t)g.timeout * 1000)
+            close_node(c);
+        if (c->pending_http && now > c->pending_http->deadline) {
+            struct connection *http = c->pending_http;
+            c->pending_http = NULL;
+            http->request_node = NULL;
+            http_error(http, 504, 9, "timeout");
+        }
+    }
+    lws_sul_schedule(g.context, 0, &g.tick, tick, 10000);
+}
+static int sdwan_valid(json_object *j) {
+    if (!j || !json_object_is_type(j, json_type_object))
+        return 0;
+    if (!gw_integer(j, "enable"))
+        return 1;
+    const char *mode = gw_string(j, "mode");
+    if (strcmp(mode, "central") && strcmp(mode, "fullmesh"))
+        return 0;
+    uint64_t tunnels = gw_integer(j, "tunnelNum"), mtu = gw_integer(j, "mtu");
+    if (tunnels < 2 || tunnels > 8 || mtu < 576 || mtu > 1500)
+        return 0;
+    char network[128];
+    snprintf(network, sizeof(network), "%s", gw_string(j, "gateway"));
+    char *slash = strchr(network, '/');
+    if (!slash)
+        return 0;
+    *slash++ = 0;
+    int family = strchr(network, ':') ? AF_INET6 : AF_INET;
+    uint64_t bits;
+    unsigned char subnet[16];
+    if (gw_decimal(slash, &bits) || bits > (family == AF_INET ? 32u : 128u) ||
+        inet_pton(family, network, subnet) != 1)
+        return 0;
+    json_object *nodes = gw_get(j, "Nodes");
+    if (!nodes)
+        nodes = gw_get(j, "nodes");
+    if (!nodes || !json_object_is_type(nodes, json_type_array) ||
+        json_object_array_length(nodes) > GW_MAX_NODES)
+        return 0;
+    int central = 0;
+    for (size_t i = 0; i < json_object_array_length(nodes); ++i) {
+        json_object *n = json_object_array_get_idx(nodes, i);
+        const char *name = gw_string(n, "name"), *ip = gw_string(n, "ip");
+        unsigned char addr[16];
+        if (!gw_node_valid(name) || inet_pton(family, ip, addr) != 1)
+            return 0;
+        for (uint64_t b = 0; b < bits; ++b)
+            if ((addr[b / 8] & (0x80 >> (b % 8))) != (subnet[b / 8] & (0x80 >> (b % 8))))
+                return 0;
+        for (size_t k = 0; k < i; ++k) {
+            json_object *other = json_object_array_get_idx(nodes, k);
+            unsigned char previous[16];
+            if (!strcmp(name, gw_string(other, "name")) ||
+                (inet_pton(family, gw_string(other, "ip"), previous) == 1 &&
+                 !memcmp(addr, previous, family == AF_INET ? 4 : 16)))
+                return 0;
+        }
+        if (!strcmp(name, gw_string(j, "centralNode")))
+            central = 1;
+    }
+    return strcmp(mode, "central") || central;
+}
+static void usage(void) {
+    puts("openp2p-gateway-c --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
+         "  [--port 27183] [--apiport 10008] [--sdwan-config FILE]\n"
+         "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
+         "Set OPENP2P_USER and OPENP2P_PASSWORD; OPENP2P_TOKEN optionally "
+         "overrides the derived uint64.\n"
+         "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183.");
+}
+static int options(int argc, char **argv) {
+    g.max_nodes = GW_MAX_NODES;
+    g.timeout = 40;
+    g.ws_port = 27183;
+    g.api_port = 10008;
+    snprintf(g.bind, sizeof(g.bind), "127.0.0.1");
+    g.cert = getenv("OPENP2P_TLS_CERT");
+    if (!g.cert)
+        g.cert = "api.crt";
+    g.key = getenv("OPENP2P_TLS_KEY");
+    if (!g.key)
+        g.key = "api.key";
+    const char *sdwan = NULL;
+    static const struct option opts[] = {{"cert", required_argument, 0, 'c'},
+                                         {"key", required_argument, 0, 'k'},
+                                         {"bind", required_argument, 0, 'b'},
+                                         {"apibind", required_argument, 0, 'a'},
+                                         {"port", required_argument, 0, 'p'},
+                                         {"apiport", required_argument, 0, 'q'},
+                                         {"max-clients", required_argument, 0, 'm'},
+                                         {"heartbeat-timeout", required_argument, 0, 't'},
+                                         {"run-seconds", required_argument, 0, 'r'},
+                                         {"sdwan-config", required_argument, 0, 's'},
+                                         {"version", no_argument, 0, 'v'},
+                                         {"help", no_argument, 0, 'h'},
+                                         {0}};
+    int option;
+    uint64_t value;
+    while ((option = getopt_long_only(argc, argv, "", opts, NULL)) != -1) {
+        switch (option) {
+        case 'c':
+            g.cert = optarg;
+            break;
+        case 'k':
+            g.key = optarg;
+            break;
+        case 'b':
+            if (strlen(optarg) >= sizeof(g.bind))
+                return -1;
+            strcpy(g.bind, optarg);
+            break;
+        case 'a':
+            if (strlen(optarg) >= sizeof(g.api_bind))
+                return -1;
+            strcpy(g.api_bind, optarg);
+            break;
+        case 's':
+            sdwan = optarg;
+            break;
+        case 'v':
+            printf("openp2p-gateway-c %s\n", GW_VERSION);
+            return 1;
+        case 'h':
+            usage();
+            return 1;
+        case 'p':
+        case 'q':
+        case 'm':
+        case 't':
+        case 'r':
+            if (gw_decimal(optarg, &value) || value > 86400 || !value)
+                return -1;
+            if (option == 'p' || option == 'q') {
+                if (value > 65535)
+                    return -1;
+                if (option == 'p')
+                    g.ws_port = (unsigned)value;
+                else
+                    g.api_port = (unsigned)value;
+            } else if (option == 'm') {
+                if (value > GW_MAX_NODES)
+                    return -1;
+                g.max_nodes = (unsigned)value;
+            } else if (option == 't') {
+                if (value < 5)
+                    return -1;
+                g.timeout = (unsigned)value;
+            } else
+                g.run_seconds = (unsigned)value;
+            break;
+        default:
+            return -1;
+        }
+    }
+    if (optind != argc || g.ws_port == g.api_port)
+        return -1;
+    if (!*g.api_bind)
+        strcpy(g.api_bind, g.bind);
+    struct in_addr address;
+    if (inet_pton(AF_INET, g.bind, &address) != 1 || inet_pton(AF_INET, g.api_bind, &address) != 1)
+        return -1;
+    g.user = getenv("OPENP2P_USER");
+    g.password = getenv("OPENP2P_PASSWORD");
+    if (!g.user || !*g.user || strlen(g.user) > 256 || !g.password || !*g.password ||
+        strlen(g.password) > 1024)
+        return -1;
+    char credentials[1281];
+    snprintf(credentials, sizeof(credentials), "%s%s", g.user, g.password);
+    g.token = gw_node_id(credentials);
+    const char *token = getenv("OPENP2P_TOKEN");
+    if (token && (gw_decimal(token, &g.token) || !g.token))
+        return -1;
+    if (!g.token)
+        return -1;
+    snprintf(g.secret, sizeof(g.secret), "%s%s@openp2p.cn", g.user, g.password);
+    OPENSSL_cleanse(credentials, sizeof(credentials));
+    if (sdwan) {
+        FILE *file = fopen(sdwan, "rb");
+        if (!file)
+            return -1;
+        char *data = malloc(GW_FRAME_LIMIT + 1);
+        if (!data) {
+            fclose(file);
+            return -1;
+        }
+        size_t n = fread(data, 1, GW_FRAME_LIMIT + 1, file);
+        int bad = ferror(file) || n > GW_FRAME_LIMIT;
+        fclose(file);
+        if (!bad)
+            g.sdwan = gw_json(data, n);
+        free(data);
+        if (bad || !sdwan_valid(g.sdwan))
+            return -1;
+    } else
+        g.sdwan = json_object_new_object();
+    return g.sdwan ? 0 : -1;
+}
+int main(int argc, char **argv) {
+    int parsed = options(argc, argv);
+    if (parsed) {
+        if (parsed < 0) {
+            fputs("Invalid gateway configuration; check credentials, options and "
+                  "SD-WAN file\n",
+                  stderr);
+            usage();
+        }
+        if (g.sdwan)
+            json_object_put(g.sdwan);
+        return parsed < 0 ? 2 : 0;
+    }
+    signal(SIGINT, signal_stop);
+    signal(SIGTERM, signal_stop);
+    signal(SIGPIPE, SIG_IGN);
+    lws_set_log_level(LLL_ERR | LLL_WARN, NULL);
+    if (gw_nat_start(&g.nat, g.bind)) {
+        fputs("Cannot bind NAT ports\n", stderr);
+        json_object_put(g.sdwan);
+        return 1;
+    }
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+                   LWS_SERVER_OPTION_DISABLE_IPV6;
+    info.uid = -1;
+    info.gid = -1;
+    info.fd_limit_per_thread = 1024;
+    info.max_http_header_data = 8192;
+    info.max_http_header_pool = 256;
+    info.timeout_secs = 10;
+    g.context = lws_create_context(&info);
+    if (!g.context) {
+        fputs("Cannot initialize TLS service\n", stderr);
+        goto failed;
+    }
+    memset(&info, 0, sizeof(info));
+    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT | LWS_SERVER_OPTION_DISABLE_IPV6;
+    info.protocols = protocols;
+    info.ssl_cert_filepath = g.cert;
+    info.ssl_private_key_filepath = g.key;
+    info.alpn = "http/1.1";
+    info.uid = -1;
+    info.gid = -1;
+    info.ssl_options_set =
+        SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_COMPRESSION;
+    info.iface = g.bind;
+    info.port = (int)g.ws_port;
+    info.vhost_name = "openp2p-wss";
+    g.ws_vhost = lws_create_vhost(g.context, &info);
+    info.iface = g.api_bind;
+    info.port = (int)g.api_port;
+    info.vhost_name = "openp2p-api";
+    g.api_vhost = lws_create_vhost(g.context, &info);
+    if (!g.ws_vhost || !g.api_vhost) {
+        fputs("Cannot load TLS certificate/key or bind HTTPS/WSS ports\n", stderr);
+        goto failed;
+    }
+    printf("{\"event\":\"ready\",\"version\":\"%s\",\"wss\":%u,\"api\":%u}\n", GW_VERSION,
+           g.ws_port, g.api_port);
+    fflush(stdout);
+    lws_sul_schedule(g.context, 0, &g.tick, tick, 10000);
+    uint64_t end = g.run_seconds ? gw_mono_ms() + (uint64_t)g.run_seconds * 1000 : 0;
+    int result = 0;
+    while (!stopping && (!end || gw_mono_ms() < end))
+        if (lws_service(g.context, 0) < 0) {
+            result = 1;
+            break;
+        }
+    lws_sul_cancel(&g.tick);
+    lws_context_destroy(g.context);
+    gw_nat_stop(&g.nat);
+    json_object_put(g.sdwan);
+    OPENSSL_cleanse(g.secret, sizeof(g.secret));
+    return result;
+failed:
+    if (g.context)
+        lws_context_destroy(g.context);
+    gw_nat_stop(&g.nat);
+    json_object_put(g.sdwan);
+    OPENSSL_cleanse(g.secret, sizeof(g.secret));
+    return 1;
+}

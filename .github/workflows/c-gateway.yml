@@ -1,0 +1,94 @@
+name: C gateway
+on:
+  push:
+    paths: ['c/gateway/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gateway:
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: ['12', '13']
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:${{ matrix.debian }}
+      options: --privileged
+    timeout-minutes: 35
+    steps:
+      - name: Install native dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev zstd
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.20.14'
+          cache-dependency-path: go/client/go.sum
+      - uses: actions/cache@v4
+        with:
+          path: ~/openp2p-dev/cross
+          key: gateway-client-deps-debian${{ matrix.debian }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+      - name: Build reference clients
+        run: |
+          mkdir -p build/go
+          (cd go/client && go build -mod=readonly -o ../../build/go/openp2p ./cmd)
+          python3 c/client/scripts/build-deps.py linux-x86_64
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
+          cmake --build build/c --parallel 3
+      - name: C gateway protocol, authentication and lifecycle with sanitizers
+        run: bash c/gateway/scripts/check.sh --sanitize
+      - name: Six Go/C clients, TCP punch, QUIC and reconnect
+        run: bash c/gateway/scripts/integration.sh
+      - name: Package native gateway
+        run: |
+          cmake -S c/gateway -B build/c-gateway-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PWD/dist/c-gateway-debian${{ matrix.debian }}-x86_64"
+          cmake --build build/c-gateway-release --parallel 3
+          cmake --install build/c-gateway-release
+          cp c/gateway/README.md c/gateway/THIRD_PARTY.md c/gateway/LICENSE dist/c-gateway-debian${{ matrix.debian }}-x86_64/
+          cp -R c/gateway/deploy dist/c-gateway-debian${{ matrix.debian }}-x86_64/
+          tar -C dist -czf dist/openp2p-c-gateway-debian${{ matrix.debian }}-x86_64.tar.gz c-gateway-debian${{ matrix.debian }}-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-gateway-debian${{ matrix.debian }}-x86_64
+          path: dist/openp2p-c-gateway-*.tar.gz
+      - name: Gather sanitized test summaries
+        if: always()
+        run: |
+          mkdir -p build/reports
+          find /tmp -path '/tmp/openp2p-c-gateway-*/logs/result.json' -exec cp --parents '{}' build/reports/ \;
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c-gateway-results-debian${{ matrix.debian }}
+          path: build/reports/
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build gateway image
+        run: docker build -t openp2p-c-gateway:test c/gateway
+      - name: Check native entrypoint
+        run: docker run --rm openp2p-c-gateway:test --version
+      - name: Boot with private TLS certificate
+        run: |
+          bash go/gateway/scripts/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
+          docker run -d --name c-gateway-test --user "$(id -u):$(id -g)" \
+            -e OPENP2P_USER=ci-test-admin -e OPENP2P_PASSWORD=ci-only-fixture-password -e OPENP2P_TOKEN=18446744073709551615 \
+            -v "$RUNNER_TEMP/c-gateway-tls/server.crt:/etc/openp2p/tls/server.crt:ro" \
+            -v "$RUNNER_TEMP/c-gateway-tls/server.key:/etc/openp2p/tls/server.key:ro" \
+            -p 127.0.0.1:10008:10008 openp2p-c-gateway:test
+          for attempt in $(seq 1 40); do
+            if curl -fsS --cacert "$RUNNER_TEMP/c-gateway-tls/ca.crt" https://127.0.0.1:10008/healthz; then exit 0; fi
+            sleep 0.25
+          done
+          docker logs c-gateway-test
+          exit 1
+      - name: Stop test container
+        if: always()
+        run: docker rm -f c-gateway-test || true
