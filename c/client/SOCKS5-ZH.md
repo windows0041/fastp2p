@@ -2,7 +2,7 @@
 
 fastp2p C 客户端提供本地 SOCKS5 入口，经 P2P TCP 打洞或 QUIC 隧道，使用指定 C 节点作为出口。支持 TCP CONNECT、UDP ASSOCIATE 和可选用户名密码认证；域名由出口解析。
 
-入口、出口与网关均需 fastp2p **1.0.0 或更新版本**，使用同一自建网关。旧协议客户端不再兼容。
+入口、出口与网关均需 fastp2p **2.0.0 或更新版本**，使用同一自建网关。1.x 客户端不再兼容。
 
 ## 使用
 
@@ -24,7 +24,7 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.com/
 
 Windows 使用 `fastp2p.exe`、`curl.exe`。浏览器或其他应用配置 SOCKS5 地址 `127.0.0.1:1080`，启用通过代理解析 DNS。`socks5h` 表示把域名传给代理；目标地址始终由出口连接，因此 `127.0.0.1` 指出口节点本机。
 
-`UnderlayProtocol` 为 `tcp` 或 `quic`，省略时为 QUIC。这是 P2P 隧道类型，与代理中的 TCP/UDP 应用独立；UDP ASSOCIATE 也可使用 TCP 打洞隧道。入口默认只监听本机回环，`BindIP` 可显式指定其他 IPv4 地址。
+`UnderlayProtocol` 为 `tcp` 或 `quic`，省略时为 QUIC。这是 P2P 隧道类型，与代理中的 TCP/UDP 应用独立；UDP ASSOCIATE 也可使用 TCP 打洞隧道。打洞失败时链路自动改走第三节点中继，代理配置不需要改动。入口默认只监听本机回环，`BindIP` 可显式指定其他 IPv4 地址。
 
 同一配置可同时包含 `apps` 固定转发和 `socks5` 数组；可设置多个不同本地端口，选择不同出口。`Enabled:false` 暂停一条代理规则。
 

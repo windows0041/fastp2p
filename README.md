@@ -2,7 +2,7 @@
 
 使用自己的网关建立点对点连接。客户端核心和网关均使用 C，主分支只维护 C 版本。
 
-支持 QUIC、TCP 打洞、TCP/UDP 端口转发和 SOCKS5。网关提供 HTTPS Web 控制台及 SQLite 节点注册表。节点名来自主机名，不足 8 位补随机数字，重名分配唯一后缀，重连后保持稳定。
+支持 QUIC、TCP 打洞、中继回退、TCP/UDP 端口转发和 SOCKS5。打洞失败或双方都在对称 NAT 后时，网关挑选第三节点中继，两个端点各自打洞到中继并配对。隧道载荷使用 AES-256-GCM，会话密钥由发起端经网关的 TLS 通道分发，中继只转发不透明帧。网关提供 HTTPS Web 控制台及 SQLite 节点注册表。节点名来自主机名，不足 8 位补随机数字，重名分配唯一后缀，重连后保持稳定。
 
 ## 下载与安装
 
@@ -55,6 +55,6 @@ Android 无配置表单，保留系统要求的服务通知及停止入口。普
 
 [2026-11-02 部署验收与管理入口](c/gateway/DEPLOYMENT-ZH.md)
 
-新协议为 `fastp2p1`，QUIC ALPN 为 `fastp2pv1`，旧客户端需要统一升级。Go 源码保留于 Git 历史和旧标签，不参与主分支构建、测试和发布。上游来源及必要版权声明见 UPSTREAM.md、LICENSE 和 THIRD_PARTY.md。
+协议为 `fastp2p2`，QUIC ALPN 为 `fastp2pv2`。2.0.0 与 1.x 不互通，网关和全部客户端需要一起升级；1.x 的 CBC 隧道载荷和 SD-WAN 配置下发已删除。Go 源码保留于 Git 历史和旧标签，不参与主分支构建、测试和发布。上游来源及必要版权声明见 UPSTREAM.md、LICENSE 和 THIRD_PARTY.md。
 
 Linux 系统服务的配置和 CA 由 root 持有，fastp2p 组可读（0640），目录权限 0750；服务进程不能写入。重复接入不会重写相同的 CA 文件。

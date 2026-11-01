@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(fastp2p_c_gateway VERSION 1.0.1 LANGUAGES C)
+project(fastp2p_c_gateway VERSION 2.0.0 LANGUAGES C)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "The gateway targets Linux; use WSL on Windows")
 endif()

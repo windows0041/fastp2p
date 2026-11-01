@@ -1,6 +1,6 @@
 # fastp2p C 网关
 
-Linux C11 网关提供 HTTPS/WSS、NAT 探测、连接协调、Web 和 SQLite。与 fastp2p 1.x 客户端配套，协议 `fastp2p1`。数据通过客户端之间的 QUIC 或 TCP 隧道传输。
+Linux C11 网关提供 HTTPS/WSS、NAT 探测、连接协调、中继候选选择、Web 和 SQLite。与 fastp2p 2.x 客户端配套，协议 `fastp2p2`。数据通过客户端之间的 QUIC 或 TCP 隧道传输；只有打洞不可用时才经第三节点中继，且中继看不到明文。
 
 ## 构建
 
@@ -27,7 +27,7 @@ bash scripts/tls/generate-cert.sh /private/tls gateway.example.com 127.0.0.1
 build/c-gateway/fastp2p-gateway --bind 0.0.0.0 --apibind 127.0.0.1
 ```
 
-默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。
+默认 WSS TCP 27183；TCP NAT 27180–27181；UDP NAT 27180–27183；Web/API HTTPS 127.0.0.1:10008。远程管理通过 SSH 转发访问。Web 可查看在线/离线节点、搜索分页、转发规则和安装 Token。中继候选排除两个端点本身、对称 NAT 节点和协议主版本不同的节点，并按最久未使用优先分配。
 
 SQLite 使用回滚日志和同步写入，文件权限 0600；通过 SQLite 在线备份接口备份。旧 C 数据库可以保留记录升级 application_id；回退旧程序前应恢复升级前数据库快照。
 

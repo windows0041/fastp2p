@@ -47,16 +47,6 @@ int main(void) {
     assert(!op_json(overflow, strlen(overflow)));
     assert(!op_json("{\"id\":1}garbage", 15));
     assert(!op_json("{\"id\":", 6));
-    const uint8_t payload[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    uint8_t encrypted[64], plain[64];
-    size_t enc, dec;
-    assert(!op_crypt(1, UINT64_MAX, payload, sizeof(payload), encrypted, sizeof(encrypted), &enc));
-    assert(enc == 32);
-    assert(!op_crypt(0, UINT64_MAX, encrypted, enc, plain, sizeof(plain), &dec));
-    assert(dec == sizeof(payload) && !memcmp(payload, plain, dec));
-    encrypted[enc - 1] ^= 0x80;
-    assert(op_crypt(0, UINT64_MAX, encrypted, enc, plain, sizeof(plain), &dec) == -1);
-    assert(op_crypt(0, 1, payload, 17, plain, sizeof(plain), &dec) == -1);
     /* Deterministic malformed stream exercise under ASan/UBSan. */
     uint32_t seed = 12345;
     for (int i = 0; i < 10000; ++i) {
@@ -72,6 +62,6 @@ int main(void) {
         op_buffer_clear(&rx);
     }
     op_buffer_clear(&wire);
-    puts("wire framing, uint64 JSON, crypto and malformed input checks passed");
+    puts("wire framing, uint64 JSON and malformed input checks passed");
     return 0;
 }

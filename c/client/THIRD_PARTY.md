@@ -1,8 +1,8 @@
 # Third-party components
 
-The QUIC adapter uses the public ngtcp2/GnuTLS API and follows the structure of
-the upstream `examples/gtlssimpleclient.c` example, version v1.11.0:
-https://github.com/ngtcp2/ngtcp2/blob/v1.11.0/examples/gtlssimpleclient.c
+The QUIC adapter uses the public ngtcp2/OpenSSL API and follows the structure of
+the upstream `examples/osslsimpleclient.c` example:
+https://github.com/ngtcp2/ngtcp2/blob/main/examples/osslsimpleclient.c
 
 Copyright (c) 2021-2022 ngtcp2 contributors
 
@@ -24,7 +24,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-The native Linux build links system-provided ngtcp2, GnuTLS, libcurl, json-c and
+The native Linux build links system-provided ngtcp2 with the OpenSSL backend, libcurl, json-c and
 OpenSSL. The portable builds statically include OpenSSL 3.5.7 (Apache-2.0),
 ngtcp2 1.22.1 (MIT), curl 8.23.0 (curl license) and json-c 0.18 (MIT).
 Source URLs and checksums are recorded in deps.lock.json. SDK packages include

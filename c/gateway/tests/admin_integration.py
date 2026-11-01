@@ -39,7 +39,7 @@ def wait(check):
     raise TimeoutError('Account/registry test condition timed out')
 def peer(device,host):
     raw=ctx.wrap_socket(socket.create_connection(('127.0.0.1',37183),timeout=3),server_hostname='127.0.0.1')
-    query=urlencode({'node':host,'token':key,'protocol':'fastp2p1','version':'1.0.0','autonode':1,'deviceid':device,'hostname':host})
+    query=urlencode({'node':host,'token':key,'protocol':'fastp2p2','version':'2.0.0','autonode':1,'deviceid':device,'hostname':host})
     raw.sendall(('GET /api/v1/login?'+query+' HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: '+base64.b64encode(secrets.token_bytes(16)).decode()+'\r\n\r\n').encode())
     data=bytearray()
     while b'\r\n\r\n' not in data:data.extend(raw.recv(4096))

@@ -3,7 +3,6 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/evp.h>
 uint16_t op_u16(const void *p) {
     const uint8_t *b = p;
     return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
@@ -158,32 +157,4 @@ void op_js(json_object *o, const char *name, const char *s) {
 }
 void op_ju(json_object *o, const char *name, uint64_t v) {
     json_object_object_add(o, name, json_object_new_uint64(v));
-}
-int op_crypt(int enc, uint64_t key, const uint8_t *in, size_t len, uint8_t *out, size_t cap,
-             size_t *written) {
-    if (!key) {
-        if (len > cap)
-            return -1;
-        memcpy(out, in, len);
-        *written = len;
-        return 0;
-    }
-    if (len > INT_MAX || len > SIZE_MAX - 16 || cap < len + 16)
-        return -1;
-    uint8_t bytes[16];
-    op_put64(bytes, key);
-    op_put64(bytes + 8, key);
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-        return -1;
-    int n = 0, tail = 0;
-    int ok = EVP_CipherInit_ex(ctx, EVP_aes_128_cbc(), NULL, bytes,
-                               (const uint8_t *)"UHNJUSBACIJFYSQN", enc) &&
-             EVP_CipherUpdate(ctx, out, &n, in, (int)len) &&
-             EVP_CipherFinal_ex(ctx, out + n, &tail);
-    EVP_CIPHER_CTX_free(ctx);
-    if (!ok)
-        return -1;
-    *written = (size_t)n + (size_t)tail;
-    return 0;
 }

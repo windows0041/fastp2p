@@ -29,7 +29,4 @@ const char *op_string(json_object *obj, const char *name);
 uint64_t op_integer(json_object *obj, const char *name);
 void op_js(json_object *obj, const char *name, const char *value);
 void op_ju(json_object *obj, const char *name, uint64_t value);
-/* Existing wire format: repeated LE uint64 key, fixed IV, AES-128-CBC/PKCS#7. */
-int op_crypt(int encrypt, uint64_t key, const uint8_t *in, size_t len, uint8_t *out,
-             size_t capacity, size_t *written);
 #endif

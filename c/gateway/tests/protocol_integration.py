@@ -77,7 +77,7 @@ class WS:
         self.socket=context.wrap_socket(raw,server_hostname='127.0.0.1');self.buffer=bytearray();self.name=name
         key=base64.b64encode(secrets.token_bytes(16)).decode()
         extra='&'+urlencode({'autonode':1,'deviceid':device,'hostname':hostname}) if device is not None else ''
-        request=(f'GET {path}?node={name}&token={credential}&protocol=fastp2p1&version=1.0.0&nattype=1{extra} HTTP/1.1\r\n'
+        request=(f'GET {path}?node={name}&token={credential}&protocol=fastp2p2&version=2.0.0&nattype=1{extra} HTTP/1.1\r\n'
             f'Host: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
             f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
         self.socket.sendall(request.encode())
@@ -131,7 +131,7 @@ class WS:
             if (m,s)==(main,sub):return frame[8:]
         raise AssertionError('Expected frame not received')
     def report(self):
-        self.send(message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'1.0.0','hasIPv4':1,'publicIPPort':31000}))
+        self.send(message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'2.0.0','hasIPv4':1,'publicIPPort':31000}))
         assert json.loads(self.until(6,7))=={}
     def query(self,peer,credential=token):
         self.send(message(7,0,{'peerNode':peer.name,'token':credential}))
@@ -152,13 +152,9 @@ class WS:
 try:
     with tempfile.TemporaryDirectory(prefix='fastp2p-c-gateway-protocol-') as temp, (logs/'gateway.log').open('w') as output:
         directory=Path(temp)
-        config={'enable':1,'gateway':'10.80.0.254/24','mode':'central','centralNode':'member-node-a',
-            'tunnelNum':2,'mtu':1420,'Nodes':[{'name':'member-node-a','ip':'10.80.0.1','enable':1},
-                                         {'name':'member-node-b','ip':'10.80.0.2','enable':1}]}
-        (directory/'sdwan.json').write_text(json.dumps(config))
         env=os.environ.copy();env.update(FASTP2P_USER=user,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=str(token))
         process=subprocess.Popen([str(Path(args.gateway).resolve()),'--cert',str(certs/'server.crt'),'--key',str(certs/'server.key'),
-            '--bind','127.0.0.1','--sdwan-config',str(directory/'sdwan.json')],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
+            '--bind','127.0.0.1'],cwd=directory,env=env,stdout=output,stderr=subprocess.STDOUT)
         wait(lambda:api('/healthz')[0]==200)
         assert api('/api/v1/devices')[0]==401
         assert api('/api/v1/user/login',{'user':user,'password':'incorrect'})[0]==401
@@ -170,7 +166,7 @@ try:
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)
-        assert status==200 and overview['version']=='1.0.1' and overview['capacity']==256
+        assert status==200 and overview['version']=='2.0.0' and overview['capacity']==256
         assert overview['nodeStorage']=='sqlite' and overview['totalNodes']==0
         assert 'nodeToken' not in overview and password not in json.dumps(overview)
         for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:
@@ -192,7 +188,7 @@ try:
         assert api('/api/v1/devices',jwt=jwt)[0]==200 and api('/api/v1/devices',jwt='Bearer '+jwt)[0]==200
         assert api('/api/v1/devices',jwt=jwt[:-4]+'AAAA')[0]==401
         limited=WS('web-c-capability')
-        limited.send(message(6,0,{'os':'linux-c','version':'1.0.0'}));limited.until(6,7)
+        limited.send(message(6,0,{'os':'linux-c','version':'2.0.0'}));limited.until(6,7)
         nodes=api('/api/v1/devices',jwt=jwt)[1]['nodes']
         capability=next(n['capabilities'] for n in nodes if n['name']==limited.name)
         assert capability['addForward'] and not capability['editForward'] and not capability['switchForward']
@@ -238,7 +234,6 @@ try:
         results['WSS_authentication_and_listener_separation']=True
         a=WS('member-node-a',source='127.0.0.2');b=WS('member-node-b',source='127.0.0.3');r=WS('relay-node-c',source='127.0.0.4')
         for c in (a,b,r):c.report()
-        assert a.query(b,0).get('online',0)==0
         assert a.push(b,2,{'from':a.name,'id':1})['error']==1
         assert a.query(b)['online']==1 and a.query(r)['online']==1
         assert a.push(b,2,{'from':a.name,'id':2})['error']==0
@@ -247,24 +242,21 @@ try:
         assert b.push(r,2,{'from':b.name,'id':4})['error']==1
         assert a.push(b,2,{'id':5},from_id=crc(r.name))['error']==1
         assert a.push(b,1,{'from':r.name,'token':token})['error']==1
-        step=int(time.time())//30
-        totp=struct.unpack('<Q',hmac.new(struct.pack('<Q',token),struct.pack('<Q',step),hashlib.sha256).digest()[:8])[0]
-        assert b.query(r,totp)['online']==1
-        results['query_TOTP_pair_grants_no_transitivity_and_spoof_rejection']=True
+        assert b.query(r)['online']==1
+        results['query_grants_no_transitivity_and_spoof_rejection']=True
         # Receive fragmented WS input, emit fragmented output, and preserve a large uint64.
-        payload=message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'1.0.0'})
+        payload=message(6,0,{'os':'test-c-peer','lanIP':'127.0.0.1','version':'2.0.0'})
         a.send(payload[:9],fin=False);a.send(payload[9:],opcode=0);a.until(6,7)
-        large={'appID':token,'appKey':token,'padding':'x'*96000}
+        large={'peer':'x','session':token,'secret':'00'*32,'padding':'x'*96000}
         assert a.push(b,13,large)['error']==0
         assert json.loads(b.until(3,13)[16:])==large
         a.send(message(1,0)+message(1,0))
         for _ in range(2):assert abs(struct.unpack('<Q',a.until(1,0))[0]-time.time_ns())<2_000_000_000
         results['WS_fragmentation_large_messages_uint64_and_coalesced_frames']=True
-        a.send(message(8,0));assert json.loads(a.until(8,1))['Nodes']==config['Nodes']
-        r.send(message(8,0));assert json.loads(r.until(8,1))=={'tunnelNum':2,'mtu':1420}
         a.send(message(5,0,{'peerNode':b.name}));relay=json.loads(a.until(5,1))
-        assert relay['relayName']==r.name and relay['relayToken']!=0
-        results['SDWAN_membership_and_relay_coordination']=True
+        assert relay['relay']==r.name and relay['error']==0
+        r.send(message(5,0,{'peerNode':b.name}));assert json.loads(r.until(5,1))['relay']==a.name
+        results['relay_offer_selects_a_third_node_and_never_an_endpoint']=True
         responses=[]
         thread=threading.Thread(target=lambda:responses.append(api('/api/v1/device/'+a.name+'/apps',jwt=jwt)));thread.start()
         a.until(3,7);a.send(message(6,3,{'Apps':[{'appName':'reply','srcPort':12345}]}));thread.join(4)

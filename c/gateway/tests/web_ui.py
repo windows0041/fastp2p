@@ -33,14 +33,14 @@ class Peer:
         self.name=name;self.apps=[];self.commands=[];self.lock=threading.Lock();self.stop=threading.Event();self.error=None
         self.sock=ssl.create_default_context(cafile=str(ca)).wrap_socket(socket.create_connection(('127.0.0.1',37183),timeout=3),server_hostname='127.0.0.1')
         key=base64.b64encode(secrets.token_bytes(16)).decode()
-        request=(f'GET /api/v1/login?node={name}&token={token}&protocol=fastp2p1&version=1.0.0&nattype=1 HTTP/1.1\r\nHost: 127.0.0.1:37183\r\n'
+        request=(f'GET /api/v1/login?node={name}&token={token}&protocol=fastp2p2&version=2.0.0&nattype=1 HTTP/1.1\r\nHost: 127.0.0.1:37183\r\n'
             f'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
         self.sock.sendall(request.encode());self.buffer=bytearray()
         while b'\r\n\r\n' not in self.buffer:self.buffer.extend(self.sock.recv(4096))
         head,self.buffer=self.buffer.split(b'\r\n\r\n',1);assert b' 101 ' in head
         self.buffer=bytearray(self.buffer)
         self.sock.settimeout(None)
-        self.send(frame(6,0,{'os':system,'version':'1.0.0','lanIP':'192.0.2.8','hasIPv4':1}))
+        self.send(frame(6,0,{'os':system,'version':'2.0.0','lanIP':'192.0.2.8','hasIPv4':1}))
         self.reader=threading.Thread(target=self.read_loop,daemon=True);self.reader.start()
         self.heartbeat=threading.Thread(target=self.heartbeat_loop,daemon=True);self.heartbeat.start()
     def exact(self,n):

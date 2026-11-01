@@ -145,8 +145,17 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             return 0;
         }
         if (sub == 1) {
-            /* The gateway has already authenticated this connection; a peer
-             * query grants the right to ask it for a tunnel. */
+            /* A connect request may only claim the sender's own node name; the
+             * gateway has already authenticated this connection, so no secret
+             * needs to travel with the request. */
+            json_object *request = gw_json(data + 16, len - 16);
+            int valid = request && !strcmp(gw_string(request, "from"), c->node);
+            if (request)
+                json_object_put(request);
+            if (!valid) {
+                send_push_result(c, 1, "push denied");
+                return 0;
+            }
             grant(c, target);
         } else if (sub != 13 && sub != 14 && g.grants[c->slot][target->slot] <= gw_mono_ms()) {
             send_push_result(c, 1, "push denied");
