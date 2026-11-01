@@ -14,7 +14,13 @@ Android APK 同时包含两种 ABI 的独立 C 库和 JNI 库。已检查各库 
 
 更新后的 Linux 核心通过常规与 ASan/UBSan 组件测试、独立双向 QUIC，以及六节点完整互通回归。12 组转发、TCP 最后响应数据、35 秒心跳、网关重启重连均通过，退出日志无 Sanitizer / undefined behavior 报错。
 
-macOS 两架构原生测试及 MSVC 消费 DLL 的运行结果随平台工作流记录。当前平台边界和使用方法见 [PLATFORMS-ZH.md](PLATFORMS-ZH.md)。本轮保留现有 Go 部署，Windows 和 Android 使用独立 C 测试节点，测试后已停止连接。
+macOS arm64 / x86_64 分别在 `macos-15` 与 `macos-15-intel` 原生 runner 上通过构建、安装后 SDK 消费、4 项组件检查、严格 CA/主机名验证、C/Go 双向 QUIC、原生 C WSS 鉴权探针及 C→Go / C→C 的 8 组应用转发。编译与运行中的 ngtcp2 均核对为 1.22.1；修复了 BSD 地址长度/填充比较问题，并固定第三方头文件优先级，防止混入系统版本。
+
+Windows 在 `windows-2022` 原生 runner 上重复通过协议、TLS、QUIC 与 8 组转发，并使用 Visual Studio MSVC 编译独立 CMake 消费项目，链接 MinGW 构建的 DLL，验证 C ABI、JSON 工厂、回调和句柄生命周期。
+
+固定 OpenSSL QUIC 后端还在 Linux 上通过 ASan/UBSan 的 4 项组件检查及 C/Go 双向 QUIC。该项覆盖新后端的内存检查；前述六节点完整 sanitizer 回归使用 Linux 系统 GnuTLS 后端。
+
+四项 CI 作业全部成功，代码提交为 `c0bf49253d31437e92613b087531e078e9fb400e`：[完整运行记录与 SDK 产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。当前平台边界和使用方法见 [PLATFORMS-ZH.md](PLATFORMS-ZH.md)。本轮保留现有 Go 部署，Windows 和 Android 使用独立 C 测试节点，测试后已停止连接。
 
 ## 0.1.0 Linux 首版
 

@@ -108,6 +108,8 @@ APK 位于 `c/client/android/app/build/outputs/apk/debug/`。依赖使用 OpenSS
 
 工作流 `.github/workflows/c-platforms.yml` 在 macOS 两架构原生构建和测试，在 Linux 构建 Android/Windows，再在 Windows 原生运行测试并检查 MSVC 消费 C SDK。产物可在对应 Actions 运行的 Artifacts 中下载。详细测试依赖 Go 1.20.14 作为协议参考对端，发布的 C 核心不依赖 Go。
 
+0.2.0 的四项作业已全部通过：[验证运行及下载](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 本机调试包使用本地 `~/.android/debug.keystore`，CI 调试包使用 runner 生成的调试密钥；两者签名可能不同，持续安装更新应使用同一把签名密钥。
+
 ## 当前边界
 
 各平台保留 Linux 首版的 IPv4 应用转发范围。复杂对称 NAT 扫描、UPnP/NAT-PMP、IPv6 数据通道、中继、SD-WAN/TUN、完整远程规则编辑、自动更新和 C 网关尚未实现。单规则显式选择 TCP 或 QUIC，未加入所有 Go 自动选路策略。

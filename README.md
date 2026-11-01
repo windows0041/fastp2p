@@ -67,6 +67,8 @@ C 客户端 0.2.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp
 
 各平台实现私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发。构建和使用见 [C 客户端说明](c/client/README.md) 与 [平台和 SDK 说明](c/client/PLATFORMS-ZH.md)，实际测试覆盖见 [验证记录](c/client/VALIDATION-ZH.md)。C 网关、SD-WAN/TUN 和中继尚未实现。
 
+Windows、Android 和 macOS 两种架构的 SDK / 调试包见 [0.2.0 验证与构建产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 已在连接的 Android 12 x86_64 设备上经自建公网网关与远端 Go 节点联调；arm64 已构建，尚未在 ARM 设备上运行。
+
 ## 配置与许可证
 
 真实 token、账号密码、运行配置、证书、私钥、Android 签名密钥及构建产物不纳入版本控制。使用 [客户端配置示例](go/client/config.example.json) 和 [网关环境变量示例](go/gateway/.env.example) 配置自己的环境。
