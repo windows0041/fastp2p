@@ -132,7 +132,7 @@ def main():
     results = {}
     try:
         # Forwarding stays off, so the two namespaces cannot reach each other.
-        run(['sysctl', '-qw', 'net.ipv4.ip_forward=0'])
+        run(['sysctl', '-qw', 'net.ipv4.ip_forward=0'], check=False)
         run(['ip', 'link', 'add', 'esc0', 'type', 'dummy'])
         run(['ip', 'addr', 'add', HOST_ADDR + '/24', 'dev', 'esc0'])
         run(['ip', 'link', 'set', 'esc0', 'up'])
