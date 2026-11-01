@@ -10,3 +10,11 @@ dist
 .env
 .env.*
 !.env.example
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+certs/
+*.csr
+*.srl
+*.log*
+__pycache__/

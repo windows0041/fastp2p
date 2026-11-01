@@ -1,5 +1,17 @@
 # C 客户端验证记录
 
+## 0.4.0 主机名与稳定身份
+
+[跨平台 CI 41298212833](https://github.com/windows0041/openp2p-test/actions/runs/41298212833)，实现提交 `b3abb4b6864023abeed05179f0fefc6368ba8bf4`，Linux、Windows、macOS arm64/x86_64 和 Android 的五个作业全部通过。新增 API 不改变结构体布局，ABI 保持 1；Windows MSVC 消费者、Android APK/lint 和原有 TLS/QUIC/SOCKS5 检查继续通过。
+
+Linux/macOS/Windows 均执行真实 CLI 身份文件测试，覆盖自动生成、再次读取、损坏文件拒绝及显式节点名兼容；POSIX 平台另验证 0600 权限和符号链接拒绝。C API 测试覆盖自动名称、身份查询/设置和无节点字段的 JSON 工厂。
+
+[网关 CI 41298212839](https://github.com/windows0041/openp2p-test/actions/runs/41298212839) 的 Debian 12/13 作业使用真实 C 0.4 客户端，验证短主机名数字补齐、重复主机名唯一分配、客户端重启、网关崩溃恢复和最终名称下的 TCP/QUIC 转发，均开启 ASan/UBSan。Android 共用同一自动命名核心和私有设备标识保存流程；本轮未增加 Android/macOS 的公网设备回归。
+
+配置及库接口见 [节点存储和命名](../NODE-STORAGE-ZH.md)。下文保留此前验证基线。
+
+# C 客户端验证记录
+
 ## 0.3.0 SOCKS5（2026-11-01）
 
 公开 ABI 保持 1，增加 `op2p_client_add_socks5`，共导出 12 个 C API。入口和出口均使用 C 0.3.0；普通固定转发继续兼容 Go 3.25.11。
