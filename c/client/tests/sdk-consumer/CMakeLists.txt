@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(fastp2p_sdk_consumer LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
-find_package(fastp2p 1.0 CONFIG REQUIRED)
+find_package(fastp2p 2.0 CONFIG REQUIRED)
 add_executable(sdk-consumer ../test_api.c)
 target_link_libraries(sdk-consumer PRIVATE fastp2p::fastp2p)
 if(MSVC)
