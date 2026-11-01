@@ -1,6 +1,6 @@
 FROM debian:12-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake ninja-build pkg-config libwebsockets-dev libjson-c-dev libssl-dev \
+    build-essential cmake ninja-build pkg-config python3 libwebsockets-dev libjson-c-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY . ./

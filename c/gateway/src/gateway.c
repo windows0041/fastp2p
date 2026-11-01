@@ -1,4 +1,5 @@
 #include "gateway.h"
+#include "web_assets.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -82,8 +83,13 @@ static int enqueue(struct connection *c, uint16_t main, uint16_t sub, const void
     return 0;
 }
 static int send_json(struct connection *c, uint16_t main, uint16_t sub, json_object *j) {
-    const char *text = j ? json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN) : "null";
-    return enqueue(c, main, sub, text, strlen(text));
+    size_t length;
+    char *text = gw_json_text(j, &length);
+    if (!text)
+        return -1;
+    int result = enqueue(c, main, sub, text, length);
+    free(text);
+    return result;
 }
 static void send_push_result(struct connection *c, unsigned error, const char *detail) {
     json_object *j = json_object_new_object();
@@ -338,6 +344,7 @@ static void clear_http(struct connection *c) {
     c->request = c->response = NULL;
     c->request_length = c->response_length = c->response_offset = 0;
     c->headers_sent = c->handled = 0;
+    c->response_type = NULL;
     c->deadline = 0;
 }
 static void http_reply(struct connection *c, int status, const void *data, size_t len) {
@@ -393,6 +400,14 @@ static json_object *devices(void) {
         gw_js(j, "mac", n->mac);
         gw_js(j, "os", n->os);
         gw_js(j, "version", n->version);
+        size_t os_len = strlen(n->os);
+        int c_client = os_len >= 2 && !strcmp(n->os + os_len - 2, "-c");
+        json_object *capabilities = json_object_new_object();
+        json_object_object_add(capabilities, "readApps", json_object_new_boolean(1));
+        json_object_object_add(capabilities, "addForward", json_object_new_boolean(1));
+        json_object_object_add(capabilities, "editForward", json_object_new_boolean(!c_client));
+        json_object_object_add(capabilities, "switchForward", json_object_new_boolean(!c_client));
+        json_object_object_add(j, "capabilities", capabilities);
         gw_ju(j, "isActive", 1);
         json_object_object_add(j, "isUpdate", json_object_new_boolean(1));
         time_t timestamp = (time_t)(n->active_wall / 1000000000);
@@ -410,6 +425,16 @@ static void handle_http(struct connection *c) {
     if (lws_get_vhost(c->wsi) != g.api_vhost) {
         http_error(c, 404, 1, "not found");
         return;
+    }
+    if (!c->post) {
+        for (size_t i = 0; i < sizeof(web_assets) / sizeof(web_assets[0]); ++i) {
+            const struct web_asset *asset = &web_assets[i];
+            if (!strcmp(c->uri, asset->path) || (i == 0 && !strcmp(c->uri, "/index.html"))) {
+                c->response_type = asset->type;
+                http_reply(c, 200, asset->data, asset->length);
+                return;
+            }
+        }
     }
     if (!c->post && !strcmp(c->uri, "/healthz")) {
         http_reply(c, 200,
@@ -452,6 +477,27 @@ static void handle_http(struct connection *c) {
     }
     if (!c->authorized) {
         http_error(c, 401, 1, "unauthorized");
+        return;
+    }
+    if (!c->post && !strcmp(c->uri, "/api/v1/status")) {
+        unsigned count = 0;
+        for (unsigned i = 0; i < g.max_nodes; ++i)
+            if (g.nodes[i] && !g.nodes[i]->closing)
+                ++count;
+        json_object *j = json_object_new_object();
+        gw_js(j, "implementation", "c");
+        gw_js(j, "version", GW_VERSION);
+        gw_js(j, "user", g.user);
+        gw_ju(j, "online", count);
+        gw_ju(j, "capacity", g.max_nodes);
+        gw_ju(j, "uptimeSeconds", (gw_mono_ms() - g.started_ms) / 1000);
+        gw_ju(j, "queuedBytes", g.queued);
+        gw_ju(j, "queueLimitBytes", GW_TOTAL_QUEUED);
+        gw_ju(j, "wssPort", g.ws_port);
+        gw_ju(j, "apiPort", g.api_port);
+        gw_ju(j, "heartbeatTimeout", g.timeout);
+        http_json(c, 200, j);
+        json_object_put(j);
         return;
     }
     if (!c->post && !strcmp(c->uri, "/api/v1/devices")) {
@@ -509,6 +555,14 @@ static void handle_http(struct connection *c) {
             http_error(c, 400, 1, "invalid JSON");
             return;
         }
+        size_t os_len = strlen(target->os);
+        int c_client = os_len >= 2 && !strcmp(target->os + os_len - 2, "-c");
+        if (c_client && (!strcmp(end, "/switchapp") || gw_integer(j, "srcPort0") ||
+                         *gw_string(j, "protocol0"))) {
+            json_object_put(j);
+            http_error(c, 501, 1, "this client supports querying and adding rules only");
+            return;
+        }
         int result = send_json(target, 3, !strcmp(end, "/app") ? 9 : 10, j);
         json_object_put(j);
         if (result)
@@ -527,12 +581,26 @@ static int write_http(struct connection *c) {
         unsigned char buffer[LWS_PRE + 1024], *start = buffer + LWS_PRE, *p = start,
                                               *end = buffer + sizeof(buffer);
         if (lws_add_http_common_headers(c->wsi, (unsigned)c->status,
-                                        "application/json; charset=utf-8",
+                                        c->response_type ? c->response_type
+                                                         : "application/json; charset=utf-8",
                                         (lws_filepos_t)c->response_length, &p, end) ||
             lws_add_http_header_by_name(c->wsi, (unsigned char *)"cache-control:",
                                         (unsigned char *)"no-store", 8, &p, end) ||
             lws_add_http_header_by_name(c->wsi, (unsigned char *)"x-content-type-options:",
                                         (unsigned char *)"nosniff", 7, &p, end) ||
+            lws_add_http_header_by_name(
+                c->wsi, (unsigned char *)"content-security-policy:",
+                (unsigned char *)"default-src 'none'; script-src 'self'; style-src 'self'; img-src "
+                                 "'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; "
+                                 "frame-ancestors 'none'",
+                (int)strlen("default-src 'none'; script-src 'self'; style-src 'self'; img-src "
+                            "'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; "
+                            "frame-ancestors 'none'"),
+                &p, end) ||
+            lws_add_http_header_by_name(c->wsi, (unsigned char *)"referrer-policy:",
+                                        (unsigned char *)"no-referrer", 11, &p, end) ||
+            lws_add_http_header_by_name(
+                c->wsi, (unsigned char *)"x-frame-options:", (unsigned char *)"DENY", 4, &p, end) ||
             lws_finalize_write_http_header(c->wsi, start, &p, end))
             return -1;
         c->headers_sent = 1;
@@ -1038,6 +1106,7 @@ int main(int argc, char **argv) {
         fputs("Cannot load TLS certificate/key or bind HTTPS/WSS ports\n", stderr);
         goto failed;
     }
+    g.started_ms = gw_mono_ms();
     printf("{\"event\":\"ready\",\"version\":\"%s\",\"wss\":%u,\"api\":%u}\n", GW_VERSION,
            g.ws_port, g.api_port);
     fflush(stdout);

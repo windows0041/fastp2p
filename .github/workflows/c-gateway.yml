@@ -1,7 +1,9 @@
 name: C gateway
 on:
   push:
-    paths: ['c/gateway/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml']
+    tags: ['c-gateway-v*']
+    branches: ['**']
+    paths: ['c/gateway/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml', 'scripts/publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -45,16 +47,32 @@ jobs:
           cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOPENP2P_SANITIZE=ON -DBUILD_TESTING=OFF -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/linux-x86_64"
           cmake --build build/c --parallel 3
       - name: C gateway protocol, authentication and lifecycle with sanitizers
-        run: bash c/gateway/scripts/check.sh --sanitize
+        run: |
+          python3 scripts/test-publish-release.py
+          bash c/gateway/scripts/check.sh --sanitize
       - name: Six Go/C clients, TCP punch, QUIC and reconnect
         run: bash c/gateway/scripts/integration.sh
+      - name: Browser console authentication and node operations
+        run: |
+          python3 -m pip install playwright==1.56.0
+          python3 -m playwright install --with-deps chromium > browser-install.log 2>&1 || { tail -40 browser-install.log; exit 1; }
+          python3 c/gateway/tests/web_ui.py --gateway build/c-gateway/openp2p-gateway-c --client build/c/openp2p-c --output build/web-ui
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gateway-web-validation-debian${{ matrix.debian }}
+          path: |
+            build/web-ui/result.json
+            build/web-ui/*.png
       - name: Package native gateway
         run: |
           cmake -S c/gateway -B build/c-gateway-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PWD/dist/c-gateway-debian${{ matrix.debian }}-x86_64"
           cmake --build build/c-gateway-release --parallel 3
           cmake --install build/c-gateway-release
-          cp c/gateway/README.md c/gateway/THIRD_PARTY.md c/gateway/LICENSE dist/c-gateway-debian${{ matrix.debian }}-x86_64/
+          cp c/gateway/README.md c/gateway/VALIDATION-ZH.md c/gateway/THIRD_PARTY.md c/gateway/LICENSE c/gateway/.env.example dist/c-gateway-debian${{ matrix.debian }}-x86_64/
           cp -R c/gateway/deploy dist/c-gateway-debian${{ matrix.debian }}-x86_64/
+          mkdir -p dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts
+          cp go/gateway/scripts/generate-cert.sh dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts/
           tar -C dist -czf dist/openp2p-c-gateway-debian${{ matrix.debian }}-x86_64.tar.gz c-gateway-debian${{ matrix.debian }}-x86_64
       - uses: actions/upload-artifact@v4
         with:
@@ -96,3 +114,31 @@ jobs:
       - name: Stop test container
         if: always()
         run: docker rm -f c-gateway-test || true
+      - name: Package Docker image
+        run: |
+          version=$(sed -n 's/.*project(openp2p_c_gateway VERSION \([0-9.]*\).*/\1/p' c/gateway/CMakeLists.txt)
+          docker tag openp2p-c-gateway:test "openp2p-c-gateway:$version"
+          mkdir -p dist
+          docker save "openp2p-c-gateway:$version" | gzip -n > dist/openp2p-c-gateway-docker-amd64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-gateway-docker-amd64
+          path: dist/openp2p-c-gateway-docker-amd64.tar.gz
+  release:
+    needs: [gateway, docker]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/c-gateway-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openp2p-c-gateway-*
+          path: release-input
+      - name: Publish verified gateway packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-release.py --kind gateway --input release-input --output release-output

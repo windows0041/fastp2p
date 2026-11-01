@@ -163,11 +163,37 @@ try:
         assert response.status==400;response.read();empty.close()
         status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and login['nodeToken']==str(token)
         jwt=login['token'];head,body,sig=jwt.split('.')
+        assert api('/api/v1/status')[0]==401
+        status,overview=api('/api/v1/status',jwt=jwt)
+        assert status==200 and overview['version']=='0.2.0' and overview['capacity']==256
+        assert 'nodeToken' not in overview and password not in json.dumps(overview)
+        for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:
+            conn=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
+            conn.request('GET',path);response=conn.getresponse();asset=response.read()
+            assert response.status==200 and kind in response.getheader('Content-Type') and asset
+            assert "script-src 'self'" in response.getheader('Content-Security-Policy')
+            assert response.getheader('X-Frame-Options')=='DENY' and response.getheader('Cache-Control')=='no-store'
+            assert password.encode() not in asset
+            conn.close()
+        conn=http.client.HTTPSConnection('127.0.0.1',27183,context=context,timeout=3)
+        conn.request('GET','/');response=conn.getresponse();assert response.status==404;response.read();conn.close()
+        assert api('/server.key',jwt=jwt)[0]==404
+        results['embedded_web_assets_security_headers_and_protected_status']=True
         expected=hmac.new((user+password+'@openp2p.cn').encode(),(head+'.'+body).encode(),hashlib.sha256).digest()
         assert hmac.compare_digest(base64.urlsafe_b64encode(expected).decode().rstrip('='),sig)
         assert json.loads(base64.urlsafe_b64decode(body+'='*(-len(body)%4)))['installToken']==str(token)
         assert api('/api/v1/devices',jwt=jwt)[0]==200 and api('/api/v1/devices',jwt='Bearer '+jwt)[0]==200
         assert api('/api/v1/devices',jwt=jwt[:-4]+'AAAA')[0]==401
+        limited=WS('web-c-capability')
+        limited.send(message(6,0,{'os':'linux-c','version':'3.25.11'}));limited.until(6,7)
+        nodes=api('/api/v1/devices',jwt=jwt)[1]['nodes']
+        capability=next(n['capabilities'] for n in nodes if n['name']==limited.name)
+        assert capability['addForward'] and not capability['editForward'] and not capability['switchForward']
+        assert api('/api/v1/device/'+limited.name+'/switchapp',{'srcPort':23456,'enabled':0},jwt)[0]==501
+        assert api('/api/v1/device/'+limited.name+'/app',{'srcPort0':23456,'protocol0':'tcp'},jwt)[0]==501
+        limited.close()
+        wait(lambda:limited.name not in [n['name'] for n in api('/api/v1/devices',jwt=jwt)[1]['nodes']])
+        results['C_client_management_capabilities_enforced']=True
         def signed(claims,algorithm='HS256'):
             encode=lambda obj:base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip('=')
             data=encode({'alg':algorithm})+'.'+encode(claims)

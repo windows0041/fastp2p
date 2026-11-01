@@ -1,7 +1,9 @@
 name: C clients
 on:
   push:
-    paths: ['c/client/**', '.github/workflows/c-platforms.yml']
+    tags: ['c-client-v*']
+    branches: ['**']
+    paths: ['c/client/**', '.github/workflows/c-platforms.yml', 'scripts/publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read
@@ -265,3 +267,21 @@ jobs:
         with:
           name: socks5-results-linux
           path: build/socks-reports/
+  release:
+    needs: [macos, cross, linux, windows]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/c-client-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openp2p-c-*
+          path: release-input
+      - name: Publish verified client SDKs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-release.py --kind client --input release-input --output release-output

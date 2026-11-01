@@ -27,6 +27,7 @@ struct connection {
     char uri[256];
     int post, authorized, status, headers_sent, handled;
     unsigned char *request, *response;
+    const char *response_type;
     size_t request_length, response_length, response_offset;
     uint64_t deadline;
     struct connection *request_node, *pending_http;
@@ -56,6 +57,7 @@ struct gateway {
     const char *cert, *key, *user, *password;
     char secret[2048];
     uint64_t token;
+    uint64_t started_ms;
     json_object *sdwan;
     struct nat_state nat;
 };

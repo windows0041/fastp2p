@@ -3,7 +3,7 @@
 #include <json-c/json.h>
 #include <stddef.h>
 #include <stdint.h>
-#define GW_VERSION "0.1.0"
+#define GW_VERSION "0.2.0"
 #define GW_FRAME_LIMIT (1024u * 1024u)
 uint16_t gw_u16(const void *p);
 uint32_t gw_u32(const void *p);
@@ -17,6 +17,7 @@ uint64_t gw_wall_ns(void);
 int gw_decimal(const char *text, uint64_t *out);
 int gw_node_valid(const char *text);
 json_object *gw_json(const void *data, size_t len);
+char *gw_json_text(json_object *value, size_t *length);
 json_object *gw_get(json_object *j, const char *name);
 const char *gw_string(json_object *j, const char *name);
 uint64_t gw_integer(json_object *j, const char *name);

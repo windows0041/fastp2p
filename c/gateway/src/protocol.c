@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -77,15 +78,118 @@ int gw_node_valid(const char *text) {
     }
     return 1;
 }
+static int utf8_valid(const unsigned char *data, size_t len) {
+    for (size_t i = 0; i < len;) {
+        unsigned lead = data[i++], remaining;
+        uint32_t value, minimum;
+        if (lead < 0x80)
+            continue;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            remaining = 1;
+            value = lead & 0x1f;
+            minimum = 0x80;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            remaining = 2;
+            value = lead & 0x0f;
+            minimum = 0x800;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            remaining = 3;
+            value = lead & 7;
+            minimum = 0x10000;
+        } else
+            return 0;
+        if (remaining > len - i)
+            return 0;
+        while (remaining--) {
+            unsigned next = data[i++];
+            if ((next & 0xc0) != 0x80)
+                return 0;
+            value = (value << 6) | (next & 0x3f);
+        }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+            return 0;
+    }
+    return 1;
+}
+static char *json_ascii(const unsigned char *data, size_t len, size_t *length) {
+    char *out = malloc(len * 3 + 1);
+    if (!out)
+        return NULL;
+    size_t used = 0;
+    int quoted = 0, escaped = 0;
+    for (size_t i = 0; i < len;) {
+        unsigned c = data[i++];
+        if (c < 0x80) {
+            out[used++] = (char)c;
+            if (quoted) {
+                if (escaped)
+                    escaped = 0;
+                else if (c == '\\')
+                    escaped = 1;
+                else if (c == '"')
+                    quoted = 0;
+            } else if (c == '"')
+                quoted = 1;
+            continue;
+        }
+        /* Non-ASCII is legal only as an unescaped character inside a string. */
+        if (!quoted || escaped) {
+            free(out);
+            return NULL;
+        }
+        unsigned remaining = c < 0xe0 ? 1 : c < 0xf0 ? 2 : 3;
+        uint32_t value = c & (remaining == 1 ? 0x1f : remaining == 2 ? 0x0f : 7);
+        while (remaining--)
+            value = (value << 6) | (data[i++] & 0x3f);
+        if (value <= 0xffff)
+            used += (size_t)sprintf(out + used, "\\u%04x", (unsigned)value);
+        else {
+            value -= 0x10000;
+            used += (size_t)sprintf(out + used, "\\u%04x\\u%04x", 0xd800u + (value >> 10),
+                                    0xdc00u + (value & 0x3ff));
+        }
+    }
+    out[used] = 0;
+    *length = used;
+    return out;
+}
+char *gw_json_text(json_object *value, size_t *length) {
+    const char *text =
+        value ? json_object_to_json_string_ext(value, JSON_C_TO_STRING_PLAIN) : "null";
+    *length = strlen(text);
+    if (*length > GW_FRAME_LIMIT || !utf8_valid((const unsigned char *)text, *length))
+        return NULL;
+    for (size_t i = 0; i < *length; ++i)
+        if ((unsigned char)text[i] >= 0x80)
+            return json_ascii((const unsigned char *)text, *length, length);
+    return strdup(text);
+}
 json_object *gw_json(const void *data, size_t len) {
     if (!data || !len || len > GW_FRAME_LIMIT || len > INT_MAX)
         return NULL;
-    json_tokener *tok = json_tokener_new();
-    if (!tok)
+    if (!utf8_valid(data, len))
         return NULL;
-    json_tokener_set_flags(tok, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    const unsigned char *input = data;
+    size_t input_len = len;
+    char *normalized = NULL;
+    for (size_t i = 0; i < len; ++i)
+        if (input[i] >= 0x80) {
+            normalized = json_ascii(data, len, &input_len);
+            if (!normalized)
+                return NULL;
+            input = (const unsigned char *)normalized;
+            break;
+        }
+    json_tokener *tok = json_tokener_new();
+    if (!tok) {
+        free(normalized);
+        return NULL;
+    }
+    /* Distro json-c strict parsing may treat signed UTF-8 bytes as controls.
+     * Validate raw UTF-8, then use equivalent JSON escapes, keeping STRICT. */
+    json_tokener_set_flags(tok, JSON_TOKENER_STRICT);
     errno = 0;
-    json_object *j = json_tokener_parse_ex(tok, data, (int)len);
+    json_object *j = json_tokener_parse_ex(tok, (const char *)input, (int)input_len);
     size_t used = json_tokener_get_parse_end(tok);
     if (json_tokener_get_error(tok) != json_tokener_success || errno == ERANGE) {
         if (j)
@@ -93,8 +197,8 @@ json_object *gw_json(const void *data, size_t len) {
         j = NULL;
     }
     if (j) {
-        const unsigned char *p = data;
-        for (size_t i = used; i < len; ++i)
+        const unsigned char *p = input;
+        for (size_t i = used; i < input_len; ++i)
             if (p[i] != ' ' && p[i] != '\t' && p[i] != '\n' && p[i] != '\r') {
                 json_object_put(j);
                 j = NULL;
@@ -102,6 +206,7 @@ json_object *gw_json(const void *data, size_t len) {
             }
     }
     json_tokener_free(tok);
+    free(normalized);
     return j;
 }
 json_object *gw_get(json_object *j, const char *name) {
