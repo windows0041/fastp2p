@@ -97,7 +97,7 @@ typedef struct {
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
-    uint64_t peer_nat;
+    uint64_t peer_nat, link_deadline;
     /* Relays that already failed for this rule; the gateway is asked to skip
      * them so one unreachable candidate cannot pin the link forever. */
     char relay_failed[4][32];
@@ -389,9 +389,19 @@ static int tunnel_by_id(fastp2p_client *c, uint64_t id) {
             return i;
     return -1;
 }
+/* A tunnel is only usable for application traffic once its session is ready on
+ * both sides.  Treating an active but unkeyed tunnel as usable is what makes an
+ * application wait forever on a link that will never carry a frame. */
+static int tunnel_ready(const tunnel *t) {
+    if (t->state != T_ACTIVE)
+        return 0;
+    if (t->relay_wait || t->relay_link >= 0 || t->relay_ready)
+        return t->relay_ready;
+    return t->keyed && t->key_acked;
+}
 static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
     for (int i = 0; i < NT; ++i)
-        if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].transport == transport &&
+        if (tunnel_ready(&c->tunnels[i]) && c->tunnels[i].transport == transport &&
             !strcmp(c->tunnels[i].peer, peer))
             return i;
     return -1;
@@ -442,6 +452,23 @@ static void release_relay(fastp2p_client *c, int index) {
         }
     }
 }
+/* Half-open relay joins would otherwise hold a slot forever: a client that
+ * asked to relay and never got a partner leaks one entry per attempt, and the
+ * table is what bounds how many sessions this node can relay. */
+static void tick_relays(fastp2p_client *c, uint64_t now) {
+    for (int i = 0; i < NRL; ++i) {
+        relay_link *r = &c->relays[i];
+        if (!r->used || (r->ta >= 0 && r->tb >= 0) || now <= r->deadline)
+            continue;
+        int side = r->ta >= 0 ? r->ta : r->tb;
+        memset(r, 0, sizeof(*r));
+        if (side >= 0 && side < NT && c->tunnels[side].state) {
+            c->tunnels[side].relay_link = -1;
+            c->tunnels[side].relay_ready = 0;
+            close_tunnel(c, side, "relay join timed out");
+        }
+    }
+}
 static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
     if (!t->state)
@@ -454,9 +481,9 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     uint64_t id = t->id;
     char failed_relay[32];
     failed_relay[0] = 0;
-    /* A relay hop that never carried traffic is remembered so the next offer
-     * skips it; a hop that worked for a minute is not held against the node. */
-    if (t->relay_wait && !t->active_at && t->peer[0])
+    /* Remember a relay hop that never carried an application session so the
+     * next offer skips it; a hop that served traffic is not held against it. */
+    if (t->relay_wait && t->peer[0])
         copy_string(failed_relay, sizeof(failed_relay), t->peer);
     t->state = T_FREE;
     for (int i = 0; i < NO; ++i)
@@ -464,10 +491,12 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             close_overlay(c, i, 0);
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].tunnel_index == index) {
+            int was_synced = c->apps[i].synced;
             c->apps[i].tunnel_index = -1;
             c->apps[i].synced = 0;
+            c->apps[i].link_deadline = 0;
             c->apps[i].retry = mono() + 2 * NS;
-            if (failed_relay[0] && c->apps[i].local) {
+            if (failed_relay[0] && c->apps[i].local && !was_synced) {
                 app *a = &c->apps[i];
                 int known = 0;
                 for (int k = 0; k < a->relay_failed_count; ++k)
@@ -712,6 +741,7 @@ static void session_ready(fastp2p_client *c, int index) {
         if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == index &&
             !c->apps[i].synced) {
             c->apps[i].synced = 1;
+            c->apps[i].link_deadline = 0;
             c->apps[i].ready_at = mono() + 100 * MS;
             c->apps[i].relay_requested = 0;
             /* attempts is deliberately not reset here: a tunnel that completes
@@ -908,8 +938,10 @@ static void tunnel_active(fastp2p_client *c, int index) {
     }
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && !strcmp(c->apps[i].peer, t->peer) &&
-            c->apps[i].transport == t->transport)
+            c->apps[i].transport == t->transport) {
             c->apps[i].tunnel_index = index;
+            c->apps[i].link_deadline = mono() + 20 * NS;
+        }
     if (t->session_owner)
         push_session(c, t, NULL);
     else
@@ -1425,6 +1457,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             if (ti < 0)
                 continue;
             a->tunnel_index = ti;
+            a->link_deadline = mono() + 20 * NS;
             a->relay_wanted = 0;
             start_punch(c, ti);
         }
@@ -2167,10 +2200,21 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                 o->deadline = now + 10 * NS;
             }
         }
+        /* A link that never finishes its session is not usable: retire it so the
+         * retry ladder can move on (and eventually escalate to a relay). */
+        if (a->tunnel_index >= 0 && !a->synced && a->link_deadline && now > a->link_deadline) {
+            int dead = a->tunnel_index;
+            a->link_deadline = 0;
+            a->tunnel_index = -1;
+            a->retry = now;
+            if (c->tunnels[dead].state)
+                close_tunnel(c, dead, "link did not become ready");
+        }
         if (a->tunnel_index < 0 && now >= a->retry && c->state == FASTP2P_ONLINE) {
             int ti = active_tunnel(c, a->peer, a->transport);
             if (ti >= 0) {
                 a->tunnel_index = ti;
+                a->link_deadline = mono() + 20 * NS;
                 if (c->tunnels[ti].key_acked)
                     session_ready(c, ti);
             } else if (a->relay_requested) {
@@ -2732,6 +2776,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     tick_accept(c, now);
     for (int i = 0; i < NT; ++i)
         tick_tunnel(c, i, now);
+    tick_relays(c, now);
     tick_apps(c, now);
     tick_socks(c, now);
     tick_overlays(c, now);
