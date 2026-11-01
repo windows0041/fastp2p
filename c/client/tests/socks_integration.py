@@ -203,8 +203,10 @@ with tempfile.TemporaryDirectory(prefix='op2p-socks-') as temporary:
         for _ in range(80):
             with greeting(port) as sock:pass
         time.sleep(.2)
-        if before is not None:assert len(list(fd_path.iterdir()))<=before
-        results['80_abandoned_handshakes_released']=True
+        if before is not None:
+            assert len(list(fd_path.iterdir()))<=before
+            results['no_fd_growth_after_disconnects']=True
+        results['80_handshake_disconnect_cycles']=True
         if args.legacy_client:
             start([Path(args.legacy_client).resolve(),'-node','socks-legacy-exit','-serverhost','127.0.0.1','-cacert',root/'certs/ca.crt','-sharebandwidth','0','-nv'],'legacy')
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));legacy_port=sock.getsockname()[1]
@@ -218,7 +220,8 @@ with tempfile.TemporaryDirectory(prefix='op2p-socks-') as temporary:
         results['both_transports_confirmed']=True
         if not args.quick:
             gateway.terminate();gateway.wait(timeout=8);children.remove(gateway)
-            if os.name!='nt':assert gateway.returncode==0
+            # The C gateway handles SIGTERM; the Go reference exits by signal.
+            if os.name!='nt':assert gateway.returncode in (0,-15)
             gateway=start(gateway_command,'gateway-restarted')
             for transport in ['tcp','quic']:
                 wait(lambda t=transport:tcp(ports[t,True],targets['tcp'][0],True,True))
