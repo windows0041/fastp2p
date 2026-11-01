@@ -8,7 +8,7 @@
 
 协议测试新增无效 UTF-8、中文/emoji、未转义控制字符及旧版 C 客户端严格 JSON 解码回归。Debian 12 的 json-c 0.16 和 Debian 13 的 json-c 0.18 均纳入 CI。发布脚本覆盖缺失/重复产物、SHA-256 清单、Android SDK 可重现打包、私钥拒绝、先草稿后发布及上传校验失败时不发布。CI 工作流另执行 Docker 版本/TLS 健康检查和六客户端 TCP 打洞/QUIC 重连测试。
 
-构建状态见 [C gateway 工作流](https://github.com/windows0041/openp2p-test/actions/workflows/c-gateway.yml)，成功的原生包与 Docker 镜像见 [Releases](https://github.com/windows0041/openp2p-test/releases)。发布策略见 [发布说明](https://github.com/windows0041/openp2p-test/blob/main/RELEASING-ZH.md)。公网更新记录在部署完成后另行追加，下文保留 0.1.0 的互通基线。
+正式版 [CI 41293287366](https://github.com/windows0041/openp2p-test/actions/runs/41293287366) 的 Debian 12/13、Docker 和发布作业全部通过，原生包、Docker 镜像与 SHA-256 清单已自动发往 [0.2.0 Release](https://github.com/windows0041/openp2p-test/releases/tag/c-gateway-v0.2.0)。main 自动预览版也已发布。发布策略见 [发布说明](https://github.com/windows0041/openp2p-test/blob/main/RELEASING-ZH.md)。已使用正式包更新 `gz.itq.cc.cd`，完成真实 Web 登录、6 节点查询、Go 转发与 C SOCKS5 的公网回归，详见 [Web 更新记录](deploy/WEB-DEBUG-ZH.md)。下文保留 0.1.0 的互通基线。
 
 ## 0.1.0 互通基线
 
