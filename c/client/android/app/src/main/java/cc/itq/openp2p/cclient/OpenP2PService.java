@@ -55,18 +55,19 @@ public final class OpenP2PService extends Service {
         if (Build.VERSION.SDK_INT >= 34)
             startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         else startForeground(1, notification());
-        worker = new Thread(() -> runClient(startId), "openp2p-c-owner");
+        worker = new Thread(this::runClient, "openp2p-c-owner");
         worker.start();
         return START_NOT_STICKY;
     }
-    private void runClient(int startId) {
+    private void runClient() {
         long handle = 0;
         String failure = null;
         try {
             String config = SecretStore.preferences(this).getString("config", "{}");
             String token = SecretStore.token(this);
             String ca = SecretStore.preferences(this).getString("ca", "");
-            handle = NativeClient.create(config.getBytes(StandardCharsets.UTF_8), token, ca.isEmpty() ? null : ca, this);
+            ca = TrustStore.resolve(this, ca);
+            handle = NativeClient.create(config.getBytes(StandardCharsets.UTF_8), token, ca, this);
             if (handle == 0) throw new IllegalArgumentException("配置无效，请检查节点、Token 和转发规则");
             int result = NativeClient.start(handle);
             if (result != 0) throw new IllegalStateException("启动失败，代码 " + result);
@@ -80,9 +81,13 @@ public final class OpenP2PService extends Service {
             record(failure);
         } finally {
             if (handle != 0) NativeClient.destroy(handle);
-            running = false; state = 0;
-            status = failure != null ? failure : "已断开";
-            main.post(() -> { stopForeground(STOP_FOREGROUND_REMOVE); stopSelfResult(startId); });
+            final String finalStatus = failure != null ? failure : "已断开";
+            main.post(() -> {
+                state = 0; status = finalStatus; worker = null;
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf();
+                running = false;
+            });
         }
     }
     // Called synchronously by JNI on the owning Java worker thread; no native handle escapes it.

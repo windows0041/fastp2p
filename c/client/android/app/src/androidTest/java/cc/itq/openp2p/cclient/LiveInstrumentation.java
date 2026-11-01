@@ -54,6 +54,8 @@ public final class LiveInstrumentation extends Instrumentation {
         Context context = getTargetContext(); Bundle result = new Bundle();
         try {
             require(!OpenP2PService.running, "Stop the existing app session first");
+            require(new File(TrustStore.resolve(context, "")).length() > 1024, "Platform CA export failed");
+            result.putString("platformTrustStore", "passed");
             File file = new File(context.getFilesDir(), "validation.json");
             JSONObject input = new JSONObject(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
             file.delete();
@@ -92,6 +94,17 @@ public final class LiveInstrumentation extends Instrumentation {
             while (OpenP2PService.running && System.currentTimeMillis() < deadline) Thread.sleep(100);
             require(!OpenP2PService.running && OpenP2PService.state == 0, "Native shutdown failed");
             result.putString("shutdown", "passed");
+            Thread.sleep(1000);
+            startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            context.startForegroundService(new Intent(context, OpenP2PService.class));
+            deadline = System.currentTimeMillis() + 40000;
+            while (OpenP2PService.state != 2 && System.currentTimeMillis() < deadline) Thread.sleep(100);
+            require(OpenP2PService.state == 2, "Reconnect after explicit stop failed");
+            context.startService(new Intent(context, OpenP2PService.class).setAction(OpenP2PService.STOP));
+            deadline = System.currentTimeMillis() + 8000;
+            while (OpenP2PService.running && System.currentTimeMillis() < deadline) Thread.sleep(100);
+            require(!OpenP2PService.running, "Second native shutdown failed");
+            result.putString("serviceRestart", "passed");
             result.putString("version", NativeClient.version());
             finish(ActivityResult.OK, result);
         } catch (Throwable error) {

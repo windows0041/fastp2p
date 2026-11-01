@@ -30,7 +30,7 @@ typedef pthread_once_t op_once;
 #define OP_ONCE_INIT PTHREAD_ONCE_INIT
 #endif
 typedef intptr_t op_socket;
-#define OP_INVALID_SOCKET ((op_socket)-1)
+#define OP_INVALID_SOCKET ((op_socket) - 1)
 #ifndef MSG_DONTWAIT
 #define MSG_DONTWAIT 0
 #endif
@@ -52,11 +52,13 @@ int op_getsockname(op_socket fd, struct sockaddr *address, op_socklen *length);
 int op_setsockopt(op_socket fd, int level, int option, const void *value, op_socklen length);
 int op_getsockopt(op_socket fd, int level, int option, void *value, op_socklen *length);
 int op_reuse_socket(op_socket fd);
+int op_address_equal(const struct sockaddr *a, op_socklen alen, const struct sockaddr *b,
+                     op_socklen blen);
 int op_poll(op_pollfd *fds, unsigned count, int timeout);
 op_ssize op_send(op_socket fd, const void *data, size_t length, int flags);
 op_ssize op_recv(op_socket fd, void *data, size_t length, int flags);
 op_ssize op_sendto(op_socket fd, const void *data, size_t length, int flags,
-                    const struct sockaddr *peer, op_socklen peer_length);
-op_ssize op_recvfrom(op_socket fd, void *data, size_t length, int flags,
-                      struct sockaddr *peer, op_socklen *peer_length);
+                   const struct sockaddr *peer, op_socklen peer_length);
+op_ssize op_recvfrom(op_socket fd, void *data, size_t length, int flags, struct sockaddr *peer,
+                     op_socklen *peer_length);
 #endif

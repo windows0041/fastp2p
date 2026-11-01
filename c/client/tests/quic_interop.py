@@ -34,7 +34,7 @@ for c_server in (False, True):
         assert 'READY' in line or 'UDP_PORT=' in line, line
         other = subprocess.run(second, capture_output=True, text=True, timeout=20)
         stdout, stderr = process.communicate(timeout=20)
-        assert other.returncode == 0, other.stdout + other.stderr
+        assert other.returncode == 0, other.stdout + other.stderr + line + stdout + stderr
         assert process.returncode == 0, line + stdout + stderr
         results['c_server_go_client' if c_server else 'c_client_go_server'] = True
     finally:

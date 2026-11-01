@@ -10,7 +10,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: quic-interop client|server IP PORT LOCAL_PORT\n");
         return 2;
     }
-    if(op_platform_init()) return 2;
+    if (op_platform_init())
+        return 2;
     int server = !strcmp(argv[1], "server");
     op_socket fd = op_socket_open(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in local = {.sin_family = AF_INET,

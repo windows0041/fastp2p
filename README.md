@@ -1,6 +1,6 @@
 # openp2p-test
 
-OpenP2P 自建网关与客户端。Go 版本是已经完成本地和跨公网联调的基线；Linux C 客户端首版已实现，使用独立目录并与 Go 版本互通。
+OpenP2P 自建网关与客户端。Go 版本保留已完成本地和跨公网联调的基线；C 客户端提供 Linux、Windows、macOS 的 CLI / C 库及 Android 应用，使用独立目录并与 Go 版本互通。
 
 ```text
 openp2p-test/
@@ -9,7 +9,7 @@ openp2p-test/
 │   ├── gateway/      # Go 网关，独立 module openp2p-gateway
 │   └── scripts/      # Go 构建与检查
 ├── c/
-│   ├── client/       # Linux C 客户端及 libopenp2p.so.1
+│   ├── client/       # 跨平台 C 核心、桌面 CLI / SDK、Android 应用
 │   └── gateway/      # C 网关计划
 └── UPSTREAM.md       # 来源、版本和本地适配记录
 ```
@@ -63,9 +63,9 @@ bash go/gateway/scripts/local-client.sh my-node-a
 
 ## C 版本
 
-Linux C 客户端提供 `openp2p-c` 命令行程序和 ABI 1 的 `libopenp2p.so.1`，实现了私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发，运行时不依赖 Go。
+C 客户端 0.2.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp2p.dll`、macOS `libopenp2p.1.dylib` 及桌面 `openp2p-c`。Android 应用包含 arm64-v8a / x86_64 的同一套 C 核心，支持 CA 导入、加密保存 token、前台连接服务和应用转发，运行时不依赖 Go。
 
-已完成 C↔Go、C↔C 的本地隔离网络测试、ASan/UBSan 检查，以及本机 C 客户端经现有公网网关连接远端 Go 节点的数据回传。构建和使用见 [C 客户端说明](c/client/README.md)，覆盖范围见 [验证记录](c/client/VALIDATION-ZH.md)。C 网关、Windows、SD-WAN/TUN 和中继尚未实现。
+各平台实现私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发。构建和使用见 [C 客户端说明](c/client/README.md) 与 [平台和 SDK 说明](c/client/PLATFORMS-ZH.md)，实际测试覆盖见 [验证记录](c/client/VALIDATION-ZH.md)。C 网关、SD-WAN/TUN 和中继尚未实现。
 
 ## 配置与许可证
 

@@ -97,8 +97,12 @@ static void close_tunnel(op2p_client *, int, const char *);
 static void close_overlay(op2p_client *, int, int);
 static void tunnel_message(op2p_client *, int, uint16_t, const uint8_t *, size_t);
 static void synchronize_app(op2p_client *, int);
-static uint64_t mono(void) { return op_monotonic_ns(); }
-static uint64_t wall(void) { return op_wall_ns(); }
+static uint64_t mono(void) {
+    return op_monotonic_ns();
+}
+static uint64_t wall(void) {
+    return op_wall_ns();
+}
 static uint64_t random_id(void) {
     uint64_t v = 0;
     while (!v)
@@ -176,8 +180,9 @@ static uint16_t socket_port(op_socket fd) {
 }
 static int connect_ready(op_socket fd) {
     op_pollfd p = {.fd = fd, .events = POLLOUT};
-    if (op_poll(&p, 1, 0) <= 0)
-        return 0;
+    int polled = op_poll(&p, 1, 0);
+    if (polled <= 0)
+        return polled;
     int error = 0;
     op_socklen n = sizeof(error);
     if (op_getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &n) || error) {
@@ -188,7 +193,8 @@ static int connect_ready(op_socket fd) {
 }
 static int flush(op_socket fd, op_buffer *b) {
     for (int i = 0; i < 32 && op_buffer_size(b); ++i) {
-        op_ssize n = op_send(fd, b->data + b->offset, op_buffer_size(b), MSG_DONTWAIT | MSG_NOSIGNAL);
+        op_ssize n =
+            op_send(fd, b->data + b->offset, op_buffer_size(b), MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n > 0)
             op_buffer_consume(b, (size_t)n);
         else if (n < 0 && errno == EINTR)
@@ -342,7 +348,7 @@ static int udp_packet(op_socket fd, const struct sockaddr_in *peer, uint16_t mai
     int rv = op_frame_add(&b, main, sub, s, strlen(s));
     if (!rv)
         rv = op_sendto(fd, b.data, b.len, MSG_DONTWAIT, (const struct sockaddr *)peer,
-                    sizeof(*peer)) != (op_ssize)b.len;
+                       sizeof(*peer)) != (op_ssize)b.len;
     op_buffer_clear(&b);
     return rv ? -1 : 0;
 }
@@ -763,9 +769,9 @@ static void tunnel_message(op2p_client *c, int ti, uint16_t sub, const uint8_t *
             o->activity = mono();
             if (o->udp) {
                 op_ssize sent = o->local_udp
-                                   ? op_sendto(o->fd, plain, n, MSG_DONTWAIT,
-                                            (struct sockaddr *)&o->source, sizeof(o->source))
-                                   : op_send(o->fd, plain, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+                                    ? op_sendto(o->fd, plain, n, MSG_DONTWAIT,
+                                                (struct sockaddr *)&o->source, sizeof(o->source))
+                                    : op_send(o->fd, plain, n, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if (sent != (op_ssize)n)
                     close_overlay(c, i, 1);
             } else if (op_buffer_add(&o->tx, plain, n, OP_QUEUE_LIMIT))
@@ -940,8 +946,8 @@ static void tick_tunnel(op2p_client *c, int ti, uint64_t now) {
         }
     }
     if (t->state == T_NAT_READ) {
-        op_ssize n =
-            op_recv(t->fd, t->probe + t->probe_len, sizeof(t->probe) - 1 - t->probe_len, MSG_DONTWAIT);
+        op_ssize n = op_recv(t->fd, t->probe + t->probe_len, sizeof(t->probe) - 1 - t->probe_len,
+                             MSG_DONTWAIT);
         if (n > 0) {
             t->probe_len += (size_t)n;
             t->probe[t->probe_len] = 0;
@@ -1007,8 +1013,8 @@ static void tick_tunnel(op2p_client *c, int ti, uint64_t now) {
             uint8_t data[1024];
             struct sockaddr_in from;
             op_socklen flen = sizeof(from);
-            op_ssize n =
-                op_recvfrom(t->fd, data, sizeof(data), MSG_DONTWAIT, (struct sockaddr *)&from, &flen);
+            op_ssize n = op_recvfrom(t->fd, data, sizeof(data), MSG_DONTWAIT,
+                                     (struct sockaddr *)&from, &flen);
             if (n < 0)
                 break;
             if (n < 8 || op_u32(data) != (uint32_t)(n - 8) || op_u16(data + 4) != 4 ||
@@ -1291,7 +1297,7 @@ static void tick_apps(op2p_client *c, uint64_t now) {
                 struct sockaddr_in from;
                 op_socklen flen = sizeof(from);
                 op_ssize n = op_recvfrom(a->fd, data, sizeof(data), MSG_DONTWAIT,
-                                     (struct sockaddr *)&from, &flen);
+                                         (struct sockaddr *)&from, &flen);
                 if (n < 0)
                     break;
                 if (n > 4096) {
@@ -1412,7 +1418,8 @@ static void connect_gateway(op2p_client *c) {
     if (c->ca[0])
         SETOPT(CURLOPT_CAINFO, c->ca);
 #ifdef _WIN32
-    if(c->ca[0]) SETOPT(CURLOPT_SSL_OPTIONS,(long)CURLSSLOPT_REVOKE_BEST_EFFORT);
+    if (c->ca[0])
+        SETOPT(CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_REVOKE_BEST_EFFORT);
 #endif
 #undef SETOPT
     if (curl_multi_add_handle(c->multi, c->ws) != CURLM_OK)
@@ -1572,7 +1579,8 @@ int op2p_client_create(const op2p_config *cfg, op2p_client **out) {
     if (!out)
         return OP2P_EINVAL;
     *out = NULL;
-    if (op_platform_init()) return OP2P_EIO;
+    if (op_platform_init())
+        return OP2P_EIO;
     if (!cfg || cfg->struct_size < sizeof(*cfg) || cfg->abi_version != OP2P_ABI_VERSION ||
         !valid_node(cfg->node) || !cfg->token || !cfg->gateway_host || !*cfg->gateway_host)
         return OP2P_EINVAL;

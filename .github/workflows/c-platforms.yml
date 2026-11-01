@@ -5,6 +5,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: c-clients-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   macos:
     strategy:
@@ -39,6 +42,9 @@ jobs:
           cmake --build build/c --parallel 3
           cmake --build build/c --target example-embed
           cmake --install build/c
+          cmake -S c/client/tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
+          cmake --build build/consumer
+          build/consumer/sdk-consumer
       - name: ABI, lifecycle and TLS validation
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
@@ -56,7 +62,7 @@ jobs:
           python3 c/client/tests/desktop_integration.py --build build/c
       - name: Package SDK
         run: |
-          cp c/client/config.example.json c/client/README.md c/client/LICENSE c/client/THIRD_PARTY.md dist/${{ matrix.target }}/
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
           tar -C dist -czf dist/openp2p-c-${{ matrix.target }}.tar.gz ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
@@ -69,3 +75,120 @@ jobs:
           path: |
             build/c/Testing/Temporary/LastTest.log
             build/c/desktop-result.json
+  cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.20.14'
+          cache-dependency-path: go/client/go.sum
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-mingw-w64-x86-64 ninja-build
+          python3 -m pip install cmake==3.31.6
+          sdkmanager "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1
+      - uses: actions/cache@v4
+        with:
+          path: ~/openp2p-dev/cross
+          key: c-deps-cross-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+          restore-keys: c-deps-cross-
+      - name: Windows CLI and SDK
+        run: |
+          python3 c/client/scripts/build-deps.py windows-x86_64
+          cmake -S c/client -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/c/client/cmake/windows-x86_64.cmake" -DOP2P_DEPS_ROOT="$HOME/openp2p-dev/cross/prefix/windows-x86_64"
+          cmake --build build/windows --parallel 4
+          cmake --install build/windows --prefix "$PWD/dist/windows-x86_64"
+          (cd go/client && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/quic-go.exe ../../c/client/tests/quic-go/main.go)
+          (cd go/client && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/go-client.exe ./cmd)
+          (cd go/gateway && GOOS=windows GOARCH=amd64 go build -mod=readonly -o ../../build/windows/gateway.exe .)
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/windows-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-validation
+          path: |
+            build/windows/*.exe
+            build/windows/openp2p.dll
+            dist/windows-x86_64/
+      - name: Android APK and lint
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
+          export OP2P_CMAKE_DIR="$(python3 -c 'import cmake; print(cmake.CMAKE_DATA)')"
+          bash c/client/scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
+          (cd c/client/android && bash gradlew --no-daemon :app:lintDebug)
+          mkdir -p dist/android
+          cp c/client/android/app/build/outputs/apk/debug/app-debug.apk dist/android/openp2p-c-android-debug.apk
+          cp -R c/client/android/app/build/intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib dist/android/lib
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-android
+          path: dist/android/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-cross
+          path: |
+            android-build.log
+            sdk-install.log
+            c/client/android/app/build/reports/lint-results-debug.*
+  windows:
+    needs: cross
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-validation
+      - name: Native Windows protocol, lifecycle, TLS and QUIC tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & build/windows/openp2p-c.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-api.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-platform.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-wire.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
+          python c/client/tests/tls_negative.py --client build/windows/openp2p-c.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/quic_interop.py --build build/windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/desktop_integration.py --build build/windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: MSVC consumer of the C DLL
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          lib /nologo /machine:x64 /def:c\client\platform\windows\openp2p.def /out:dist\windows-x86_64\lib\openp2p.lib
+          if errorlevel 1 exit /b 1
+          cmake -S c/client/tests/sdk-consumer -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CD%/dist/windows-x86_64"
+          if errorlevel 1 exit /b 1
+          cmake --build build/msvc
+          if errorlevel 1 exit /b 1
+          copy /y dist\windows-x86_64\bin\openp2p.dll build\msvc\openp2p.dll
+          build\msvc\sdk-consumer.exe
+          if errorlevel 1 exit /b 1
+      - name: Package Windows SDK
+        shell: pwsh
+        run: Compress-Archive -Path dist/windows-x86_64 -DestinationPath dist/openp2p-c-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openp2p-c-windows-x86_64
+          path: dist/openp2p-c-windows-x86_64.zip
