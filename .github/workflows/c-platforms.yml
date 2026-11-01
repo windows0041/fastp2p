@@ -30,6 +30,7 @@ jobs:
         with:
           path: ~/openp2p-dev/cross
           key: c-deps-${{ matrix.target }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+          restore-keys: c-deps-${{ matrix.target }}-
       - name: Build pinned dependencies
         run: python3 c/client/scripts/build-deps.py ${{ matrix.target }}
       - name: Build CLI and C SDK

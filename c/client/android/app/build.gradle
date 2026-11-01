@@ -1,0 +1,36 @@
+plugins { id 'com.android.application' }
+
+def depsBase = providers.gradleProperty('op2pDepsBase').orElse(
+        System.getenv('OP2P_DEPS_BASE') ?: "${System.getProperty('user.home')}/openp2p-dev/cross/prefix").get()
+
+android {
+    namespace 'cc.itq.openp2p.cclient'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    ndkVersion '30.0.16248370'
+    defaultConfig {
+        applicationId 'cc.itq.openp2p.cclient'
+        minSdk 26
+        targetSdk 36
+        versionCode 200
+        versionName '0.2.0'
+        testInstrumentationRunner 'cc.itq.openp2p.cclient.LiveInstrumentation'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=none', '-DOPENP2P_BUILD_SHARED=OFF',
+                        '-DOPENP2P_BUILD_CLI=OFF', '-DBUILD_TESTING=OFF', "-DOP2P_DEPS_BASE=${depsBase}"
+                targets 'openp2p_jni'
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake { path '../../CMakeLists.txt'; version '3.31.6' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    buildTypes { release { minifyEnabled false } }
+    packaging { jniLibs { useLegacyPackaging false } }
+}

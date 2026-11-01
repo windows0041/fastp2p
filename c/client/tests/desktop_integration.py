@@ -66,57 +66,57 @@ def roundtrip(proto, port):
             received.extend(chunk)
         return bytes(received)==data
 
+runtime=tempfile.TemporaryDirectory(prefix='op2p-desktop-')
 try:
-    with tempfile.TemporaryDirectory(prefix='op2p-desktop-') as temp:
-        root=Path(temp)
-        create_certificates(root/'certs','127.0.0.1')
-        token=str(secrets.randbits(63)|(1<<63)|1)
-        environment=os.environ.copy()
-        environment.update(OPENP2P_USER='desktop-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=token)
-        context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'))
-        def start(command,name,directory):
-            f=(root/(name+'.log')).open('w');files.append(f)
-            p=subprocess.Popen([str(x) for x in command],cwd=directory,env=environment,stdout=f,stderr=subprocess.STDOUT)
-            processes.append(p);return p
-        gateway=start([build/('gateway'+suffix),'-bind','127.0.0.1','-apibind','127.0.0.1',
-            '-cert',root/'certs/server.crt','-key',root/'certs/server.key'],'gateway',root)
-        def health():
-            with urllib.request.urlopen('https://127.0.0.1:10008/healthz',context=context,timeout=2) as r:
-                return r.status==200
-        wait(health)
-        ports={}
-        for proto,cls,handler in [('tcp',socketserver.ThreadingTCPServer,TCP),('udp',socketserver.ThreadingUDPServer,UDP)]:
-            s=cls(('127.0.0.1',0),handler);s.daemon_threads=True;servers.append(s)
-            threading.Thread(target=s.serve_forever,daemon=True).start();ports[proto]=s.server_address[1]
-        def client(name,go=False,apps=None):
-            d=root/name;d.mkdir()
-            config={'network':{'Node':name,'Token':0,'ServerHost':'127.0.0.1','ServerPort':27183,'ShareBandwidth':0},
-                'CACertFile':str(root/'certs/ca.crt'),'apps':apps or [],'LogLevel':0}
-            (d/'config.json').write_text(json.dumps(config))
-            if go:
-                return start([build/('go-client'+suffix),'-node',name,'-serverhost','127.0.0.1',
-                    '-cacert',root/'certs/ca.crt','-sharebandwidth','0','-nv'],name,d)
-            return start([build/('openp2p-c'+suffix),'--config',d/'config.json','--run-seconds','100'],name,d)
-        client('desktop-go-target',True)
-        client('desktop-c-target')
-        cases=[];apps=[]
-        for peer in ('desktop-go-target','desktop-c-target'):
-            for transport in ('tcp','quic'):
-                for proto in ('tcp','udp'):
-                    with socket.socket(socket.AF_INET,socket.SOCK_STREAM if proto=='tcp' else socket.SOCK_DGRAM) as s:
-                        s.bind(('127.0.0.1',0));port=s.getsockname()[1]
-                    label=peer+'-'+transport+'-'+proto
-                    apps.append({'AppName':label,'PeerNode':peer,'SrcPort':port,'DstHost':'127.0.0.1',
-                        'DstPort':ports[proto],'Protocol':proto,'UnderlayProtocol':transport})
-                    cases.append((label,proto,port))
-        client('desktop-c-source',apps=apps)
-        for label,proto,port in cases:
-            wait(lambda pr=proto,p=port:roundtrip(pr,p))
-            results[label]=True;print(label+' passed',flush=True)
-        log=(root/'desktop-c-source.log').read_text()
-        assert 'TCP tunnel connected' in log and 'QUIC tunnel connected' in log
-        results['both_transports_confirmed']=True
-        results['success']=True
+    root=Path(runtime.name)
+    create_certificates(root/'certs','127.0.0.1')
+    token=str(secrets.randbits(63)|(1<<63)|1)
+    environment=os.environ.copy()
+    environment.update(OPENP2P_USER='desktop-test',OPENP2P_PASSWORD=secrets.token_urlsafe(24),OPENP2P_TOKEN=token)
+    context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'))
+    def start(command,name,directory):
+        f=(root/(name+'.log')).open('w');files.append(f)
+        p=subprocess.Popen([str(x) for x in command],cwd=directory,env=environment,stdout=f,stderr=subprocess.STDOUT)
+        processes.append(p);return p
+    gateway=start([build/('gateway'+suffix),'-bind','127.0.0.1','-apibind','127.0.0.1',
+        '-cert',root/'certs/server.crt','-key',root/'certs/server.key'],'gateway',root)
+    def health():
+        with urllib.request.urlopen('https://127.0.0.1:10008/healthz',context=context,timeout=2) as r:
+            return r.status==200
+    wait(health)
+    ports={}
+    for proto,cls,handler in [('tcp',socketserver.ThreadingTCPServer,TCP),('udp',socketserver.ThreadingUDPServer,UDP)]:
+        s=cls(('127.0.0.1',0),handler);s.daemon_threads=True;servers.append(s)
+        threading.Thread(target=s.serve_forever,daemon=True).start();ports[proto]=s.server_address[1]
+    def client(name,go=False,apps=None):
+        d=root/name;d.mkdir()
+        config={'network':{'Node':name,'Token':0,'ServerHost':'127.0.0.1','ServerPort':27183,'ShareBandwidth':0},
+            'CACertFile':str(root/'certs/ca.crt'),'apps':apps or [],'LogLevel':0}
+        (d/'config.json').write_text(json.dumps(config))
+        if go:
+            return start([build/('go-client'+suffix),'-node',name,'-serverhost','127.0.0.1',
+                '-cacert',root/'certs/ca.crt','-sharebandwidth','0','-nv'],name,d)
+        return start([build/('openp2p-c'+suffix),'--config',d/'config.json','--run-seconds','100'],name,d)
+    client('desktop-go-target',True)
+    client('desktop-c-target')
+    cases=[];apps=[]
+    for peer in ('desktop-go-target','desktop-c-target'):
+        for transport in ('tcp','quic'):
+            for proto in ('tcp','udp'):
+                with socket.socket(socket.AF_INET,socket.SOCK_STREAM if proto=='tcp' else socket.SOCK_DGRAM) as s:
+                    s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+                label=peer+'-'+transport+'-'+proto
+                apps.append({'AppName':label,'PeerNode':peer,'SrcPort':port,'DstHost':'127.0.0.1',
+                    'DstPort':ports[proto],'Protocol':proto,'UnderlayProtocol':transport})
+                cases.append((label,proto,port))
+    client('desktop-c-source',apps=apps)
+    for label,proto,port in cases:
+        wait(lambda pr=proto,p=port:roundtrip(pr,p))
+        results[label]=True;print(label+' passed',flush=True)
+    log=(root/'desktop-c-source.log').read_text()
+    assert 'TCP tunnel connected' in log and 'QUIC tunnel connected' in log
+    results['both_transports_confirmed']=True
+    results['success']=True
 finally:
     for p in reversed(processes):
         if p.poll() is None:p.terminate()
@@ -125,5 +125,6 @@ finally:
         except subprocess.TimeoutExpired:p.kill();p.wait()
     for s in servers:s.shutdown();s.server_close()
     for f in files:f.close()
+    runtime.cleanup()
     (build/'desktop-result.json').write_text(json.dumps(results,indent=2)+'\n')
     print(json.dumps(results,indent=2))

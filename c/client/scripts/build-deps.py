@@ -26,7 +26,8 @@ build=work/'build'/args.target
 prefix=work/'prefix'/args.target
 for p in (cache,sources,build,prefix): p.mkdir(parents=True,exist_ok=True)
 stamp=prefix/'openp2p-dependencies.json'
-if stamp.exists() and json.loads(stamp.read_text())==manifest:
+fingerprint={'sources':manifest,'recipe_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+if stamp.exists() and json.loads(stamp.read_text())==fingerprint:
     print('Dependencies already built:',prefix)
     raise SystemExit(0)
 paths={}
@@ -114,7 +115,7 @@ cmake('ngtcp2',ssl+['-DENABLE_LIB_ONLY=ON','-DENABLE_SHARED_LIB=OFF','-DENABLE_S
 cmake('json-c',['-DDISABLE_WERROR=ON','-DBUILD_APPS=OFF','-DENABLE_THREADING=OFF'])
 curl=['-DBUILD_CURL_EXE=OFF','-DBUILD_EXAMPLES=OFF','-DBUILD_LIBCURL_DOCS=OFF','-DBUILD_MISC_DOCS=OFF',
       '-DCURL_DISABLE_LDAP=ON','-DCURL_DISABLE_LDAPS=ON',
-      '-DCURL_USE_LIBPSL=OFF','-DCURL_BROTLI=OFF','-DCURL_ZSTD=OFF','-DCURL_ZLIB=OFF',
+      '-DUSE_LIBIDN2=OFF','-DCURL_USE_LIBPSL=OFF','-DCURL_BROTLI=OFF','-DCURL_ZSTD=OFF','-DCURL_ZLIB=OFF',
       '-DCURL_USE_LIBSSH2=OFF','-DCURL_USE_LIBSSH=OFF','-DUSE_NGHTTP2=OFF','-DUSE_NGTCP2=OFF',
       '-DENABLE_THREADED_RESOLVER=OFF','-DENABLE_ARES=OFF','-DENABLE_WEBSOCKETS=ON']
 if args.target=='windows-x86_64':
@@ -124,5 +125,5 @@ else:
     if args.target.startswith('macos-'): curl+=['-DCURL_USE_SECTRUST=ON']
     if args.target.startswith('android-'): curl+=['-DCURL_CA_PATH=/system/etc/security/cacerts']
 cmake('curl',curl)
-stamp.write_text(json.dumps(manifest,indent=2)+'\n')
+stamp.write_text(json.dumps(fingerprint,indent=2)+'\n')
 print('Dependency prefix:',prefix,flush=True)
