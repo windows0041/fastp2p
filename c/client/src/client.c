@@ -745,6 +745,13 @@ static void bind_pending_key(fastp2p_client *c, int index) {
         close_tunnel(c, index, "session key derivation failed");
         return;
     }
+    /* A second unkeyed tunnel to the same peer and transport is a leftover
+     * attempt.  Leaving it open lets the peer talk to a tunnel that will never
+     * be keyed, so retire it as soon as the live session is known. */
+    for (int i = 0; i < NT; ++i)
+        if (i != index && c->tunnels[i].state == T_ACTIVE && !c->tunnels[i].keyed &&
+            c->tunnels[i].peer_id == t->peer_id && c->tunnels[i].transport == t->transport)
+            close_tunnel(c, i, "superseded by a newer session");
     t->keyed = 1;
     OPENSSL_cleanse(k->secret, sizeof(k->secret));
     memset(k, 0, sizeof(*k));
@@ -868,13 +875,16 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
             start_punch(c, ti);
         return;
     }
+    /* Bind to the most recently established matching tunnel: an older unkeyed
+     * tunnel belongs to an attempt that is already being replaced. */
+    int newest = -1;
     for (int i = 0; i < NT; ++i)
         if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].peer_id == peer_id &&
-            c->tunnels[i].transport == transport &&
-            !c->tunnels[i].keyed) {
-            bind_pending_key(c, i);
-            return;
-        }
+            c->tunnels[i].transport == transport && !c->tunnels[i].keyed &&
+            (newest < 0 || c->tunnels[i].active_at >= c->tunnels[newest].active_at))
+            newest = i;
+    if (newest >= 0)
+        bind_pending_key(c, newest);
 }
 static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -1303,6 +1313,13 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             if (c->report_ok)
                 set_state(c, FASTP2P_ONLINE, "gateway authenticated");
         }
+    } else if (main == 3 && sub == 0) {
+        /* The gateway answers every push with its own result frame.  Surface it
+         * so a rejected push is visible instead of silently dropped. */
+        uint64_t error = op_integer(j, "error");
+        if (error)
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
+                 op_string(j, "detail") ? op_string(j, "detail") : "gateway rejected a push");
     } else if (main == 6 && sub == 7) {
         c->report_ok = 1;
         if (c->login_ok)
