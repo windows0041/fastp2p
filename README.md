@@ -53,6 +53,8 @@ Android 无配置表单，保留系统要求的服务通知及停止入口。普
 
 [网关部署](c/gateway/README.md) · [客户端与 C SDK](c/client/README.md) · [SOCKS5](c/client/SOCKS5-ZH.md) · [发布](RELEASING-ZH.md) · [节点存储](c/NODE-STORAGE-ZH.md)
 
+[2026-11-02 部署验收与管理入口](c/gateway/DEPLOYMENT-ZH.md)
+
 新协议为 `fastp2p1`，QUIC ALPN 为 `fastp2pv1`，旧客户端需要统一升级。Go 源码保留于 Git 历史和旧标签，不参与主分支构建、测试和发布。上游来源及必要版权声明见 UPSTREAM.md、LICENSE 和 THIRD_PARTY.md。
 
 Linux 系统服务的配置和 CA 由 root 持有，fastp2p 组可读（0640），目录权限 0750；服务进程不能写入。重复接入不会重写相同的 CA 文件。
