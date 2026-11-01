@@ -1,0 +1,13 @@
+LIBRARY openp2p
+EXPORTS
+    op2p_abi_version
+    op2p_version
+    op2p_client_create
+    op2p_client_create_json
+    op2p_client_add_forward
+    op2p_client_start
+    op2p_client_step
+    op2p_client_stop
+    op2p_client_destroy
+    op2p_client_state
+    op2p_client_last_error
