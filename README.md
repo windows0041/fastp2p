@@ -1,6 +1,6 @@
 # openp2p-test
 
-OpenP2P 自建网关与客户端。Go 版本保留已完成本地和跨公网联调的基线；C 客户端提供 Linux、Windows、macOS 的 CLI / C 库及 Android 应用，使用独立目录并与 Go 版本互通。
+OpenP2P 自建网关与客户端。Go 版本保留已完成本地和跨公网联调的基线；C 版本提供独立的 Linux 网关，以及 Linux、Windows、macOS 客户端 CLI / C 库和 Android 应用，各端使用独立目录并与 Go 版本互通。
 
 ```text
 openp2p-test/
@@ -10,7 +10,7 @@ openp2p-test/
 │   └── scripts/      # Go 构建与检查
 ├── c/
 │   ├── client/       # 跨平台 C 核心、桌面 CLI / SDK、Android 应用
-│   └── gateway/      # C 网关计划
+│   └── gateway/      # Linux C 网关、协议测试、systemd / Docker 部署
 └── UPSTREAM.md       # 来源、版本和本地适配记录
 ```
 
@@ -65,9 +65,11 @@ bash go/gateway/scripts/local-client.sh my-node-a
 
 C 客户端 0.2.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp2p.dll`、macOS `libopenp2p.1.dylib` 及桌面 `openp2p-c`。Android 应用包含 arm64-v8a / x86_64 的同一套 C 核心，支持 CA 导入、加密保存 token、前台连接服务和应用转发，运行时不依赖 Go。
 
-各平台实现私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发。构建和使用见 [C 客户端说明](c/client/README.md) 与 [平台和 SDK 说明](c/client/PLATFORMS-ZH.md)，实际测试覆盖见 [验证记录](c/client/VALIDATION-ZH.md)。C 网关、SD-WAN/TUN 和中继尚未实现。
+各平台实现私有 CA 验证、WSS 登录/心跳/重连、NAT 探测、TCP 打洞、UDP 打洞/QUIC 和 TCP/UDP 应用转发。构建和使用见 [C 客户端说明](c/client/README.md) 与 [平台和 SDK 说明](c/client/PLATFORMS-ZH.md)，实际测试覆盖见 [客户端验证记录](c/client/VALIDATION-ZH.md)。C 客户端的 SD-WAN/TUN 和中继数据面尚未实现。
 
 Windows、Android 和 macOS 两种架构的 SDK / 调试包见 [0.2.0 验证与构建产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 已在连接的 Android 12 x86_64 设备上经自建公网网关与远端 Go 节点联调；arm64 已构建，尚未在 ARM 设备上运行。
+
+C 网关 0.1.0 实现自定义 TLS 证书、HTTPS/WSS、JWT 管理鉴权、节点发现与心跳、TCP/UDP NAT 探测、打洞控制消息、应用管理、SD-WAN 成员配置和中继节点协调。通过 C→Go、Go→C、C→C 的 TCP 打洞 / QUIC 及 TCP/UDP 应用联调，业务数据仍由客户端直传。构建、自签证书与部署见 [C 网关说明](c/gateway/README.md)，测试范围和发行包见 [网关验证记录](c/gateway/VALIDATION-ZH.md)。现网 Go 服务保留，C 网关可独立部署。
 
 ## 配置与许可证
 

@@ -108,6 +108,8 @@ sudo bash c/gateway/scripts/integration.sh
 
 网络测试使用独立 network namespace，需 root、`unshare`、`iproute2`；不会占用现有部署端口。Go 参考客户端使用 Go 1.20.14。完整联调覆盖 C→Go、Go→C、C→C，分别使用 TCP 打洞 / QUIC 传输 TCP/UDP 应用，并检查 35 秒心跳、最后响应数据和网关重启重连。临时证书、随机测试账号及日志保存在私有 `/tmp/openp2p-c-gateway-*` 目录。
 
+实际环境、CI 发行包及测试边界见 [验证记录](VALIDATION-ZH.md)。
+
 ## 部署
 
 systemd 模板：`deploy/openp2p-c-gateway.service`。准备专用 `openp2p` 用户，安装程序到 `/opt/openp2p-c/bin`，环境文件为 `/etc/openp2p-c/gateway.env`，TLS 文件放在该目录的 `tls/` 中，确保仅服务账号可读私钥。换证书后重启，客户端会重新鉴权。
