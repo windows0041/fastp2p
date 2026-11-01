@@ -139,7 +139,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-socks-') as temporary:
     root=Path(temporary)
     try:
         create_certificates(root/'certs','127.0.0.1')
-        env=os.environ.copy();env.update(FASTP2P_USER='socks-test',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(secrets.randbits(63)|(1<<63)|1))
+        env=os.environ.copy();env.update(FASTP2P_USER='socks-test',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(secrets.randbelow(9*10**15)+10**15))
         def start(command,name):
             directory=root/name;directory.mkdir(exist_ok=True)
             f=(logs/(name+'.log')).open('w');files.append(f)

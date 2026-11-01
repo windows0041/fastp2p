@@ -38,7 +38,7 @@ c_processes = []
 results = {}
 gateway_host = '10.203.0.1'
 password = secrets.token_urlsafe(24)
-install_token = secrets.randbits(63) | (1 << 63) | 1
+install_token = secrets.randbelow(9*10**15) + 10**15
 credentials = {'FASTP2P_USER': 'c-integration-user', 'FASTP2P_PASSWORD': password,
                'FASTP2P_TOKEN': str(install_token)}
 jwt = None
@@ -220,7 +220,7 @@ try:
             return set(nodes) <= {n['name'] for n in data if n.get('lanip')}
         wait(online)
         results['all_six_clients_authenticated'] = True
-        results['uint64_token_above_int64_max'] = True
+        results['sixteen_digit_install_token'] = True
         print('Six fastp2p C clients authenticated', flush=True)
         for name, proto, port, host in cases:
             wait(lambda p=port, pr=proto, h=host: tcp_roundtrip(p,h) if pr == 'tcp' else udp_roundtrip(p,h), timeout=65)

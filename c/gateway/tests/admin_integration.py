@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 p=argparse.ArgumentParser();p.add_argument('--gateway',required=True);p.add_argument('--cert-dir',required=True);p.add_argument('--logs',required=True)
 args=p.parse_args();logs=Path(args.logs);logs.mkdir(parents=True,exist_ok=True)
 ctx=ssl.create_default_context(cafile=str(Path(args.cert_dir)/'ca.crt'))
-user='admin-before';password=secrets.token_urlsafe(24);changed=secrets.token_urlsafe(24);key=str(2**64-1)
+user='admin-before';password=secrets.token_urlsafe(24);changed=secrets.token_urlsafe(24);key='9999999999999999'
 process=None;peers=[];results={};jwt=None
 
 def api(path,body=None,auth=True,method=None):

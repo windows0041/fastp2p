@@ -18,6 +18,7 @@ for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY
 shutil.copyfile(project.parent/'NODE-STORAGE-ZH.md',sdk/'NODE-STORAGE-ZH.md')
 shutil.copyfile(project/'include/fastp2p.h',sdk/'include/fastp2p.h')
 shutil.copyfile(project/'examples/embed.c',sdk/'examples/embed.c')
+shutil.copyfile(project.parent/'common/bootstrap.json',sdk/'gateway-public.json')
 notices=sdk/'licenses';notices.mkdir(exist_ok=True)
 manifest=json.loads((project/'deps.lock.json').read_text())
 for name,item in manifest.items():

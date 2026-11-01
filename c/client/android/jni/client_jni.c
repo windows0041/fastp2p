@@ -1,4 +1,5 @@
 #include "fastp2p.h"
+#include "bootstrap.h"
 #include <jni.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -119,4 +120,8 @@ JNIEXPORT jstring JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_version(JNIEn
                                                                            jclass cls) {
     (void)cls;
     return (*env)->NewStringUTF(env, fastp2p_version());
+}
+JNIEXPORT jstring JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_bootstrap(JNIEnv *env, jclass cls) {
+    (void)cls;
+    return (*env)->NewStringUTF(env, fastp2p_default_gateway());
 }

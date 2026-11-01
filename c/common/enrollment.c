@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+int fastp2p_install_key_valid(const char *key) {
+    if (!key || strlen(key) != 16 || key[0] < '1' || key[0] > '9') return 0;
+    for (const char *p = key; *p; ++p) if (*p < '0' || *p > '9') return 0;
+    return 1;
+}
+
 int fastp2p_enrollment_host_valid(const char *host) {
     size_t length = host ? strlen(host) : 0;
     if (!length || length > 253 || host[0] == '.' || host[0] == '-')
@@ -34,7 +40,7 @@ static int valid(json_object *root) {
         json_object_get_int64(version) != 1 || !json_object_object_get_ex(root, "port", &port) ||
         !json_object_is_type(port, json_type_int) || json_object_get_int64(port) < 1 ||
         json_object_get_int64(port) > 65535 || !fastp2p_enrollment_host_valid(host) ||
-        !key || !*key || strlen(key) > 20 || !ca || strlen(ca) > 16384)
+        !fastp2p_install_key_valid(key) || !ca || strlen(ca) > 16384)
         return 0;
     for (const char *p = key; *p; ++p)
         if (*p < '0' || *p > '9')

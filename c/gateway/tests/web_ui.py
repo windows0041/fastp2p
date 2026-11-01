@@ -98,7 +98,7 @@ def main():
         root=Path(directory)
         assert root.resolve().parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith('fastp2p-web-')
         create_certificates(root/'certs','127.0.0.1')
-        username='web-admin';password=secrets.token_urlsafe(24);token=str(2**64-1)
+        username='web-admin';password=secrets.token_urlsafe(24);token='9999999999999999'
         env=os.environ.copy();env.update(FASTP2P_USER=username,FASTP2P_PASSWORD=password,FASTP2P_TOKEN=token)
         if args.wsl:
             remote=subprocess.check_output(['wsl.exe','-d','Debian','-u','maoyu','--','wslpath','-a',root.as_posix()],text=True).strip()
@@ -148,7 +148,7 @@ def main():
                     page.locator('#username').fill(username);page.locator('#password').fill(password);page.locator('#login-submit').click()
                     expect(page.locator('#online-count')).to_have_text('2',timeout=15000)
                 login();results['login_and_authenticated_overview']=True
-                page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(__import__('re').compile(r'^FP1\.'))
+                page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(__import__('re').compile(r'^[1-9][0-9]{15}$'))
                 assert page.locator('#install-token').get_attribute('type')=='password'
                 page.locator('#reveal-token').click();assert page.locator('#install-token').get_attribute('type')=='text'
                 page.locator('#close-token').click();expect(page.locator('#install-token')).to_have_value('')

@@ -32,7 +32,7 @@ result={};children=[];handles=[];process=None;echo=None
 with tempfile.TemporaryDirectory(prefix='fastp2p-registry-') as temporary:
     root=Path(temporary);assert root.resolve().parent==Path(tempfile.gettempdir()).resolve()
     create_certificates(root/'certs','127.0.0.1')
-    environment=os.environ.copy();environment.update(FASTP2P_USER='registry-admin',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(2**64-1))
+    environment=os.environ.copy();environment.update(FASTP2P_USER='registry-admin',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN='9999999999999999')
     context=ssl.create_default_context(cafile=str(root/'certs/ca.crt'));jwt=None
     def start(command,name):
         log=(root/(name+'.log')).open('w');handles.append(log)

@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "1.0.0"
+#define FASTP2P_VERSION "1.0.1"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)
@@ -84,7 +84,7 @@ typedef struct {
     const char *name;
     const char *bind_ip; /* NULL = 127.0.0.1 */
     uint16_t local_port;
-    const char *peer_node; /* Exit node must run C client >= 0.3.0. */
+    const char *peer_node; /* Exit node must run fastp2p 1.x. */
     fastp2p_transport transport;
     const char *username; /* NULL/empty and password empty = no authentication. */
     const char *password; /* If supplied, both strings must be 1..255 bytes. */

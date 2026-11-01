@@ -19,7 +19,7 @@
 #define NP 16
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
-#define WIRE_VERSION "1.0.0"
+#define WIRE_VERSION FASTP2P_VERSION
 enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
 enum tunnel_state {
     T_FREE,
@@ -674,7 +674,7 @@ static void overlay_ack(fastp2p_client *c, int oi, unsigned status) {
 static void socks_acknowledged(fastp2p_client *c, int oi, json_object *ack) {
     overlay *o = &c->overlays[oi];
     if (!ack || !json_object_is_type(ack, json_type_object)) {
-        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "SOCKS5 exit requires C client 0.3.0 or newer");
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "SOCKS5 exit requires a compatible fastp2p client");
         socks_failure(c, oi, 7);
         return;
     }

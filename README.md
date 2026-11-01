@@ -17,7 +17,7 @@
 
 桌面客户端无需旁带项目 DLL/共享库，SDK 单独提供。Linux 产物面向 Debian 12 或更新的 glibc 环境。使用同一 Release 的 SHA256SUMS.txt 校验下载。
 
-在网关 Web 登录后取得 FP1 安装 Token，其中包含地址、接入密钥和公开 CA。客户端先校验证书链、主机名和网关登录，再保存配置。不要公开 Token。
+在网关 Web 登录后取得 16 位数字安装 Token。专用客户端包已预置网关地址和公开 CA。客户端先校验证书链、主机名和网关登录，再保存配置。不要公开 Token。
 
 Windows：
 
@@ -38,10 +38,10 @@ Android 安装 APK 后，在设备浏览器打开网关“安装 Token → 安�
 
 ```sh
 adb install -r fastp2p-android.apk
-adb shell am start -n cc.itq.fastp2p.cclient/.InstallActivity --es token 'FP1.…'
+adb shell am start -n cc.itq.fastp2p.cclient/.InstallActivity --es token 'YOUR_16_DIGIT_TOKEN'
 ```
 
-Android 无配置表单，保留系统要求的服务通知及停止入口。普通 APK 安装器不能附加业务 Token，需要随后调用接入入口。已有信任配置不会被外部 Intent 静默替换；更换网关前在系统设置中清除应用数据。
+Android 无配置表单，保留系统要求的服务通知及停止入口。普通 APK 安装器不能附加业务 Token，需要随后调用接入入口。已有信任配置不会被外部 Intent 静默替换；更换网关前在系统设置中清除应用数据；同一网关更新 Token 可保留设备身份。
 
 ## 源码
 

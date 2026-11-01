@@ -33,7 +33,7 @@ if Path('/proc/self/ns/net').readlink() == Path('/proc/1/ns/net').readlink():
 logs = Path(args.logs).resolve(); logs.mkdir(parents=True, exist_ok=True)
 certs = Path(args.cert_dir).resolve()
 context = ssl.create_default_context(cafile=str(certs/'ca.crt'))
-token = (1 << 64)-1
+token = 9999999999999999
 user, password = 'gateway-protocol-test', secrets.token_urlsafe(24)
 results, clients = {}, []
 process = None
@@ -166,7 +166,7 @@ try:
         empty=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
         empty.request('POST','/api/v1/user/login',b'');response=empty.getresponse()
         assert response.status==400;response.read();empty.close()
-        status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and login['installToken'].startswith('FP1.')
+        status,login=api('/api/v1/user/login',{'user':user,'password':password});assert status==200 and len(login['installToken'])==16
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)

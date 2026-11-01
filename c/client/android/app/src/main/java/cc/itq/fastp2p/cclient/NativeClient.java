@@ -8,4 +8,5 @@ final class NativeClient {
     static native int step(long handle);
     static native void destroy(long handle);
     static native String version();
+    static native String bootstrap();
 }

@@ -63,7 +63,7 @@ static int integer(const char *s, uint64_t *value) {
     return 0;
 }
 static void usage(void) {
-    puts("fastp2p install --token FP1... [--no-service] [--config FILE]\n"
+    puts("fastp2p install --token 16_DIGITS [--no-service] [--config FILE]\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
          "fastp2p stop [--config FILE]\n"

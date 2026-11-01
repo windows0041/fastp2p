@@ -89,7 +89,7 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
             raise RuntimeError('Tag runtime source differs from the tested build')
     notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 Debian 12/13 x86_64 原生包和 amd64 Docker 镜像。' if kind == 'gateway' else
              'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。包含 Linux Debian 12、Windows、macOS 两种架构和签名 Android APK。Windows EXE、Linux/macOS 可执行文件可直接下载。')
-    body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。运行配置、账号、证书和私钥不在发行包中。'
+    body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。专用客户端包含网关地址和公开 CA；账号、接入 Token 和私钥不在发行包中。'
     metadata = {'tag_name': tag, 'target_commitish': sha,
                 'name': ('fastp2p Gateway ' if kind == 'gateway' else 'fastp2p Client ') + version + ('' if stable else ' · development ' + run_id),
                 'body': body, 'draft': True, 'prerelease': not stable}

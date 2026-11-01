@@ -21,7 +21,7 @@ result={};gateway=None
 with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
     root=Path(temporary).resolve();assert root.parent==Path(tempfile.gettempdir()).resolve()
     create_certificates(root/'tls','127.0.0.1');create_certificates(root/'untrusted','127.0.0.1')
-    environment=os.environ.copy();environment.update(FASTP2P_USER='install-admin',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN=str(2**64-1))
+    environment=os.environ.copy();environment.update(FASTP2P_USER='install-admin',FASTP2P_PASSWORD=secrets.token_urlsafe(24),FASTP2P_TOKEN='9999999999999999')
     client_environment=environment.copy();client_environment.pop('FASTP2P_TOKEN',None)
     context=ssl.create_default_context(cafile=str(root/'tls/ca.crt'))
     log=(root/'gateway.log').open('w')
@@ -40,10 +40,12 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
         connection=http.client.HTTPSConnection('127.0.0.1',31008,context=context,timeout=5)
         connection.request('POST','/api/v1/user/login',json.dumps({'user':environment['FASTP2P_USER'],'password':environment['FASTP2P_PASSWORD']}),{'Content-Type':'application/json'})
         response=connection.getresponse();body=json.loads(response.read());connection.close();assert response.status==200
-        token=body['installToken'];assert token.startswith('FP1.')
-        value=token[4:];payload=json.loads(base64.urlsafe_b64decode(value+'='*((-len(value))%4)))
-        assert payload['host']=='127.0.0.1' and payload['port']==37183 and payload['key']==str(2**64-1)
-        result['single_token_carries_address_key_and_CA']=True
+        token=body['installToken'];assert len(token)==16 and token.isdecimal()
+        payload={'v':1,**body['gateway'],'key':token}
+        assert payload['host']=='127.0.0.1' and payload['port']==37183 and payload['key']=='9999999999999999'
+        preset=root/'public-gateway.json';preset.write_text(json.dumps({k:payload[k] for k in ['host','port','ca']}))
+        client_environment['FASTP2P_BOOTSTRAP_FILE']=str(preset)
+        result['sixteen_digits_with_trusted_public_gateway_preset']=True
         profile=root/'client.profile';token_file=root/'install.token';token_file.write_text(token)
         def install(expected=0):
             completed=subprocess.run([str(Path(args.client).resolve()),'install','--token-file',str(token_file),
@@ -63,12 +65,13 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
         result['saved_profile_connects_without_token_or_CA_arguments']=True
         before=profile.read_bytes()
         def replace(change):
-            bad={**payload,**change};token_file.write_text('FP1.'+base64.urlsafe_b64encode(json.dumps(bad,separators=(',',':')).encode()).rstrip(b'=').decode())
+            bad={**payload,**change};preset.write_text(json.dumps({k:bad[k] for k in ['host','port','ca']}));token_file.write_text(bad['key'])
             install(1);assert profile.read_bytes()==before
         replace({'ca':(root/'untrusted/ca.crt').read_text()});result['wrong_CA_rejected_without_replacing_profile']=True
         replace({'host':'localhost'});result['wrong_hostname_rejected_without_replacing_profile']=True
-        replace({'key':'1'});result['wrong_access_key_rejected_without_replacing_profile']=True
-        token_file.write_text('FP1.invalid');install(2);assert profile.read_bytes()==before
+        replace({'key':'9999999999999998'});result['wrong_access_key_rejected_without_replacing_profile']=True
+        for malformed in ['FP1.invalid','123456789012345','12345678901234567','0000000000000000','abcdefghijklmnop']:
+            token_file.write_text(malformed);install(2);assert profile.read_bytes()==before
         result['malformed_token_rejected']=True;result['success']=True
     finally:
         if gateway and gateway.poll() is None:gateway.terminate();gateway.wait(timeout=8)

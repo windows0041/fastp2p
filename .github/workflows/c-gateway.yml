@@ -100,7 +100,7 @@ jobs:
           bash scripts/tls/generate-cert.sh "$RUNNER_TEMP/c-gateway-tls" localhost 127.0.0.1 > "$RUNNER_TEMP/c-gateway-cert.log" 2>&1
           mkdir -p "$RUNNER_TEMP/c-gateway-state"
           docker run -d --name c-gateway-test --user "$(id -u):$(id -g)" \
-            -e FASTP2P_USER=ci-test-admin -e FASTP2P_PASSWORD=ci-only-fixture-password -e FASTP2P_TOKEN=18446744073709551615 \
+            -e FASTP2P_USER=ci-test-admin -e FASTP2P_PASSWORD=ci-only-fixture-password -e FASTP2P_TOKEN=1234567890123456 \
             -v "$RUNNER_TEMP/c-gateway-tls/server.crt:/etc/fastp2p/tls/server.crt:ro" \
             -v "$RUNNER_TEMP/c-gateway-tls/server.key:/etc/fastp2p/tls/server.key:ro" \
             -v "$RUNNER_TEMP/c-gateway-tls/ca.crt:/etc/fastp2p/tls/ca.crt:ro" \

@@ -19,7 +19,7 @@ cmake --build build/c-gateway --parallel
 bash scripts/tls/generate-cert.sh /private/tls gateway.example.com 127.0.0.1
 ```
 
-复制 `.env.example` 到私有环境文件，配置强管理密码、非零 uint64 接入密钥、证书和数据库路径。`FASTP2P_PUBLIC_HOST` 必须是客户端可达、且出现在服务器证书 SAN 中的地址。`FASTP2P_CA_FILE` 指向公开 CA，供安装 Token 携带；公有 CA 可省略并使用客户端系统信任库。
+复制 `.env.example` 到私有环境文件，配置强管理密码、16 位数字接入 Token（首位非零）、证书和数据库路径。`FASTP2P_PUBLIC_HOST` 必须是客户端可达、且出现在服务器证书 SAN 中的地址。`FASTP2P_CA_FILE` 指向公开 CA，用于专用客户端的公开信任配置；公有 CA 可省略并使用客户端系统信任库。
 
 加载私有环境变量后启动：
 
@@ -50,3 +50,5 @@ Web 右上角“账号设置”可修改账号和密码，需要输入当前密�
 离线节点的操作列提供“删除”，确认后移除 SQLite 登记记录及名称保留；在线节点不能删除。删除记录不撤销安装 Token，仍持有有效 Token 的设备再次上线会重新登记。
 
 数据库 schema version 2，升级保留节点并新增账号表。回退 1.0.0 前需恢复升级前数据库备份。
+
+专用客户端包通过 c/common/bootstrap.json 预置本网关地址和公开 CA，用户只需输入 16 位数字 Token。更换服务器 CA 或地址后需要重新构建专用客户端。

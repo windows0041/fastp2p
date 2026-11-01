@@ -485,14 +485,10 @@ static void handle_http(struct connection *c) {
         char number[32];
         snprintf(number, sizeof(number), "%" PRIu64, g.token);
         gw_js(j, "token", jwt);
-        char *install = fastp2p_enrollment_encode(g.public_host, g.ws_port, g.token, g.enrollment_ca);
-        if (!install) {
-            free(jwt); json_object_put(j);
-            http_error(c, 503, 1, "installation profile unavailable");
-            return;
-        }
-        gw_js(j, "installToken", install);
-        OPENSSL_cleanse(install, strlen(install)); free(install);
+        gw_js(j, "installToken", number);
+        json_object *preset = json_object_new_object();
+        gw_js(preset, "host", g.public_host); gw_ju(preset, "port", g.ws_port);
+        gw_js(preset, "ca", g.enrollment_ca); json_object_object_add(j, "gateway", preset);
         gw_ju(j, "error", 0);
         http_json(c, 200, j);
         json_object_put(j);
@@ -1081,8 +1077,7 @@ static void usage(void) {
          "  [--port 27183] [--apiport 10008] [--sdwan-config FILE] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
          "  [--reset-admin] (stop the gateway before resetting its account)\n"
-         "Set FASTP2P_USER and FASTP2P_PASSWORD; FASTP2P_TOKEN optionally "
-         "overrides the derived uint64.\n"
+         "Set FASTP2P_USER, FASTP2P_PASSWORD and a 16-digit FASTP2P_TOKEN.\n"
          "Default bind: 127.0.0.1. NAT ports: TCP 27180-27181, UDP 27180-27183.");
 }
 static int options(int argc, char **argv) {
@@ -1196,15 +1191,11 @@ static int options(int argc, char **argv) {
     if (!g.user || !*g.user || strlen(g.user) > 256 || !g.password || !*g.password ||
         strlen(g.password) > 1024)
         return -1;
-    char credentials[1281];
-    snprintf(credentials, sizeof(credentials), "%s%s", g.user, g.password);
-    g.token = gw_node_id(credentials);
     const char *token = getenv("FASTP2P_TOKEN");
-    if (token && (gw_decimal(token, &g.token) || !g.token))
+    if (!fastp2p_install_key_valid(token) || gw_decimal(token, &g.token))
         return -1;
     if (!g.token)
         return -1;
-    OPENSSL_cleanse(credentials, sizeof(credentials));
     if (sdwan) {
         FILE *file = fopen(sdwan, "rb");
         if (!file)

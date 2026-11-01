@@ -19,7 +19,7 @@ public final class InstallActivity extends Activity {
         Uri uri = getIntent().getData();
         if (token == null && uri != null && "fastp2p".equals(uri.getScheme()) && "install".equals(uri.getHost()))
             token = uri.getQueryParameter("token");
-        if (token != null && (token.length() > 32768 || !token.startsWith("FP1."))) {
+        if (token != null && !token.matches("[1-9][0-9]{15}")) {
             Toast.makeText(this, "安装 Token 无效", Toast.LENGTH_LONG).show(); finish();
         }
     }

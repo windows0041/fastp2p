@@ -3,6 +3,7 @@
 #include "enrollment.h"
 #include "identity_file.h"
 #include "platform.h"
+#include "bootstrap.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <openssl/crypto.h>
@@ -180,9 +181,26 @@ int fastp2p_install_command(int argc, char **argv) {
             token = (const char *)owned;
         }
     }
-    json_object *enrollment = fastp2p_enrollment_decode(token);
+    char *expanded = NULL;
+    if (fastp2p_install_key_valid(token)) {
+        const char *preset = fastp2p_default_gateway();
+        const char *override = getenv("FASTP2P_BOOTSTRAP_FILE");
+        unsigned char *data = NULL;
+        if (override && *override) { size_t length; data = read_file(override, FASTP2P_INSTALL_TOKEN_LIMIT, &length); preset = (const char *)data; }
+        json_object *gateway = preset ? json_tokener_parse(preset) : NULL;
+        json_object *port = NULL;
+        if (gateway && json_object_is_type(gateway, json_type_object) &&
+            json_object_object_get_ex(gateway, "port", &port) && json_object_is_type(port, json_type_int) &&
+            json_object_get_int64(port) >= 1 && json_object_get_int64(port) <= 65535)
+            expanded = fastp2p_enrollment_encode(field(gateway, "host"), (unsigned)json_object_get_int64(port),
+                                                (uint64_t)strtoull(token, NULL, 10), field(gateway, "ca"));
+        if (gateway) json_object_put(gateway);
+        free(data);
+    }
+    json_object *enrollment = expanded ? fastp2p_enrollment_decode(expanded) : NULL;
+    if (expanded) { OPENSSL_cleanse(expanded, strlen(expanded)); free(expanded); }
     if (owned) { OPENSSL_cleanse(owned, strlen((char *)owned)); free(owned); }
-    if (!enrollment) { fputs("Invalid installation token. Copy the FP1 token from the gateway console.\n", stderr); return 2; }
+    if (!enrollment) { fputs("Invalid installation token or public gateway preset. Copy the 16-digit token from the gateway console.\n", stderr); return 2; }
     char default_path[4096], ca_path[4096], identity[33];
     if (!profile) { if (fastp2p_default_profile(default_path)) { json_object_put(enrollment); return 2; } profile = default_path; }
     const char *ca = field(enrollment, "ca");

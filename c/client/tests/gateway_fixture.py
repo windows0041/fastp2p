@@ -37,10 +37,6 @@ def crc(text):
 def packet(main,sub,body):
     if not isinstance(body,bytes):body=json.dumps(body,separators=(',',':'),ensure_ascii=True).encode()
     return struct.pack('<IHH',len(body),main,sub)+body
-def install_token():
-    ca=Path(args.enrollment_ca or str(Path(args.cert).with_name('ca.crt'))).read_text()
-    payload={'v':1,'host':'127.0.0.1','port':args.port,'key':str(key),'ca':ca}
-    return 'FP1.'+base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).rstrip(b'=').decode()
 class ThreadServer(socketserver.ThreadingTCPServer):
     allow_reuse_address=True;daemon_threads=True
 class UDPServer(socketserver.ThreadingUDPServer):
@@ -72,7 +68,7 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         try:body=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
         except (ValueError,TypeError):self.reply({},400);return
         if self.path=='/api/v1/user/login' and body=={'user':user,'password':password}:
-            self.reply({'token':jwt,'installToken':install_token(),'error':0})
+            self.reply({'token':jwt,'installToken':str(key),'gateway':{'host':'127.0.0.1','port':args.port,'ca':Path(args.enrollment_ca).read_text() if args.enrollment_ca else ''},'error':0})
         else:self.reply({},401)
     def do_GET(self):
         path=urlsplit(self.path);query=parse_qs(path.query)
