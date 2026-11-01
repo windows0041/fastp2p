@@ -20,3 +20,5 @@
 提供过的 `openp2p-gateway-edge:3.24.37` 镜像用于分析参考，未作为源码或二进制纳入本仓库；公开 `gateway-lite` 并非其完整对应源码。
 
 2026-11-01 C 客户端 0.3.0 增加 SOCKS5 TCP CONNECT / UDP ASSOCIATE、出口 DNS、可选认证和请求级连接确认，公开接口增加 `op2p_client_add_socks5` 并保持 ABI 1。CLI、JSON 工厂和 Android 共用配置，Android 增加代理配置并加密保存完整配置。普通 Go/C 转发协议保持兼容；新 SOCKS5 功能需要 C 0.3.0+ 出口。协议实现参考 RFC 1928 / 1929，未新增第三方库。
+
+2026-11-01 C 网关 0.2.0 增加原生 HTML/CSS/JavaScript Web 控制台，构建时嵌入程序，无前端运行时依赖。补充鉴权状态接口、客户端管理能力标记、跨 json-c 版本的中文与严格 JSON 兼容，以及真实 C 客户端的浏览器联调。网关和 C 客户端工作流增加 GitHub Releases 自动发布，使用标准库脚本检查产物完整性、生成 SHA-256 清单并在草稿中校验上传后发布，源码仍按语言和客户端/网关分目录维护。

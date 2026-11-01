@@ -1,4 +1,16 @@
-# C 网关 0.1.0 验证记录
+# C 网关验证记录
+
+## 0.2.0 Web 控制台与发布
+
+2026-11-01 在 WSL Debian 13 的 ASan/UBSan 网关及真实 C 0.3 客户端上完成浏览器集成测试，使用临时随机账号、自签 CA 和独立端口。测试覆盖登录成功/失败、状态和节点查询、uint64 安装 Token 的精确显示与隐藏、搜索、真实 C 客户端中文规则新增与回读、C 管理能力限制、Go 节点规则编辑/开关/删除、会话过期、节点离线和退出。Go 管理操作使用协议测试对端，真实 Go/C 转发另由六客户端集成测试覆盖。
+
+桌面与 390px 移动视口均检查了页面布局和横向溢出。恶意节点/规则字段作为文本显示，未执行脚本；静态资源检查 MIME、CSP、禁止缓存、管理/WSS 监听分离、私钥路径不可访问。登录 JWT 及安装 Token 不写入浏览器持久存储。
+
+协议测试新增无效 UTF-8、中文/emoji、未转义控制字符及旧版 C 客户端严格 JSON 解码回归。Debian 12 的 json-c 0.16 和 Debian 13 的 json-c 0.18 均纳入 CI。发布脚本覆盖缺失/重复产物、SHA-256 清单、Android SDK 可重现打包、私钥拒绝、先草稿后发布及上传校验失败时不发布。CI 工作流另执行 Docker 版本/TLS 健康检查和六客户端 TCP 打洞/QUIC 重连测试。
+
+构建状态见 [C gateway 工作流](https://github.com/windows0041/openp2p-test/actions/workflows/c-gateway.yml)，成功的原生包与 Docker 镜像见 [Releases](https://github.com/windows0041/openp2p-test/releases)。发布策略见 [发布说明](https://github.com/windows0041/openp2p-test/blob/main/RELEASING-ZH.md)。公网更新记录在部署完成后另行追加，下文保留 0.1.0 的互通基线。
+
+## 0.1.0 互通基线
 
 日期：2026-11-01。此版本为独立 Linux C 网关，运行时不调用 Go。Go 3.25.11 与 C 0.2.0 客户端作为互通测试对端，客户端源码及 Go 网关未修改。
 

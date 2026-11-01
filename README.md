@@ -69,9 +69,15 @@ C 客户端 0.3.0 保持 ABI 1，提供 Linux `libopenp2p.so.1`、Windows `openp
 
 Windows、Android 和 macOS 两种架构的 SDK / 调试包见 [0.2.0 验证与构建产物](https://github.com/windows0041/openp2p-test/actions/runs/41268179414)。Android 已在连接的 Android 12 x86_64 设备上经自建公网网关与远端 Go 节点联调；arm64 已构建，尚未在 ARM 设备上运行。
 
-最新 [0.3.0 SDK 和验证](https://github.com/windows0041/openp2p-test/actions/runs/41284347086) 增加 Debian 12 原生 Linux 包，五项 CI 作业全部通过。本机已启用 SOCKS5 `127.0.0.1:1080`（QUIC）和 `1081`（TCP 打洞），使用 xrwmaster C 节点作为出口；Android 同轮 SOCKS5 设备测试通过，详见 [代理部署记录](c/client/deploy/SOCKS5-DEBUG-ZH.md)。
+最新 [0.3.0 SDK 下载](https://github.com/windows0041/openp2p-test/releases/tag/c-client-v0.3.0) 增加 Debian 12 原生 Linux 包，对应[五项 CI 作业](https://github.com/windows0041/openp2p-test/actions/runs/41284347086)全部通过。本机已启用 SOCKS5 `127.0.0.1:1080`（QUIC）和 `1081`（TCP 打洞），使用 xrwmaster C 节点作为出口；Android 同轮 SOCKS5 设备测试通过，详见 [代理部署记录](c/client/deploy/SOCKS5-DEBUG-ZH.md)。
 
-C 网关 0.1.0 实现自定义 TLS 证书、HTTPS/WSS、JWT 管理鉴权、节点发现与心跳、TCP/UDP NAT 探测、打洞控制消息、应用管理、SD-WAN 成员配置和中继节点协调。通过 C→Go、Go→C、C→C 的 TCP 打洞 / QUIC 及 TCP/UDP 应用联调，业务数据仍由客户端直传。构建、自签证书与部署见 [C 网关说明](c/gateway/README.md)，测试范围和发行包见 [网关验证记录](c/gateway/VALIDATION-ZH.md)。`gz.itq.cc.cd` 已切换到 C 网关，完成本机 Go / WSL C / Windows C 与 xrwmaster 的公网联调，原 Go 程序保留供回退，详见 [切换记录](c/gateway/deploy/REMOTE-DEBUG-ZH.md)。
+C 网关 0.2.0 增加内嵌 Web 控制台，支持登录、网关状态、节点搜索和转发管理。默认与管理 API 共用 `https://127.0.0.1:10008/`，远程可通过 SSH 转发访问。Go 节点支持增删改和开关；C 0.3 节点支持查询和新增，已有规则与 SOCKS5 在客户端配置中修改。
+
+网关实现自定义 TLS 证书、HTTPS/WSS、JWT 管理鉴权、节点发现与心跳、TCP/UDP NAT 探测、打洞控制消息、应用管理、SD-WAN 成员配置和中继节点协调。通过 C→Go、Go→C、C→C 的 TCP 打洞 / QUIC 及 TCP/UDP 应用联调，业务数据仍由客户端直传。构建、自签证书与部署见 [C 网关说明](c/gateway/README.md)，测试范围和发行包见 [网关验证记录](c/gateway/VALIDATION-ZH.md)。`gz.itq.cc.cd` 已切换到 C 网关，完成本机 Go / WSL C / Windows C 与 xrwmaster 的公网联调，原 Go 程序保留供回退，详见 [切换记录](c/gateway/deploy/REMOTE-DEBUG-ZH.md)。
+
+## 下载与自动发布
+
+GitHub 编译并测试通过后，将网关原生包、Docker 镜像和跨平台 C 客户端 SDK 发布至本项目 [Releases](https://github.com/windows0041/openp2p-test/releases)，附 `SHA256SUMS.txt`。`main` 自动发布预览版，`c-gateway-v*` / `c-client-v*` 标签发布对应正式版。规则和下载用法见 [发布说明](RELEASING-ZH.md)。
 
 ## 配置与许可证
 
