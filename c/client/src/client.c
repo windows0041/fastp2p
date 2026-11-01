@@ -725,23 +725,31 @@ static void bind_pending_key(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     if (t->keyed || t->session_owner)
         return;
+    /* Retries leave several keys queued for the same peer; the newest one is
+     * the session the current tunnel belongs to.  Binding an older key derives
+     * a different pair of keys and every frame then fails authentication. */
+    pending_key *best = NULL;
     for (int i = 0; i < NPK; ++i) {
         pending_key *k = &c->keys[i];
         if (!k->used || k->peer_id != t->peer_id || k->transport != t->transport || k->relay[0])
             continue;
-        t->session = k->session;
-        memcpy(t->secret, k->secret, sizeof(t->secret));
-        if (fp_crypto_init(&t->crypto, t->secret, t->session, t->peer_id, c->node_id, 0)) {
-            close_tunnel(c, index, "session key derivation failed");
-            return;
-        }
-        t->keyed = 1;
-        OPENSSL_cleanse(k->secret, sizeof(k->secret));
-        memset(k, 0, sizeof(*k));
-        push_session_ack(c, t->peer, t->session);
-        session_ready(c, index);
+        if (!best || k->deadline >= best->deadline)
+            best = k;
+    }
+    if (!best)
+        return;
+    pending_key *k = best;
+    t->session = k->session;
+    memcpy(t->secret, k->secret, sizeof(t->secret));
+    if (fp_crypto_init(&t->crypto, t->secret, t->session, t->peer_id, c->node_id, 0)) {
+        close_tunnel(c, index, "session key derivation failed");
         return;
     }
+    t->keyed = 1;
+    OPENSSL_cleanse(k->secret, sizeof(k->secret));
+    memset(k, 0, sizeof(*k));
+    push_session_ack(c, t->peer, t->session);
+    session_ready(c, index);
 }
 static void relay_join(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -833,6 +841,15 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
     k->transport = transport;
     k->deadline = mono() + 30 * NS;
     memcpy(k->secret, secret, FP_SESSION_SECRET);
+    /* A newer session for the same peer and transport supersedes any key still
+     * waiting from a failed attempt. */
+    for (int i = 0; i < NPK; ++i) {
+        pending_key *old = &c->keys[i];
+        if (old == k || !old->used || old->peer_id != peer_id || old->transport != transport)
+            continue;
+        OPENSSL_cleanse(old->secret, sizeof(old->secret));
+        memset(old, 0, sizeof(*old));
+    }
     if (relay && *relay) {
         if (!valid_node(relay)) {
             memset(k, 0, sizeof(*k));
