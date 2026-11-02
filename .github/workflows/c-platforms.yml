@@ -171,6 +171,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-secure.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-session-binding.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-socks.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
