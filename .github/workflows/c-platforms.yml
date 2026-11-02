@@ -141,6 +141,12 @@ jobs:
         with:
           name: android-device-validation
           path: c/client/android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+      # Debuggable build signed with the release key: installs over the production
+      # app and writes the client event stream to logcat. Never published.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-logging
+          path: c/client/android/app/build/outputs/apk/staging/app-staging.apk
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

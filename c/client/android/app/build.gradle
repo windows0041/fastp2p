@@ -42,7 +42,16 @@ android {
             }
         }
     }
-    buildTypes { release { minifyEnabled false; signingConfig signingConfigs.release } }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.release }
+        // Same signing key and application id as release, but debuggable: it can
+        // be installed over the production app to collect client logs.
+        staging {
+            initWith release
+            debuggable true
+            matchingFallbacks = ['release']
+        }
+    }
     testBuildType signingFile ? 'release' : 'debug'
     packaging { jniLibs { useLegacyPackaging false } }
 }

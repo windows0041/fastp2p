@@ -78,7 +78,7 @@ public final class FastP2PService extends Service {
             }
         } catch (Exception error) {
             failure = error instanceof IllegalArgumentException ? error.getMessage() : "连接或配置保存失败";
-            android.util.Log.w("fastp2p", "Client stopped: configuration or connection failure");
+            android.util.Log.w("fastp2p", "client stopped: " + failure, error);
         } finally {
             if (handle != 0) NativeClient.destroy(handle);
             final String finalStatus = failure == null ? "已停止" : failure;
@@ -92,6 +92,10 @@ public final class FastP2PService extends Service {
         }
     }
     public void onNativeEvent(int type, int newState, int code, String id, String message) {
+        // The desktop client prints these events to stdout; on Android logcat is
+        // the only place they can be observed, so record every one of them.
+        android.util.Log.i("fastp2p", "event type=" + type + " state=" + newState + " code=" + code
+                + " id=" + id + " " + message);
         state = newState;
         status = newState == 2 ? "已连接" : newState == 3 ? "正在重连" : newState == 1 ? "正在连接" : "已停止";
         if (type == 0) main.post(() -> { if (running && canNotify()) getSystemService(NotificationManager.class).notify(1, notification(true)); });

@@ -13,6 +13,6 @@ if [[ -n "${FASTP2P_CMAKE_DIR:-}" ]]; then
 fi
 cd "$project/android"
 if [[ -n "${FASTP2P_ANDROID_KEYSTORE:-}" ]]; then
-  exec bash ./gradlew --no-daemon "-Pfastp2pDepsBase=$work/prefix" :app:assembleRelease :app:assembleReleaseAndroidTest :app:lintRelease
+  exec bash ./gradlew --no-daemon "-Pfastp2pDepsBase=$work/prefix" :app:assembleRelease :app:assembleStaging :app:assembleReleaseAndroidTest :app:lintRelease
 fi
 exec bash ./gradlew --no-daemon "-Pfastp2pDepsBase=$work/prefix" :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
