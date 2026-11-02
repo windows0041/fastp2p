@@ -17,14 +17,15 @@ root=${MUSL_CROSS_ROOT:-$HOME/musl-cross}
 jobs=${FASTP2P_MUSL_JOBS:-$(nproc)}
 
 case "$arch" in
-  x86_64)   triple=x86_64-linux-musl;    qemu=qemu-x86_64-static ;;
-  aarch64)  triple=aarch64-linux-musl;   qemu=qemu-aarch64-static ;;
-  armv7)    triple=arm-linux-musleabihf; qemu=qemu-arm-static ;;
-  i686)     triple=i486-linux-musl;      qemu=qemu-i386-static ;;
-  riscv64)  triple=riscv64-linux-musl;   qemu=qemu-riscv64-static ;;
-  s390x)    triple=s390x-linux-musl;     qemu=qemu-s390x-static ;;
-  ppc64le)  triple=powerpc64le-linux-musl; qemu=qemu-ppc64le-static ;;
-  mips64el) triple=mips64el-linux-musl;  qemu=qemu-mips64el-static ;;
+  x86_64)   triple=x86_64-linux-musl;      bootlin_family=x86-64;             qemu=qemu-x86_64-static ;;
+  aarch64)  triple=aarch64-linux-musl;     bootlin_family=aarch64;            qemu=qemu-aarch64-static ;;
+  armv7)    triple=arm-linux-musleabihf;   bootlin_family=armv7-eabihf;       qemu=qemu-arm-static ;;
+  i686)     triple=i486-linux-musl;        bootlin_family=x86-i686;           qemu=qemu-i386-static ;;
+  riscv64)  triple=riscv64-linux-musl;     bootlin_family=riscv64;            qemu=qemu-riscv64-static ;;
+  s390x)    triple=s390x-linux-musl;       bootlin_family=s390x-z13;          qemu=qemu-s390x-static ;;
+  ppc64le)  triple=powerpc64le-linux-musl; bootlin_family=powerpc64le-power8; qemu=qemu-ppc64le-static ;;
+  # Bootlin only ships the n32 ABI for mips64el; it still runs on mips64el CPUs.
+  mips64el) triple=mips64el-linux-musl;    bootlin_family=mips64el-n32;       qemu=qemu-mips64el-static ;;
   *) echo "unsupported architecture: $arch" >&2; exit 2 ;;
 esac
 
@@ -32,13 +33,35 @@ toolchain=$root/$triple-cross
 if [[ ! -x $toolchain/bin/$triple-gcc ]]; then
   echo "fetching musl toolchain $triple" >&2
   mkdir -p "$root"
-  curl -sSL --retry 3 --max-time 900 -o "$toolchain.tgz" "https://musl.cc/$triple-cross.tgz"
-  tar xzf "$toolchain.tgz" -C "$root"
-  rm -f "$toolchain.tgz"
+  musl_cc_url=${MUSL_CC_URL:-https://musl.cc}
+  if ! curl -fsSL --retry 2 --connect-timeout 30 --max-time 900 \
+      -o "$toolchain.tgz" "$musl_cc_url/$triple-cross.tgz"; then
+    # musl.cc is not reachable from every CI network; Bootlin publishes the same
+    # kind of static toolchain under a predictable directory listing.
+    family=$bootlin_family
+    listing="https://toolchains.bootlin.com/downloads/releases/toolchains/$family/tarballs/"
+    echo "musl.cc unavailable, falling back to Bootlin ($family)" >&2
+    latest=$(curl -fsSL --max-time 120 "$listing" |
+      grep -o "[a-z0-9._-]*--musl--stable-[0-9.]*-[0-9]*\.tar\.bz2" |
+      sort -V | tail -1)
+    [[ -n $latest ]] || { echo "cannot locate a Bootlin toolchain for $family" >&2; exit 1; }
+    curl -fsSL --retry 3 --max-time 900 -o "$root/bootlin.tar.bz2" "$listing$latest"
+    mkdir -p "$root/bootlin-$arch"
+    tar xjf "$root/bootlin.tar.bz2" -C "$root/bootlin-$arch" --strip-components=1
+    rm -f "$root/bootlin.tar.bz2"
+    toolchain=$root/bootlin-$arch
+  else
+    tar xzf "$toolchain.tgz" -C "$root"
+    rm -f "$toolchain.tgz"
+  fi
 fi
 
+compiler=$(ls "$toolchain"/bin/*-gcc | head -1)
+[[ -x $compiler ]] || { echo "no compiler in $toolchain" >&2; exit 1; }
+binutils=${compiler%-gcc}
+
 python3 "$repository/c/client/scripts/build-deps.py" "linux-$arch-musl" \
-  --work "$work" --musl-root "$root" --jobs "$jobs"
+  --work "$work" --musl-toolchain "$toolchain" --jobs "$jobs"
 
 build=$work/build/$arch
 prefix=$work/prefix/linux-$arch-musl
@@ -46,9 +69,9 @@ cmake -S "$repository/c/client" -B "$build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
   -DCMAKE_TOOLCHAIN_FILE="$repository/c/client/cmake/linux-musl.cmake" \
   -DFASTP2P_TARGET_ARCH="$arch" \
-  -DCMAKE_C_COMPILER="$toolchain/bin/$triple-gcc" \
-  -DCMAKE_AR="$toolchain/bin/$triple-ar" \
-  -DCMAKE_RANLIB="$toolchain/bin/$triple-ranlib" \
+  -DCMAKE_C_COMPILER="$compiler" \
+  -DCMAKE_AR="${binutils}-ar" \
+  -DCMAKE_RANLIB="${binutils}-ranlib" \
   -DCMAKE_EXE_LINKER_FLAGS=-static \
   -DFASTP2P_DEPS_ROOT="$prefix" >/dev/null
 cmake --build "$build" --parallel "$jobs"

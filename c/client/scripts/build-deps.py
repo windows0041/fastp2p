@@ -32,6 +32,8 @@ parser.add_argument('--ndk',default=os.environ.get('ANDROID_NDK_HOME',''))
 parser.add_argument('--jobs',type=int,default=min(4,os.cpu_count() or 2))
 parser.add_argument('--musl-root',default=os.environ.get('MUSL_CROSS_ROOT',str(Path.home()/'musl-cross')),
     help='directory holding <triple>/bin/<triple>-gcc musl cross toolchains')
+parser.add_argument('--musl-toolchain',default='',
+    help='explicit musl toolchain directory (any layout with bin/*-gcc)')
 args=parser.parse_args()
 project=Path(__file__).resolve().parents[1]
 manifest=json.loads((project/'deps.lock.json').read_text())
@@ -109,17 +111,29 @@ elif args.target.startswith('android-'):
 elif args.target.endswith('-musl'):
     arch=args.target.removeprefix('linux-').removesuffix('-musl')
     triple,openssl_target,arch_flags=LINUX_MUSL[arch]
-    # musl.cc archives extract to <triple>-cross while the binaries keep the
-    # bare triple, so accept either layout.
-    toolchain=Path(args.musl_root)/triple
-    if not (toolchain/'bin').is_dir():
-        toolchain=Path(args.musl_root)/(triple+'-cross')
-    compiler=toolchain/'bin'/(triple+'-gcc')
-    if not compiler.exists():
-        raise SystemExit('Missing musl toolchain: %s (see --musl-root)'%compiler)
-    environment['CC']=str(compiler)
-    environment['AR']=str(toolchain/'bin'/(triple+'-ar'))
-    environment['RANLIB']=str(toolchain/'bin'/(triple+'-ranlib'))
+    if args.musl_toolchain:
+        # Any toolchain layout works: the compiler and its binutils are found by
+        # globbing, which keeps musl.cc and Bootlin interchangeable.
+        toolchain=Path(args.musl_toolchain)
+        gccs=sorted((toolchain/'bin').glob('*-gcc'))
+        if not gccs:
+            raise SystemExit('No *-gcc in musl toolchain: %s'%toolchain)
+        prefix=gccs[0].name[:-4]
+        environment['CC']=str(gccs[0])
+        environment['AR']=str(toolchain/'bin'/(prefix+'-ar'))
+        environment['RANLIB']=str(toolchain/'bin'/(prefix+'-ranlib'))
+    else:
+        # musl.cc archives extract to <triple>-cross while the binaries keep the
+        # bare triple, so accept either layout.
+        toolchain=Path(args.musl_root)/triple
+        if not (toolchain/'bin').is_dir():
+            toolchain=Path(args.musl_root)/(triple+'-cross')
+        compiler=toolchain/'bin'/(triple+'-gcc')
+        if not compiler.exists():
+            raise SystemExit('Missing musl toolchain: %s (see --musl-root)'%compiler)
+        environment['CC']=str(compiler)
+        environment['AR']=str(toolchain/'bin'/(triple+'-ar'))
+        environment['RANLIB']=str(toolchain/'bin'/(triple+'-ranlib'))
     environment['CFLAGS']=('-O2 -fPIC '+arch_flags).strip()
     environment['LDFLAGS']='-static'
     cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(project/'cmake/linux-musl.cmake'),
