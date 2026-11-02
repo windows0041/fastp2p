@@ -72,7 +72,7 @@ enum tunnel_state {
 typedef struct {
     int state, server, initiator, transport, notified;
     op_socket fd, listen_fd, alternate_fd;
-    uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next;
+    uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t active_at;
     char peer[32], ip[INET_ADDRSTRLEN], mode[16], probe[96];
     uint16_t local_port, mapped_port, remote_port;
@@ -421,6 +421,13 @@ enum { NAT_UNKNOWN = 314, NAT_CONE = 1, NAT_HARD_SYM = 2, NAT_EASY_SYM_INC = 3,
 /* A symmetric NAT is the only case where a direct punch is hopeless between two
  * peers, so both the relay decision and the gateway's candidate filter use it. */
 static int nat_is_hard_sym(uint64_t nat) { return nat == NAT_HARD_SYM; }
+/* Two cone NATs open their filters on the first packet either side sends, so the
+ * first moments decide the outcome: send densely for half a second, then fall
+ * back to a steady cadence that keeps the mapping alive for the rest of the
+ * window. */
+static uint64_t punch_interval(uint64_t elapsed) {
+    return elapsed < 500 * MS ? 50 * MS : 200 * MS;
+}
 /* Decide the mapping behaviour from observed mapped ports.  The first two come
  * from the same local socket talking to two different destinations, which is
  * what separates endpoint-independent mapping (cone) from per-destination
@@ -2013,6 +2020,7 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (t->transport == FASTP2P_TRANSPORT_QUIC && !strcmp(t->mode, "udppunch")) {
             t->state = T_PUNCH;
             t->punch_next = 0;
+            t->punch_started = now;
         } else
             start_underlay(c, ti);
     }
@@ -2023,7 +2031,7 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         op_ju(j, "id", t->id);
         if (now >= t->punch_next) {
             udp_packet(t->fd, &peer, 4, 0, j);
-            t->punch_next = now + 200 * MS;
+            t->punch_next = now + punch_interval(now - t->punch_started);
         }
         for (int k = 0; k < 8 && t->state == T_PUNCH; ++k) {
             uint8_t data[1024];
