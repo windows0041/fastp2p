@@ -190,10 +190,35 @@ static void relay_endpoint_shares_only_with_the_logical_peer(void) {
     assert(active_tunnel(c, "relay-node", FASTP2P_TRANSPORT_TCP) == -1);
     dispose(c);
 }
+static void relay_requests_are_shared_and_expire(void) {
+    fastp2p_client *c = fixture();
+    c->state = FASTP2P_ONLINE; c->force_relay = c->running = 1;
+    c->ws = (CURL *)(uintptr_t)1; /* ws_frame only queues bytes in this test. */
+    for (int i = 0; i < 6; ++i) {
+        app *a = &c->apps[i];
+        a->used = a->local = 1; a->tunnel_index = a->fd = -1;
+        a->transport = i < 3 ? FASTP2P_TRANSPORT_TCP : FASTP2P_TRANSPORT_QUIC;
+        strcpy(a->peer, "sender-node");
+    }
+    tick_apps(c, mono());
+    int count = 0;
+    uint16_t main, sub; uint8_t *body; size_t size;
+    while (op_frame_take(&c->ws_tx, &main, &sub, &body, &size) > 0) {
+        assert(main == 5 && sub == 0); ++count; free(body);
+    }
+    assert(count == 2); /* One request for each logical peer/transport pair. */
+    c->state = 0;
+    for (int i = 0; i < 6; ++i) c->apps[i].link_deadline = mono() - 1;
+    tick_apps(c, mono());
+    for (int i = 0; i < 6; ++i) assert(!c->apps[i].relay_requested);
+    c->ws = NULL;
+    dispose(c);
+}
 
 int main(void) {
     relay_cannot_steal_direct_rule();
     relay_endpoint_shares_only_with_the_logical_peer();
+    relay_requests_are_shared_and_expire();
     exact_connection();
     reordered_and_duplicate_keys();
     acknowledgement_and_certificate();

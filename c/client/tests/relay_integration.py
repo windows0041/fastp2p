@@ -123,7 +123,7 @@ def main():
             path.chmod(0o600)
             return start([client, '--config', str(path)], name, extra_env)
 
-        node('relay-target', [])
+        target_process = node('relay-target', [])
         direct = [{'AppName':'own-'+transport,'Protocol':'tcp','SrcPort':port,
                    'PeerNode':'relay-target','DstHost':'127.0.0.1','DstPort':echo_port,
                    'UnderlayProtocol':transport,'Enabled':1}
@@ -132,14 +132,14 @@ def main():
         wait(lambda: log_text(logs/'relay-third.log').count('forward attached to tunnel')>=2,
              60, what='relay node owns direct TCP and QUIC sessions before relaying')
         rules = []
-        for port, transport in ((26000, 'tcp'), (26001, 'quic')):
+        for port, transport in ((26000, 'tcp'), (26001, 'quic'), (26004, 'tcp'), (26005, 'quic')):
             rules.append({'AppName': 'relay-' + transport, 'Protocol': 'tcp', 'SrcPort': port,
                           'PeerNode': 'relay-target', 'DstHost': '127.0.0.1',
                           'DstPort': echo_port, 'UnderlayProtocol': transport, 'Enabled': 1})
         node('relay-source', rules, {'FASTP2P_FORCE_RELAY': '1'})
 
         def attached():
-            return log_text(logs / 'relay-source.log').count('forward attached to relay') >= 2
+            return log_text(logs / 'relay-source.log').count('forward attached to relay') >= 4
 
         wait(attached, 70, what='both rules attached to a relay')
         results['source_attached_through_relay'] = True
@@ -152,6 +152,14 @@ def main():
         for port in (26002,26003):
             assert roundtrip(port,payload)==payload
         results['relay_node_own_direct_sessions_survive_same_peer_relay_hops'] = True
+        assert roundtrip(26004,payload)==payload and roundtrip(26005,payload)==payload
+        results['multiple_rules_share_two_relay_sessions'] = True
+        target_process.terminate();target_process.wait(timeout=5)
+        node('relay-target', [])
+        for port in (26000,26001,26002,26003,26004,26005):
+            wait(lambda port=port: roundtrip(port,payload)==payload,75,
+                 what='direct/relayed rule recovered after target restart: '+str(port))
+        results['shared_relay_and_direct_rules_recover_after_peer_restart'] = True
 
         third = log_text(logs / 'relay-third.log')
         assert third.count('relay session paired') >= 2, third

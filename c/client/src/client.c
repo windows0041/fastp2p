@@ -2258,6 +2258,11 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
         app *a = &c->apps[i];
         if (!a->used || !a->local)
             continue;
+        if (a->relay_requested && a->link_deadline && now > a->link_deadline) {
+            a->relay_requested = 0;
+            a->link_deadline = 0;
+            a->retry = now;
+        }
         if (a->socks) {
             for (int k = 0; k < 4; ++k) {
                 struct sockaddr_in from;
@@ -2301,6 +2306,11 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                 /* Waiting for the gateway to name a relay node. */
             } else {
                 int in_progress = 0;
+                for (int k = 0; k < NA; ++k)
+                    if (k != i && c->apps[k].used && c->apps[k].local &&
+                        c->apps[k].relay_requested && c->apps[k].transport == a->transport &&
+                        !strcmp(c->apps[k].peer, a->peer))
+                        in_progress = 1;
                 for (int k = 0; k < NT; ++k)
                     if (c->tunnels[k].state && c->tunnels[k].relay_link < 0 &&
                         c->tunnels[k].transport == a->transport &&
@@ -2328,6 +2338,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                         fp_random(a->secret, sizeof(a->secret));
                         a->has_session = 1;
                         a->relay_requested = 1;
+                        a->link_deadline = now + 20 * NS;
                         json_object *j = json_object_new_object();
                         op_js(j, "peerNode", a->peer);
                         if (a->relay_failed_count) {
