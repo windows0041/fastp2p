@@ -167,6 +167,7 @@ struct fastp2p_client {
     op_socket nat_fd2;
     uint16_t nat_port2, nat_second;
     int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
+    int nat_override; /* FASTP2P_NAT_TYPE diagnostic switch, 0 = use the probe */
     op_socket listener, nat_fd;
     uint16_t nat_port;
     uint64_t nat_deadline;
@@ -2802,6 +2803,8 @@ static void tick_nat(fastp2p_client *c, uint64_t now) {
              "UDP NAT discovery unavailable; TCP transport can still be attempted");
     }
     if (finish) {
+        if (c->nat_override)
+            c->nat_type = c->nat_override;
         op_close(c->nat_fd);
         c->nat_fd = -1;
         if (c->nat_fd2 >= 0) {
@@ -2862,6 +2865,16 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     c->user = cfg->user;
     c->listener = c->nat_fd = c->nat_fd2 = -1;
     c->force_relay = getenv("FASTP2P_FORCE_RELAY") != NULL;
+    /* Diagnostic only: pretend the probe classified us differently, so the punch
+     * ladder and the port window can be exercised without a matching NAT. */
+    c->nat_override = 0;
+    const char *nat_override = getenv("FASTP2P_NAT_TYPE");
+    if (nat_override && *nat_override) {
+        long value = strtol(nat_override, NULL, 10);
+        if (value == NAT_CONE || value == NAT_HARD_SYM || value == NAT_EASY_SYM_INC ||
+            value == NAT_EASY_SYM_DEC)
+            c->nat_override = (int)value;
+    }
     strcpy(c->ip, "0.0.0.0");
     strcpy(c->local_ip, "0.0.0.0");
     for (int i = 0; i < NT; ++i)

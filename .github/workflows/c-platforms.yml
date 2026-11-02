@@ -256,6 +256,11 @@ jobs:
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \
           FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
           bash c/client/scripts/check-escalation.sh
+      - name: C punch with a peer advertising a mapping window
+        run: |
+          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
+          bash c/client/scripts/check-nat-window.sh
       - name: Package native C client SDK
         run: |
           cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
