@@ -166,7 +166,10 @@ try:
         jwt=login['token'];head,body,sig=jwt.split('.')
         assert api('/api/v1/status')[0]==401
         status,overview=api('/api/v1/status',jwt=jwt)
-        assert status==200 and overview['version']=='2.0.0' and overview['capacity']==256
+        import re
+        expected_version=re.search(r'project\([^\n]+\bVERSION\s+(\d+\.\d+\.\d+)',
+            (Path(__file__).resolve().parents[1]/'CMakeLists.txt').read_text()).group(1)
+        assert status==200 and overview['version']==expected_version and overview['capacity']==256
         assert overview['nodeStorage']=='sqlite' and overview['totalNodes']==0
         assert 'nodeToken' not in overview and password not in json.dumps(overview)
         for path,kind in [('/','text/html'),('/index.html','text/html'),('/app.js','text/javascript'),('/style.css','text/css'),('/favicon.svg','image/svg+xml')]:

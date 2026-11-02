@@ -3,7 +3,9 @@
 #include <json-c/json.h>
 #include <stddef.h>
 #include <stdint.h>
-#define GW_VERSION "2.0.0"
+#ifndef GW_VERSION
+#error "Build the gateway with CMake to configure its version"
+#endif
 #define GW_FRAME_LIMIT (1024u * 1024u)
 uint16_t gw_u16(const void *p);
 uint32_t gw_u32(const void *p);
