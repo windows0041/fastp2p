@@ -420,15 +420,17 @@ static int tunnel_by_id(fastp2p_client *c, uint64_t id) {
 static int tunnel_ready(const tunnel *t) {
     if (t->state != T_ACTIVE)
         return 0;
-    if (t->relay_wait || t->relay_link >= 0 || t->relay_ready)
-        return t->relay_ready;
+    if (t->relay_link >= 0)
+        return 0; /* A middle hop never owns an application session. */
+    if (t->relay_wait)
+        return t->keyed && t->relay_ready;
     return t->keyed && t->key_acked &&
            (t->transport != FASTP2P_TRANSPORT_QUIC || t->cert_checked);
 }
 static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
     for (int i = 0; i < NT; ++i)
         if (tunnel_ready(&c->tunnels[i]) && c->tunnels[i].transport == transport &&
-            !strcmp(c->tunnels[i].peer, peer))
+            !strcmp(c->tunnels[i].relay_wait ? c->tunnels[i].relay_peer : c->tunnels[i].peer, peer))
             return i;
     return -1;
 }
@@ -782,20 +784,25 @@ static void session_ready(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     if (!tunnel_ready(t))
         return;
-    int relayed = t->relay_link >= 0 || t->relay_wait || t->relay_ready;
-    for (int i = 0; i < NA; ++i)
-        if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == index &&
-            !c->apps[i].synced) {
-            c->apps[i].synced = 1;
-            c->apps[i].link_deadline = 0;
-            c->apps[i].ready_at = mono() + 100 * MS;
-            c->apps[i].relay_requested = 0;
+    int relayed = t->relay_wait;
+    const char *peer = relayed ? t->relay_peer : t->peer;
+    for (int i = 0; i < NA; ++i) {
+        app *a = &c->apps[i];
+        if (a->used && a->local && !strcmp(a->peer, peer) && a->transport == t->transport) {
+            if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
+                continue; /* Keep existing overlays on their authenticated session. */
+            a->tunnel_index = index;
+            a->synced = 1;
+            a->link_deadline = 0;
+            a->ready_at = mono() + 100 * MS;
+            a->relay_requested = 0;
             /* attempts is deliberately not reset here: a tunnel that completes
              * the key exchange and then dies must not restart the direct-punch
              * ladder, or a pair that cannot punch never reaches the relay. */
             emit(c, FASTP2P_EVENT_FORWARD, c->apps[i].id, 0,
                  relayed ? "forward attached to relay" : "forward attached to tunnel");
         }
+    }
 }
 static void bind_pending_key(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -842,6 +849,9 @@ static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport
     a->session = t->session;
     memcpy(a->secret, t->secret, FP_SESSION_SECRET);
     a->has_session = 1;
+    a->tunnel_index = ti;
+    a->link_deadline = 0; /* Underlay states have their own deadlines. */
+    a->synced = 0;
     t->keyed = 1;
     t->session_owner = 1;
     return ti;
@@ -984,9 +994,7 @@ static void tunnel_active(fastp2p_client *c, int index) {
         return;
     }
     for (int i = 0; i < NA; ++i)
-        if (c->apps[i].used && c->apps[i].local && !strcmp(c->apps[i].peer, t->peer) &&
-            c->apps[i].transport == t->transport) {
-            c->apps[i].tunnel_index = index;
+        if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == index) {
             c->apps[i].link_deadline = mono() + 20 * NS;
         }
     if (t->session_owner)
@@ -1413,14 +1421,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             inet_pton(AF_INET, op_string(j, "fromIP"), &peer_ip) == 1 &&
             (!strcmp(mode, "tcppunch") || !strcmp(mode, "tcp4") || !strcmp(mode, "intranet") ||
              udp)) {
-            /* One tunnel per peer and transport.  A peer only asks again after
-             * its own link failed, and keeping the old one alive is what made
-             * both sides bind session keys to different tunnels. */
-            for (int k = 0; k < NT; ++k)
-                if (c->tunnels[k].state && c->tunnels[k].peer_id == sender &&
-                    c->tunnels[k].transport ==
-                        (udp ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP))
-                    close_tunnel(c, k, "replaced by a newer connection request");
+            /* A peer may open a relay hop while our direct session with it is
+             * carrying traffic. Handshake IDs isolate the two connections. */
             int ti = new_tunnel(c, from, id, udp ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP, 0);
             if (ti >= 0) {
                 tunnel *t = &c->tunnels[ti];
@@ -1682,15 +1684,14 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
         return;
     }
     if (sub == TUN_RELAY_READY) {
-        if (len != 8 || op_u64(data) != t->session) {
+        if (!t->relay_wait || t->relay_link >= 0 || len != 8 || op_u64(data) != t->session) {
             close_tunnel(c, ti, "invalid relay ready");
             return;
         }
         t->relay_ready = 1;
-        if (t->session_owner)
-            session_ready(c, ti);
-        else
+        if (!t->session_owner)
             push_session_ack(c, t->relay_peer, t->session, 0);
+        session_ready(c, ti);
         return;
     }
     if (sub == TUN_CERT_BIND) {
@@ -2295,14 +2296,14 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             if (ti >= 0) {
                 a->tunnel_index = ti;
                 a->link_deadline = mono() + 20 * NS;
-                if (c->tunnels[ti].key_acked)
-                    session_ready(c, ti);
+                session_ready(c, ti);
             } else if (a->relay_requested) {
                 /* Waiting for the gateway to name a relay node. */
             } else {
                 int in_progress = 0;
                 for (int k = 0; k < NT; ++k)
-                    if (c->tunnels[k].state && c->tunnels[k].transport == a->transport &&
+                    if (c->tunnels[k].state && c->tunnels[k].relay_link < 0 &&
+                        c->tunnels[k].transport == a->transport &&
                         (!strcmp(c->tunnels[k].peer, a->peer) ||
                          (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
                         in_progress = 1;
@@ -2347,7 +2348,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             }
             a->retry = now + 2 * NS;
         }
-        if (a->tunnel_index < 0 || !a->synced || now < a->ready_at)
+        if (a->tunnel_index < 0 || !a->synced ||
+            !tunnel_ready(&c->tunnels[a->tunnel_index]) || now < a->ready_at)
             continue;
         if (a->socks)
             continue;

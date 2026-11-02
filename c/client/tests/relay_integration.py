@@ -124,7 +124,13 @@ def main():
             return start([client, '--config', str(path)], name, extra_env)
 
         node('relay-target', [])
-        node('relay-third', [])
+        direct = [{'AppName':'own-'+transport,'Protocol':'tcp','SrcPort':port,
+                   'PeerNode':'relay-target','DstHost':'127.0.0.1','DstPort':echo_port,
+                   'UnderlayProtocol':transport,'Enabled':1}
+                  for port,transport in [(26002,'tcp'),(26003,'quic')]]
+        node('relay-third', direct)
+        wait(lambda: log_text(logs/'relay-third.log').count('forward attached to tunnel')>=2,
+             60, what='relay node owns direct TCP and QUIC sessions before relaying')
         rules = []
         for port, transport in ((26000, 'tcp'), (26001, 'quic')):
             rules.append({'AppName': 'relay-' + transport, 'Protocol': 'tcp', 'SrcPort': port,
@@ -143,6 +149,9 @@ def main():
         results['tcp_over_relay'] = True
         assert roundtrip(26001, payload) == payload
         results['quic_over_relay'] = True
+        for port in (26002,26003):
+            assert roundtrip(port,payload)==payload
+        results['relay_node_own_direct_sessions_survive_same_peer_relay_hops'] = True
 
         third = log_text(logs / 'relay-third.log')
         assert third.count('relay session paired') >= 2, third

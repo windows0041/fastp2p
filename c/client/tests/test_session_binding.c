@@ -107,6 +107,8 @@ static void acknowledgement_and_certificate(void) {
     app *a = &c->apps[0];
     a->used = a->local = 1;
     a->tunnel_index = ti;
+    strcpy(a->peer, "sender-node");
+    a->transport = FASTP2P_TRANSPORT_QUIC;
     json_object *j = json_object_new_object();
     op_ju(j, "session", t->session);
     op_ju(j, "tunnelID", 100);
@@ -142,7 +144,56 @@ static void retries_use_fresh_keys(void) {
     dispose(c);
 }
 
+static void relay_cannot_steal_direct_rule(void) {
+    fastp2p_client *c = fixture();
+    int direct = new_tunnel(c, "sender-node", 200, FASTP2P_TRANSPORT_TCP, 1);
+    assert(direct >= 0);
+    c->tunnels[direct].state = T_ACTIVE;
+    c->tunnels[direct].key_acked = 1;
+    app *a = &c->apps[0];
+    a->used = a->local = a->synced = 1;
+    a->transport = FASTP2P_TRANSPORT_TCP;
+    a->tunnel_index = direct;
+    strcpy(a->peer, "sender-node");
+    /* The same endpoint opens another hop because we relay for a third node. */
+    int hop = new_tunnel(c, "sender-node", 300, FASTP2P_TRANSPORT_TCP, 0);
+    assert(hop >= 0);
+    tunnel_active(c, hop);
+    assert(a->tunnel_index == direct && a->synced);
+    c->tunnels[hop].relay_link = 0;
+    c->tunnels[hop].relay_ready = 1;
+    assert(active_tunnel(c, "sender-node", FASTP2P_TRANSPORT_TCP) == direct);
+    close_tunnel(c, direct, NULL);
+    assert(active_tunnel(c, "sender-node", FASTP2P_TRANSPORT_TCP) == -1);
+    dispose(c);
+}
+
+static void relay_endpoint_shares_only_with_the_logical_peer(void) {
+    fastp2p_client *c = fixture();
+    app session = {0};
+    session.session = 999; session.transport = FASTP2P_TRANSPORT_TCP;
+    int ti = relay_tunnel(c, &session, "relay-node", "sender-node", 1);
+    assert(ti >= 0);
+    c->tunnels[ti].state = T_ACTIVE;
+    c->tunnels[ti].relay_ready = 1;
+    for (int i = 0; i < 2; ++i) {
+        app *a = &c->apps[i];
+        a->used = a->local = 1;
+        a->tunnel_index = -1;
+        a->transport = FASTP2P_TRANSPORT_TCP;
+        strcpy(a->peer, "sender-node");
+    }
+    session_ready(c, ti);
+    assert(c->apps[0].synced && c->apps[1].synced);
+    assert(c->apps[0].tunnel_index == ti && c->apps[1].tunnel_index == ti);
+    assert(active_tunnel(c, "sender-node", FASTP2P_TRANSPORT_TCP) == ti);
+    assert(active_tunnel(c, "relay-node", FASTP2P_TRANSPORT_TCP) == -1);
+    dispose(c);
+}
+
 int main(void) {
+    relay_cannot_steal_direct_rule();
+    relay_endpoint_shares_only_with_the_logical_peer();
     exact_connection();
     reordered_and_duplicate_keys();
     acknowledgement_and_certificate();
