@@ -22,6 +22,7 @@
 #define NRL 32
 /* Sessions this node is willing to relay for at once. */
 #define RELAY_SESSION_LIMIT 4
+#define SYM_WINDOW_MAX 50
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define WIRE_VERSION FASTP2P_VERSION
@@ -73,6 +74,11 @@ typedef struct {
     int state, server, initiator, transport, notified;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
+    /* Peer's predicted mapping window: base port, direction and width. A
+     * symmetric peer changes port per destination, so the peer tells us
+     * where its next mapping is likely to land and we spray that range. */
+    uint16_t sym_base, sym_count;
+    int sym_up, sym_sprayed;
     uint64_t active_at;
     char peer[32], ip[INET_ADDRSTRLEN], mode[16], probe[96];
     uint16_t local_port, mapped_port, remote_port;
@@ -428,6 +434,21 @@ static int nat_is_hard_sym(uint64_t nat) { return nat == NAT_HARD_SYM; }
 static uint64_t punch_interval(uint64_t elapsed) {
     return elapsed < 500 * MS ? 50 * MS : 200 * MS;
 }
+/* Ports to hit when the peer's mapping shifts with every destination.  Returns
+ * the first port of the window; the caller walks `count` steps in `direction`.
+ * Zero means the peer has no predictable mapping, so only its observed port is
+ * worth a packet. */
+static uint16_t sym_window_base(uint16_t observed, int up, uint16_t count) {
+    if (!count)
+        return observed;
+    if (up)
+        return (uint16_t)(observed < 65535 - count ? observed + 1 : observed);
+    return (uint16_t)(observed > count ? observed - count : 1);
+}
+/* Cap the window so a peer cannot make us send an unbounded burst. */
+static uint16_t sym_window_cap(uint16_t requested) {
+    return requested > SYM_WINDOW_MAX ? SYM_WINDOW_MAX : requested;
+}
 /* Decide the mapping behaviour from observed mapped ports.  The first two come
  * from the same local socket talking to two different destinations, which is
  * what separates endpoint-independent mapping (cone) from per-destination
@@ -747,6 +768,13 @@ static void probe_complete(fastp2p_client *c, int index) {
         uint64_t ts = (uint64_t)((int64_t)wall() - c->clock_delta) + 3 * NS;
         op_js(j, "to", t->peer);
         op_ju(j, "punchts", ts);
+        /* Our mapping moves with every destination we contact, so tell the peer
+         * where the next one is likely to land and let it spray that window. */
+        if (c->nat_type == NAT_EASY_SYM_INC || c->nat_type == NAT_EASY_SYM_DEC) {
+            op_ju(j, "symBase", t->mapped_port);
+            op_ju(j, "symCount", SYM_WINDOW_MAX);
+            op_ju(j, "symUp", c->nat_type == NAT_EASY_SYM_INC ? 1 : 0);
+        }
         push(c, t->peer, 2, j);
         t->at = mono() + 3 * NS;
         t->state = T_TIME;
@@ -1507,6 +1535,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 t->at = mono() + (uint64_t)delay;
                 t->deadline = t->at + 10 * NS;
                 t->state = T_TIME;
+                /* A symmetric peer's port shifts per destination; remember the
+                 * window it advertised so the punch can cover it. */
+                uint64_t base = op_integer(j, "symBase"), count = op_integer(j, "symCount");
+                if (base > 0 && base <= 65535) {
+                    t->sym_base = (uint16_t)base;
+                    t->sym_count = sym_window_cap((uint16_t)count);
+                    t->sym_up = op_integer(j, "symUp") ? 1 : 0;
+                }
             } else if (t->state == T_REPLY)
                 close_tunnel(c, ti, "peer rejected connection or sent an invalid response");
         }
@@ -2031,6 +2067,21 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         op_ju(j, "id", t->id);
         if (now >= t->punch_next) {
             udp_packet(t->fd, &peer, 4, 0, j);
+            /* A symmetric peer maps a fresh port per destination, so the port it
+             * reported is only the start of a window. Spray the rest of it once,
+             * early, when the peer's filters are most likely to still be open. */
+            if (t->sym_count && !t->sym_sprayed) {
+                t->sym_sprayed = 1;
+                uint16_t start = sym_window_base(t->sym_base, t->sym_up, t->sym_count);
+                for (uint16_t k = 0; k < t->sym_count; ++k) {
+                    struct sockaddr_in candidate = peer;
+                    uint16_t port = t->sym_up ? (uint16_t)(start + k) : (uint16_t)(start - k);
+                    if (!port)
+                        continue;
+                    candidate.sin_port = htons(port);
+                    udp_packet(t->fd, &candidate, 4, 0, j);
+                }
+            }
             t->punch_next = now + punch_interval(now - t->punch_started);
         }
         for (int k = 0; k < 8 && t->state == T_PUNCH; ++k) {
