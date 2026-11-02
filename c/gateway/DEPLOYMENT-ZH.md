@@ -27,6 +27,19 @@
 
 QUIC 规则只有在会话密钥与证书指纹均校验通过后才启用。回归用例复现 NAT 映射端口与旧本地端口碰撞造成的错绑，旧代码失败、修补版通过；另覆盖延迟密钥、旧 ACK、重复/冲突密钥和重试会话隔离。直连重试及切换中继都使用新会话，避免复用 AEAD 密钥和序号。早期 2.0.0 开发包需要统一升级到包含此修复的稳定包。
 
+### 稳定版发布及现有安装复测
+
+两个稳定标签均指向 `a936b111226684fd71f55a018ebf3672c9e9fe10`：
+
+- [客户端 2.0.0 Release](https://github.com/windows0041/fastp2p/releases/tag/fastp2p-client-v2.0.0)，[标签 CI](https://github.com/windows0041/fastp2p/actions/runs/41390723241) 全部成功：Windows 原生检查（包含会话绑定回归）、macOS 双架构、Linux 八架构、Android 双 ABI 固定密钥签名和发布。共 14 个资产。
+- [网关 2.0.0 Release](https://github.com/windows0041/fastp2p/releases/tag/fastp2p-gateway-v2.0.0)，[标签 CI](https://github.com/windows0041/fastp2p/actions/runs/41390723465) 全部成功：Debian 12/13 完整测试、静态双架构网关、Docker 和发布。共 4 个资产。
+
+发布清单与全部 GitHub 资产的 SHA-256 摘要逐项一致。现有 Windows、xrwmaster、WSL 已安装标签 CI 构建的客户端；安卓使用该 CI 的签名 APK 覆盖升级，保留已有加密配置。安装 Token、CA、设备身份及现有转发配置未改动。客户端回退二进制和配置备份分别位于 Linux `/root/fastp2p-v2-quic-20261102T125520` 及 Windows 私有部署备份目录。
+
+现有 Windows SOCKS5 的 1080（QUIC）和 1081（TCP 打洞）通过 TCP 256 KiB、UDP 1000 字节、SSH 主机密钥与身份核验、35 秒心跳复测；Windows 和 xrwmaster 当前进程日志中 `tunnel authentication failed` 为零。另从 Windows 同网段经安卓 C 客户端转发实际 ADB 数据，QUIC 和 TCP 均通过，无认证失败、无中继回退。验收后 SQLite `quick_check=ok`，仅保留原四个节点，临时登记已清理。
+
+验收范围：WSL 到安卓的当前跨网段路径未通过附加数据检查，测试前的 WSL 配置和权限已原样恢复；上述安卓真机结论来自 Windows 同网段路径，不代表 WSL 跨网段可达性已修复。不可打洞时的中继升级另在隔离 netns 测试中通过。
+
 升级顺序（网关先，客户端后；期间旧客户端会登录失败）：
 
 1. 备份 `/var/lib/fastp2p/nodes.sqlite3`（schema 仍为 2，节点名与 DeviceID 保留）。
