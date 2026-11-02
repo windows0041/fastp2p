@@ -434,6 +434,12 @@ static int nat_is_hard_sym(uint64_t nat) { return nat == NAT_HARD_SYM; }
 static uint64_t punch_interval(uint64_t elapsed) {
     return elapsed < 500 * MS ? 50 * MS : 200 * MS;
 }
+/* Rounds of direct punching worth spending before asking for a relay.  Two is
+ * the historical budget; when either side maps a fresh port per destination with
+ * no pattern, the second round cannot help, so only one is spent. */
+static int direct_rounds_allowed(int hard_self, int hard_peer) {
+    return hard_self || hard_peer ? 1 : 2;
+}
 /* Ports to hit when the peer's mapping shifts with every destination.  Returns
  * the first port of the window; the caller walks `count` steps in `direction`.
  * Zero means the peer has no predictable mapping, so only its observed port is
@@ -2416,7 +2422,14 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                      * reachable: ask the gateway for a relay.  A reachable LAN
                      * address is tried first, because it needs no NAT support
                      * at all and stays direct. */
-                    if (lan_punch_possible(c, a) && a->attempts < 2 && !c->force_relay) {
+                    /* One side maps a different port per destination with no
+                     * pattern, so no amount of sending or spraying finds it.
+                     * Skip the punch ladder entirely: the first round is worth
+                     * trying for the LAN case, then go straight to the relay. */
+                    int rounds = direct_rounds_allowed(
+                        nat_is_hard_sym((uint64_t)c->nat_type),
+                        nat_is_hard_sym(a->peer_nat));
+                    if (lan_punch_possible(c, a) && a->attempts < rounds && !c->force_relay) {
                         ++a->attempts;
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {

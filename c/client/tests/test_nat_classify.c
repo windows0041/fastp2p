@@ -34,6 +34,16 @@ int main(void) {
     assert(sym_window_base(40000, 1, 50) == 40001);
     assert(sym_window_base(20, 0, 50) == 1);
 
+    /* Punch ladder budget: a hard symmetric side wastes the second round. */
+    assert(direct_rounds_allowed(0, 0) == 2);
+    assert(direct_rounds_allowed(1, 0) == 1);
+    assert(direct_rounds_allowed(0, 1) == 1);
+    assert(direct_rounds_allowed(1, 1) == 1);
+    assert(direct_rounds_allowed(nat_is_hard_sym(NAT_CONE),
+                                 nat_is_hard_sym(NAT_EASY_SYM_INC)) == 2);
+    assert(direct_rounds_allowed(nat_is_hard_sym(NAT_EASY_SYM_DEC),
+                                 nat_is_hard_sym(NAT_HARD_SYM)) == 1);
+
     /* Only the hard symmetric value feeds the relay decision. */
     assert(nat_is_hard_sym(NAT_HARD_SYM));
     assert(!nat_is_hard_sym(NAT_CONE));
