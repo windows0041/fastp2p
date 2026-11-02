@@ -25,12 +25,16 @@ KINDS = {
     'gateway': ('fastp2p-gateway', 'c/gateway/CMakeLists.txt', [
         'fastp2p-gateway-debian12-x86_64.tar.gz',
         'fastp2p-gateway-debian13-x86_64.tar.gz',
+        'fastp2p-gateway-debian-arm64.tar.gz',
         'fastp2p-gateway-docker-amd64.tar.gz']),
     'client': ('fastp2p-client', 'c/client/CMakeLists.txt', [
         'fastp2p-linux-debian12-x86_64.tar.gz', 'fastp2p-windows-x86_64.zip',
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
         'fastp2p-linux-x86_64', 'fastp2p-windows-x86_64.exe',
-        'fastp2p-macos-arm64', 'fastp2p-macos-x86_64', 'fastp2p-android.apk'])
+        'fastp2p-macos-arm64', 'fastp2p-macos-x86_64', 'fastp2p-android.apk',
+        'fastp2p-linux-aarch64', 'fastp2p-linux-armv7', 'fastp2p-linux-i686',
+        'fastp2p-linux-riscv64', 'fastp2p-linux-s390x', 'fastp2p-linux-ppc64le',
+        'fastp2p-linux-mips64el'])
 }
 
 def prepare(kind, incoming, output):

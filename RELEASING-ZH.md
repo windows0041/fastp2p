@@ -2,7 +2,7 @@
 
 主分支只构建 C 客户端与 C 网关，不安装 Go，不使用 Go 参考实现测试。
 
-`c-platforms.yml` 构建 Windows EXE、Linux 可执行文件、macOS 双架构可执行文件、Android 双 ABI 签名 APK，并额外打包桌面 C SDK。`c-gateway.yml` 构建 Debian 12/13 原生网关和 amd64 Docker 镜像。
+`c-platforms.yml` 构建 Windows EXE、Linux x86_64（glibc）、Linux 8 个架构的 static-pie musl 可执行文件、macOS 双架构可执行文件、Android 双 ABI 签名 APK，并额外打包桌面 C SDK。`c-gateway.yml` 另外交叉编译 Debian 12 arm64 网关。`c-gateway.yml` 构建 Debian 12/13 原生网关和 amd64 Docker 镜像。
 
 所有平台通过后，main 生成开发 Release。稳定标签分别为 `fastp2p-client-v2.0.0` 和 `fastp2p-gateway-v2.0.0`，必须匹配对应 CMake VERSION。先将提交合入并推送 main，再推标签。
 

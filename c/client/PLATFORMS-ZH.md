@@ -2,10 +2,13 @@
 
 | 平台 | 核心与入口 | 自动运行 |
 | --- | --- | --- |
-| Linux x86_64 | C11 / CLI / C SDK | root 安装 systemd；普通用户手动 run |
+| Linux x86_64 (glibc) | C11 / CLI / C SDK | root 安装 systemd；普通用户手动 run |
+| Linux 静态 musl（8 个架构） | C11 / CLI | root 安装 systemd；普通用户手动 run |
 | Windows x86_64 | C11 / 单文件 EXE / C DLL SDK | 当前用户 HKCU Run，后台进程 |
 | macOS 13+ ARM64/x86_64 | C11 / CLI / dylib SDK | 用户 LaunchAgent |
 | Android 8+ ARM64/x86_64 | C 核心 + JNI/Java 前台服务 | 系统通知、开机恢复 |
+
+Linux 除 glibc 构建外，还提供 x86_64、aarch64、armv7、i686、riscv64、s390x、ppc64le、mips64el 的 **static-pie musl 构建**：不依赖目标机 libc 版本，可直接运行在路由器、NAS 和各类 ARM 盒子上。它静态链接 OpenSSL、curl、ngtcp2 和 json-c，因此每个架构都要单独构建这四个依赖（`scripts/build-musl.sh`）。
 
 客户端默认无配置 GUI，安装时接收 16 位数字 Token 并自动验证网关身份。Windows 使用 DPAPI；Android 使用 Keystore/AES-GCM；手动运行的 POSIX 配置权限 0600。
 

@@ -270,8 +270,38 @@ jobs:
         with:
           name: socks5-results-linux
           path: build/socks-reports/
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, armv7, i686, riscv64, s390x, ppc64le, mips64el]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Static musl toolchain and emulator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build qemu-user-static
+      - uses: actions/cache@v4
+        with:
+          path: ~/musl-cross
+          key: musl-cross-${{ matrix.arch }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/fastp2p-dev/musl
+          key: musl-deps-${{ matrix.arch }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py') }}
+      - name: Build static client
+        run: FASTP2P_MUSL_OUT="$PWD/dist" bash c/client/scripts/build-musl.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-linux-${{ matrix.arch }}
+          path: dist/fastp2p-linux-${{ matrix.arch }}
   release:
-    needs: [macos, cross, linux, windows]
+    needs: [macos, cross, linux, windows, musl]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')
     runs-on: ubuntu-24.04
     permissions:
