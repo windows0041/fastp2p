@@ -259,7 +259,10 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                 ++skip_peer;
                 continue;
             }
-            if (n->nat == 2) {
+            /* nat 1 is endpoint-independent; 2, 3 and 4 are symmetric in
+             * different flavours and cannot accept an unsolicited peer.
+             * Unknown (314) stays eligible: it usually means probing failed. */
+            if (n->nat == 2 || n->nat == 3 || n->nat == 4) {
                 ++skip_nat;
                 continue;
             }

@@ -156,6 +156,10 @@ struct fastp2p_client {
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
     int nat_phase, nat_type;
+    /* Second probe socket: the mapping has to be compared across two different
+     * local ports to tell a predictable symmetric NAT from a random one. */
+    op_socket nat_fd2;
+    uint16_t nat_port2, nat_second;
     int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
     op_socket listener, nat_fd;
     uint16_t nat_port;
@@ -409,6 +413,31 @@ static int tseal(fastp2p_client *c, tunnel *t, uint16_t sub, const void *data, s
 static int tjson_sealed(fastp2p_client *c, tunnel *t, uint16_t sub, json_object *obj) {
     const char *s = obj ? json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN) : "null";
     return tseal(c, t, sub, s, strlen(s));
+}
+/* Mapping behaviour, reported to peers through the login query. 1 and 2 keep
+ * their historical meaning so older peers still read the value correctly. */
+enum { NAT_UNKNOWN = 314, NAT_CONE = 1, NAT_HARD_SYM = 2, NAT_EASY_SYM_INC = 3,
+       NAT_EASY_SYM_DEC = 4 };
+/* A symmetric NAT is the only case where a direct punch is hopeless between two
+ * peers, so both the relay decision and the gateway's candidate filter use it. */
+static int nat_is_hard_sym(uint64_t nat) { return nat == NAT_HARD_SYM; }
+/* Decide the mapping behaviour from observed mapped ports.  The first two come
+ * from the same local socket talking to two different destinations, which is
+ * what separates endpoint-independent mapping (cone) from per-destination
+ * mapping (symmetric).  The third is the same probe from a second local port:
+ * a small step in one direction means the next mapping can be predicted. */
+static int nat_classify(uint16_t first, uint16_t second, uint16_t third) {
+    if (first == second)
+        return NAT_CONE;
+    if (!third)
+        return NAT_HARD_SYM;
+    if (third == first)
+        return NAT_CONE;
+    if (third > first && third - first <= 100)
+        return NAT_EASY_SYM_INC;
+    if (first > third && first - third <= 100)
+        return NAT_EASY_SYM_DEC;
+    return NAT_HARD_SYM;
 }
 static int tunnel_by_id(fastp2p_client *c, uint64_t id) {
     for (int i = 0; i < NT; ++i)
@@ -2336,7 +2365,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             start_punch(c, ti);
                         }
                     } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
-                        (c->nat_type == 2 && a->peer_nat == 2)) {
+                        (nat_is_hard_sym((uint64_t)c->nat_type) &&
+                         nat_is_hard_sym(a->peer_nat))) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();
@@ -2642,9 +2672,10 @@ static void tick_nat(fastp2p_client *c, uint64_t now) {
     uint8_t data[1024];
     struct sockaddr_in from;
     op_socklen flen = sizeof(from);
-    op_ssize n =
-        op_recvfrom(c->nat_fd, data, sizeof(data), MSG_DONTWAIT, (struct sockaddr *)&from, &flen);
-    uint16_t expected = (uint16_t)(27179 + c->nat_phase);
+    /* Phase 3 reads from the second socket; phases 1 and 2 share the first. */
+    op_socket fd = c->nat_phase == 3 && c->nat_fd2 >= 0 ? c->nat_fd2 : c->nat_fd;
+    op_ssize n = op_recvfrom(fd, data, sizeof(data), MSG_DONTWAIT, (struct sockaddr *)&from, &flen);
+    uint16_t expected = c->nat_phase == 3 ? 27180 : (uint16_t)(27179 + c->nat_phase);
     int finish = 0;
     if (n >= 8 && from.sin_addr.s_addr == c->gateway.sin_addr.s_addr &&
         from.sin_port == htons(expected) && op_u16(data + 4) == 2 &&
@@ -2661,8 +2692,31 @@ static void tick_nat(fastp2p_client *c, uint64_t now) {
                 struct sockaddr_in peer = c->gateway;
                 peer.sin_port = htons(27181);
                 udp_packet(c->nat_fd, &peer, 2, 0, NULL);
+            } else if (c->nat_phase == 2) {
+                c->nat_second = (uint16_t)port;
+                if (c->nat_port == port) {
+                    /* Same mapping for a different destination: the NAT keeps
+                     * the port, so a punch from any address reaches us. */
+                    c->nat_type = NAT_CONE;
+                    finish = 1;
+                } else {
+                    /* Different mapping: symmetric.  Probe from a second local
+                     * port to see whether the next mapping is predictable. */
+                    c->nat_fd2 = socket_bound(1, NULL, 0, 0);
+                    if (c->nat_fd2 < 0) {
+                        c->nat_type = NAT_HARD_SYM;
+                        finish = 1;
+                    } else {
+                        c->nat_phase = 3;
+                        c->nat_deadline = now + 2 * NS;
+                        struct sockaddr_in peer = c->gateway;
+                        peer.sin_port = htons(27180);
+                        udp_packet(c->nat_fd2, &peer, 2, 0, NULL);
+                    }
+                }
             } else {
-                c->nat_type = c->nat_port == port ? 1 : 2;
+                c->nat_port2 = (uint16_t)port;
+                c->nat_type = nat_classify(c->nat_port, c->nat_second, c->nat_port2);
                 finish = 1;
             }
         }
@@ -2678,6 +2732,10 @@ static void tick_nat(fastp2p_client *c, uint64_t now) {
     if (finish) {
         op_close(c->nat_fd);
         c->nat_fd = -1;
+        if (c->nat_fd2 >= 0) {
+            op_close(c->nat_fd2);
+            c->nat_fd2 = -1;
+        }
         connect_gateway(c);
     }
 }
@@ -2730,7 +2788,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     c->node_id = op_node_id(c->node);
     c->callback = cfg->on_event;
     c->user = cfg->user;
-    c->listener = c->nat_fd = -1;
+    c->listener = c->nat_fd = c->nat_fd2 = -1;
     c->force_relay = getenv("FASTP2P_FORCE_RELAY") != NULL;
     strcpy(c->ip, "0.0.0.0");
     strcpy(c->local_ip, "0.0.0.0");
@@ -2958,6 +3016,9 @@ int fastp2p_client_stop(fastp2p_client *c) {
     if (c->nat_fd >= 0)
         op_close(c->nat_fd);
     c->nat_fd = -1;
+    if (c->nat_fd2 >= 0)
+        op_close(c->nat_fd2);
+    c->nat_fd2 = -1;
     close_gateway(c);
     if (c->multi) {
         curl_multi_cleanup(c->multi);
