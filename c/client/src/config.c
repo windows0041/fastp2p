@@ -102,7 +102,8 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
                           .transport = (*transport ? !strcmp(transport, "tcp")
                                                    : (op_integer(a, "PunchPriority") & 2) != 0)
                                            ? FASTP2P_TRANSPORT_TCP
-                                           : FASTP2P_TRANSPORT_QUIC};
+                                           : FASTP2P_TRANSPORT_QUIC,
+                          .relay_node = op_string(a, "RelayNode")};
         rv = fastp2p_client_add_forward(*out, &f, NULL);
     }
     json_object *proxies = op_get(root, "socks5");

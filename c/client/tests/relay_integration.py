@@ -136,10 +136,16 @@ def main():
             rules.append({'AppName': 'relay-' + transport, 'Protocol': 'tcp', 'SrcPort': port,
                           'PeerNode': 'relay-target', 'DstHost': '127.0.0.1',
                           'DstPort': echo_port, 'UnderlayProtocol': transport, 'Enabled': 1})
+        # A rule may name its relay: with only one other node online it must be
+        # used even though the gateway would otherwise choose freely.
+        rules.append({'AppName': 'named-relay', 'Protocol': 'tcp', 'SrcPort': 26006,
+                      'PeerNode': 'relay-target', 'DstHost': '127.0.0.1',
+                      'DstPort': echo_port, 'UnderlayProtocol': 'tcp', 'Enabled': 1,
+                      'RelayNode': 'relay-third'})
         node('relay-source', rules, {'FASTP2P_FORCE_RELAY': '1'})
 
         def attached():
-            return log_text(logs / 'relay-source.log').count('forward attached to relay') >= 4
+            return log_text(logs / 'relay-source.log').count('forward attached to relay') >= 5
 
         wait(attached, 70, what='both rules attached to a relay')
         results['source_attached_through_relay'] = True

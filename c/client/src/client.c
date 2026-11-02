@@ -100,6 +100,8 @@ typedef struct {
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
+    /* Operator-chosen relay for this rule; empty means automatic. */
+    char relay_node[32];
     uint64_t peer_nat, link_deadline;
     /* Relays that already failed for this rule; the gateway is asked to skip
      * them so one unreachable candidate cannot pin the link forever. */
@@ -1323,6 +1325,8 @@ static void report_apps(fastp2p_client *c) {
         op_ju(j, "dstPort", a->dst_port);
         op_ju(j, "srcPort", a->port);
         op_ju(j, "enabled", 1);
+        if (a->relay_node[0])
+            op_js(j, "relayNode", a->relay_node);
         op_ju(j, "isActive", a->tunnel_index >= 0 && c->tunnels[a->tunnel_index].state == T_ACTIVE);
         op_js(j, "linkMode", a->transport == FASTP2P_TRANSPORT_QUIC ? "udppunch" : "ipv4");
         json_object_array_add(list, j);
@@ -1547,7 +1551,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                               .protocol = op_string(j, "protocol"),
                               .transport = (op_integer(j, "punchPriority") & 2)
                                                ? FASTP2P_TRANSPORT_TCP
-                                               : FASTP2P_TRANSPORT_QUIC};
+                                               : FASTP2P_TRANSPORT_QUIC,
+                              .relay_node = op_string(j, "relayNode")};
             int rv = fastp2p_client_add_forward(c, &f, NULL);
             if (rv)
                 emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add gateway forwarding rule");
@@ -2330,25 +2335,33 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             c->tunnels[ti].lan = 1;
                             start_punch(c, ti);
                         }
-                    } else if (a->attempts >= 2 || c->force_relay ||
+                    } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
                         (c->nat_type == 2 && a->peer_nat == 2)) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();
                         fp_random(a->secret, sizeof(a->secret));
                         a->has_session = 1;
-                        a->relay_requested = 1;
                         a->link_deadline = now + 20 * NS;
-                        json_object *j = json_object_new_object();
-                        op_js(j, "peerNode", a->peer);
-                        if (a->relay_failed_count) {
-                            json_object *skip = json_object_new_array();
-                            for (int k = 0; k < a->relay_failed_count; ++k)
-                                json_object_array_add(skip, json_object_new_string(a->relay_failed[k]));
-                            json_object_object_add(j, "exclude", skip);
+                        if (a->relay_node[0]) {
+                            /* The rule named its relay, so skip the offer and
+                             * punch that node directly. */
+                            int relay_index = relay_tunnel(c, a, a->relay_node, a->peer, 1);
+                            if (relay_index >= 0)
+                                start_punch(c, relay_index);
+                        } else {
+                            a->relay_requested = 1;
+                            json_object *j = json_object_new_object();
+                            op_js(j, "peerNode", a->peer);
+                            if (a->relay_failed_count) {
+                                json_object *skip = json_object_new_array();
+                                for (int k = 0; k < a->relay_failed_count; ++k)
+                                    json_object_array_add(skip, json_object_new_string(a->relay_failed[k]));
+                                json_object_object_add(j, "exclude", skip);
+                            }
+                            ws_json(c, 5, 0, j);
+                            json_object_put(j);
                         }
-                        ws_json(c, 5, 0, j);
-                        json_object_put(j);
                     } else {
                         ++a->attempts;
                         ti = app_tunnel(c, a, a->peer, a->transport);
@@ -2733,7 +2746,10 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     return FASTP2P_OK;
 }
 int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint64_t *id) {
-    if (!c || !f || f->struct_size < sizeof(*f) || c->in_callback || !valid_node(f->peer_node) ||
+    /* relay_node is appended to the struct, so callers built against the
+     * earlier layout stay valid and simply have no opinion on the relay. */
+    if (!c || !f || f->struct_size < offsetof(fastp2p_forward, relay_node) ||
+        c->in_callback || !valid_node(f->peer_node) ||
         ((!c->automatic_node || c->login_ok) && !strcmp(f->peer_node, c->node)) || !f->local_port || !f->destination_port ||
         !f->destination_host || !*f->destination_host || !f->protocol ||
         (strcmp(f->protocol, "tcp") && strcmp(f->protocol, "udp")) ||
@@ -2750,6 +2766,9 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
             a->fd = -1;
             a->tunnel_index = -1;
             if (copy_string(a->peer, sizeof(a->peer), f->peer_node) ||
+                (f->struct_size >= sizeof(*f) && f->relay_node && *f->relay_node &&
+                 (!valid_node(f->relay_node) ||
+                  copy_string(a->relay_node, sizeof(a->relay_node), f->relay_node))) ||
                 copy_string(a->destination, sizeof(a->destination), f->destination_host) ||
                 copy_string(a->bind_ip, sizeof(a->bind_ip),
                             f->bind_ip ? f->bind_ip : "127.0.0.1") ||

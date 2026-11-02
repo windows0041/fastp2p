@@ -77,6 +77,9 @@ typedef struct {
     uint16_t destination_port;
     const char *protocol;     /* tcp or udp */
     fastp2p_transport transport; /* TCP punch or UDP punch + QUIC */
+    /* Optional: relay this rule through a specific online node instead of
+     * letting the gateway pick one. Empty/NULL keeps automatic selection. */
+    const char *relay_node;
 } fastp2p_forward;
 
 typedef struct {

@@ -228,6 +228,17 @@
     $('peer-names').replaceChildren(...state.nodes.filter(n => n.name !== state.selected.name).map(n => {
       const option = element('option'); option.value = n.name; return option;
     }));
+    // Relay candidates: every other registered node, labelled with its NAT type
+    // so a node reachable without hairpin NAT is easy to pick.
+    const relay = $('rule-relay');
+    relay.replaceChildren(element('option', null, '自动选择（按 NAT 质量）'));
+    relay.firstChild.value = '';
+    for (const n of state.nodes) {
+      if (n.name === state.selected.name) continue;
+      const option = element('option', null, n.natType === 1 ? `${n.name}（NAT 1）` : `${n.name}（NAT ${n.natType ?? '?'}）`);
+      option.value = n.name; relay.append(option);
+    }
+    relay.value = app?.relayNode || '';
     $('rule-dialog').showModal();
   }
   $('login-form').addEventListener('submit', async event => {
@@ -268,6 +279,12 @@
         srcPort: Number($('rule-source').value), peerNode: $('rule-peer').value.trim(),
         dstHost: $('rule-destination').value.trim(), dstPort: Number($('rule-target').value),
         punchPriority: $('rule-transport').value === 'tcp' ? 3 : 0};
+      const relay = $('rule-relay').value;
+      if (relay) {
+        if (relay === app.peerNode) throw new Error('中继节点不能是对端节点本身。');
+        if (relay === node.name) throw new Error('中继节点不能是本节点本身。');
+        app.relayNode = relay;
+      }
       if (!app.appName || !app.dstHost || app.peerNode === node.name) throw new Error('请填写有效名称、目标地址和其他对端节点。');
       if (!node.capabilities?.editForward && (new TextEncoder().encode(app.appName).length > 63 ||
           new TextEncoder().encode(app.dstHost).length > 255)) throw new Error('名称或目标地址过长，请缩短后重试。');

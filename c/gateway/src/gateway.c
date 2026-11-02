@@ -237,6 +237,13 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         struct connection *peer = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
         json_object *exclude = gw_get(j, "exclude");
         struct connection *relay = NULL;
+        /* Rank candidates by how likely they are to be reachable: a node on a
+         * different public address than the peer does not need hairpin NAT, an
+         * endpoint-independent mapping (nat 1) beats an unknown one, a larger
+         * shared bandwidth beats a smaller one, and the least recently used
+         * relay breaks ties so no single node carries every session. */
+#define RELAY_RANK(n) \
+    (((n)->ip[0] && peer && peer->ip[0] && !strcmp((n)->ip, peer->ip)) ? 0u : 1u)
         unsigned seen = 0, skip_self = 0, skip_peer = 0, skip_nat = 0, skip_major = 0,
                  skip_exclude = 0;
         for (unsigned i = 0; i < g.max_nodes; ++i) {
@@ -274,8 +281,21 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                 ++skip_exclude;
                 continue;
             }
-            if (!relay || n->relay_time < relay->relay_time)
+            if (!relay)
                 relay = n;
+            else {
+                unsigned rank = RELAY_RANK(n), best = RELAY_RANK(relay);
+                unsigned quality = n->nat == 1 ? 1u : 0u;
+                unsigned best_quality = relay->nat == 1 ? 1u : 0u;
+                if (rank != best)
+                    relay = rank > best ? n : relay;
+                else if (quality != best_quality)
+                    relay = quality > best_quality ? n : relay;
+                else if (n->bandwidth != relay->bandwidth)
+                    relay = n->bandwidth > relay->bandwidth ? n : relay;
+                else if (n->relay_time < relay->relay_time)
+                    relay = n;
+            }
         }
         /* An empty offer is otherwise indistinguishable from a busy gateway, so
          * report the pool and the reason each node was passed over.  Repeated
@@ -284,9 +304,11 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         if (relay || now_ms - c->relay_log_ms >= 5000) {
             printf("{\"event\":\"relay-select\",\"from\":\"%s\",\"peer\":\"%s\","
                    "\"connected\":%u,\"skipped\":{\"self\":%u,\"peer\":%u,\"symmetric\":%u,"
-                   "\"major\":%u,\"excluded\":%u},\"relay\":\"%s\"}\n",
+                   "\"major\":%u,\"excluded\":%u},\"relay\":\"%s\",\"relayNat\":%u,"
+                   "\"relayBandwidth\":%u}\n",
                    c->node, peer ? peer->node : "", seen, skip_self, skip_peer, skip_nat, skip_major,
-                   skip_exclude, relay ? relay->node : "");
+                   skip_exclude, relay ? relay->node : "", relay ? relay->nat : 0,
+                   relay ? relay->bandwidth : 0);
             fflush(stdout);
             c->relay_log_ms = now_ms;
         }
