@@ -13,10 +13,25 @@ import time
 import urllib.request
 
 parser=argparse.ArgumentParser()
-parser.add_argument('target',choices=['linux-x86_64','windows-x86_64','android-arm64-v8a','android-x86_64','macos-arm64','macos-x86_64'])
+LINUX_MUSL = {
+    # target suffix: (musl cross triple, OpenSSL Configure target, extra CFLAGS)
+    'aarch64': ('aarch64-linux-musl', 'linux-aarch64', ''),
+    'armv7': ('arm-linux-musleabihf', 'linux-armv4',
+              '-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard'),
+    'i686': ('i486-linux-musl', 'linux-x86', '-march=i686'),
+    'x86_64': ('x86_64-linux-musl', 'linux-x86_64', ''),
+    'riscv64': ('riscv64-linux-musl', 'linux64-riscv64', ''),
+    's390x': ('s390x-linux-musl', 'linux64-s390x', ''),
+    'ppc64le': ('powerpc64le-linux-musl', 'linux64-ppc64le', ''),
+    'mips64el': ('mips64el-linux-musl', 'linux64-mips64', ''),
+}
+parser.add_argument('target',choices=['linux-x86_64','windows-x86_64','android-arm64-v8a','android-x86_64',
+    'macos-arm64','macos-x86_64']+['linux-'+a+'-musl' for a in LINUX_MUSL])
 parser.add_argument('--work',default=str(Path.home()/'fastp2p-dev/cross'))
 parser.add_argument('--ndk',default=os.environ.get('ANDROID_NDK_HOME',''))
 parser.add_argument('--jobs',type=int,default=min(4,os.cpu_count() or 2))
+parser.add_argument('--musl-root',default=os.environ.get('MUSL_CROSS_ROOT',str(Path.home()/'musl-cross')),
+    help='directory holding <triple>/bin/<triple>-gcc musl cross toolchains')
 args=parser.parse_args()
 project=Path(__file__).resolve().parents[1]
 manifest=json.loads((project/'deps.lock.json').read_text())
@@ -91,6 +106,28 @@ elif args.target.startswith('android-'):
     openssl_extra=['-D__ANDROID_API__=26']
     cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(ndk/'build/cmake/android.toolchain.cmake'),
                    '-DANDROID_ABI='+abi,'-DANDROID_PLATFORM=android-26','-DANDROID_STL=none']
+elif args.target.endswith('-musl'):
+    arch=args.target.removeprefix('linux-').removesuffix('-musl')
+    triple,openssl_target,arch_flags=LINUX_MUSL[arch]
+    # musl.cc archives extract to <triple>-cross while the binaries keep the
+    # bare triple, so accept either layout.
+    toolchain=Path(args.musl_root)/triple
+    if not (toolchain/'bin').is_dir():
+        toolchain=Path(args.musl_root)/(triple+'-cross')
+    compiler=toolchain/'bin'/(triple+'-gcc')
+    if not compiler.exists():
+        raise SystemExit('Missing musl toolchain: %s (see --musl-root)'%compiler)
+    environment['CC']=str(compiler)
+    environment['AR']=str(toolchain/'bin'/(triple+'-ar'))
+    environment['RANLIB']=str(toolchain/'bin'/(triple+'-ranlib'))
+    environment['CFLAGS']=('-O2 -fPIC '+arch_flags).strip()
+    environment['LDFLAGS']='-static'
+    cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(project/'cmake/linux-musl.cmake'),
+                   '-DFASTP2P_TARGET_ARCH='+arch,
+                   '-DCMAKE_C_COMPILER='+str(compiler),
+                   '-DCMAKE_AR='+str(toolchain/'bin'/(triple+'-ar')),
+                   '-DCMAKE_RANLIB='+str(toolchain/'bin'/(triple+'-ranlib')),
+                   '-DCMAKE_EXE_LINKER_FLAGS=-static']
 elif args.target.startswith('macos-'):
     if sys.platform!='darwin': raise SystemExit('macOS dependencies require an Apple SDK on macOS')
     arch=args.target.removeprefix('macos-')
@@ -110,7 +147,10 @@ def run(command,directory,label):
 
 openssl_build=build/'openssl'
 openssl_build.mkdir(exist_ok=True)
-run(['perl',paths['openssl']/'Configure',openssl_target,'no-shared','no-tests','no-apps','no-module',
+openssl_flags=['no-shared','no-tests','no-apps','no-module']
+if args.target.endswith('-musl') and args.target.split('-')[1] not in ('x86_64','aarch64'):
+    openssl_flags.append('no-asm')
+run(['perl',paths['openssl']/'Configure',openssl_target,*openssl_flags,
      '--prefix='+str(prefix),'--libdir=lib',*openssl_extra],openssl_build,'openssl-configure')
 run(['make','-j'+str(args.jobs)],openssl_build,'openssl-build')
 run(['make','install_sw'],openssl_build,'openssl-install')
