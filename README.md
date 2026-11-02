@@ -22,9 +22,13 @@
 Windows：
 
 ```powershell
-Expand-Archive fastp2p-windows-x86_64.zip -DestinationPath .
-.\fastp2p.exe install --token-file .\token.txt
+Expand-Archive fastp2p-windows-x86_64.zip -Destination C:\Tools
+C:\Tools\windows-x86_64\bin\fastp2p.exe install --token-file .\token.txt
 ```
+
+安装器会先验证网关证书与主机名，再写入 `%LOCALAPPDATA%\fastp2p\`（配置为 DPAPI 加密）并在
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册名为 `fastp2p` 的自启项，最后在后台启动。
+加 `--no-service` 可只安装不要自启；升级时用新包再执行一次同样的 `install`，设备身份与节点名保持不变。
 
 Linux：
 
