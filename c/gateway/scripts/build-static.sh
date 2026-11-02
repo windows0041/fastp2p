@@ -28,12 +28,8 @@ case "$arch" in
   aarch64) triple=aarch64-linux-musl ;;
   *) echo "unsupported architecture: $arch" >&2; exit 2 ;;
 esac
-toolchain=$root/$triple-cross
-[[ -x $toolchain/bin/$triple-gcc ]] || {
-  echo "missing musl toolchain: $toolchain" >&2
-  echo "run c/client/scripts/build-musl.sh $arch once, or fetch the pinned archive" >&2
-  exit 1
-}
+# Same pinned toolchain the client uses, fetched on demand.
+toolchain=$(bash "$repository/c/client/scripts/fetch-musl-toolchain.sh" "$arch")
 
 # The client recipe already builds OpenSSL and json-c for this target.
 prefix=$work/prefix/linux-$arch-musl
