@@ -99,7 +99,7 @@ cmake -S "$repository/c/client" -B "$build" -G Ninja \
 cmake --build "$build" --parallel "$jobs"
 
 mkdir -p "$out"
-binary=$out/fastp2p-linux-$arch
+binary=$out/fastp2p-linux-static-$arch
 cp "$build/fastp2p" "$binary"
 file "$binary"
 

@@ -32,9 +32,10 @@ KINDS = {
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
         'fastp2p-linux-x86_64', 'fastp2p-windows-x86_64.exe',
         'fastp2p-macos-arm64', 'fastp2p-macos-x86_64', 'fastp2p-android.apk',
-        'fastp2p-linux-aarch64', 'fastp2p-linux-armv7', 'fastp2p-linux-i686',
-        'fastp2p-linux-riscv64', 'fastp2p-linux-s390x', 'fastp2p-linux-ppc64le',
-        'fastp2p-linux-mips64el'])
+        'fastp2p-linux-static-x86_64', 'fastp2p-linux-static-aarch64',
+        'fastp2p-linux-static-armv7', 'fastp2p-linux-static-i686',
+        'fastp2p-linux-static-riscv64', 'fastp2p-linux-static-s390x',
+        'fastp2p-linux-static-ppc64le', 'fastp2p-linux-static-mips64el'])
 }
 
 def prepare(kind, incoming, output):

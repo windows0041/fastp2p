@@ -298,8 +298,8 @@ jobs:
         run: FASTP2P_MUSL_OUT="$PWD/dist" bash c/client/scripts/build-musl.sh ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
-          name: fastp2p-linux-${{ matrix.arch }}
-          path: dist/fastp2p-linux-${{ matrix.arch }}
+          name: fastp2p-linux-static-${{ matrix.arch }}
+          path: dist/fastp2p-linux-static-${{ matrix.arch }}
   release:
     needs: [macos, cross, linux, windows, musl]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')
