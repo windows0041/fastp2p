@@ -48,7 +48,9 @@ class ReleaseTests(unittest.TestCase):
         for name in release.KINDS['client'][2]:
             directory=self.incoming/name;directory.mkdir()
             (directory/name).write_bytes(b'fixture')
-        self.assertEqual(len(release.prepare('client',self.incoming,self.output)),10)
+        # prepare() also emits SHA256SUMS.txt next to the allowlisted artifacts.
+        self.assertEqual(len(release.prepare('client',self.incoming,self.output)),
+            len(release.KINDS['client'][2])+1)
     def publication(self,bad_digest=False):
         self.artifacts('gateway');files=release.prepare('gateway',self.incoming,self.output);calls=[]
         class FakeAPI:
@@ -70,7 +72,8 @@ class ReleaseTests(unittest.TestCase):
         return calls
     def test_draft_until_all_assets_verified(self):
         calls=self.publication()
-        self.assertEqual(sum(m=='POST' and p.startswith('https://uploads.') for p,m,d in calls),4)
+        self.assertEqual(sum(m=='POST' and p.startswith('https://uploads.') for p,m,d in calls),
+            len(release.KINDS['gateway'][2])+1)
         self.assertEqual(calls[-1][1],'PATCH');self.assertFalse(calls[-1][2]['draft'])
     def test_upload_mismatch_never_publishes(self):
         calls=self.publication(True)
