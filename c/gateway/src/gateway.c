@@ -237,12 +237,29 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         struct connection *peer = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
         json_object *exclude = gw_get(j, "exclude");
         struct connection *relay = NULL;
+        unsigned seen = 0, skip_self = 0, skip_peer = 0, skip_nat = 0, skip_major = 0,
+                 skip_exclude = 0;
         for (unsigned i = 0; i < g.max_nodes; ++i) {
             struct connection *n = g.nodes[i];
-            if (!n || n->closing || n->slot == c->slot || n->nat == 2 || n->major != c->major)
+            if (!n || n->closing)
                 continue;
-            if (peer && n->slot == peer->slot)
+            ++seen;
+            if (n->slot == c->slot) {
+                ++skip_self;
                 continue;
+            }
+            if (peer && n->slot == peer->slot) {
+                ++skip_peer;
+                continue;
+            }
+            if (n->nat == 2) {
+                ++skip_nat;
+                continue;
+            }
+            if (n->major != c->major) {
+                ++skip_major;
+                continue;
+            }
             /* A candidate that already failed for this rule is skipped so one
              * unreachable node cannot pin the link to a dead relay. */
             int rejected = 0;
@@ -253,10 +270,25 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                         !strcmp(n->node, json_object_get_string(item)))
                         rejected = 1;
                 }
-            if (rejected)
+            if (rejected) {
+                ++skip_exclude;
                 continue;
+            }
             if (!relay || n->relay_time < relay->relay_time)
                 relay = n;
+        }
+        /* An empty offer is otherwise indistinguishable from a busy gateway, so
+         * report the pool and the reason each node was passed over.  Repeated
+         * failures are rate limited; a successful choice is always recorded. */
+        uint64_t now_ms = gw_mono_ms();
+        if (relay || now_ms - c->relay_log_ms >= 5000) {
+            printf("{\"event\":\"relay-select\",\"from\":\"%s\",\"peer\":\"%s\","
+                   "\"connected\":%u,\"skipped\":{\"self\":%u,\"peer\":%u,\"symmetric\":%u,"
+                   "\"major\":%u,\"excluded\":%u},\"relay\":\"%s\"}\n",
+                   c->node, peer ? peer->node : "", seen, skip_self, skip_peer, skip_nat, skip_major,
+                   skip_exclude, relay ? relay->node : "");
+            fflush(stdout);
+            c->relay_log_ms = now_ms;
         }
         json_object *response = json_object_new_object();
         gw_js(response, "relay", relay ? relay->node : "");

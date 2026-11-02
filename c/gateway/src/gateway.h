@@ -33,7 +33,7 @@ struct connection {
     unsigned char *request, *response;
     const char *response_type;
     size_t request_length, response_length, response_offset;
-    uint64_t deadline;
+    uint64_t deadline, relay_log_ms;
     struct connection *request_node, *pending_http;
 };
 struct probe {
