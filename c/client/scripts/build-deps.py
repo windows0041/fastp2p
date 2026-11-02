@@ -113,15 +113,13 @@ elif args.target.endswith('-musl'):
     triple,openssl_target,arch_flags=LINUX_MUSL[arch]
     if args.musl_toolchain:
         # Any toolchain layout works: the compiler and its binutils are found by
-        # globbing, which keeps musl.cc and Bootlin interchangeable.
+        # globbing, which keeps musl.cc, Bootlin and the pinned archives
+        # interchangeable.
         toolchain=Path(args.musl_toolchain)
         gccs=sorted((toolchain/'bin').glob('*-gcc'))
         if not gccs:
             raise SystemExit('No *-gcc in musl toolchain: %s'%toolchain)
-        prefix=gccs[0].name[:-4]
-        environment['CC']=str(gccs[0])
-        environment['AR']=str(toolchain/'bin'/(prefix+'-ar'))
-        environment['RANLIB']=str(toolchain/'bin'/(prefix+'-ranlib'))
+        compiler=gccs[0]
     else:
         # musl.cc archives extract to <triple>-cross while the binaries keep the
         # bare triple, so accept either layout.
@@ -131,16 +129,19 @@ elif args.target.endswith('-musl'):
         compiler=toolchain/'bin'/(triple+'-gcc')
         if not compiler.exists():
             raise SystemExit('Missing musl toolchain: %s (see --musl-root)'%compiler)
-        environment['CC']=str(compiler)
-        environment['AR']=str(toolchain/'bin'/(triple+'-ar'))
-        environment['RANLIB']=str(toolchain/'bin'/(triple+'-ranlib'))
+    tool_prefix=compiler.name[:-len('-gcc')]
+    archiver=toolchain/'bin'/(tool_prefix+'-ar')
+    ranlib=toolchain/'bin'/(tool_prefix+'-ranlib')
+    environment['CC']=str(compiler)
+    environment['AR']=str(archiver)
+    environment['RANLIB']=str(ranlib)
     environment['CFLAGS']=('-O2 -fPIC '+arch_flags).strip()
     environment['LDFLAGS']='-static'
     cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(project/'cmake/linux-musl.cmake'),
                    '-DFASTP2P_TARGET_ARCH='+arch,
                    '-DCMAKE_C_COMPILER='+str(compiler),
-                   '-DCMAKE_AR='+str(toolchain/'bin'/(triple+'-ar')),
-                   '-DCMAKE_RANLIB='+str(toolchain/'bin'/(triple+'-ranlib')),
+                   '-DCMAKE_AR='+str(archiver),
+                   '-DCMAKE_RANLIB='+str(ranlib),
                    '-DCMAKE_EXE_LINKER_FLAGS=-static']
 elif args.target.startswith('macos-'):
     if sys.platform!='darwin': raise SystemExit('macOS dependencies require an Apple SDK on macOS')
