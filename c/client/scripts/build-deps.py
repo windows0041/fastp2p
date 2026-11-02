@@ -22,7 +22,7 @@ LINUX_MUSL = {
     'x86_64': ('x86_64-linux-musl', 'linux-x86_64', ''),
     'riscv64': ('riscv64-linux-musl', 'linux64-riscv64', ''),
     's390x': ('s390x-linux-musl', 'linux64-s390x', ''),
-    'ppc64le': ('powerpc64le-linux-musl', 'linux64-ppc64le', ''),
+    'ppc64le': ('powerpc64le-linux-musl', 'linux-ppc64le', ''),
     'mips64el': ('mips64el-linux-musl', 'linux64-mips64', ''),
 }
 parser.add_argument('target',choices=['linux-x86_64','windows-x86_64','android-arm64-v8a','android-x86_64',
