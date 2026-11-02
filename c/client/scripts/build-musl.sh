@@ -31,8 +31,29 @@ esac
 
 toolchain=$root/$triple-cross
 if [[ ! -x $toolchain/bin/$triple-gcc ]]; then
-  echo "fetching musl toolchain $triple" >&2
   mkdir -p "$root"
+  # Preferred source: the pinned archives published with the project, verified
+  # against the committed digest list. External mirrors are only a fallback.
+  base=${FASTP2P_TOOLCHAIN_BASE:-https://github.com/windows0041/fastp2p/releases/download/musl-toolchains}
+  name=$triple-cross.tar.gz
+  expected=$(awk -v n="$name" '$2 == n { print $1 }' \
+    "$repository/c/client/scripts/musl-toolchains.txt" 2>/dev/null || true)
+  fetched=0
+  if [[ -n $expected ]]; then
+    echo "fetching pinned toolchain $name" >&2
+    if curl -fsSL --retry 2 --connect-timeout 30 --max-time 1200 -o "$root/$name" "$base/$name"; then
+      if echo "$expected  $root/$name" | sha256sum -c --status; then
+        tar xzf "$root/$name" -C "$root" && fetched=1
+      else
+        echo "checksum mismatch for $name, ignoring the download" >&2
+      fi
+    fi
+    rm -f "$root/$name"
+  fi
+  if ((fetched)); then
+    :
+  else
+  echo "fetching musl toolchain $triple" >&2
   musl_cc_url=${MUSL_CC_URL:-https://musl.cc}
   if ! curl -fsSL --retry 2 --connect-timeout 30 --max-time 900 \
       -o "$toolchain.tgz" "$musl_cc_url/$triple-cross.tgz"; then
@@ -53,6 +74,7 @@ if [[ ! -x $toolchain/bin/$triple-gcc ]]; then
   else
     tar xzf "$toolchain.tgz" -C "$root"
     rm -f "$toolchain.tgz"
+  fi
   fi
 fi
 

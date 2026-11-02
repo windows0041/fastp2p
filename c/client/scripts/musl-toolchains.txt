@@ -1,0 +1,8 @@
+24037aaeec797762226a28b8bf7195642f83de047297c8ee4fa93c41b1005e65  x86_64-linux-musl-cross.tar.gz
+a7154d1e1cb5581b18a5cc037f221000311be3078b721cc2718ddd9c88660138  aarch64-linux-musl-cross.tar.gz
+b081de3e5703d7c06b8632176a8e70e06783a3998a0032572d676f0e5b5dbe9d  arm-linux-musleabihf-cross.tar.gz
+beedcf853bde1a029f99143d4a4eb5ae333cbff65bb1d8bd8852ef407922e3cf  i486-linux-musl-cross.tar.gz
+601857b525308d9c94e02e657d19612f872219b49296952d21a7a576b6ba5c66  riscv64-linux-musl-cross.tar.gz
+a09d5821edb84e5218f3fc90bb43c7cdf9eefd35e617c5928a68082c82aa1f1f  s390x-linux-musl-cross.tar.gz
+e2108abe576d62c87f46f8b42bd3d625b73a35ef751c775b0f041a7a6419e22b  powerpc64le-linux-musl-cross.tar.gz
+dcabbe242d0c0aba8771427ff066d33bf59c2159245676909ec0171e5df09aa7  mips64el-linux-musl-cross.tar.gz
