@@ -58,6 +58,8 @@ class ReleaseTests(unittest.TestCase):
             def __init__(self,*args):pass
             def request(self,path,data=None,method='GET',content_type=None):
                 calls.append((path,method,data if isinstance(data,dict) else None))
+                if path.startswith('/releases?per_page='):
+                    return []
                 if path.startswith('/releases/tags/'):
                     raise urllib.error.HTTPError('fixture',404,'not found',{},None)
                 if path=='/releases' and method=='POST':
@@ -75,7 +77,13 @@ class ReleaseTests(unittest.TestCase):
         calls=self.publication()
         self.assertEqual(sum(m=='POST' and p.startswith('https://uploads.') for p,m,d in calls),
             len(release.KINDS['gateway'][2])+1)
-        self.assertEqual(calls[-1][1],'PATCH');self.assertFalse(calls[-1][2]['draft'])
+        # The release is only published after every upload; later bookkeeping
+        # calls (like pruning old development builds) are allowed to follow.
+        uploads=[i for i,(p,m,d) in enumerate(calls) if m=='POST' and p.startswith('https://uploads.')]
+        patches=[i for i,(p,m,d) in enumerate(calls) if m=='PATCH']
+        self.assertTrue(patches)
+        self.assertGreater(patches[0],max(uploads))
+        self.assertFalse(calls[patches[0]][2]['draft'])
     def test_upload_mismatch_never_publishes(self):
         calls=self.publication(True)
         self.assertFalse(any(method=='PATCH' for path,method,data in calls))
