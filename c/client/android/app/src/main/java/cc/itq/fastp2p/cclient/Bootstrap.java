@@ -24,6 +24,9 @@ final class Bootstrap {
         return text.toString();
     }
     static Bootstrap decode(Context context, String encoded) throws Exception {
+        return decode(context, encoded, false);
+    }
+    static Bootstrap decode(Context context, String encoded, boolean migrate) throws Exception {
         if (encoded == null || !encoded.matches("[1-9][0-9]{15}"))
             throw new IllegalArgumentException("安装 Token 无效");
         JSONObject payload = new JSONObject(NativeClient.bootstrap()).put("v", 1).put("key", encoded);
@@ -47,8 +50,9 @@ final class Bootstrap {
             String previousPEM = previousCA.isFile() ? new String(Files.readAllBytes(previousCA.toPath()), StandardCharsets.US_ASCII) : "";
             accepted = digest(previous.getString("ServerHost") + "\n" + previous.optInt("ServerPort", 27183) + "\n" + previousPEM);
         }
-        // An exported enrollment Intent cannot silently replace an existing gateway.
-        if (!accepted.isEmpty() && !accepted.equals(fingerprint))
+        // Migration can only select the immutable preset in this signed APK.
+        // Its TLS identity and Token must still verify before commit().
+        if (!accepted.isEmpty() && !accepted.equals(fingerprint) && !migrate)
             throw new IllegalArgumentException("已配置其他接入凭据，请先在系统设置中清除本应用数据");
         String identity = preferences.getString("deviceID", "");
         if (identity.isEmpty()) {
@@ -67,7 +71,9 @@ final class Bootstrap {
         }
         JSONObject network = new JSONObject().put("AutoNode", true).put("DeviceID", identity)
                 .put("ServerHost", host).put("ServerPort", port).put("Token", 0);
-        JSONObject root = new JSONObject().put("product", "fastp2p").put("network", network);
+        JSONObject root = preferences.contains("enrollment") ? new JSONObject(SecretStore.config(context)) : new JSONObject();
+        root.put("product", "fastp2p").put("network", network);
+        root.remove("CACertFile");
         return new Bootstrap(root.toString(), key, ca, fingerprint);
     }
     void commit(Context context) throws Exception {

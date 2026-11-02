@@ -42,7 +42,7 @@ adb install -r fastp2p-android.apk
 adb shell am start -n cc.itq.fastp2p.cclient/.InstallActivity --es token 'YOUR_16_DIGIT_TOKEN'
 ```
 
-Android 无配置表单，保留系统要求的服务通知及停止入口。普通 APK 安装器不能附加业务 Token，需要随后调用接入入口。已有信任配置不会被外部 Intent 静默替换；更换网关前在系统设置中清除应用数据；同一网关更新 Token 可保留设备身份。
+Android 无配置表单，保留系统要求的服务通知及停止入口。普通 APK 安装器不能附加业务 Token，需要随后调用接入入口。普通安装链接不能替换已有网关；迁移时先安装新网关专用的签名 APK，再由操作者携带 Token 和 `--ez migrate true` 调用同一接入入口。目标地址和 CA 只能来自 APK 内置配置，校验证书及登录成功后才保存，保留 DeviceID 和规则。同一网关更新 Token 无需迁移标记。
 
 ## 源码
 
@@ -59,3 +59,5 @@ Android 无配置表单，保留系统要求的服务通知及停止入口。普
 协议为 `fastp2p2`，QUIC ALPN 为 `fastp2pv2`。2.0.0 与 1.x 不互通，网关和全部客户端需要一起升级；1.x 的 CBC 隧道载荷和 SD-WAN 配置下发已删除。Go 源码保留于 Git 历史和旧标签，不参与主分支构建、测试和发布。上游来源及必要版权声明见 UPSTREAM.md、LICENSE 和 THIRD_PARTY.md。
 
 Linux 系统服务的配置和 CA 由 root 持有，fastp2p 组可读（0640），目录权限 0750；服务进程不能写入。重复接入不会重写相同的 CA 文件。
+
+2.0.1 起，网关专用客户端预置 `fastp2p.top:27183`，信任 Certum Trusted Network CA 公共根证书。网关证书续期时只要域名及信任链保持不变，无需重发客户端。证书私钥不进入仓库或客户端包。

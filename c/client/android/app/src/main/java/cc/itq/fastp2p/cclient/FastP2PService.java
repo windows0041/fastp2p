@@ -49,17 +49,18 @@ public final class FastP2PService extends Service {
         }
         if (worker != null) return START_STICKY;
         final String enrollment = intent == null ? null : intent.getStringExtra("token");
+        final boolean migrate = intent != null && intent.getBooleanExtra("migrate", false);
         if (enrollment == null && !SecretStore.preferences(this).contains("enrollment")) { stopSelf(); return START_NOT_STICKY; }
         running = true; state = 1; status = "正在校验网关"; stopping.set(false);
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, notification(true), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         else startForeground(1, notification(true));
-        worker = new Thread(() -> runClient(enrollment), "fastp2p-owner"); worker.start();
+        worker = new Thread(() -> runClient(enrollment, migrate), "fastp2p-owner"); worker.start();
         return START_STICKY;
     }
-    private void runClient(String enrollment) {
+    private void runClient(String enrollment, boolean migrate) {
         long handle = 0; String failure = null;
         try {
-            Bootstrap pending = enrollment == null ? null : Bootstrap.decode(this, enrollment);
+            Bootstrap pending = enrollment == null ? null : Bootstrap.decode(this, enrollment, migrate);
             String config = pending == null ? SecretStore.config(this) : pending.config;
             String token = pending == null ? SecretStore.token(this) : pending.token;
             String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;

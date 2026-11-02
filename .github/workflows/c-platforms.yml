@@ -138,6 +138,10 @@ jobs:
           name: fastp2p-android
           path: dist/android/fastp2p-android.apk
       - uses: actions/upload-artifact@v4
+        with:
+          name: android-device-validation
+          path: c/client/android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+      - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: diagnostics-cross

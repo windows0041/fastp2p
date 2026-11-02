@@ -41,6 +41,7 @@ public final class InstallActivity extends Activity {
     private void startAgent() {
         Intent intent = new Intent(this, FastP2PService.class);
         if (token != null) intent.putExtra("token", token);
+        intent.putExtra("migrate", getIntent().getBooleanExtra("migrate", false));
         SecretStore.preferences(this).edit().putBoolean("enabled", true).apply();
         startForegroundService(intent);
         finish();
