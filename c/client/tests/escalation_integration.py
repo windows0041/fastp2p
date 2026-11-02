@@ -176,6 +176,32 @@ def main():
 
         assert 'relay session paired' in log_text(logs / 'esc-relay.log')
         results['third_node_paired'] = True
+
+        # Second phase: once the two namespaces can reach each other, the same
+        # rule must go back to a direct link over the private addresses instead
+        # of staying on the relay.
+        run(['sysctl', '-qw', 'net.ipv4.ip_forward=1'], check=False)
+        for process, handle in list(processes):
+            if process.args and 'esc-source.json' in ' '.join(process.args):
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                handle.close()
+                processes.remove((process, handle))
+        (logs / 'esc-source.log').unlink(missing_ok=True)
+        node('esc-source',
+             [{'AppName': 'to-target', 'Protocol': 'tcp', 'SrcPort': 28100,
+               'PeerNode': 'esc-target', 'DstHost': HOST_ADDR, 'DstPort': ECHO_PORT,
+               'BindIP': '0.0.0.0', 'UnderlayProtocol': 'tcp', 'Enabled': 1}],
+             ['ip', 'netns', 'exec', 'esca'])
+        wait(lambda: 'forward attached to tunnel' in log_text(logs / 'esc-source.log'),
+             90, what='source returned to a direct LAN link')
+        results['direct_lan_link_when_reachable'] = True
+        payload = b'lan-' + os.urandom(6)
+        assert roundtrip(A_ADDR, 28100, payload) == payload
+        results['traffic_over_lan_link'] = True
         results['success'] = True
     finally:
         for process, handle in processes:

@@ -135,6 +135,7 @@ typedef struct {
 typedef struct {
     int used, transport;
     uint64_t session, peer_id, deadline;
+    uint16_t peer_port; /* the port this peer bound for the tunnel */
     uint8_t secret[FP_SESSION_SECRET];
     char relay[32];
 } pending_key;
@@ -580,7 +581,8 @@ static void secret_to_hex(const uint8_t *secret, char out[FP_SESSION_SECRET * 2 
         snprintf(out + i * 2, 3, "%02x", secret[i]);
 }
 static void push_session_to(fastp2p_client *c, const char *peer, uint64_t session,
-                            const uint8_t *secret, const char *relay, int transport) {
+                            const uint8_t *secret, const char *relay, int transport,
+                            const char *peer_ip, uint16_t peer_port) {
     char hex[FP_SESSION_SECRET * 2 + 1];
     json_object *j = json_object_new_object();
     secret_to_hex(secret, hex);
@@ -590,6 +592,11 @@ static void push_session_to(fastp2p_client *c, const char *peer, uint64_t sessio
     op_ju(j, "session", session);
     op_js(j, "secret", hex);
     op_js(j, "transport", transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
+    /* The address this receiver holds for the tunnel, so it can bind the key to
+     * the right one when several attempts are alive at once. */
+    if (peer_ip && *peer_ip)
+        op_js(j, "peerIP", peer_ip);
+    op_ju(j, "peerPort", peer_port);
     if (relay && *relay)
         op_js(j, "relay", relay);
     push(c, peer, PUSH_SESSION, j);
@@ -597,7 +604,8 @@ static void push_session_to(fastp2p_client *c, const char *peer, uint64_t sessio
     OPENSSL_cleanse(hex, sizeof(hex));
 }
 static void push_session(fastp2p_client *c, tunnel *t, const char *relay) {
-    push_session_to(c, t->peer, t->session, t->secret, relay, t->transport);
+    push_session_to(c, t->peer, t->session, t->secret, relay, t->transport, t->ip,
+                    t->remote_port);
 }
 static void push_session_ack(fastp2p_client *c, const char *peer, uint64_t session) {
     json_object *j = json_object_new_object();
@@ -801,6 +809,15 @@ static void bind_pending_key(fastp2p_client *c, int index) {
         pending_key *k = &c->keys[i];
         if (!k->used || k->peer_id != t->peer_id || k->transport != t->transport || k->relay[0])
             continue;
+        if (k->peer_port) {
+            /* The key names the port this side bound for the tunnel it belongs
+             * to.  Binding it anywhere else derives a different key pair. */
+            if (k->peer_port == t->local_port) {
+                best = k;
+                break;
+            }
+            continue;
+        }
         if (!best || k->deadline >= best->deadline)
             best = k;
     }
@@ -891,7 +908,8 @@ static void start_punch(fastp2p_client *c, int ti) {
  * secret is bound to the tunnel it punched; for a relayed link we punch the
  * relay ourselves and join the session there. */
 static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *peer, uint64_t session,
-                            const uint8_t *secret, const char *relay, int transport) {
+                            const uint8_t *secret, const char *relay, int transport,
+                            uint16_t peer_port) {
     int slot = -1;
     for (int i = 0; i < NPK; ++i)
         if (c->keys[i].used && c->keys[i].session == session && c->keys[i].peer_id == peer_id) {
@@ -914,6 +932,7 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
     k->session = session;
     k->peer_id = peer_id;
     k->transport = transport;
+    k->peer_port = peer_port;
     k->deadline = mono() + 30 * NS;
     memcpy(k->secret, secret, FP_SESSION_SECRET);
     /* A newer session for the same peer and transport supersedes any key still
@@ -971,7 +990,8 @@ static void tunnel_active(fastp2p_client *c, int index) {
          * endpoint which relay to punch so it can join the same session. */
         relay_join(c, index);
         if (t->session_owner)
-            push_session_to(c, t->relay_peer, t->session, t->secret, t->peer, t->transport);
+            push_session_to(c, t->relay_peer, t->session, t->secret, t->peer, t->transport,
+                            NULL, 0);
         return;
     }
     for (int i = 0; i < NA; ++i)
@@ -1404,6 +1424,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             inet_pton(AF_INET, op_string(j, "fromIP"), &peer_ip) == 1 &&
             (!strcmp(mode, "tcppunch") || !strcmp(mode, "tcp4") || !strcmp(mode, "intranet") ||
              udp)) {
+            /* One tunnel per peer and transport.  A peer only asks again after
+             * its own link failed, and keeping the old one alive is what made
+             * both sides bind session keys to different tunnels. */
+            for (int k = 0; k < NT; ++k)
+                if (c->tunnels[k].state && c->tunnels[k].peer_id == sender &&
+                    c->tunnels[k].transport ==
+                        (udp ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP))
+                    close_tunnel(c, k, "replaced by a newer connection request");
             int ti = new_tunnel(c, from, id, udp ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP, 0);
             if (ti >= 0) {
                 tunnel *t = &c->tunnels[ti];
@@ -1460,9 +1488,11 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                  !secret_from_hex(op_string(j, "secret"), secret);
         if (ok) {
             int quic = !transport || strcmp(transport, "tcp");
+            uint64_t peer_port = op_integer(j, "peerPort");
             session_receive(c, sender, peer, session, secret,
                             relay && *relay ? relay : NULL,
-                            quic ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP);
+                            quic ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP,
+                            peer_port <= 65535 ? (uint16_t)peer_port : 0);
         } else {
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid session key");
         }
