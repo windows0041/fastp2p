@@ -10,27 +10,27 @@
 
 | 平台 | 客户端 | 自动运行 |
 | --- | --- | --- |
-| Windows x86_64 | `fastp2p-windows-x86_64.exe` | 当前用户登录后启动 |
-| Linux x86_64 | `fastp2p-linux-x86_64`（glibc） | root 安装 systemd 服务 |
-| Linux 静态 musl | `fastp2p-linux-static-{x86_64,aarch64,armv7,i686,riscv64,s390x,ppc64le,mips64el}` | root 安装 systemd 服务 |
-| macOS ARM64 / x86_64 | `fastp2p-macos-*` | 用户 LaunchAgent |
+| Windows x86_64 | `fastp2p-windows-x86_64.zip` | 当前用户登录后启动 |
+| Linux（静态） | `fastp2p-linux-static-{x86_64,aarch64,armv7,i686,riscv64,s390x,ppc64le,mips64el}.tar.gz` | root 安装 systemd 服务 |
+| macOS ARM64 / x86_64 | `fastp2p-macos-{arm64,x86_64}.tar.gz` | 用户 LaunchAgent |
 | Android ARM64 / x86_64 | `fastp2p-android.apk` | 前台服务及开机恢复 |
 
-桌面客户端无需旁带项目 DLL/共享库，SDK 单独提供。`fastp2p-linux-x86_64` 面向 Debian 12 或更新的 glibc 环境；`fastp2p-linux-static-<arch>` 是 static-pie musl 构建，不要求目标机 libc 版本，可直接用于路由器和 NAS。使用同一 Release 的 SHA256SUMS.txt 校验下载。
+桌面客户端无需旁带项目 DLL/共享库，SDK 单独提供（`fastp2p-sdk-linux-x86_64.tar.gz` 是需要链接本项目的 C 应用用的开发包）。Linux 客户端只有一套静态 musl 构建：static-pie，不依赖目标机 libc，Debian、Ubuntu、Alpine 以及路由器和 NAS 用的是同一个文件。每个平台只发布压缩包，使用同一 Release 的 SHA256SUMS.txt 校验下载。
 
 在网关 Web 登录后取得 16 位数字安装 Token。专用客户端包已预置网关地址和公开 CA。客户端先校验证书链、主机名和网关登录，再保存配置。不要公开 Token。
 
 Windows：
 
 ```powershell
-.\fastp2p-windows-x86_64.exe install --token-file .\token.txt
+Expand-Archive fastp2p-windows-x86_64.zip -DestinationPath .
+.\fastp2p.exe install --token-file .\token.txt
 ```
 
 Linux：
 
 ```sh
-chmod +x fastp2p-linux-x86_64
-sudo ./fastp2p-linux-x86_64 install --token-file token.txt
+tar xzf fastp2p-linux-static-x86_64.tar.gz
+sudo ./fastp2p-linux-static-x86_64/bin/fastp2p install --token-file token.txt
 ```
 
 也支持 `install --token` 和 `FASTP2P_INSTALL_TOKEN`。非 root Linux 使用 `--no-service` 安装后手动 `run`。Windows 配置使用 DPAPI 加密；手动运行的 POSIX 配置权限为 0600。

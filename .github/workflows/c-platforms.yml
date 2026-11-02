@@ -63,7 +63,6 @@ jobs:
         run: |
           python3 c/client/scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
           tar -C dist -czf dist/fastp2p-${{ matrix.target }}.tar.gz ${{ matrix.target }}
-          cp build/c/fastp2p dist/fastp2p-${{ matrix.target }}
       - name: Native SOCKS5 TCP, UDP, authentication and reconnect
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
@@ -71,7 +70,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-${{ matrix.target }}
-          path: dist/fastp2p-*
+          path: dist/fastp2p-*.tar.gz
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -200,13 +199,10 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path dist/windows-x86_64 -DestinationPath dist/fastp2p-windows-x86_64.zip
-          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-windows-x86_64
-          path: |
-            dist/fastp2p-windows-x86_64.zip
-            dist/fastp2p-windows-x86_64.exe
+          path: dist/fastp2p-windows-x86_64.zip
   linux:
     runs-on: ubuntu-24.04
     container:
@@ -248,18 +244,15 @@ jobs:
           bash c/client/scripts/check-escalation.sh
       - name: Package native C client SDK
         run: |
-          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/linux-debian12-x86_64"
+          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
           cmake --build build/client-release --parallel 3
           cmake --install build/client-release
-          python3 c/client/scripts/sdk-metadata.py --sdk dist/linux-debian12-x86_64
-          tar -C dist -czf dist/fastp2p-linux-debian12-x86_64.tar.gz linux-debian12-x86_64
-          cp build/client-release/fastp2p dist/fastp2p-linux-x86_64
+          python3 c/client/scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
+          tar -C dist -czf dist/fastp2p-sdk-linux-x86_64.tar.gz sdk-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
-          name: fastp2p-linux-debian12-x86_64
-          path: |
-            dist/fastp2p-linux-debian12-x86_64.tar.gz
-            dist/fastp2p-linux-x86_64
+          name: fastp2p-sdk-linux-x86_64
+          path: dist/fastp2p-sdk-linux-x86_64.tar.gz
       - name: Gather sanitized SOCKS5 summaries
         if: always()
         run: |
@@ -299,7 +292,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-linux-static-${{ matrix.arch }}
-          path: dist/fastp2p-linux-static-${{ matrix.arch }}
+          path: dist/fastp2p-linux-static-${{ matrix.arch }}.tar.gz
   release:
     needs: [macos, cross, linux, windows, musl]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')

@@ -61,31 +61,7 @@ jobs:
             build/web-ui/result.json
             build/web-ui/*.png
             build/registry/result.json
-      - name: Package native gateway
-        run: |
-          cmake -S c/gateway -B build/c-gateway-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$PWD/dist/c-gateway-debian${{ matrix.debian }}-x86_64"
-          cmake --build build/c-gateway-release --parallel 3
-          cmake --install build/c-gateway-release
-          cp c/gateway/README.md c/gateway/VALIDATION-ZH.md c/gateway/THIRD_PARTY.md c/gateway/LICENSE c/gateway/.env.example dist/c-gateway-debian${{ matrix.debian }}-x86_64/
-          cp c/NODE-STORAGE-ZH.md dist/c-gateway-debian${{ matrix.debian }}-x86_64/
-          cp -R c/gateway/deploy dist/c-gateway-debian${{ matrix.debian }}-x86_64/
-          mkdir -p dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts
-          cp scripts/tls/generate-cert.sh dist/c-gateway-debian${{ matrix.debian }}-x86_64/scripts/
-          tar -C dist -czf dist/fastp2p-gateway-debian${{ matrix.debian }}-x86_64.tar.gz c-gateway-debian${{ matrix.debian }}-x86_64
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastp2p-gateway-debian${{ matrix.debian }}-x86_64
-          path: dist/fastp2p-gateway-*.tar.gz
-      - name: Gather sanitized test summaries
-        if: always()
-        run: |
-          mkdir -p build/reports
-          find /tmp -path '/tmp/fastp2p-gateway-*/logs/result.json' -exec cp --parents '{}' build/reports/ \;
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: c-gateway-results-debian${{ matrix.debian }}
-          path: build/reports/
+
   docker:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -125,37 +101,34 @@ jobs:
         with:
           name: fastp2p-gateway-docker-amd64
           path: dist/fastp2p-gateway-docker-amd64.tar.gz
-  arm64:
+  static:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    container:
-      image: python:3.13-slim-bookworm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
     steps:
-      - name: Enable arm64 packages
+      - name: Build tools
         run: |
-          apt-get update -qq
-          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config \
-            python3 gcc-aarch64-linux-gnu dpkg-dev
-          dpkg --add-architecture arm64
-          # Extend the existing (already trusted) Debian source instead of adding a
-          # second stanza, which would need its own keyring entry.
-          src=/etc/apt/sources.list.d/debian.sources
-          if grep -q '^Architectures:' "$src"; then
-            sed -i 's/^Architectures:.*/Architectures: amd64 arm64/' "$src"
-          else
-            sed -i 's/^Components: main$/Components: main\nArchitectures: amd64 arm64/' "$src"
-          fi
-          apt-get update -qq
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build python3 qemu-user-static file
       - uses: actions/checkout@v5
-      - name: Cross-build and package the arm64 gateway
-        run: bash c/gateway/scripts/build-arm64.sh --out "$PWD/dist"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/musl-cross
+            ~/fastp2p-dev
+          key: gateway-static-${{ matrix.arch }}-${{ hashFiles('c/client/deps.lock.json', 'c/client/scripts/build-deps.py', 'c/gateway/scripts/build-static.sh') }}
+      - name: Build the static gateway
+        run: |
+          FASTP2P_STATIC_OUT="$PWD/dist" bash c/gateway/scripts/build-static.sh ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
-          name: fastp2p-gateway-debian-arm64
-          path: |
-            dist/fastp2p-gateway-debian-arm64.tar.gz
+          name: fastp2p-gateway-linux-static-${{ matrix.arch }}
+          path: dist/fastp2p-gateway-linux-static-${{ matrix.arch }}.tar.gz
   release:
-    needs: [gateway, docker, arm64]
+    needs: [gateway, docker, static]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-gateway-v')
     runs-on: ubuntu-24.04
     permissions:

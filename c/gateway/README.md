@@ -4,7 +4,13 @@ Linux C11 网关提供 HTTPS/WSS、NAT 探测、连接协调、中继候选选�
 
 ## 构建
 
-Debian 12/13：
+静态构建（推荐，产出一个不依赖发行版运行库的可执行文件）：
+
+```sh
+bash c/gateway/scripts/build-static.sh x86_64
+```
+
+本地开发也可以直接链接系统库（Debian 12/13）：
 
 ```sh
 sudo apt-get install build-essential cmake ninja-build pkg-config python3 \

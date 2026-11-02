@@ -23,19 +23,17 @@ def digest(path):
 
 KINDS = {
     'gateway': ('fastp2p-gateway', 'c/gateway/CMakeLists.txt', [
-        'fastp2p-gateway-debian12-x86_64.tar.gz',
-        'fastp2p-gateway-debian13-x86_64.tar.gz',
-        'fastp2p-gateway-debian-arm64.tar.gz',
+        'fastp2p-gateway-linux-static-x86_64.tar.gz',
+        'fastp2p-gateway-linux-static-aarch64.tar.gz',
         'fastp2p-gateway-docker-amd64.tar.gz']),
     'client': ('fastp2p-client', 'c/client/CMakeLists.txt', [
-        'fastp2p-linux-debian12-x86_64.tar.gz', 'fastp2p-windows-x86_64.zip',
+        'fastp2p-sdk-linux-x86_64.tar.gz', 'fastp2p-windows-x86_64.zip',
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
-        'fastp2p-linux-x86_64', 'fastp2p-windows-x86_64.exe',
-        'fastp2p-macos-arm64', 'fastp2p-macos-x86_64', 'fastp2p-android.apk',
-        'fastp2p-linux-static-x86_64', 'fastp2p-linux-static-aarch64',
-        'fastp2p-linux-static-armv7', 'fastp2p-linux-static-i686',
-        'fastp2p-linux-static-riscv64', 'fastp2p-linux-static-s390x',
-        'fastp2p-linux-static-ppc64le', 'fastp2p-linux-static-mips64el'])
+        'fastp2p-android.apk',
+        'fastp2p-linux-static-x86_64.tar.gz', 'fastp2p-linux-static-aarch64.tar.gz',
+        'fastp2p-linux-static-armv7.tar.gz', 'fastp2p-linux-static-i686.tar.gz',
+        'fastp2p-linux-static-riscv64.tar.gz', 'fastp2p-linux-static-s390x.tar.gz',
+        'fastp2p-linux-static-ppc64le.tar.gz', 'fastp2p-linux-static-mips64el.tar.gz'])
 }
 
 def prepare(kind, incoming, output):
@@ -92,7 +90,7 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
                  ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/jni','c/client/android/app/build.gradle'])
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
-    notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 Debian 12/13 x86_64 原生包和 amd64 Docker 镜像。' if kind == 'gateway' else
+    notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 x86_64 与 aarch64 静态可执行包（不依赖发行版运行库）和 amd64 Docker 镜像。' if kind == 'gateway' else
              'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。包含 Linux Debian 12、Windows、macOS 两种架构和签名 Android APK。Windows EXE、Linux/macOS 可执行文件可直接下载。')
     body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。专用客户端包含网关地址和公开 CA；账号、接入 Token 和私钥不在发行包中。'
     metadata = {'tag_name': tag, 'target_commitish': sha,

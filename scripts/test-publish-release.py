@@ -40,8 +40,9 @@ class ReleaseTests(unittest.TestCase):
         self.artifacts('client')
         files=release.prepare('client',self.incoming,self.output)
         self.assertIn('fastp2p-android.apk',{p.name for p in files})
-        self.assertIn('fastp2p-windows-x86_64.exe',{p.name for p in files})
-        self.assertIn('fastp2p-linux-x86_64',{p.name for p in files})
+        self.assertIn('fastp2p-windows-x86_64.zip',{p.name for p in files})
+        self.assertIn('fastp2p-linux-static-x86_64.tar.gz',{p.name for p in files})
+        self.assertIn('fastp2p-sdk-linux-x86_64.tar.gz',{p.name for p in files})
         (self.incoming/'private.key').write_text('fixture')
         self.assertNotIn('private.key',{p.name for p in release.prepare('client',self.incoming,self.output)})
     def test_artifact_directory_can_share_binary_name(self):
