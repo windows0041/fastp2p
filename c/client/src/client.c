@@ -962,16 +962,24 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
             start_punch(c, ti);
         return;
     }
-    /* Bind to the most recently established matching tunnel: an older unkeyed
-     * tunnel belongs to an attempt that is already being replaced. */
-    int newest = -1;
-    for (int i = 0; i < NT; ++i)
-        if (c->tunnels[i].state == T_ACTIVE && c->tunnels[i].peer_id == peer_id &&
-            c->tunnels[i].transport == transport && !c->tunnels[i].keyed &&
-            (newest < 0 || c->tunnels[i].active_at >= c->tunnels[newest].active_at))
-            newest = i;
-    if (newest >= 0)
-        bind_pending_key(c, newest);
+    /* Prefer the tunnel whose bound port the sender named, so the key lands on
+     * the link the peer is actually using; fall back to the newest unkeyed one
+     * when the sender had no port to report. */
+    int chosen = -1;
+    for (int i = 0; i < NT; ++i) {
+        tunnel *candidate = &c->tunnels[i];
+        if (candidate->state != T_ACTIVE || candidate->peer_id != peer_id ||
+            candidate->transport != transport || candidate->keyed)
+            continue;
+        if (peer_port && candidate->local_port == peer_port) {
+            chosen = i;
+            break;
+        }
+        if (!peer_port && (chosen < 0 || candidate->active_at >= c->tunnels[chosen].active_at))
+            chosen = i;
+    }
+    if (chosen >= 0)
+        bind_pending_key(c, chosen);
 }
 static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];

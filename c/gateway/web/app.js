@@ -4,6 +4,17 @@
   const state = {token: '', installToken: '', nodes: [], selected: null, apps: [],
     refreshing: false, loadingApps: false, selection: 0, editing: null, confirm: null,
     offset: 0, total: 0, registered: 0};
+  /* The console keeps its session in sessionStorage: it survives a reload, but
+   * it dies with the tab and is never shared with another tab. */
+  const STORE = 'fastp2p.console';
+  function persist() {
+    try {
+      if (state.token)
+        sessionStorage.setItem(STORE, JSON.stringify({token: state.token, installToken: state.installToken}));
+      else
+        sessionStorage.removeItem(STORE);
+    } catch { /* storage disabled: the console still works for this page view */ }
+  }
   function text(id, value) { $(id).textContent = String(value ?? '—'); }
   function element(tag, cls, value) {
     const node = document.createElement(tag);
@@ -20,6 +31,7 @@
   }
   function logout(expired = false) {
     state.token = state.installToken = ''; state.nodes = []; state.apps = []; state.selected = null;
+    persist();
     state.selection++; $('console').hidden = true; $('login-screen').hidden = false;
     state.offset = state.total = state.registered = 0; $('node-search').value = '';
     $('install-token').value = ''; $('password').value = ''; $('nodes').replaceChildren(); $('rules').replaceChildren();
@@ -224,6 +236,7 @@
       const login = await api('/api/v1/user/login', {user: $('username').value, password: $('password').value});
       if (typeof login.token !== 'string' || typeof login.installToken !== 'string') throw new Error('无法读取登录凭据。');
       state.token = login.token; state.installToken = login.installToken; $('password').value = '';
+    persist();
       $('login-screen').hidden = true; $('console').hidden = false; message(''); await refresh();
     } catch (error) { text('login-error', error.message); $('login-error').hidden = false; }
     finally { $('login-submit').disabled = false; }
@@ -300,4 +313,13 @@
   for (const id of ['close-rule-dialog', 'cancel-rule']) $(id).addEventListener('click', () => $('rule-dialog').close());
   $('cancel-confirm').addEventListener('click', () => $('confirm-dialog').close());
   setInterval(() => { if (!document.hidden) refresh(); }, 10000);
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STORE) || 'null');
+    if (saved && typeof saved.token === 'string' && saved.token) {
+      state.token = saved.token;
+      state.installToken = typeof saved.installToken === 'string' ? saved.installToken : '';
+      $('login-screen').hidden = true; $('console').hidden = false;
+      refresh();
+    }
+  } catch { try { sessionStorage.removeItem(STORE); } catch { /* ignore */ } }
 })();

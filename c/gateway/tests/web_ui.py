@@ -148,6 +148,12 @@ def main():
                     page.locator('#username').fill(username);page.locator('#password').fill(password);page.locator('#login-submit').click()
                     expect(page.locator('#online-count')).to_have_text('2',timeout=15000)
                 login();results['login_and_authenticated_overview']=True
+                # A reload must keep the operator signed in: the console stores its
+                # session per tab instead of only in memory.
+                page.reload()
+                expect(page.locator('#online-count')).to_have_text('2',timeout=15000)
+                expect(page.locator('#login-screen')).to_be_hidden()
+                results['reload_keeps_the_console_session']=True
                 page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(__import__('re').compile(r'^[1-9][0-9]{15}$'))
                 assert page.locator('#install-token').get_attribute('type')=='password'
                 page.locator('#reveal-token').click();assert page.locator('#install-token').get_attribute('type')=='text'
