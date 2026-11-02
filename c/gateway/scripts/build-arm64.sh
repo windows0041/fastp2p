@@ -66,5 +66,5 @@ cp -R "$repository/c/gateway/deploy" "$out/c-gateway-debian-arm64/"
 mkdir -p "$out/c-gateway-debian-arm64/scripts"
 cp "$repository/scripts/tls/generate-cert.sh" "$out/c-gateway-debian-arm64/scripts/"
 tar -C "$out" -czf "$out/fastp2p-gateway-debian-arm64.tar.gz" c-gateway-debian-arm64
-file "$out/c-gateway-debian-arm64/bin/fastp2p-gateway"
+command -v file >/dev/null && file "$out/c-gateway-debian-arm64/bin/fastp2p-gateway" || true
 echo "artifact: $out/fastp2p-gateway-debian-arm64.tar.gz"
