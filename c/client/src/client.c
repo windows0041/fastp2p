@@ -106,8 +106,7 @@ typedef struct {
     char relay_failed[4][32];
     int relay_failed_count;
     char peer_lan[INET_ADDRSTRLEN];
-    /* The session belongs to the rule so the secret survives a failed punch and
-     * can be reused when the same link falls back to a relay. */
+    /* The current attempt's session; relay offers create a fresh session. */
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
     int has_session;
@@ -134,8 +133,7 @@ typedef struct {
  * usable.  Pending entries expire so a failed punch cannot leak state. */
 typedef struct {
     int used, transport;
-    uint64_t session, peer_id, deadline;
-    uint16_t peer_port; /* the port this peer bound for the tunnel */
+    uint64_t session, peer_id, tunnel_id, deadline;
     uint8_t secret[FP_SESSION_SECRET];
     char relay[32];
 } pending_key;
@@ -424,7 +422,8 @@ static int tunnel_ready(const tunnel *t) {
         return 0;
     if (t->relay_wait || t->relay_link >= 0 || t->relay_ready)
         return t->relay_ready;
-    return t->keyed && t->key_acked;
+    return t->keyed && t->key_acked &&
+           (t->transport != FASTP2P_TRANSPORT_QUIC || t->cert_checked);
 }
 static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
     for (int i = 0; i < NT; ++i)
@@ -582,7 +581,7 @@ static void secret_to_hex(const uint8_t *secret, char out[FP_SESSION_SECRET * 2 
 }
 static void push_session_to(fastp2p_client *c, const char *peer, uint64_t session,
                             const uint8_t *secret, const char *relay, int transport,
-                            const char *peer_ip, uint16_t peer_port) {
+                            uint64_t tunnel_id) {
     char hex[FP_SESSION_SECRET * 2 + 1];
     json_object *j = json_object_new_object();
     secret_to_hex(secret, hex);
@@ -592,11 +591,9 @@ static void push_session_to(fastp2p_client *c, const char *peer, uint64_t sessio
     op_ju(j, "session", session);
     op_js(j, "secret", hex);
     op_js(j, "transport", transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
-    /* The address this receiver holds for the tunnel, so it can bind the key to
-     * the right one when several attempts are alive at once. */
-    if (peer_ip && *peer_ip)
-        op_js(j, "peerIP", peer_ip);
-    op_ju(j, "peerPort", peer_port);
+    /* NAT ports can change and retries can reuse ports. Only the identifier
+     * confirmed by the tunnel handshake identifies this connection. */
+    op_ju(j, "tunnelID", tunnel_id);
     if (relay && *relay)
         op_js(j, "relay", relay);
     push(c, peer, PUSH_SESSION, j);
@@ -604,13 +601,14 @@ static void push_session_to(fastp2p_client *c, const char *peer, uint64_t sessio
     OPENSSL_cleanse(hex, sizeof(hex));
 }
 static void push_session(fastp2p_client *c, tunnel *t, const char *relay) {
-    push_session_to(c, t->peer, t->session, t->secret, relay, t->transport, t->ip,
-                    t->remote_port);
+    push_session_to(c, t->peer, t->session, t->secret, relay, t->transport, t->id);
 }
-static void push_session_ack(fastp2p_client *c, const char *peer, uint64_t session) {
+static void push_session_ack(fastp2p_client *c, const char *peer, uint64_t session,
+                             uint64_t tunnel_id) {
     json_object *j = json_object_new_object();
     op_js(j, "peer", peer);
     op_ju(j, "session", session);
+    op_ju(j, "tunnelID", tunnel_id);
     push(c, peer, PUSH_SESSION_ACK, j);
     json_object_put(j);
 }
@@ -782,6 +780,8 @@ static void start_underlay(fastp2p_client *c, int index) {
 }
 static void session_ready(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
+    if (!tunnel_ready(t))
+        return;
     int relayed = t->relay_link >= 0 || t->relay_wait || t->relay_ready;
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == index &&
@@ -801,25 +801,14 @@ static void bind_pending_key(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     if (t->keyed || t->session_owner)
         return;
-    /* Retries leave several keys queued for the same peer; the newest one is
-     * the session the current tunnel belongs to.  Binding an older key derives
-     * a different pair of keys and every frame then fails authentication. */
     pending_key *best = NULL;
     for (int i = 0; i < NPK; ++i) {
         pending_key *k = &c->keys[i];
-        if (!k->used || k->peer_id != t->peer_id || k->transport != t->transport || k->relay[0])
+        if (!k->used || k->peer_id != t->peer_id || k->transport != t->transport ||
+            k->relay[0] || k->tunnel_id != t->id || k->deadline <= mono())
             continue;
-        if (k->peer_port) {
-            /* The key names the port this side bound for the tunnel it belongs
-             * to.  Binding it anywhere else derives a different key pair. */
-            if (k->peer_port == t->local_port) {
-                best = k;
-                break;
-            }
-            continue;
-        }
-        if (!best || k->deadline >= best->deadline)
-            best = k;
+        best = k;
+        break;
     }
     if (!best)
         return;
@@ -830,17 +819,10 @@ static void bind_pending_key(fastp2p_client *c, int index) {
         close_tunnel(c, index, "session key derivation failed");
         return;
     }
-    /* A second unkeyed tunnel to the same peer and transport is a leftover
-     * attempt.  Leaving it open lets the peer talk to a tunnel that will never
-     * be keyed, so retire it as soon as the live session is known. */
-    for (int i = 0; i < NT; ++i)
-        if (i != index && c->tunnels[i].state == T_ACTIVE && !c->tunnels[i].keyed &&
-            c->tunnels[i].peer_id == t->peer_id && c->tunnels[i].transport == t->transport)
-            close_tunnel(c, i, "superseded by a newer session");
-    t->keyed = 1;
+    t->keyed = t->key_acked = 1;
     OPENSSL_cleanse(k->secret, sizeof(k->secret));
     memset(k, 0, sizeof(*k));
-    push_session_ack(c, t->peer, t->session);
+    push_session_ack(c, t->peer, t->session, t->id);
     session_ready(c, index);
 }
 static void relay_join(fastp2p_client *c, int index) {
@@ -856,19 +838,10 @@ static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport
     if (ti < 0)
         return -1;
     tunnel *t = &c->tunnels[ti];
-    if (a->has_session) {
-        fp_crypto_clear(&t->crypto);
-        t->session = a->session;
-        memcpy(t->secret, a->secret, FP_SESSION_SECRET);
-        if (fp_crypto_init(&t->crypto, t->secret, t->session, c->node_id, t->peer_id, 1)) {
-            close_tunnel(c, ti, "session key derivation failed");
-            return -1;
-        }
-    } else {
-        a->session = t->session;
-        memcpy(a->secret, t->secret, FP_SESSION_SECRET);
-        a->has_session = 1;
-    }
+    /* A retry must not reset AEAD counters under a previously used key. */
+    a->session = t->session;
+    memcpy(a->secret, t->secret, FP_SESSION_SECRET);
+    a->has_session = 1;
     t->keyed = 1;
     t->session_owner = 1;
     return ti;
@@ -909,10 +882,38 @@ static void start_punch(fastp2p_client *c, int ti) {
  * relay ourselves and join the session there. */
 static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *peer, uint64_t session,
                             const uint8_t *secret, const char *relay, int transport,
-                            uint16_t peer_port) {
+                            uint64_t tunnel_id) {
+    int direct = -1;
+    if (!relay || !*relay) {
+        direct = tunnel_id ? tunnel_by_id(c, tunnel_id) : -1;
+        if (direct < 0)
+            return; /* An expired attempt must not replace a live session. */
+        tunnel *t = &c->tunnels[direct];
+        if (t->peer_id != peer_id || t->transport != transport || t->session_owner ||
+            t->relay_wait || t->relay_link >= 0)
+            return;
+        if (t->keyed) {
+            if (t->session == session && fp_equal(t->secret, secret, FP_SESSION_SECRET))
+                push_session_ack(c, peer, session, tunnel_id);
+            return; /* Duplicate delivery must not reset sequence numbers. */
+        }
+    } else {
+        for (int i = 0; i < NT; ++i) {
+            tunnel *t = &c->tunnels[i];
+            if (t->state && t->relay_wait && !t->session_owner && t->session == session &&
+                t->transport == transport && !strcmp(t->peer, relay) &&
+                !strcmp(t->relay_peer, peer)) {
+                if (t->relay_ready && fp_equal(t->secret, secret, FP_SESSION_SECRET))
+                    push_session_ack(c, peer, session, 0);
+                return;
+            }
+        }
+    }
     int slot = -1;
     for (int i = 0; i < NPK; ++i)
-        if (c->keys[i].used && c->keys[i].session == session && c->keys[i].peer_id == peer_id) {
+        if (c->keys[i].used && c->keys[i].tunnel_id == tunnel_id &&
+            c->keys[i].transport == transport && c->keys[i].peer_id == peer_id &&
+            !strcmp(c->keys[i].relay, relay ? relay : "")) {
             slot = i;
             break;
         }
@@ -927,28 +928,22 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
         return;
     }
     pending_key *k = &c->keys[slot];
+    if (k->used && (k->session != session || !fp_equal(k->secret, secret, FP_SESSION_SECRET)))
+        return; /* One immutable key per connection, including before HELLO. */
     memset(k, 0, sizeof(*k));
     k->used = 1;
     k->session = session;
     k->peer_id = peer_id;
     k->transport = transport;
-    k->peer_port = peer_port;
+    k->tunnel_id = tunnel_id;
     k->deadline = mono() + 30 * NS;
     memcpy(k->secret, secret, FP_SESSION_SECRET);
-    /* A newer session for the same peer and transport supersedes any key still
-     * waiting from a failed attempt. */
-    for (int i = 0; i < NPK; ++i) {
-        pending_key *old = &c->keys[i];
-        if (old == k || !old->used || old->peer_id != peer_id || old->transport != transport)
-            continue;
-        OPENSSL_cleanse(old->secret, sizeof(old->secret));
-        memset(old, 0, sizeof(*old));
-    }
     if (relay && *relay) {
         if (!valid_node(relay)) {
             memset(k, 0, sizeof(*k));
             return;
         }
+        copy_string(k->relay, sizeof(k->relay), relay);
         app probe = {0};
         probe.transport = transport;
         probe.session = session;
@@ -960,26 +955,12 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
             memset(k, 0, sizeof(*k));
         else
             start_punch(c, ti);
+        OPENSSL_cleanse(k->secret, sizeof(k->secret));
+        memset(k, 0, sizeof(*k));
         return;
     }
-    /* Prefer the tunnel whose bound port the sender named, so the key lands on
-     * the link the peer is actually using; fall back to the newest unkeyed one
-     * when the sender had no port to report. */
-    int chosen = -1;
-    for (int i = 0; i < NT; ++i) {
-        tunnel *candidate = &c->tunnels[i];
-        if (candidate->state != T_ACTIVE || candidate->peer_id != peer_id ||
-            candidate->transport != transport || candidate->keyed)
-            continue;
-        if (peer_port && candidate->local_port == peer_port) {
-            chosen = i;
-            break;
-        }
-        if (!peer_port && (chosen < 0 || candidate->active_at >= c->tunnels[chosen].active_at))
-            chosen = i;
-    }
-    if (chosen >= 0)
-        bind_pending_key(c, chosen);
+    if (c->tunnels[direct].state == T_ACTIVE)
+        bind_pending_key(c, direct);
 }
 static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -999,7 +980,7 @@ static void tunnel_active(fastp2p_client *c, int index) {
         relay_join(c, index);
         if (t->session_owner)
             push_session_to(c, t->relay_peer, t->session, t->secret, t->peer, t->transport,
-                            NULL, 0);
+                            0);
         return;
     }
     for (int i = 0; i < NA; ++i)
@@ -1493,27 +1474,29 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         const char *transport = op_string(j, "transport");
         uint8_t secret[FP_SESSION_SECRET];
         int ok = session && valid_node(peer) && sender == op_node_id(peer) &&
+                 (!strcmp(transport, "tcp") || !strcmp(transport, "quic")) &&
                  !secret_from_hex(op_string(j, "secret"), secret);
         if (ok) {
             int quic = !transport || strcmp(transport, "tcp");
-            uint64_t peer_port = op_integer(j, "peerPort");
             session_receive(c, sender, peer, session, secret,
                             relay && *relay ? relay : NULL,
                             quic ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP,
-                            peer_port <= 65535 ? (uint16_t)peer_port : 0);
+                            op_integer(j, "tunnelID"));
         } else {
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid session key");
         }
         OPENSSL_cleanse(secret, sizeof(secret));
     } else if (main == 3 && sub == PUSH_SESSION_ACK) {
         uint64_t session = op_integer(j, "session");
+        uint64_t tunnel_id = op_integer(j, "tunnelID");
         for (int i = 0; i < NT; ++i) {
             tunnel *t = &c->tunnels[i];
             if (t->state != T_ACTIVE || !t->session_owner || t->session != session)
                 continue;
             uint64_t peer =
                 t->relay_wait || t->relay_ready ? op_node_id(t->relay_peer) : t->peer_id;
-            if (peer != sender)
+            if (peer != sender || (!(t->relay_wait || t->relay_ready) &&
+                                   (!tunnel_id || t->id != tunnel_id)))
                 continue;
             t->key_acked = 1;
             session_ready(c, i);
@@ -1686,7 +1669,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
         if (t->server && sub == TUN_HELLO && len == 8 && op_u64(data) == t->id) {
             tframe(t, TUN_HELLO_ACK, data, len);
             tunnel_active(c, ti);
-        } else if (!t->server && sub == TUN_HELLO_ACK)
+        } else if (!t->server && sub == TUN_HELLO_ACK && len == 8 && op_u64(data) == t->id)
             tunnel_active(c, ti);
         else
             close_tunnel(c, ti, "invalid tunnel handshake");
@@ -1707,7 +1690,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
         if (t->session_owner)
             session_ready(c, ti);
         else
-            push_session_ack(c, t->relay_peer, t->session);
+            push_session_ack(c, t->relay_peer, t->session, 0);
         return;
     }
     if (sub == TUN_CERT_BIND) {
@@ -1720,6 +1703,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
             return;
         }
         t->cert_checked = 1;
+        session_ready(c, ti);
         return;
     }
     if (sub == TUN_KEEPALIVE) {
@@ -2065,7 +2049,8 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
          * tunnel is the only case where both endpoints hold the session keys;
          * on a relay hop the QUIC peer is the relay, which forwards frames
          * without being able to open them. */
-        if (!t->cert_sent && t->keyed && (t->key_acked || !t->session_owner) &&
+        if (t->state == T_ACTIVE && !t->cert_sent && t->keyed &&
+            (t->key_acked || !t->session_owner) &&
             t->relay_link < 0 && !t->relay_wait) {
             uint8_t digest[32];
             if (!opq_peer_digest(t->quic, digest) && !tseal(c, t, TUN_CERT_BIND, digest, 32))
@@ -2336,6 +2321,11 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                         }
                     } else if (a->attempts >= 2 || c->force_relay ||
                         (c->nat_type == 2 && a->peer_nat == 2)) {
+                        /* Direct attempts may already have sealed certificate
+                         * frames. Never restart counters with that same key. */
+                        a->session = random_id();
+                        fp_random(a->secret, sizeof(a->secret));
+                        a->has_session = 1;
                         a->relay_requested = 1;
                         json_object *j = json_object_new_object();
                         op_js(j, "peerNode", a->peer);

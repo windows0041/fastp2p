@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
         op_poll(&pollfd, 1, 2);
     }
     if (success)
-        puts("QUIC_INTEROP_OK ALPN=fastp2pv1 frame_bytes=16");
+        puts("QUIC_INTEROP_OK ALPN=fastp2pv2 frame_bytes=16");
     opq_free(q);
     op_close(fd);
     return success ? 0 : 1;

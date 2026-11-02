@@ -1,6 +1,7 @@
 # C 客户端验证
 
 - `ctest`：C API 生命周期、协议、平台、身份文件、SOCKS5 解析、TLS 拒绝、会话密钥派生与重放窗口。
+- `ctest -R session-binding`：NAT 映射端口碰撞、64 位隧道 ID、旧密钥延迟到达、握手前密钥、重复/冲突推送、旧 ACK、QUIC 证书就绪门槛及重试密钥隔离。旧的端口绑定实现会在该回归用例失败。
 - `tests/quic_native.py`：真实 C QUIC 客户端/服务端、fastp2pv2 ALPN、精确流帧。
 - `tests/enrollment_integration.py`：16 位 Token 与可信网关配置安装、私有配置、无参数重连、错误 CA/主机名/密钥拒绝且保留旧配置；Windows 检查 DPAPI。
 - `scripts/check-socks.sh`：真实 C 网关和客户端，TCP/UDP、TCP 打洞/QUIC、认证、并发、断连恢复。

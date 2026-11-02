@@ -6,7 +6,9 @@
 
 所有平台通过后，main 生成开发 Release。稳定标签分别为 `fastp2p-client-v2.0.0` 和 `fastp2p-gateway-v2.0.0`，必须匹配对应 CMake VERSION。先将提交合入并推送 main，再推标签。
 
-发布脚本只接受明确列出的产物，全部上传并核对 SHA-256 后才公开草稿。已公开资产不自动覆盖，每个 Release 附 SHA256SUMS.txt。客户端主产物直接提供 EXE、ELF、APK，无需下载 SDK。
+发布脚本只接受明确列出的产物，全部上传并核对 SHA-256 后才公开草稿。已公开资产不自动覆盖，每个 Release 附 SHA256SUMS.txt。客户端压缩包内提供 EXE、ELF、APK，无需下载 SDK。
+
+2.0.0 稳定版以隧道握手的 `tunnelID` 绑定直连会话密钥和 ACK，QUIC 证书绑定通过后才启用规则。早期 2.0.0 开发包使用端口配对，需要一起升级全部客户端；不要将开发版与稳定版混用。每次直连重试及切换中继都生成新会话，避免重复初始化 AEAD 序号。
 
 Android release 使用 Actions Secrets `FASTP2P_ANDROID_KEYSTORE_BASE64`（PKCS12）和 `FASTP2P_ANDROID_KEYSTORE_PASSWORD`，别名 `fastp2p`。固定私钥离线备份并复用，在 runner 临时目录解密。实际安装 Token 和签名私钥不进入发布包。
 
