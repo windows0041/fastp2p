@@ -4,7 +4,7 @@
 
 `c-platforms.yml` 构建 Windows 压缩包、Linux 8 个架构的 static-pie musl 压缩包（x86_64、aarch64、armv7、i686、riscv64、s390x、ppc64le、mips64el）、macOS 双架构压缩包、Android 双 ABI 签名 APK，并额外打包 Linux C SDK。`c-gateway.yml` 在 Debian 12/13 容器内跑完整测试，并另外构建 x86_64 与 aarch64 静态网关压缩包和 amd64 Docker 镜像。发布产物一律为压缩包，不再附带裸可执行文件。
 
-所有平台通过后，main 生成开发 Release。本次迁移准备的稳定标签分别为 `fastp2p-client-v2.0.1` 和 `fastp2p-gateway-v2.0.1`，必须匹配对应 CMake VERSION，完成迁移验收后发布。先将提交合入并推送 main，再推标签。已公开的 2.0.0 标签保留不变。
+所有平台通过后，main 生成开发 Release。当前稳定标签分别为 `fastp2p-client-v2.0.1` 和 `fastp2p-gateway-v2.0.1`，必须匹配对应 CMake VERSION。先将提交合入并推送 main，再推标签。已公开的 2.0.0 标签保留不变。
 
 发布脚本只接受明确列出的产物，全部上传并核对 SHA-256 后才公开草稿。已公开资产不自动覆盖，每个 Release 附 SHA256SUMS.txt。客户端压缩包内提供 EXE、ELF、APK，无需下载 SDK。
 

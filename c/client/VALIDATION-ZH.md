@@ -13,3 +13,5 @@
 - Android `LiveInstrumentation`：私有 Token 接入、加密保存、无 Token 恢复。
 
 `gateway_fixture.py` 仅作为 Windows/macOS 测试用 Python TLS/WSS 夹具；生产与 Linux 集成测试使用 C 网关。历史 Go/C 互通记录对应旧标签，不代表新协议兼容旧客户端。2.0.0 与 1.x 不互通。
+
+多条同一对端/传输规则共享中继请求；单测验证请求去重及超时释放。中继集成测试覆盖共享规则和对端重启后的恢复。
