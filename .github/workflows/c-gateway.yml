@@ -134,11 +134,17 @@ jobs:
       - name: Enable arm64 packages
         run: |
           apt-get update -qq
-          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config python3 gcc-aarch64-linux-gnu dpkg-dev
+          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config \
+            python3 gcc-aarch64-linux-gnu dpkg-dev
           dpkg --add-architecture arm64
-          printf 'Types: deb\nURIs: https://deb.debian.org/debian\nSuites: bookworm bookworm-updates\nComponents: main\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' > /etc/apt/sources.list.d/arm64.sources
-          printf 'Types: deb\nURIs: https://security.debian.org/debian-security\nSuites: bookworm-security\nComponents: main\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' >> /etc/apt/sources.list.d/arm64.sources
-          sed -i 's/^Components: main$/Components: main\nArchitectures: amd64/' /etc/apt/sources.list.d/debian.sources
+          # Extend the existing (already trusted) Debian source instead of adding a
+          # second stanza, which would need its own keyring entry.
+          src=/etc/apt/sources.list.d/debian.sources
+          if grep -q '^Architectures:' "$src"; then
+            sed -i 's/^Architectures:.*/Architectures: amd64 arm64/' "$src"
+          else
+            sed -i 's/^Components: main$/Components: main\nArchitectures: amd64 arm64/' "$src"
+          fi
           apt-get update -qq
       - uses: actions/checkout@v5
       - name: Cross-build and package the arm64 gateway
