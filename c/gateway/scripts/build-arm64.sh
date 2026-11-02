@@ -22,9 +22,12 @@ while (($#)); do
 done
 
 if ((!skip_install)); then
-  packages="libwebsockets-dev libwebsockets19t64 libjson-c-dev libjson-c5 libsqlite3-dev libsqlite3-0
-            libssl-dev libssl3t64 libcap-dev libcap2 zlib1g-dev zlib1g libev-dev libev4 libc6 libc6-dev
-            libgcc-s1 libstdc++6 linux-libc-dev libzstd1 liblzma5 libbz2-1.0 libgssapi-krb5-2 libkrb5-3
+  # Both the bookworm and the trixie runtime package names are listed; the ones
+  # that do not exist on this release are skipped with a notice.
+  packages="libwebsockets-dev libwebsockets17 libwebsockets19t64 libjson-c-dev libjson-c5
+            libsqlite3-dev libsqlite3-0 libssl-dev libssl3 libssl3t64 libcap-dev libcap2
+            zlib1g-dev zlib1g libev-dev libev4 libc6 libc6-dev libgcc-s1 libstdc++6
+            linux-libc-dev libzstd1 liblzma5 libbz2-1.0 libgssapi-krb5-2 libkrb5-3
             libk5crypto3 libkrb5support0 libkeyutils1 libcom-err2"
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -48,6 +51,8 @@ cmake -S "$repository/c/gateway" -B "$build" -G Ninja \
   -DOPENSSL_INCLUDE_DIR="$sysroot/usr/include" \
   -DOPENSSL_SSL_LIBRARY="$sysroot/usr/lib/aarch64-linux-gnu/libssl.so" \
   -DOPENSSL_CRYPTO_LIBRARY="$sysroot/usr/lib/aarch64-linux-gnu/libcrypto.so" \
+  -DSQLite3_LIBRARY="$sysroot/usr/lib/aarch64-linux-gnu/libsqlite3.so" \
+  -DSQLite3_INCLUDE_DIR="$sysroot/usr/include" \
   -DCMAKE_INSTALL_PREFIX="$out/c-gateway-debian-arm64" >/dev/null
 cmake --build "$build" --parallel "$(nproc)"
 cmake --install "$build"
