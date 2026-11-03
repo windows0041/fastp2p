@@ -837,8 +837,13 @@ static void handle_http(struct connection *c) {
             http_error(c, 400, 1, "invalid JSON");
             return;
         }
-        const char *protocol = gw_string(j, "protocol");
+        /* Copy the identity strings out of the request before it is released:
+         * they point into the JSON object, which is freed below. */
+        char protocol[16], old_protocol[16];
+        snprintf(protocol, sizeof(protocol), "%s", gw_string(j, "protocol"));
+        snprintf(old_protocol, sizeof(old_protocol), "%s", gw_string(j, "protocol0"));
         uint64_t src = gw_integer(j, "srcPort");
+        uint64_t old_port = gw_integer(j, "srcPort0");
         int switching = !strcmp(end, "/switchapp");
 
         /* switchapp only toggles an existing rule. */
@@ -878,8 +883,6 @@ static void handle_http(struct connection *c) {
 
         /* /app with srcPort=0 removes the rule identified by protocol0/srcPort0. */
         if (!src) {
-            const char *old_protocol = gw_string(j, "protocol0");
-            uint64_t old_port = gw_integer(j, "srcPort0");
             json_object_put(j);
             if (!*old_protocol || !old_port || old_port > 65535 ||
                 gw_store_rule_delete(g.db, name, old_protocol, (unsigned)old_port)) {
@@ -904,8 +907,6 @@ static void handle_http(struct connection *c) {
         }
 
         /* Editing carries the identity of the old rule; remove that key first. */
-        const char *old_protocol = gw_string(j, "protocol0");
-        uint64_t old_port = gw_integer(j, "srcPort0");
         int edited = *old_protocol && old_port;
         if (edited && !strcmp(protocol, "socks5") && gw_integer(j, "keepPassword")) {
             /* The browser never receives a stored password. When the user leaves
@@ -942,11 +943,15 @@ static void handle_http(struct connection *c) {
                 json_object_put(remove);
             }
         }
-        /* Normalise the identity fields before storing the payload verbatim. */
-        gw_js(j, "protocol", protocol);
+        /* Normalise the identity fields before storing the payload verbatim.
+         * Copy the protocol first: re-adding the key frees the string the JSON
+         * object owned, and the pointer would dangle. */
+        char protocol_copy[16];
+        snprintf(protocol_copy, sizeof(protocol_copy), "%s", protocol);
+        gw_js(j, "protocol", protocol_copy);
         gw_ju(j, "srcPort", src);
         const char *payload = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
-        int rv = gw_store_rule_put(g.db, name, protocol, (unsigned)src, payload, 1);
+        int rv = gw_store_rule_put(g.db, name, protocol_copy, (unsigned)src, payload, 1);
         if (target && !rv)
             send_json(target, 3, 9, j); /* RULE_APPLY */
         json_object_put(j);
