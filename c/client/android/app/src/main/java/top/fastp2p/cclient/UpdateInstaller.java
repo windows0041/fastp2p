@@ -50,6 +50,7 @@ final class UpdateInstaller {
                 if (next <= installed) {
                     android.util.Log.w(TAG, "update package versionCode " + next
                             + " is not newer than installed " + installed + "; ignoring");
+                    packageFile.delete();
                     return;
                 }
             }

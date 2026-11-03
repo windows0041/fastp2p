@@ -716,6 +716,13 @@ static void handle_http(struct connection *c) {
         update_path(final_path, sizeof(final_path), filename);
         snprintf(staged, sizeof(staged), "%s", c->upload_tmp);
         c->upload_tmp[0] = 0;
+        /* Re-uploading the same version with different content leaves the old
+         * file behind unless it is removed after the row is replaced. */
+        char previous_file[260] = "", previous_sha[65];
+        uint64_t previous_size = 0;
+        int had_previous =
+            gw_store_update_find(g.db, c->upload_platform, c->upload_version,
+                                 previous_sha, previous_file, &previous_size) == 0;
         if (rename(staged, final_path)) {
             unlink(staged);
             http_error(c, 503, 1, "cannot store package");
@@ -725,6 +732,11 @@ static void handle_http(struct connection *c) {
                                 c->upload_size, filename)) {
             http_error(c, 503, 1, "cannot record package");
             return;
+        }
+        if (had_previous && *previous_file && strcmp(previous_file, filename)) {
+            char previous_path[700];
+            update_path(previous_path, sizeof(previous_path), previous_file);
+            unlink(previous_path);
         }
         json_object *j = json_object_new_object();
         gw_js(j, "platform", c->upload_platform);

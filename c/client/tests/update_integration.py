@@ -142,6 +142,19 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         assert status == 200 and any(u['version'] == '9.9.9' for u in body['updates']), body
         results['package_listed'] = True
 
+        # Re-uploading the same version with different content must replace the
+        # entry rather than add a second one.
+        with package.open('ab') as handle:
+            handle.write(b'\n# second upload\n')
+        digest = hashlib.sha256(package.read_bytes()).hexdigest()
+        status, body = api('/api/v1/update?platform=linux&version=9.9.9', token=token,
+                           method='PUT', raw=package.read_bytes())
+        assert status == 200 and body['sha256'] == digest, (status, body)
+        status, body = api('/api/v1/updates', token=token)
+        same = [u for u in body['updates'] if u['version'] == '9.9.9']
+        assert len(same) == 1 and same[0]['sha256'] == digest, body
+        results['reupload_replaces_the_version'] = True
+
         # --- The download endpoint refuses a wrong token and unknown packages.
         assert api('/api/v1/update/download?platform=linux&version=9.9.9&token=1111111111111111',
                    token=token)[0] == 401
