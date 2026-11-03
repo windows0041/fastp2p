@@ -119,7 +119,7 @@ static int execute(char *const arguments[]) {
 int fastp2p_stop_installed(const char *profile) {
     (void)profile;
 #ifdef __APPLE__
-    char service[80]; snprintf(service, sizeof(service), "gui/%lu/cc.itq.fastp2p", (unsigned long)getuid());
+    char service[80]; snprintf(service, sizeof(service), "gui/%lu/top.fastp2p", (unsigned long)getuid());
     char *const stop[] = {"/bin/launchctl", "bootout", service, NULL}; return execute(stop);
 #else
     char *const stop[] = {"/usr/bin/systemctl", "stop", "fastp2p-client.service", NULL}; return execute(stop);
@@ -168,8 +168,8 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     if (!home || strchr(home, '<') || strchr(home, '&') || strchr(profile, '<') || strchr(profile, '&')) return -1;
     char target[4096], plist[4096], domain[64], text[12000];
     if (snprintf(target, sizeof(target), "%s/Library/Application Support/fastp2p/fastp2p", home) >= (int)sizeof(target) ||
-        snprintf(plist, sizeof(plist), "%s/Library/LaunchAgents/cc.itq.fastp2p.plist", home) >= (int)sizeof(plist) || copy_binary(target)) return -1;
-    int size = snprintf(text, sizeof(text), "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>cc.itq.fastp2p</string><key>ProgramArguments</key><array><string>%s</string><string>run</string><string>--config</string><string>%s</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>", target, profile);
+        snprintf(plist, sizeof(plist), "%s/Library/LaunchAgents/top.fastp2p.plist", home) >= (int)sizeof(plist) || copy_binary(target)) return -1;
+    int size = snprintf(text, sizeof(text), "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>top.fastp2p</string><key>ProgramArguments</key><array><string>%s</string><string>run</string><string>--config</string><string>%s</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>", target, profile);
     if (size < 0 || size >= (int)sizeof(text) || fastp2p_private_parents(plist)) return -1;
     FILE *file = fopen(plist, "wb");
     if (!file) return -1;
