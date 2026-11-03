@@ -194,9 +194,12 @@ try:
         limited.send(message(6,0,{'os':'linux-c','version':'2.0.0'}));limited.until(6,7)
         nodes=api('/api/v1/devices',jwt=jwt)[1]['nodes']
         capability=next(n['capabilities'] for n in nodes if n['name']==limited.name)
-        assert capability['addForward'] and not capability['editForward'] and not capability['switchForward']
-        assert api('/api/v1/device/'+limited.name+'/switchapp',{'srcPort':23456,'enabled':0},jwt)[0]==501
-        assert api('/api/v1/device/'+limited.name+'/app',{'srcPort0':23456,'protocol0':'tcp'},jwt)[0]==501
+        # Rules live in the gateway database, so a C client supports the full
+        # add/edit/toggle/delete surface whether or not it is online.
+        assert capability['addForward'] and capability['editForward'] and capability['switchForward']
+        # Toggling or deleting a rule that does not exist is a 404, not "unsupported".
+        assert api('/api/v1/device/'+limited.name+'/switchapp',{'protocol':'tcp','srcPort':23456,'enabled':0},jwt)[0]==404
+        assert api('/api/v1/device/'+limited.name+'/app',{'protocol':'tcp','srcPort':0,'srcPort0':23456,'protocol0':'tcp'},jwt)[0]==404
         limited.close()
         wait(lambda:limited.name not in [n['name'] for n in api('/api/v1/devices',jwt=jwt)[1]['nodes']])
         results['C_client_management_capabilities_enforced']=True
@@ -261,13 +264,16 @@ try:
         r.send(message(5,0,{'peerNode':b.name}));assert json.loads(r.until(5,1))['relay']==a.name
         a.send(message(5,0,{'peerNode':b.name,'exclude':[r.name]}));assert json.loads(a.until(5,1))['relay']==''
         results['relay_offer_selects_a_third_node_and_never_an_endpoint']=True
-        responses=[]
-        thread=threading.Thread(target=lambda:responses.append(api('/api/v1/device/'+a.name+'/apps',jwt=jwt)));thread.start()
-        a.until(3,7);a.send(message(6,3,{'Apps':[{'appName':'reply','srcPort':12345}]}));thread.join(4)
-        assert responses==[(200,{'Apps':[{'appName':'reply','srcPort':12345}]})]
-        assert api('/api/v1/device/'+a.name+'/app',{'appName':'new','srcPort':12345},jwt)[0]==200
+        # Rules are served from the database, not by asking the client.
+        assert api('/api/v1/device/'+a.name+'/apps',jwt=jwt)==(200,{'Apps':[]})
+        assert api('/api/v1/device/'+a.name+'/app',{'appName':'new','protocol':'tcp','srcPort':12345,'peerNode':b.name,'dstHost':'127.0.0.1','dstPort':22},jwt)[0]==200
         assert json.loads(a.until(3,9))['appName']=='new'
-        assert api('/api/v1/device/'+a.name+'/switchapp',{'srcPort':12345,'enabled':0},jwt)[0]==200;a.until(3,10)
+        assert api('/api/v1/device/'+a.name+'/apps',jwt=jwt)[1]['Apps'][0]['appName']=='new'
+        # Disabling pushes RULE_REMOVE (3/17); re-enabling pushes RULE_APPLY (3/9).
+        assert api('/api/v1/device/'+a.name+'/switchapp',{'protocol':'tcp','srcPort':12345,'enabled':0},jwt)[0]==200
+        assert json.loads(a.until(3,17))['srcPort']==12345
+        assert api('/api/v1/device/'+a.name+'/switchapp',{'protocol':'tcp','srcPort':12345,'enabled':1},jwt)[0]==200
+        assert json.loads(a.until(3,9))['appName']=='new'
         assert api('/api/v1/device/'+a.name+'/restart',jwt=jwt)[0]==200;a.until(3,11)
         results['management_apps_async_edit_switch_restart']=True
         replacement=WS(a.name,source='127.0.0.2');assert a.closed();replacement.report()
@@ -290,16 +296,20 @@ try:
         persistent=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
         for _ in range(40):assert api('/healthz',connection=persistent)[0]==200
         persistent.close();results['HTTP_keepalive_transactions']=True
-        # A waiting HTTP request never blocks the node's WebSocket callbacks.
+        # Rule queries are served from the database now, so they never wait on the
+        # node and cannot time out or fail because the node went away.
         replies=[]
         thread=threading.Thread(target=lambda:replies.append(api('/api/v1/device/'+replacement.name+'/apps',jwt=jwt,timeout=15)))
-        thread.start();replacement.until(3,7)
-        assert api('/api/v1/device/'+replacement.name+'/apps',jwt=jwt)[0]==409
-        thread.join(13);assert replies and replies[0][0]==504
-        disconnected=[]
-        thread=threading.Thread(target=lambda:disconnected.append(api('/api/v1/device/'+replacement.name+'/apps',jwt=jwt)))
-        thread.start();replacement.until(3,7);replacement.close();thread.join(4)
-        assert disconnected and disconnected[0][0]==503
+        thread.start();thread.join(5)
+        assert replies and replies[0][0]==200
+        concurrent=[]
+        threads=[threading.Thread(target=lambda:concurrent.append(api('/api/v1/device/'+replacement.name+'/apps',jwt=jwt)))
+                 for _ in range(4)]
+        for t in threads:t.start()
+        for t in threads:t.join(5)
+        assert len(concurrent)==4 and all(r[0]==200 for r in concurrent)
+        replacement.close()
+        assert api('/api/v1/device/'+replacement.name+'/apps',jwt=jwt)[0]==200
         results['pending_HTTP_concurrency_timeout_and_peer_disconnect']=True
         conn=http.client.HTTPSConnection('127.0.0.1',10008,context=context,timeout=3)
         conn.request('PUT','/healthz');response=conn.getresponse();assert response.status==405;response.read();conn.close()

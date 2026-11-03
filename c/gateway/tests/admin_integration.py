@@ -96,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-admin-') as temporary:
         with sqlite3.connect(directory/'nodes.sqlite3') as db:
             row=db.execute('SELECT username,length(salt),length(password_hash),iterations FROM admin').fetchone()
             assert row==('admin-after',16,32,600000)
-            assert db.execute('PRAGMA user_version').fetchone()[0]==2
+            assert db.execute('PRAGMA user_version').fetchone()[0]==3
             assert db.execute('PRAGMA quick_check').fetchone()[0]=='ok'
         data=(directory/'nodes.sqlite3').read_bytes()
         assert password.encode() not in data and changed.encode() not in data
