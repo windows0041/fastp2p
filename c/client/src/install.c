@@ -364,8 +364,10 @@ int fastp2p_name_token(const char *path, char out[17]) {
 }
 int fastp2p_service_install_token(const char *token) {
     if (!fastp2p_service_supported() || !token || !*token) return 2;
-    /* Creating a service needs rights a plain double-click does not have. */
-    if (!fastp2p_service_elevated()) return fastp2p_service_elevate(NULL) == 0 ? 0 : 1;
+    /* Creating a service needs rights a plain double-click does not have. The
+     * elevated copy repeats this work, so report the hand-off rather than a
+     * result this process never saw. */
+    if (!fastp2p_service_elevated()) return fastp2p_service_elevate(NULL) == 0 ? 3 : 1;
     char profile[4096];
     if (fastp2p_service_profile(profile)) return 1;
     return install_token(token, NULL, profile, NULL, 0, 1) ? 1 : 0;

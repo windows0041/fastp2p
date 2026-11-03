@@ -64,6 +64,7 @@ static int integer(const char *s, uint64_t *value) {
 }
 static void usage(void) {
     puts("fastp2p install --token 16_DIGITS [--no-service] [--service] [--config FILE]\n"
+         "fastp2p uninstall   (removes the Windows service)\n"
          "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
@@ -256,11 +257,25 @@ int main(int argc, char **argv) {
             int rv = fastp2p_service_install_token(token);
             if (rv == 0)
                 puts("fastp2p service installed; it starts with Windows and restarts if it stops.");
+            else if (rv == 3)
+                puts("Waiting for administrator approval; the installer continues in the new window.");
             else
                 fputs("fastp2p could not be installed. Run it as an administrator, and make "
                       "sure the file name still contains the 16-digit token.\n", stderr);
-            return rv;
+            return rv == 3 ? 0 : rv;
         }
+    }
+#endif
+#ifdef _WIN32
+    if (argc > 1 && !strcmp(argv[1], "uninstall")) {
+        if (fastp2p_service_installed() && !fastp2p_service_elevated())
+            return fastp2p_service_elevate("uninstall") == 0 ? 0 : 1;
+        if (fastp2p_service_remove()) {
+            fputs("The fastp2p service could not be removed.\n", stderr);
+            return 1;
+        }
+        puts("fastp2p service removed.");
+        return 0;
     }
 #endif
     if (argc > 1 && !strcmp(argv[1], "service")) {
