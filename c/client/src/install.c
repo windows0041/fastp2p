@@ -255,11 +255,13 @@ static int install_token(const char *token, const char *token_file, const char *
     if (fastp2p_install_key_valid(token)) {
         const char *preset = fastp2p_default_gateway();
         const char *override = getenv("FASTP2P_BOOTSTRAP_FILE");
-#ifdef _WIN32
-        /* The environment is under the invoking user's control; a privileged
-         * install must verify against the gateway compiled into this binary. */
-        if (override && *override && fastp2p_service_elevated()) override = NULL;
-#endif
+        /* Only the double-clicked machine install (machine=1) is driven by a
+         * file name a user can choose, where it must trust the compiled-in preset
+         * rather than an inherited environment variable. An explicit CLI install
+         * --token/--token-file legitimately uses FASTP2P_BOOTSTRAP_FILE to target a
+         * test or private gateway, so the override stays available there even when
+         * the shell happens to be elevated. */
+        if (machine && override && *override) override = NULL;
         unsigned char *data = NULL;
         if (override && *override) { size_t length; data = read_file(override, FASTP2P_INSTALL_TOKEN_LIMIT, &length); preset = (const char *)data; }
         json_object *gateway = preset ? json_tokener_parse(preset) : NULL;
