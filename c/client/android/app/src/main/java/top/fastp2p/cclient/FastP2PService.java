@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class FastP2PService extends Service {
     static final String STOP = "top.fastp2p.cclient.STOP";
     private static final String CHANNEL = "fastp2p-connection";
+    private static final String UPDATE_CHANNEL = "fastp2p-update";
     static volatile boolean running;
     static volatile int state;
     static volatile String status = "未连接";
@@ -36,6 +37,24 @@ public final class FastP2PService extends Service {
     }
     private boolean canNotify() {
         return Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+    }
+    /** Offers a verified upgrade package; tapping it opens the installer. */
+    private void notifyUpdate(String path) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager == null) return;
+        manager.createNotificationChannel(
+            new NotificationChannel(UPDATE_CHANNEL, "fastp2p 升级", NotificationManager.IMPORTANCE_DEFAULT));
+        Intent install = new Intent(this, InstallActivity.class)
+                .putExtra("install", path)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Notification notice = new Notification.Builder(this, UPDATE_CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("fastp2p 有新版本")
+            .setContentText("点按安装已验证的升级包")
+            .setContentIntent(PendingIntent.getActivity(this, 2, install,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE))
+            .setAutoCancel(true).build();
+        manager.notify(2, notice);
     }
     @Override public void onCreate() {
         super.onCreate();
@@ -114,10 +133,11 @@ public final class FastP2PService extends Service {
                 + " id=" + id + " " + message);
         state = newState;
         status = newState == 2 ? "已连接" : newState == 3 ? "正在重连" : newState == 1 ? "正在连接" : "已停止";
-        // A verified upgrade package is ready: hand it to the system installer,
-        // which always asks the user before replacing the app.
+        // A verified upgrade package is ready. Android refuses an install handed
+        // over by a background service, so offer it through a notification the
+        // user taps; the activity then runs in the foreground.
         if (message != null && message.startsWith("update-ready:"))
-            UpdateInstaller.install(this, message.substring("update-ready:".length()));
+            notifyUpdate(message.substring("update-ready:".length()));
         if (type == 0) main.post(() -> { if (running && canNotify()) getSystemService(NotificationManager.class).notify(1, notification(true)); });
     }
     @Override public void onDestroy() { stopping.set(true); super.onDestroy(); }

@@ -12,10 +12,12 @@ import android.widget.Toast;
 /** Transient enrollment entry point. No configuration screen or graphical UI. */
 public final class InstallActivity extends Activity {
     private String token;
+    private String installPath;
     private boolean started;
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         token = getIntent().getStringExtra("token");
+        installPath = getIntent().getStringExtra("install");
         Uri uri = getIntent().getData();
         if (token == null && uri != null && "fastp2p".equals(uri.getScheme()) && "install".equals(uri.getHost()))
             token = uri.getQueryParameter("token");
@@ -27,6 +29,13 @@ public final class InstallActivity extends Activity {
         super.onResume();
         if (started || isFinishing()) return;
         started = true;
+        // Android only lets a foreground app hand a package to the installer, so
+        // an upgrade order surfaces as a notification that opens this activity.
+        if (installPath != null && !installPath.isEmpty()) {
+            UpdateInstaller.install(this, installPath);
+            finish();
+            return;
+        }
         if (token == null && !SecretStore.preferences(this).contains("enrollment")) {
             Toast.makeText(this, "请使用网关控制台提供的安装链接接入", Toast.LENGTH_LONG).show(); finish(); return;
         }
