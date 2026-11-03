@@ -291,6 +291,23 @@ SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u10
 在 `punchPriority:0`（QUIC）下 3/3 成功。两次测试都在中继上线之后，但样本很小，
 还不能断言 TCP 传输有问题，需要后续单独对比。
 
+### 窗口喷洒在真实互联网上的数据面验证
+
+`check-nat-window.sh` 在回环上验证过，但真机一直缺对称 NAT。用 `FASTP2P_NAT_TYPE`
+让 `gzvps105`（公网 `134.175.48.57`）上的一个临时客户端声称自己是 EasySym，
+与 `xrwmaster` 走真实公网配对：
+
+```
+{"event":"state","state":2,"message":"gateway authenticated"}
+{"event":"tunnel","state":2,"message":"QUIC tunnel connected"}      ← 直连，没有中继
+{"event":"forward","state":2,"message":"forward attached to tunnel"}
+读到对端 banner：SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u10
+```
+
+这条证明了「公布窗口 → 对端记录 → 喷洒 → 直连 → 数据流动」整条链路在真实网络上可用，
+且不需要中继兜底。它不证明喷洒能救回一个真正的对称 NAT（那需要真机），只证明这条路
+不会破坏本来能通的场景——与集成测试的结论一致，但这次是真实公网。
+
 ### 拦截是按目的地址，不是按端口（2026-11-03 对照实验）
 
 用香港主机 `xrwhk`（`85.189.40.130`）做对照，同样在 443 上起监听：
