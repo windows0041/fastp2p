@@ -9,6 +9,19 @@
 #define GW_HTTP_LIMIT (64u * 1024u)
 #define GW_QUEUE_LIMIT (4u * 1024u * 1024u)
 #define GW_TOTAL_QUEUED (64u * 1024u * 1024u)
+/* Login is deliberately expensive (PBKDF2) and runs on the single service
+ * thread, so it must be rate limited before any hash is computed. */
+#define GW_LOGIN_SLOTS 64
+#define GW_LOGIN_WINDOW_MS 60000u
+#define GW_LOGIN_MAX_ATTEMPTS 8u
+#define GW_LOGIN_FAIL_LOCK 5u
+#define GW_LOGIN_LOCK_MS 300000u
+struct login_attempt {
+    uint32_t address;         /* source IPv4 in network order, 0 = unused */
+    uint64_t window_start;
+    uint64_t locked_until;
+    unsigned attempts, failures;
+};
 struct packet {
     struct packet *next;
     size_t length, offset;
@@ -73,6 +86,7 @@ struct gateway {
     const char *database;
     const char *public_host, *enrollment_ca_file;
     char enrollment_ca[16385];
+    struct login_attempt logins[GW_LOGIN_SLOTS];
     struct nat_state nat;
 };
 int gw_nat_start(struct nat_state *state, const char *bind);

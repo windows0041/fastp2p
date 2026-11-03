@@ -44,6 +44,10 @@ jobs:
         run: |
           python3 scripts/test-publish-release.py
           bash c/gateway/scripts/check.sh --sanitize
+      - name: Login rate limiting before the expensive password hash
+        run: |
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/c-gateway" \
+          bash c/gateway/scripts/check-login-ratelimit.sh
       - name: Six C clients, TCP punch, QUIC and reconnect
         run: bash c/gateway/scripts/integration.sh
       - name: SQLite recovery and real hostname-based C clients

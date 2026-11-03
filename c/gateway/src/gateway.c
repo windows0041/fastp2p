@@ -497,6 +497,67 @@ static json_object *devices(void) {
     }
     return root;
 }
+/* Per-source-IP budget for the login endpoint. Returns non-zero when the request
+ * must be rejected before the expensive password hash runs. The table is small
+ * and bounded: a busy public gateway cannot be made to allocate without limit. */
+static struct login_attempt *login_slot(uint32_t address) {
+    /* Mix the address so sequential sources do not all land in one slot. */
+    uint32_t hash = address ^ (address >> 16) ^ (address >> 8);
+    unsigned index = hash % GW_LOGIN_SLOTS;
+    for (unsigned i = 0; i < GW_LOGIN_SLOTS; ++i) {
+        struct login_attempt *entry = &g.logins[(index + i) % GW_LOGIN_SLOTS];
+        if (entry->address == address || !entry->address)
+            return entry;
+    }
+    /* All slots are taken: evict the oldest window. */
+    struct login_attempt *oldest = &g.logins[index];
+    for (unsigned i = 1; i < GW_LOGIN_SLOTS; ++i)
+        if (g.logins[i].window_start < oldest->window_start)
+            oldest = &g.logins[i];
+    return oldest;
+}
+static int login_limited(struct connection *c, uint32_t *out_address) {
+    struct sockaddr_in peer;
+    socklen_t length = sizeof(peer);
+    if (getpeername(lws_get_socket_fd(c->wsi), (struct sockaddr *)&peer, &length) ||
+        peer.sin_family != AF_INET)
+        return 0; /* no usable address: fall through to credentials as before */
+    *out_address = peer.sin_addr.s_addr;
+    uint64_t now = gw_mono_ms();
+    struct login_attempt *entry = login_slot(peer.sin_addr.s_addr);
+    if (entry->address != peer.sin_addr.s_addr) {
+        memset(entry, 0, sizeof(*entry));
+        entry->address = peer.sin_addr.s_addr;
+    }
+    if (entry->locked_until && now < entry->locked_until)
+        return 1;
+    if (entry->locked_until) { /* lock expired: start clean */
+        entry->locked_until = 0;
+        entry->attempts = entry->failures = 0;
+    }
+    if (now - entry->window_start >= GW_LOGIN_WINDOW_MS) {
+        entry->window_start = now;
+        entry->attempts = 0;
+    }
+    if (entry->attempts >= GW_LOGIN_MAX_ATTEMPTS)
+        return 1;
+    ++entry->attempts;
+    return 0;
+}
+static void login_result(uint32_t address, int success) {
+    if (!address)
+        return;
+    struct login_attempt *entry = login_slot(address);
+    if (entry->address != address)
+        return;
+    if (success) {
+        memset(entry, 0, sizeof(*entry));
+        return;
+    }
+    if (++entry->failures >= GW_LOGIN_FAIL_LOCK)
+        entry->locked_until = gw_mono_ms() + GW_LOGIN_LOCK_MS;
+}
+
 static void handle_http(struct connection *c) {
     if (c->handled || c->request_node)
         return;
@@ -522,10 +583,18 @@ static void handle_http(struct connection *c) {
         return;
     }
     if (c->post && !strcmp(c->uri, "/api/v1/user/login")) {
+        /* Reject before the expensive PBKDF2 verification when this source has
+         * used up its budget or is serving a lockout. */
+        uint32_t address = 0;
+        if (login_limited(c, &address)) {
+            http_error(c, 429, 9, "too many login attempts");
+            return;
+        }
         json_object *j = gw_json(c->request, c->request_length);
         if (!j || !json_object_is_type(j, json_type_object)) {
             if (j)
                 json_object_put(j);
+            login_result(address, 0);
             http_error(c, 400, 1, "invalid JSON");
             return;
         }
@@ -533,6 +602,7 @@ static void handle_http(struct connection *c) {
                     gw_admin_verify(&g.admin, gw_string(j, "password"));
         if (j)
             json_object_put(j);
+        login_result(address, valid);
         if (!valid) {
             http_error(c, 401, 1, "invalid credentials");
             return;
