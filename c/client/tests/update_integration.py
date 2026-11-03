@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Remote client upgrade through the gateway.
+
+Uploads a package, orders one node to upgrade, and checks the client really did
+download it, verified it, replaced its own executable and came back online.
+"""
+import argparse
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+
+p = argparse.ArgumentParser()
+p.add_argument('--client', required=True)
+p.add_argument('--gateway', required=True)
+p.add_argument('--logs', required=True)
+args = p.parse_args()
+logs = Path(args.logs).resolve()
+logs.mkdir(parents=True, exist_ok=True)
+results = {}
+children = []
+files = []
+
+
+def wait(action, timeout=90, what='condition'):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if action():
+                return
+        except (OSError, AssertionError):
+            pass
+        time.sleep(0.2)
+    raise TimeoutError('timed out waiting for ' + what)
+
+
+with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
+    root = Path(temporary)
+    try:
+        # The certificate helper lives beside the other integration tests.
+        from certificates import create_certificates
+        create_certificates(root / 'certs', '127.0.0.1')
+
+        env = os.environ.copy()
+        env.update(FASTP2P_USER='update-admin',
+                   FASTP2P_PASSWORD=secrets.token_urlsafe(24),
+                   FASTP2P_TOKEN='9999999999999999')
+        ctx = ssl.create_default_context(cafile=str(root / 'certs' / 'ca.crt'))
+
+        def start(command, name):
+            directory = root / name
+            directory.mkdir(exist_ok=True)
+            f = (logs / (name + '.log')).open('a')
+            files.append(f)
+            child = subprocess.Popen([str(x) for x in command], cwd=directory, env=env,
+                                     stdout=f, stderr=subprocess.STDOUT)
+            children.append(child)
+            return child
+
+        start([Path(args.gateway).resolve(), '--bind', '127.0.0.1', '--apibind', '127.0.0.1',
+               '--cert', root / 'certs' / 'server.crt', '--key', root / 'certs' / 'server.key'],
+              'gateway')
+        wait(lambda: socket.create_connection(('127.0.0.1', 27183), timeout=1).close() is None,
+             what='gateway wss')
+
+        # Run the client from a private copy: the upgrade replaces this file.
+        install_dir = root / 'install'
+        install_dir.mkdir()
+        installed = install_dir / 'fastp2p'
+        shutil.copy2(Path(args.client).resolve(), installed)
+        installed.chmod(0o755)
+        config = install_dir / 'config.json'
+        config.write_text(json.dumps({'network': {'Node': 'update-node-1', 'ServerHost': '127.0.0.1'},
+                                      'CACertFile': str(root / 'certs' / 'ca.crt'), 'apps': []}))
+        start([installed, '--config', config], 'client')
+
+        def api(path, body=None, token=None, method=None, raw=None):
+            conn = http.client.HTTPSConnection('127.0.0.1', 10008, context=ctx, timeout=60)
+            headers = {'Content-Type': 'application/json'}
+            if token:
+                headers['Authorization'] = 'Bearer ' + token
+            payload = raw if raw is not None else (
+                json.dumps(body).encode() if body is not None else None)
+            conn.request(method or ('POST' if body is not None else 'GET'), path, payload, headers)
+            response = conn.getresponse()
+            status = response.status
+            data = response.read()
+            conn.close()
+            return status, (json.loads(data) if data and data[:1] in b'{[' else data)
+
+        status, body = api('/api/v1/user/login',
+                           {'user': env['FASTP2P_USER'], 'password': env['FASTP2P_PASSWORD']})
+        assert status == 200, (status, body)
+        token = body['token']
+
+        def online():
+            status, body = api('/api/v1/nodes?query=update-node&limit=50', token=token)
+            return status == 200 and any(n.get('name') == 'update-node-1' and n.get('isActive')
+                                         for n in body['nodes'])
+        wait(online, what='client online')
+        results['client_registered'] = True
+
+        # --- Upload a package. It is a real executable so the swap is realistic.
+        package = install_dir / 'package.bin'
+        shutil.copy2(installed, package)
+        with package.open('ab') as handle:
+            handle.write(b'\n# upgrade marker\n')
+        digest = hashlib.sha256(package.read_bytes()).hexdigest()
+        status, body = api('/api/v1/update?platform=linux&version=9.9.9', token=token,
+                           method='PUT', raw=package.read_bytes())
+        assert status == 200 and body['sha256'] == digest, (status, body)
+        results['package_uploaded_and_hashed'] = True
+
+        status, body = api('/api/v1/updates', token=token)
+        assert status == 200 and any(u['version'] == '9.9.9' for u in body['updates']), body
+        results['package_listed'] = True
+
+        # --- The download endpoint refuses a wrong token and unknown packages.
+        assert api('/api/v1/update/download?platform=linux&version=9.9.9&token=1111111111111111',
+                   token=token)[0] == 401
+        assert api('/api/v1/update/download?platform=linux&version=0.0.1&token=9999999999999999',
+                   token=token)[0] == 404
+        results['download_requires_the_install_token'] = True
+
+        # --- Batch upgrade finds the outdated node and orders it.
+        status, body = api('/api/v1/upgrades', {}, token)
+        assert status == 200, body
+        assert any(item['node'] == 'update-node-1' and item['to'] == '9.9.9'
+                   for item in body['queued']), body
+        results['batch_upgrade_queues_outdated_nodes'] = True
+
+        def replaced():
+            if not installed.is_file():
+                return False
+            return hashlib.sha256(installed.read_bytes()).hexdigest() == digest
+        wait(replaced, timeout=90, what='client to replace its executable')
+        results['client_installed_the_new_build'] = True
+
+        # The re-exec keeps the same supervisor running, so the node must return.
+        wait(online, timeout=90, what='client back online after upgrade')
+        results['client_came_back_online'] = True
+
+        # --- An unknown version is rejected rather than silently ignored.
+        assert api('/api/v1/device/update-node-1/upgrade', {'version': '8.8.8'}, token)[0] == 404
+        results['unknown_version_rejected'] = True
+        results['success'] = True
+    finally:
+        for child in children:
+            child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                child.kill()
+        for f in files:
+            f.close()
+
+print(json.dumps(results, indent=2))

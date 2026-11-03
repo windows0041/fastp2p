@@ -87,6 +87,25 @@ int main(void) {
     json_object_put(rules);
     assert(gw_store_rule_put(db, "not-a-node!", "tcp", 1, "{}", 1) == -1);
     assert(gw_store_rule_put(db, name, "bogus", 1, "{}", 1) == -1);
+    /* Upgrade package metadata: upsert, lookup and input validation. */
+    const char *sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert(!gw_store_update_put(db, "linux", "2.0.2", sha, 1234, "linux-2.0.2-abc"));
+    char found_sha[65], found_file[260];
+    uint64_t found_size = 0;
+    assert(!gw_store_update_find(db, "linux", "2.0.2", found_sha, found_file, &found_size));
+    assert(!strcmp(found_sha, sha) && found_size == 1234 && !strcmp(found_file, "linux-2.0.2-abc"));
+    json_object *updates = gw_store_updates(db);
+    assert(updates && json_object_array_length(updates) == 1);
+    json_object *row = json_object_array_get_idx(updates, 0);
+    assert(!strcmp(gw_string(row, "platform"), "linux") && !strcmp(gw_string(row, "version"), "2.0.2"));
+    json_object_put(updates);
+    assert(!gw_store_update_put(db, "linux", "2.0.2", sha, 4321, "linux-2.0.2-def"));
+    assert(!gw_store_update_find(db, "linux", "2.0.2", found_sha, found_file, &found_size) &&
+           found_size == 4321); /* upsert, not a second row */
+    assert(gw_store_update_put(db, "solaris", "1.0.0", sha, 1, "x") == -1);
+    assert(gw_store_update_put(db, "linux", "not-a-version", sha, 1, "x") == -1);
+    assert(gw_store_update_put(db, "linux", "1.0.0", "short", 1, "x") == -1);
+    assert(gw_store_update_find(db, "linux", "9.9.9", found_sha, found_file, &found_size) == -1);
     sqlite3_close(db);
     assert(!gw_store_open(&db, path));
     assert(gw_store_resolve(db, first, name) == 1 && !strcmp(name, original));

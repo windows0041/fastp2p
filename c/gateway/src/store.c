@@ -29,7 +29,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
     sqlite3_int64 app = 0, version = 0, tables = 0;
     if (scalar(db, "PRAGMA application_id", &app) || scalar(db, "PRAGMA user_version", &version) ||
         scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &tables) ||
-        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 3)
+        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 4)
         goto fail;
     /* One event-loop writer; rollback journaling also supports simple offline backups. */
     if (sql(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;") ||
@@ -52,7 +52,12 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "PRIMARY KEY(node,protocol,src_port),"
                 "FOREIGN KEY(node) REFERENCES nodes(name) ON DELETE CASCADE);"
                 "CREATE TABLE IF NOT EXISTS rule_nodes(node TEXT PRIMARY KEY);"
-                "PRAGMA application_id=1179660880; PRAGMA user_version=3;"
+                "CREATE TABLE IF NOT EXISTS updates("
+                "platform TEXT NOT NULL CHECK(platform IN('windows','linux','android','macos')),"
+                "version TEXT NOT NULL,sha256 TEXT NOT NULL CHECK(length(sha256)=64),"
+                "size INTEGER NOT NULL,filename TEXT NOT NULL,uploaded_at INTEGER NOT NULL,"
+                "PRIMARY KEY(platform,version));"
+                "PRAGMA application_id=1179660880; PRAGMA user_version=4;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
     *out = db;
@@ -367,6 +372,94 @@ int gw_store_rule_managed(sqlite3 *db, const char *node) {
     int managed = sqlite3_step(s) == SQLITE_ROW;
     sqlite3_finalize(s);
     return managed;
+}
+
+/* --- Client upgrade packages ---------------------------------------------- */
+static int update_platform_valid(const char *platform) {
+    return platform && (!strcmp(platform, "windows") || !strcmp(platform, "linux") ||
+                        !strcmp(platform, "android") || !strcmp(platform, "macos"));
+}
+/* Dotted numeric versions only, so comparing them is unambiguous. */
+static int update_version_valid(const char *version) {
+    if (!version || !*version || strlen(version) > 31)
+        return 0;
+    int parts = 1;
+    for (const char *p = version; *p; ++p) {
+        if (*p == '.') {
+            if (++parts > 4)
+                return 0;
+        } else if (*p < '0' || *p > '9') {
+            return 0;
+        }
+    }
+    return 1;
+}
+int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
+                        const char *sha256, uint64_t size, const char *filename) {
+    if (!update_platform_valid(platform) || !update_version_valid(version) ||
+        !sha256 || strlen(sha256) != 64 || !filename || !*filename || !size)
+        return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO updates(platform,version,sha256,size,filename,uploaded_at) "
+        "VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(platform,version) DO UPDATE SET "
+        "sha256=excluded.sha256,size=excluded.size,filename=excluded.filename,"
+        "uploaded_at=excluded.uploaded_at", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, platform, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, version, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, sha256, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 4, (sqlite3_int64)size);
+    sqlite3_bind_text(s, 5, filename, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 6, (sqlite3_int64)time(NULL));
+    int ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_finalize(s);
+    return ok ? 0 : -1;
+}
+json_object *gw_store_updates(sqlite3 *db) {
+    json_object *list = json_object_new_array();
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT platform,version,sha256,size,uploaded_at FROM updates "
+                           "ORDER BY platform,uploaded_at DESC", -1, &s, NULL) != SQLITE_OK) {
+        json_object_put(list);
+        return NULL;
+    }
+    int result;
+    while ((result = sqlite3_step(s)) == SQLITE_ROW) {
+        json_object *row = json_object_new_object();
+        gw_js(row, "platform", (const char *)sqlite3_column_text(s, 0));
+        gw_js(row, "version", (const char *)sqlite3_column_text(s, 1));
+        gw_js(row, "sha256", (const char *)sqlite3_column_text(s, 2));
+        gw_ju(row, "size", (uint64_t)sqlite3_column_int64(s, 3));
+        gw_ju(row, "uploadedAt", (uint64_t)sqlite3_column_int64(s, 4));
+        json_object_array_add(list, row);
+    }
+    sqlite3_finalize(s);
+    if (result != SQLITE_DONE) {
+        json_object_put(list);
+        return NULL;
+    }
+    return list;
+}
+int gw_store_update_find(sqlite3 *db, const char *platform, const char *version,
+                         char sha256[65], char filename[260], uint64_t *size) {
+    if (!update_platform_valid(platform) || !update_version_valid(version))
+        return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT sha256,size,filename FROM updates "
+                           "WHERE platform=?1 AND version=?2", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, platform, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, version, -1, SQLITE_TRANSIENT);
+    int found = -1;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        snprintf(sha256, 65, "%s", (const char *)sqlite3_column_text(s, 0));
+        snprintf(filename, 260, "%s", (const char *)sqlite3_column_text(s, 2));
+        *size = (uint64_t)sqlite3_column_int64(s, 1);
+        found = 0;
+    }
+    sqlite3_finalize(s);
+    return found;
 }
 int gw_store_rule_delete(sqlite3 *db, const char *node, const char *protocol,
                          unsigned src_port) {

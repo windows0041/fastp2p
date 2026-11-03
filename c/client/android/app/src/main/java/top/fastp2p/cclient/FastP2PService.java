@@ -65,6 +65,9 @@ public final class FastP2PService extends Service {
             String token = pending == null ? SecretStore.token(this) : pending.token;
             String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
             ca = TrustStore.resolve(this, ca);
+            // The library stages a downloaded upgrade here; Android then asks the
+            // user to confirm the install because an app cannot replace itself.
+            NativeClient.setUpdateDir(getCacheDir().getAbsolutePath());
             handle = NativeClient.create(config.getBytes(StandardCharsets.UTF_8), token, ca, this);
             if (handle == 0) throw new IllegalArgumentException("接入配置无效");
             if (NativeClient.start(handle) != 0) throw new IllegalStateException();
@@ -98,6 +101,10 @@ public final class FastP2PService extends Service {
                 + " id=" + id + " " + message);
         state = newState;
         status = newState == 2 ? "已连接" : newState == 3 ? "正在重连" : newState == 1 ? "正在连接" : "已停止";
+        // A verified upgrade package is ready: hand it to the system installer,
+        // which always asks the user before replacing the app.
+        if (message != null && message.startsWith("update-ready:"))
+            UpdateInstaller.install(this, message.substring("update-ready:".length()));
         if (type == 0) main.post(() -> { if (running && canNotify()) getSystemService(NotificationManager.class).notify(1, notification(true)); });
     }
     @Override public void onDestroy() { stopping.set(true); super.onDestroy(); }

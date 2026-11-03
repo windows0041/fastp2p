@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  const state = {token: '', installToken: '', nodes: [], selected: null, apps: [],
+  const state = {token: '', installToken: '', nodes: [], selected: null, apps: [], updates: [],
     refreshing: false, loadingApps: false, selection: 0, editing: null, confirm: null,
     offset: 0, total: 0, registered: 0};
   /* The console keeps its session in sessionStorage: it survives a reload, but
@@ -95,6 +95,21 @@
       button.type = 'button'; button.setAttribute('aria-label', '查看 ' + n.name + ' 的规则');
       button.addEventListener('click', event => { event.stopPropagation(); selectNode(n); });
       action.append(button);
+      const latest = latestFor(platformForOs(n.os));
+      if (active && latest && compareVersions(n.version, latest) < 0) {
+        const upgrade = element('button', 'link-button', '升级到 ' + latest); upgrade.type = 'button';
+        upgrade.setAttribute('aria-label', '升级节点 ' + n.name + ' 到 ' + latest);
+        upgrade.addEventListener('click', event => {
+          event.stopPropagation();
+          confirm('升级客户端', `${n.name}：${n.version || '未知版本'} → ${latest}。客户端会从网关下载、校验并重启，连接会短暂中断。`, async () => {
+            await api('/api/v1/device/' + encodeURIComponent(n.name) + '/upgrade', {version: latest});
+            await new Promise(resolve => setTimeout(resolve, 800));
+            await refresh();
+            return '升级指令已发送到 ' + n.name + '。';
+          });
+        });
+        action.append(upgrade);
+      }
       if (!active) {
         const remove = element('button', 'link-button remove', '删除'); remove.type = 'button';
         remove.setAttribute('aria-label', '删除离线节点 ' + n.name);
@@ -145,6 +160,7 @@
         else state.selected = selected;
       }
       renderNodes();
+      loadUpdates();
     } catch (error) { if (state.token === token) {
       message(error.message, true); text('gateway-label', '连接中断'); $('gateway-status').classList.add('offline');
     } }
@@ -207,6 +223,56 @@
         })); actions.append(remove);
       } else actions.append(element('span', 'muted', '客户端配置'));
       row.append(actions); $('rules').append(row);
+    }
+  }
+  /* --- Client upgrades ---------------------------------------------------- */
+  function platformForOs(os) {
+    const value = String(os || '');
+    if (!value.endsWith('-c')) return '';
+    if (value.startsWith('windows')) return 'windows';
+    if (value.startsWith('linux')) return 'linux';
+    if (value.startsWith('android')) return 'android';
+    if (value.startsWith('darwin')) return 'macos';
+    return '';
+  }
+  function compareVersions(left, right) {
+    const a = String(left || '').split('.').map(Number), b = String(right || '').split('.').map(Number);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      const x = a[i] || 0, y = b[i] || 0;
+      if (x !== y) return x < y ? -1 : 1;
+    }
+    return 0;
+  }
+  function latestFor(platform) {
+    let best = '';
+    for (const update of state.updates)
+      if (update.platform === platform && (!best || compareVersions(update.version, best) > 0))
+        best = update.version;
+    return best;
+  }
+  function renderUpdates() {
+    $('updates').replaceChildren();
+    for (const update of state.updates) {
+      const row = element('tr');
+      row.append(element('td', '', update.platform), element('td', 'mono', update.version),
+        element('td', 'mono', bytes(update.size)),
+        element('td', 'mono', String(update.sha256 || '').slice(0, 16) + '…'),
+        element('td', 'mono', update.uploadedAt
+          ? new Date(update.uploadedAt * 1000).toLocaleString('zh-CN', {hour12: false}) : '—'));
+      $('updates').append(row);
+    }
+    $('update-message').classList.remove('error');
+    text('update-message', state.updates.length ? '' : '尚未上传安装包。');
+  }
+  async function loadUpdates() {
+    try {
+      const body = await api('/api/v1/updates');
+      state.updates = Array.isArray(body.updates) ? body.updates : [];
+      renderUpdates();
+      // The per-node upgrade buttons depend on which versions are available.
+      if (state.nodes.length) renderNodes();
+    } catch (error) {
+      $('update-message').classList.add('error'); text('update-message', error.message);
     }
   }
   function confirm(title, description, action) {
@@ -343,6 +409,45 @@
     } catch (error) { text('rule-error', error.message); $('rule-error').hidden = false; }
     finally { $('save-rule').disabled = false; }
   });
+  $('upload-update').addEventListener('click', () => {
+    $('update-form').reset(); $('update-error').hidden = true;
+    $('update-dialog').showModal();
+  });
+  $('close-update-dialog').addEventListener('click', () => $('update-dialog').close());
+  $('cancel-update').addEventListener('click', () => $('update-dialog').close());
+  $('refresh-updates').addEventListener('click', loadUpdates);
+  $('update-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const file = $('update-file').files[0];
+    const platform = $('update-platform').value, version = $('update-version').value.trim();
+    if (!file) { text('update-error', '请选择安装包文件。'); $('update-error').hidden = false; return; }
+    if (!/^\d+(\.\d+){0,3}$/.test(version)) {
+      text('update-error', '版本号应类似 2.0.2。'); $('update-error').hidden = false; return;
+    }
+    $('save-update').disabled = true; $('update-error').hidden = true;
+    try {
+      // Raw binary upload: the gateway hashes the stream as it writes it.
+      const response = await fetch('/api/v1/update?platform=' + encodeURIComponent(platform) +
+        '&version=' + encodeURIComponent(version), {
+        method: 'PUT', body: file, credentials: 'omit',
+        headers: {Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/octet-stream'}});
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) { logout(true); throw new Error('会话已过期，请重新登录。'); }
+      if (!response.ok || body.error) throw new Error(body.detail || '上传失败。');
+      $('update-dialog').close();
+      message('安装包已上传：' + platform + ' ' + version);
+      await loadUpdates(); await refresh();
+    } catch (error) { text('update-error', error.message); $('update-error').hidden = false; }
+    finally { $('save-update').disabled = false; }
+  });
+  $('upgrade-all').addEventListener('click', () => confirm('升级所有旧版本',
+    '对所有版本低于最新安装包的在线节点下发升级。客户端会从网关下载、校验并重启，连接会短暂中断。',
+    async () => {
+      const body = await api('/api/v1/upgrades', {});
+      const queued = Array.isArray(body.queued) ? body.queued : [];
+      await new Promise(resolve => setTimeout(resolve, 800)); await refresh();
+      return queued.length ? '已向 ' + queued.length + ' 个节点下发升级。' : '没有需要升级的在线节点。';
+    }));
   $('confirm-form').addEventListener('submit', async event => {
     event.preventDefault(); $('confirm-action').disabled = true;
     try { const result = await state.confirm?.(); $('confirm-dialog').close(); message(result || '操作已完成。');

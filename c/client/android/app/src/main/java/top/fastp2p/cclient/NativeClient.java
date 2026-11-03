@@ -9,4 +9,6 @@ final class NativeClient {
     static native void destroy(long handle);
     static native String version();
     static native String bootstrap();
+    /** Directory where the library stages a downloaded upgrade package. */
+    static native void setUpdateDir(String directory);
 }

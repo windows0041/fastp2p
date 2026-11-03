@@ -4,9 +4,13 @@
 #include "store.h"
 #include <libwebsockets.h>
 #include <netinet/in.h>
+#include <stdio.h>
 #define GW_MAX_NODES 256
 #define GW_MAX_PROBES 128
 #define GW_HTTP_LIMIT (64u * 1024u)
+/* An upgrade package may be tens of megabytes; cap it so a bad upload cannot
+ * fill the disk. */
+#define GW_UPLOAD_LIMIT (128ull * 1024ull * 1024ull)
 #define GW_QUEUE_LIMIT (4u * 1024u * 1024u)
 #define GW_TOTAL_QUEUED (64u * 1024u * 1024u)
 /* Login is deliberately expensive (PBKDF2) and runs on the single service
@@ -42,6 +46,13 @@ struct connection {
     /* HTTP transactions share the protocol allocation, never the WS role. */
     char uri[256];
     int post, deleting, authorized, status, headers_sent, handled;
+    int put;
+    /* Upgrade packages are far larger than the in-memory HTTP limit, so an
+     * upload streams straight to a temporary file while its digest is computed. */
+    FILE *upload;
+    void *upload_digest;
+    uint64_t upload_size;
+    char upload_tmp[640], upload_platform[16], upload_version[32];
     uint64_t auth_generation;
     unsigned char *request, *response;
     const char *response_type;
@@ -86,6 +97,8 @@ struct gateway {
     const char *database;
     const char *public_host, *enrollment_ca_file;
     char enrollment_ca[16385];
+    /* Upgrade packages live next to the database so a backup covers both. */
+    char update_dir[512];
     struct login_attempt logins[GW_LOGIN_SLOTS];
     struct nat_state nat;
 };

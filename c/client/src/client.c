@@ -1,5 +1,6 @@
 #include "platform.h"
 #include "fastp2p.h"
+#include "update.h"
 #include "wire.h"
 #include "quic.h"
 #include "socks.h"
@@ -1743,6 +1744,43 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 remove_rule(c, i);
                 break;
             }
+    } else if (main == 3 && sub == 18) {
+        /* UPDATE: the operator asked for this node to be upgraded. Download,
+         * verify, then hand over to the new build. */
+        const char *url = op_string(j, "url"), *sha = op_string(j, "sha256");
+        const char *version = op_string(j, "version");
+        uint64_t size = op_integer(j, "size");
+        if (!*url || strlen(sha) != 64) {
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid upgrade order");
+        } else {
+            char staged[4200], error[256], message[192];
+            snprintf(staged, sizeof(staged), "%s", "");
+            snprintf(message, sizeof(message), "downloading build %s", *version ? version : "update");
+            emit(c, FASTP2P_EVENT_STATE, 0, 0, message);
+            if (fp_update_stage_path(staged, sizeof(staged))) {
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "cannot locate the install directory");
+            } else if (fp_update_download(url, c->ca, staged, sha, size, error, sizeof(error))) {
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+#ifdef __ANDROID__
+            } else {
+                /* Android cannot replace its own package: hand the verified APK
+                 * to the app, which asks the user to confirm the install. */
+                char ready[4300];
+                snprintf(ready, sizeof(ready), "update-ready:%s", staged);
+                emit(c, FASTP2P_EVENT_STATE, 0, 0, ready);
+            }
+#else
+            } else if (fp_update_apply(staged, error, sizeof(error))) {
+                remove(staged);
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+            } else {
+                emit(c, FASTP2P_EVENT_STATE, 0, 0, "installing the new build");
+                /* Stop the event loop so the swap can take the executable. */
+                c->stopping = 1;
+                c->running = 0;
+            }
+#endif
+        }
     } else if (main == 3 && sub == 9) {
         apply_rule(c, j);
     }

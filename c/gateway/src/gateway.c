@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static struct gateway g;
 static volatile sig_atomic_t stopping;
@@ -22,6 +24,7 @@ static void signal_stop(int signal) {
 }
 static void http_reply(struct connection *c, int status, const void *data, size_t len);
 static void http_error(struct connection *c, int status, unsigned code, const char *detail);
+static void upload_abort(struct connection *c);
 static int query(struct lws *wsi, const char *name, char *out, size_t capacity);
 static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit, unsigned fallback);
 
@@ -440,6 +443,9 @@ static void clear_http(struct connection *c) {
     c->headers_sent = c->handled = 0;
     c->response_type = NULL;
     c->deadline = 0;
+    c->put = 0;
+    if (c->upload || c->upload_digest || *c->upload_tmp)
+        upload_abort(c);
 }
 static void http_reply(struct connection *c, int status, const void *data, size_t len) {
     if (c->handled || len > GW_FRAME_LIMIT)
@@ -579,6 +585,95 @@ static void login_result(uint32_t address, int success) {
         entry->locked_until = gw_mono_ms() + GW_LOGIN_LOCK_MS;
 }
 
+/* --- Client upgrade packages ---------------------------------------------
+ * Binaries are hosted by the gateway so a node never has to reach the public
+ * internet to update. Metadata lives in SQLite; files are content addressed. */
+static void update_path(char *out, size_t length, const char *filename) {
+    snprintf(out, length, "%s/%s", g.update_dir, filename);
+}
+static int update_dir_ready(void) {
+    return mkdir(g.update_dir, 0700) == 0 || errno == EEXIST ? 0 : -1;
+}
+static void update_hex(const unsigned char *digest, unsigned length, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < length; ++i) {
+        out[i * 2] = digits[digest[i] >> 4];
+        out[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    out[length * 2] = 0;
+}
+static void upload_abort(struct connection *c) {
+    if (c->upload)
+        fclose(c->upload);
+    if (c->upload_digest)
+        EVP_MD_CTX_free((EVP_MD_CTX *)c->upload_digest);
+    if (*c->upload_tmp)
+        unlink(c->upload_tmp);
+    c->upload = NULL;
+    c->upload_digest = NULL;
+    c->upload_size = 0;
+    c->upload_tmp[0] = 0;
+}
+/* Compares dotted numeric versions; returns <0, 0 or >0. */
+static int version_compare(const char *left, const char *right) {
+    for (;;) {
+        unsigned long a = 0, b = 0;
+        while (*left >= '0' && *left <= '9')
+            a = a * 10 + (unsigned long)(*left++ - '0');
+        while (*right >= '0' && *right <= '9')
+            b = b * 10 + (unsigned long)(*right++ - '0');
+        if (a != b)
+            return a < b ? -1 : 1;
+        if (!*left && !*right)
+            return 0;
+        if (*left == '.')
+            ++left;
+        if (*right == '.')
+            ++right;
+        if (!*left && !*right)
+            return 0;
+    }
+}
+
+/* Maps the OS string a client reports onto an update platform name. */
+static const char *platform_for_os(const char *os) {
+    size_t length = os ? strlen(os) : 0;
+    if (length < 2 || strcmp(os + length - 2, "-c"))
+        return NULL;
+    if (!strncmp(os, "windows", 7))
+        return "windows";
+    if (!strncmp(os, "linux", 5))
+        return "linux";
+    if (!strncmp(os, "android", 7))
+        return "android";
+    if (!strncmp(os, "darwin", 6))
+        return "macos";
+    return NULL;
+}
+/* Sends one upgrade order to a connected node. Returns 0 when it was queued. */
+static int push_update(struct connection *node, const char *version) {
+    const char *platform = platform_for_os(node->os);
+    if (!platform)
+        return 1;
+    char sha[65], filename[260];
+    uint64_t size = 0;
+    if (gw_store_update_find(g.db, platform, version, sha, filename, &size))
+        return 1;
+    json_object *j = json_object_new_object();
+    gw_js(j, "version", version);
+    gw_js(j, "sha256", sha);
+    gw_ju(j, "size", size);
+    gw_js(j, "platform", platform);
+    char url[640];
+    snprintf(url, sizeof(url),
+             "https://%s:%u/api/v1/update/download?platform=%s&version=%s&token=%" PRIu64,
+             g.public_host, g.api_port, platform, version, g.token);
+    gw_js(j, "url", url);
+    int rv = send_json(node, 3, 18, j);
+    json_object_put(j);
+    return rv ? 1 : 0;
+}
+
 static void handle_http(struct connection *c) {
     if (c->handled || c->request_node)
         return;
@@ -595,6 +690,156 @@ static void handle_http(struct connection *c) {
                 return;
             }
         }
+    }
+    if (c->put && !strcmp(c->uri, "/api/v1/update")) {
+        /* Finalise the streamed upload begun in LWS_CALLBACK_HTTP. */
+        if (!c->upload) {
+            http_error(c, 400, 1, "no upload in progress");
+            return;
+        }
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned digest_length = 0;
+        if (fflush(c->upload) ||
+            EVP_DigestFinal_ex((EVP_MD_CTX *)c->upload_digest, digest, &digest_length) != 1) {
+            upload_abort(c);
+            http_error(c, 500, 1, "cannot finalise upload");
+            return;
+        }
+        fclose(c->upload);
+        c->upload = NULL;
+        EVP_MD_CTX_free((EVP_MD_CTX *)c->upload_digest);
+        c->upload_digest = NULL;
+        char sha[65];
+        update_hex(digest, digest_length, sha);
+        char filename[160], final_path[700], staged[640];
+        snprintf(filename, sizeof(filename), "%s-%s-%s", c->upload_platform, c->upload_version, sha);
+        update_path(final_path, sizeof(final_path), filename);
+        snprintf(staged, sizeof(staged), "%s", c->upload_tmp);
+        c->upload_tmp[0] = 0;
+        if (rename(staged, final_path)) {
+            unlink(staged);
+            http_error(c, 503, 1, "cannot store package");
+            return;
+        }
+        if (gw_store_update_put(g.db, c->upload_platform, c->upload_version, sha,
+                                c->upload_size, filename)) {
+            http_error(c, 503, 1, "cannot record package");
+            return;
+        }
+        json_object *j = json_object_new_object();
+        gw_js(j, "platform", c->upload_platform);
+        gw_js(j, "version", c->upload_version);
+        gw_js(j, "sha256", sha);
+        gw_ju(j, "size", c->upload_size);
+        gw_ju(j, "error", 0);
+        http_json(c, 200, j);
+        json_object_put(j);
+        return;
+    }
+    if (!c->post && !c->put && !strcmp(c->uri, "/api/v1/updates")) {
+        if (!c->authorized || c->auth_generation != g.auth_generation) {
+            http_error(c, 401, 1, "unauthorized");
+            return;
+        }
+        json_object *list = gw_store_updates(g.db);
+        if (!list) {
+            http_error(c, 503, 1, "update storage unavailable");
+            return;
+        }
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "updates", list);
+        http_json(c, 200, root);
+        json_object_put(root);
+        return;
+    }
+    if (!c->post && !c->put && !strcmp(c->uri, "/api/v1/update/download")) {
+        /* The client presents the shared install token, the same secret it uses
+         * to authenticate the WebSocket, so no extra credential is introduced. */
+        char platform[16], version[32], token[32];
+        if (query(c->wsi, "platform=", platform, sizeof(platform)) ||
+            query(c->wsi, "version=", version, sizeof(version)) ||
+            query(c->wsi, "token=", token, sizeof(token))) {
+            http_error(c, 400, 1, "platform, version and token are required");
+            return;
+        }
+        uint64_t supplied = 0;
+        if (gw_decimal(token, &supplied) || supplied != g.token) {
+            http_error(c, 401, 1, "unauthorized");
+            return;
+        }
+        char sha[65], filename[260], path[700];
+        uint64_t size = 0;
+        if (gw_store_update_find(g.db, platform, version, sha, filename, &size)) {
+            http_error(c, 404, 1, "package not found");
+            return;
+        }
+        update_path(path, sizeof(path), filename);
+        if (lws_serve_http_file(c->wsi, path, "application/octet-stream", NULL, 0) < 0) {
+            http_error(c, 503, 1, "cannot serve package");
+            return;
+        }
+        return;
+    }
+    if (c->post && !strcmp(c->uri, "/api/v1/upgrades")) {
+        /* Batch upgrade: every connected node whose version is behind the newest
+         * package for its platform, or an explicit target version. */
+        if (!c->authorized || c->auth_generation != g.auth_generation) {
+            http_error(c, 401, 1, "unauthorized");
+            return;
+        }
+        json_object *body = gw_json(c->request, c->request_length);
+        char wanted[32];
+        wanted[0] = 0;
+        if (body && json_object_is_type(body, json_type_object))
+            snprintf(wanted, sizeof(wanted), "%s", gw_string(body, "version"));
+        if (body)
+            json_object_put(body);
+        json_object *available = gw_store_updates(g.db);
+        if (!available) {
+            http_error(c, 503, 1, "update storage unavailable");
+            return;
+        }
+        /* Newest version per platform. */
+        char latest[4][32];
+        const char *platforms[4] = {"windows", "linux", "android", "macos"};
+        memset(latest, 0, sizeof(latest));
+        for (size_t i = 0; i < json_object_array_length(available); ++i) {
+            json_object *row = json_object_array_get_idx(available, i);
+            const char *platform = gw_string(row, "platform"), *version = gw_string(row, "version");
+            for (int k = 0; k < 4; ++k)
+                if (!strcmp(platform, platforms[k]) &&
+                    (!latest[k][0] || version_compare(version, latest[k]) > 0))
+                    snprintf(latest[k], sizeof(latest[k]), "%s", version);
+        }
+        json_object_put(available);
+        json_object *queued = json_object_new_array();
+        for (unsigned i = 0; i < g.max_nodes; ++i) {
+            struct connection *node = g.nodes[i];
+            if (!node)
+                continue;
+            const char *platform = platform_for_os(node->os);
+            if (!platform)
+                continue;
+            const char *target_version = *wanted ? wanted : NULL;
+            for (int k = 0; k < 4 && !target_version; ++k)
+                if (!strcmp(platform, platforms[k]) && latest[k][0])
+                    target_version = latest[k];
+            if (!target_version || version_compare(node->version, target_version) >= 0)
+                continue;
+            if (push_update(node, target_version))
+                continue;
+            json_object *item = json_object_new_object();
+            gw_js(item, "node", node->node);
+            gw_js(item, "from", node->version);
+            gw_js(item, "to", target_version);
+            json_object_array_add(queued, item);
+        }
+        json_object *root = json_object_new_object();
+        gw_ju(root, "error", 0);
+        json_object_object_add(root, "queued", queued);
+        http_json(c, 200, root);
+        json_object_put(root);
+        return;
     }
     if (!c->post && !strcmp(c->uri, "/healthz")) {
         http_reply(c, 200,
@@ -827,6 +1072,46 @@ static void handle_http(struct connection *c) {
             http_error(c, 503, 1, "device unavailable");
         else
             http_reply(c, 200, "{\"error\":0}", 11);
+        return;
+    }
+    if (c->post && !strcmp(end, "/upgrade")) {
+        /* Manual, operator-initiated upgrade of one node. */
+        json_object *j = gw_json(c->request, c->request_length);
+        if (!j || !json_object_is_type(j, json_type_object)) {
+            if (j)
+                json_object_put(j);
+            http_error(c, 400, 1, "invalid JSON");
+            return;
+        }
+        char version[32];
+        snprintf(version, sizeof(version), "%s", gw_string(j, "version"));
+        json_object_put(j);
+        if (!*version) {
+            http_error(c, 400, 1, "version is required");
+            return;
+        }
+        if (!target) {
+            http_error(c, 503, 1, "device offline");
+            return;
+        }
+        const char *platform = platform_for_os(target->os);
+        char sha[65], filename[260];
+        uint64_t size = 0;
+        if (!platform || gw_store_update_find(g.db, platform, version, sha, filename, &size)) {
+            http_error(c, 404, 1, "no package for this platform and version");
+            return;
+        }
+        if (push_update(target, version)) {
+            http_error(c, 503, 1, "device unavailable");
+            return;
+        }
+        json_object *reply = json_object_new_object();
+        gw_ju(reply, "error", 0);
+        gw_js(reply, "version", version);
+        gw_js(reply, "sha256", sha);
+        gw_ju(reply, "size", size);
+        http_json(c, 200, reply);
+        json_object_put(reply);
         return;
     }
     if (c->post && (!strcmp(end, "/app") || !strcmp(end, "/switchapp"))) {
@@ -1206,7 +1491,8 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
         char *method_uri = NULL;
         int method_length = 0;
         int method = lws_http_get_uri_and_method(wsi, &method_uri, &method_length);
-        if (method != LWSHUMETH_GET && method != LWSHUMETH_POST &&
+        int is_upload = method == LWSHUMETH_PUT && !strcmp(c->uri, "/api/v1/update");
+        if (method != LWSHUMETH_GET && method != LWSHUMETH_POST && !is_upload &&
             !(method == LWSHUMETH_DELETE && !strncmp(c->uri, "/api/v1/nodes/", 14))) {
             http_error(c, 405, 1, "method not allowed");
             return 0;
@@ -1218,6 +1504,58 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
         c->authorized =
             n > 0 && gw_jwt_verify(auth, g.user, g.token, g.secret, gw_wall_ns() / 1000000000);
         c->auth_generation = g.auth_generation;
+        if (is_upload) {
+            /* Stream the package to a temporary file; it is far larger than the
+             * in-memory HTTP body limit. */
+            c->put = 1;
+            if (!c->authorized || c->auth_generation != g.auth_generation) {
+                http_error(c, 401, 1, "unauthorized");
+                return 0;
+            }
+            char platform[16], version[32], length[32];
+            if (query(wsi, "platform=", platform, sizeof(platform)) ||
+                query(wsi, "version=", version, sizeof(version))) {
+                http_error(c, 400, 1, "platform and version are required");
+                return 0;
+            }
+            uint64_t declared = 0;
+            if (lws_hdr_copy(wsi, length, sizeof(length), WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0 &&
+                (gw_decimal(length, &declared) || declared > GW_UPLOAD_LIMIT)) {
+                http_error(c, 413, 1, "package too large");
+                return 0;
+            }
+            if (update_dir_ready()) {
+                http_error(c, 503, 1, "update storage unavailable");
+                return 0;
+            }
+            snprintf(c->upload_platform, sizeof(c->upload_platform), "%s", platform);
+            snprintf(c->upload_version, sizeof(c->upload_version), "%s", version);
+            snprintf(c->upload_tmp, sizeof(c->upload_tmp), "%s/.upload-XXXXXX", g.update_dir);
+            int fd = mkstemp(c->upload_tmp);
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (fd < 0 || !ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+                if (fd >= 0)
+                    close(fd);
+                if (ctx)
+                    EVP_MD_CTX_free(ctx);
+                c->upload_tmp[0] = 0;
+                http_error(c, 503, 1, "cannot stage upload");
+                return 0;
+            }
+            fchmod(fd, 0600);
+            c->upload = fdopen(fd, "wb");
+            if (!c->upload) {
+                close(fd);
+                EVP_MD_CTX_free(ctx);
+                unlink(c->upload_tmp);
+                c->upload_tmp[0] = 0;
+                http_error(c, 503, 1, "cannot stage upload");
+                return 0;
+            }
+            c->upload_digest = ctx;
+            c->upload_size = 0;
+            return 0;
+        }
         if (c->post) {
             if (strcmp(c->uri, "/api/v1/user/login") && !c->authorized) {
                 http_error(c, 401, 1, "unauthorized");
@@ -1242,6 +1580,23 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
     case LWS_CALLBACK_HTTP_BODY:
         if (c->handled)
             return 0;
+        if (c->upload) {
+            if (c->upload_size + len > GW_UPLOAD_LIMIT) {
+                upload_abort(c);
+                http_error(c, 413, 1, "package too large");
+                return 0;
+            }
+            if (len) {
+                if (fwrite(in, 1, len, c->upload) != len) {
+                    upload_abort(c);
+                    http_error(c, 500, 1, "cannot write upload");
+                    return 0;
+                }
+                EVP_DigestUpdate((EVP_MD_CTX *)c->upload_digest, in, len);
+                c->upload_size += len;
+            }
+            return 0;
+        }
         if (len > GW_HTTP_LIMIT - c->request_length) {
             http_error(c, 413, 1, "request too large");
             return 0;
@@ -1260,6 +1615,10 @@ static int callback(struct lws *wsi, enum lws_callback_reasons reason, void *use
         return 0;
     case LWS_CALLBACK_HTTP_WRITEABLE:
         return write_http(c);
+    case LWS_CALLBACK_HTTP_FILE_COMPLETION:
+        /* An upgrade package finished streaming; close the transaction so the
+         * connection can serve another request. */
+        return lws_http_transaction_completed(wsi) ? -1 : 0;
     case LWS_CALLBACK_CLOSED_HTTP:
     case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
         clear_http(c);
@@ -1417,6 +1776,18 @@ static int options(int argc, char **argv) {
         return -1;
     if (!*g.api_bind)
         strcpy(g.api_bind, g.bind);
+    /* Upgrade packages sit beside the database so one backup captures both. */
+    {
+        const char *slash = strrchr(g.database, '/');
+        if (slash) {
+            size_t length = (size_t)(slash - g.database);
+            if (length > sizeof(g.update_dir) - 16)
+                return -1;
+            snprintf(g.update_dir, sizeof(g.update_dir), "%.*s/updates", (int)length, g.database);
+        } else {
+            snprintf(g.update_dir, sizeof(g.update_dir), "updates");
+        }
+    }
     struct in_addr address;
     if (inet_pton(AF_INET, g.bind, &address) != 1 || inet_pton(AF_INET, g.api_bind, &address) != 1)
         return -1;

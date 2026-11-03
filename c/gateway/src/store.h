@@ -43,4 +43,14 @@ json_object *gw_store_rules(sqlite3 *db, const char *node);
  * it. That fact survives deleting the last rule, so a restart does not silently
  * fall back to rules from a local config file. */
 int gw_store_rule_managed(sqlite3 *db, const char *node);
+
+/* Client upgrade packages hosted by the gateway. Files are stored content
+ * addressed next to the database; only metadata lives in SQLite. */
+int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
+                        const char *sha256, uint64_t size, const char *filename);
+/* JSON array of {platform, version, sha256, size, uploadedAt}, newest first. */
+json_object *gw_store_updates(sqlite3 *db);
+/* Fills the out-parameters when the row exists; 0 found, -1 missing/failure. */
+int gw_store_update_find(sqlite3 *db, const char *platform, const char *version,
+                         char sha256[65], char filename[260], uint64_t *size);
 #endif

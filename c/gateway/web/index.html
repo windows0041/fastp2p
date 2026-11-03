@@ -48,10 +48,20 @@
           <p id="rule-message" class="inline-message" role="status">尚未选择节点。</p>
           <div class="table-scroll"><table class="rules-table"><thead><tr><th>规则名称</th><th>入口</th><th>对端 / 目标</th><th>链路</th><th>状态</th><th>操作</th></tr></thead><tbody id="rules"></tbody></table></div>
         </section>
+        <section class="panel updates-panel"><div class="panel-heading"><div><span class="eyebrow">CLIENT UPDATES</span><h2>客户端升级</h2><p>上传安装包后，可对单个节点或所有旧版本节点下发升级。节点在线时立即执行。</p></div><div class="rule-toolbar"><button id="refresh-updates" class="button" type="button">刷新</button><button id="upload-update" class="button" type="button">上传安装包</button><button id="upgrade-all" class="button primary" type="button">升级所有旧版本</button></div></div>
+          <p id="update-message" class="inline-message" role="status">尚未上传安装包。</p>
+          <div class="table-scroll"><table class="rules-table"><thead><tr><th>平台</th><th>版本</th><th>大小</th><th>SHA256</th><th>上传时间</th></tr></thead><tbody id="updates"></tbody></table></div>
+        </section>
         <footer class="main-footer"><span>FastP2P C Gateway</span><span>数据在客户端之间传输，网关负责连接协调。</span></footer>
       </main>
     </div>
   </div>
+  <dialog id="update-dialog"><form id="update-form"><div class="dialog-heading"><div><span class="eyebrow">CLIENT UPDATE</span><h2>上传客户端安装包</h2></div><button id="close-update-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
+    <div class="form-grid"><div><label for="update-platform">平台</label><select id="update-platform"><option value="windows">Windows（.exe）</option><option value="linux">Linux</option><option value="android">Android（.apk）</option><option value="macos">macOS</option></select></div><div><label for="update-version">版本号</label><input id="update-version" maxlength="31" required placeholder="2.0.2"></div></div>
+    <label for="update-file">安装包文件</label><input id="update-file" type="file" required>
+    <p id="update-help" class="muted form-help">上传后即可在节点列表中对旧版本节点下发升级。安装包保存在网关，客户端从网关下载。</p>
+    <p id="update-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-update" class="button" type="button">取消</button><button id="save-update" class="button primary" type="submit">上传</button></div>
+  </form></dialog>
   <dialog id="rule-dialog"><form id="rule-form"><div class="dialog-heading"><div><span class="eyebrow">PORT FORWARDING</span><h2 id="rule-dialog-title">添加转发</h2></div><button id="close-rule-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
     <label for="rule-name">规则名称</label><input id="rule-name" maxlength="63" required placeholder="例如：远端 SSH">
     <div class="form-grid"><div><label for="rule-protocol">应用协议</label><select id="rule-protocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="socks5">SOCKS5 代理（动态目标）</option></select></div><div><label for="rule-source">本地入口端口</label><input id="rule-source" type="number" min="1" max="65535" required placeholder="23322"></div></div>

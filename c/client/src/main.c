@@ -2,6 +2,7 @@
 #include "identity_file.h"
 #include "install.h"
 #include "notices.h"
+#include "update.h"
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -80,6 +81,11 @@ static int client_main(int argc, char **argv) {
         return fwrite(fastp2p_notices, 1, sizeof(fastp2p_notices), stdout) == sizeof(fastp2p_notices) ? 0 : 1;
     }
     if (argc > 1 && !strcmp(argv[1], "install")) return fastp2p_install_command(argc, argv);
+    if (argc == 5 && !strcmp(argv[1], "--apply-update")) {
+        /* Detached helper spawned by a self-update: installs the staged build
+         * over the target and restarts the service. */
+        return fp_update_swap(argv[2], argv[3], argv[4]) ? 1 : 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "stop")) {
         char profile[4096]; const char *path = NULL;
         if (argc == 4 && !strcmp(argv[2], "--config")) path = argv[3];
