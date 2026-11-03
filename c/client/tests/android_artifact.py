@@ -24,9 +24,13 @@ with zipfile.ZipFile(args.apk) as apk, tempfile.TemporaryDirectory(prefix='fastp
     manifest=apk.read('AndroidManifest.xml')
     assert args.package.encode('utf-16-le') in manifest, 'unexpected applicationId in the manifest'
     assert b'cc.itq.fastp2p' not in manifest, 'the retired package name is still in the manifest'
+    # Modern builds sign with scheme v2/v3, which lives in the APK Signing Block
+    # rather than META-INF; a v1-only APK keeps the JAR signature instead.
     names=apk.namelist()
-    assert any(n.startswith('META-INF/') and n.endswith(('.RSA','.DSA','.EC')) for n in names), 'APK is not signed'
-    assert any(n.startswith('META-INF/') and n.endswith('.SF') for n in names), 'APK signature file missing'
+    jar_signed=any(n.startswith('META-INF/') and n.endswith('.SF') for n in names)
+    with open(args.apk,'rb') as raw:
+        block_signed=b'APK Sig Block 42' in raw.read()
+    assert jar_signed or block_signed, 'APK carries no signature'
     for abi,machine in [('arm64-v8a',183),('x86_64',62)]:
         for library in ['libfastp2p.so','libfastp2p_jni.so']:
             data=apk.read('lib/'+abi+'/'+library)
