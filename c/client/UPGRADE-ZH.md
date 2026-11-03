@@ -51,10 +51,14 @@ Android 不允许应用静默替换自己，也**不允许后台服务直接调�
 |---|---|
 | `c/client/include/fastp2p.h` | `FASTP2P_VERSION` |
 | `c/client/CMakeLists.txt` | `project(fastp2p_c VERSION ...)` |
+| `c/client/android/app/build.gradle` | `versionCode`（必须递增）与 `versionName` |
 
 客户端登录时把 `FASTP2P_VERSION` 上报给网关，控制台正是用它和上传包的版本号比较。
 如果上传的包版本写成 `2.0.2`、但构建里仍是 `2.0.1`，客户端升级后依然上报 `2.0.1`，
 控制台就会一直认为它需要升级。
+
+Android 还额外要求 APK 的 `versionCode` **严格大于**已安装版本：同版本或更低会被系统
+直接拒绝且没有任何提示。客户端会先比较，发现不是更高版本就写日志跳过。
 
 ## 首次升级必须手动
 

@@ -3,8 +3,10 @@ package top.fastp2p.cclient;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.net.Uri;
+import android.os.Build;
 import android.provider.Settings;
 import java.io.File;
 import java.io.FileInputStream;
@@ -33,6 +35,26 @@ final class UpdateInstaller {
         if (!context.getPackageManager().canRequestPackageInstalls()) {
             android.util.Log.w(TAG, "install unknown apps is not allowed for this app");
             openInstallSettings(context);
+            return;
+        }
+        // Android refuses to replace an app with the same versionCode, and the
+        // rejection is silent. Say so instead of failing without explanation.
+        try {
+            PackageInfo staged = context.getPackageManager().getPackageArchiveInfo(path, 0);
+            PackageInfo current = context.getPackageManager()
+                    .getPackageInfo(context.getPackageName(), 0);
+            if (staged != null) {
+                long next = Build.VERSION.SDK_INT >= 28 ? staged.getLongVersionCode() : staged.versionCode;
+                long installed = Build.VERSION.SDK_INT >= 28
+                        ? current.getLongVersionCode() : current.versionCode;
+                if (next <= installed) {
+                    android.util.Log.w(TAG, "update package versionCode " + next
+                            + " is not newer than installed " + installed + "; ignoring");
+                    return;
+                }
+            }
+        } catch (Exception error) {
+            android.util.Log.w(TAG, "cannot compare update package versions", error);
             return;
         }
         int session = -1;
