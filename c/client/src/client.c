@@ -168,6 +168,9 @@ struct fastp2p_client {
     uint16_t nat_port2, nat_second;
     int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
     int nat_override; /* FASTP2P_NAT_TYPE diagnostic switch, 0 = use the probe */
+    /* Curl writes the detailed TLS reason here; the short error code alone
+     * cannot say whether the handshake was refused, reset, or rejected. */
+    char curl_error[CURL_ERROR_SIZE];
     op_socket listener, nat_fd;
     uint16_t nat_port;
     uint64_t nat_deadline;
@@ -2590,9 +2593,13 @@ static void gateway_failed(fastp2p_client *c) {
  * cannot distinguish an unreachable host from an unreadable CA or a hostname
  * mismatch, which is exactly what a reported failure usually needs. */
 static void gateway_failed_curl(fastp2p_client *c, CURLcode rv) {
-    char message[192];
-    snprintf(message, sizeof(message), "WSS connection failed: %s (curl %d)",
-             curl_easy_strerror(rv), (int)rv);
+    char message[448];
+    if (c->curl_error[0])
+        snprintf(message, sizeof(message), "WSS connection failed: %s (curl %d): %s",
+                 curl_easy_strerror(rv), (int)rv, c->curl_error);
+    else
+        snprintf(message, sizeof(message), "WSS connection failed: %s (curl %d)",
+                 curl_easy_strerror(rv), (int)rv);
     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
     close_gateway(c);
 }
@@ -2628,6 +2635,8 @@ static void connect_gateway(fastp2p_client *c) {
             return;                                                                                \
         }                                                                                          \
     } while (0)
+    c->curl_error[0] = 0;
+    SETOPT(CURLOPT_ERRORBUFFER, c->curl_error);
     SETOPT(CURLOPT_URL, c->path);
     SETOPT(CURLOPT_RESOLVE, c->resolve);
     SETOPT(CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
