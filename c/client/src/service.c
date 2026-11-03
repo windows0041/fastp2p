@@ -326,9 +326,14 @@ int fastp2p_service_purge(void) {
             (int)sizeof(installed)) {
             WCHAR wide_installed[4096];
             if (!wide(installed, wide_installed)) {
-                /* This cannot delete the image that is running this very command. */
-                if (!DeleteFileW(wide_installed) && GetLastError() != ERROR_FILE_NOT_FOUND)
-                    leftover = 1;
+                /* Running this very image locks it. Schedule the delete for the
+                 * next boot instead of leaving the file behind. */
+                if (!DeleteFileW(wide_installed) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+                    if (MoveFileExW(wide_installed, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+                        puts("The installed copy is in use; it will be removed at the next restart.");
+                    else
+                        leftover = 1;
+                }
             }
         }
         char installed_directory[4096];
