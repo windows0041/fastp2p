@@ -25,10 +25,15 @@ void fp_update_set_dir(const char *dir);
 int fp_update_stage_path(char *out, size_t length);
 
 /* Replaces the running executable with staged and arranges the restart.
- * On success the process is expected to exit: on POSIX it re-execs itself, and
- * on Windows it leaves a detached helper to swap the image and restart the
- * service. Returns 0 when the caller should stop. */
+ * On Windows a detached helper is spawned immediately. On POSIX the package is
+ * only recorded here; call fp_update_run_pending once the event loop has exited
+ * so the swap happens after a clean shutdown.
+ * Returns 0 when the caller should stop. */
 int fp_update_apply(const char *staged, char *error, size_t error_length);
+
+/* POSIX: performs a deferred install. Does not return on success. A no-op when
+ * nothing is pending or on Windows. */
+int fp_update_run_pending(void);
 
 /* Detached-helper entry point: waits for the old image to be released, installs
  * staged over target, then restarts the service. */

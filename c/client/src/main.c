@@ -249,6 +249,10 @@ done:
     if (rv)
         fprintf(stderr, "Client failed (%d): %s\n", rv, fastp2p_client_last_error(client));
     fastp2p_client_destroy(client);
+    /* Install a verified upgrade package only after a clean shutdown: the run
+     * loop then returns success, so a service manager sees a normal stop instead
+     * of a failure it would answer with a restart of the old image. */
+    fp_update_run_pending();
     fastp2p_runtime_end();
     json_object_put(root);
     return rv ? 1 : 0;

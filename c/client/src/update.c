@@ -235,6 +235,7 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
     CloseHandle(information.hProcess);
     return 0;
 }
+int fp_update_run_pending(void) { return 0; } /* Windows installs from the helper. */
 #else
 int fp_update_own_path(char *out, size_t length) {
 #ifdef __APPLE__
@@ -279,31 +280,41 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
         return -1;
     return rename(staged, target) ? -1 : 0;
 }
+/* Recorded by fp_update_apply and installed once the client has shut down. */
+static char pending_update[4200];
 int fp_update_apply(const char *staged, char *error, size_t error_length) {
-    char own[4096];
-    if (fp_update_own_path(own, sizeof(own))) {
-        set_error(error, error_length, "cannot locate the installed executable");
-        return -1;
-    }
     if (chmod(staged, 0755)) {
         set_error(error, error_length, "cannot make the new build executable");
         return -1;
     }
+    snprintf(pending_update, sizeof(pending_update), "%s", staged);
+    return 0;
+}
+int fp_update_run_pending(void) {
+    if (!pending_update[0])
+        return 0;
+    char staged[4200];
+    snprintf(staged, sizeof(staged), "%s", pending_update);
+    pending_update[0] = 0;
+
+    char own[4096];
+    if (fp_update_own_path(own, sizeof(own)))
+        return -1;
     /* Keep the previous build until the replacement is in place. */
     char previous[4200];
     snprintf(previous, sizeof(previous), "%s.old", own);
     remove(previous);
     if (rename(own, previous)) {
-        set_error(error, error_length, "cannot move the current build aside");
+        remove(staged);
         return -1;
     }
     if (rename(staged, own)) {
         rename(previous, own);
-        set_error(error, error_length, "cannot install the new build");
         return -1;
     }
     /* Re-exec so the process keeps running the same command line under whatever
-     * supervisor started it, without a visible restart. */
+     * supervisor started it, without a visible restart. Every socket is already
+     * closed at this point, so the new image can bind its ports again. */
     char command[4096];
     FILE *cmdline = fopen("/proc/self/cmdline", "rb");
     size_t used = 0;
@@ -311,10 +322,8 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
         used = fread(command, 1, sizeof(command) - 1, cmdline);
         fclose(cmdline);
     }
-    if (used < 2) {
-        /* No command line to reuse: ask the supervisor to restart us. */
-        return 0;
-    }
+    if (used < 2)
+        return 0; /* No command line to reuse: let the supervisor restart us. */
     command[used] = 0;
     char *argv[64];
     int argc = 0;
@@ -325,7 +334,6 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
     argv[argc] = NULL;
     execv(own, argv);
     /* execv only returns on failure; the supervisor will restart the service. */
-    set_error(error, error_length, "the new build could not be started");
-    return 0;
+    _exit(1);
 }
 #endif

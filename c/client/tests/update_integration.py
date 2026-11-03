@@ -108,6 +108,25 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         wait(online, what='client online')
         results['client_registered'] = True
 
+        def listening(port):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=1).close()
+                return True
+            except OSError:
+                return False
+
+        # Give the client a listening rule first: after the upgrade the new image
+        # must be able to bind the same port again, which fails if it inherited
+        # the old listening socket.
+        rule_port = 24470
+        status, body = api('/api/v1/device/update-node-1/app',
+                           {'appName': 'update-rule', 'protocol': 'tcp', 'srcPort': rule_port,
+                            'peerNode': 'update-peer-9', 'dstHost': '127.0.0.1', 'dstPort': 22},
+                           token)
+        assert status == 200, (status, body)
+        wait(lambda: listening(rule_port), what='rule listening before the upgrade')
+        results['rule_listening_before_upgrade'] = True
+
         # --- Upload a package. It is a real executable so the swap is realistic.
         package = install_dir / 'package.bin'
         shutil.copy2(installed, package)
@@ -147,6 +166,10 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         # The re-exec keeps the same supervisor running, so the node must return.
         wait(online, timeout=90, what='client back online after upgrade')
         results['client_came_back_online'] = True
+
+        # The rule is restored from the gateway and its port binds again.
+        wait(lambda: listening(rule_port), timeout=60, what='rule listening after the upgrade')
+        results['rule_listening_after_upgrade'] = True
 
         # --- An unknown version is rejected rather than silently ignored.
         assert api('/api/v1/device/update-node-1/upgrade', {'version': '8.8.8'}, token)[0] == 404

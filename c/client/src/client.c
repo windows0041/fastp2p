@@ -1775,9 +1775,10 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
             } else {
                 emit(c, FASTP2P_EVENT_STATE, 0, 0, "installing the new build");
-                /* Stop the event loop so the swap can take the executable. */
+                /* Ask for a normal stop: the run loop then reports a clean exit,
+                 * so a Windows service manager does not treat it as a failure and
+                 * race the updater by restarting the old image. */
                 c->stopping = 1;
-                c->running = 0;
             }
 #endif
         }
