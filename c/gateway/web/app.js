@@ -166,16 +166,15 @@
     else ruleMessage(node ? `节点已离线，登记信息保留在 SQLite 中。首次在线：${node.firstSeen || '—'}；最近离线：${node.lastOffline || '—'}。` : '尚未选择节点。');
   }
   async function loadApps() {
-    if (!state.selected || Number(state.selected.isActive) !== 1 || state.loadingApps) return;
+    if (!state.selected || state.loadingApps) return;
     const node = state.selected, selection = state.selection;
-    state.loadingApps = true; $('refresh-apps').disabled = true; ruleMessage('正在向客户端查询规则…');
+    state.loadingApps = true; $('refresh-apps').disabled = true; ruleMessage('正在读取网关保存的规则…');
     try {
       const body = await api('/api/v1/device/' + encodeURIComponent(node.name) + '/apps');
       if (selection !== state.selection || !state.token) return;
       state.apps = Array.isArray(body.Apps) ? body.Apps : Array.isArray(body.apps) ? body.apps : [];
       renderApps();
-      const c = !node.capabilities?.editForward;
-      ruleMessage(body.TunError || (c ? '此 C 客户端支持查询和添加固定转发；现有规则与 SOCKS5 请在客户端配置中修改。' : state.apps.length ? '' : '此节点尚未配置转发规则。'), Boolean(body.TunError));
+      ruleMessage(body.TunError || (state.apps.length ? '' : '此节点尚未配置转发规则。'), Boolean(body.TunError));
     } catch (error) { if (selection === state.selection && state.token) ruleMessage(error.message, true); }
     finally { if (selection === state.selection) { state.loadingApps = false; $('refresh-apps').disabled = false; } }
   }
@@ -192,7 +191,7 @@
       const status = element('td'), active = Number(app.isActive) === 1, enabled = app.enabled === undefined || Number(app.enabled) === 1;
       status.append(element('span', 'badge ' + (active ? 'online' : enabled ? 'warning' : 'offline'), active ? '● 已连接' : enabled ? '等待连接' : '已停用')); row.append(status);
       const actions = element('td');
-      if (state.selected.capabilities?.editForward && ['tcp', 'udp'].includes(app.protocol)) {
+      if (state.selected.capabilities?.editForward && ['tcp', 'udp', 'socks5'].includes(app.protocol)) {
         const nodeName = state.selected.name;
         const edit = element('button', 'link-button', '编辑'); edit.type = 'button'; edit.addEventListener('click', () => openRule(app)); actions.append(edit);
         const toggle = element('button', 'link-button', enabled ? '停用' : '启用'); toggle.type = 'button';
@@ -236,9 +235,19 @@
     $('rule-destination').value = app?.dstHost || '127.0.0.1'; $('rule-target').value = app?.dstPort || '';
     $('rule-transport').value = app && (Number(app.punchPriority) & 2) ? 'tcp' : 'quic';
     $('rule-whitelist').value = app ? app.whitelist || '' : '127.0.0.1';
+    if (app && app.protocol === 'socks5') {
+      // The gateway never returns a stored password; show the username and let a
+      // blank password mean "keep the existing one".
+      $('rule-socks-user').value = app.Username || '';
+      $('rule-socks-password').placeholder = app.hasPassword
+        ? '留空 = 保留原密码' : '留空 = 不启用认证';
+    } else {
+      $('rule-socks-password').placeholder = '留空 = 不启用认证';
+    }
     $('whitelist-field').hidden = !state.selected.capabilities?.editForward;
-    text('rule-help', state.selected.capabilities?.editForward ? '规则保存行为由客户端能力决定。' :
-      'C 客户端新增规则仅在本次进程中生效，入口绑定 127.0.0.1。SOCKS5 代理的目标由每次请求动态指定，可自定义本地端口；已有 SOCKS5 规则需修改客户端配置。需要持久化时同步修改客户端配置。');
+    text('rule-help', state.selected.capabilities?.editForward
+      ? '规则保存在网关数据库中，节点在线时立即生效，离线时在下次连接后生效。'
+      : '规则保存在网关数据库中，节点下次连接后生效。');
     $('peer-names').replaceChildren(...state.nodes.filter(n => n.name !== state.selected.name).map(n => {
       const option = element('option'); option.value = n.name; return option;
     }));
@@ -300,8 +309,14 @@
         // target is sent. Credentials are optional but must come as a pair.
         app.Username = $('rule-socks-user').value.trim();
         app.Password = $('rule-socks-password').value;
-        if (Boolean(app.Username) !== Boolean(app.Password))
+        const keep = old && old.protocol === 'socks5' && old.hasPassword && !app.Password;
+        if (keep) {
+          // Blank password while editing an authenticated proxy keeps the stored
+          // one; the browser never receives it in the first place.
+          app.keepPassword = 1;
+        } else if (Boolean(app.Username) !== Boolean(app.Password)) {
           throw new Error('SOCKS5 用户名和密码必须同时填写，或同时留空。');
+        }
       } else {
         app.dstHost = $('rule-destination').value.trim();
         app.dstPort = Number($('rule-target').value);

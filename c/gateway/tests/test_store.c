@@ -51,6 +51,42 @@ int main(void) {
     json_object_put(list);
     assert(!gw_store_save(db, &connection, 0));
     assert(!gw_store_save(db, &connection, 1));
+    /* Persistent rules: upsert, toggle, list and delete, with the JSON payload
+     * preserved verbatim and scoped to one node. */
+    const char *tcp_rule = "{\"appName\":\"ssh\",\"protocol\":\"tcp\",\"srcPort\":2222,"
+                           "\"peerNode\":\"host-one\",\"dstHost\":\"127.0.0.1\",\"dstPort\":22}";
+    const char *socks_rule = "{\"appName\":\"proxy\",\"protocol\":\"socks5\",\"srcPort\":1080,"
+                             "\"peerNode\":\"host-one\",\"Username\":\"alice\",\"Password\":\"secret\"}";
+    assert(!gw_store_rule_put(db, name, "tcp", 2222, tcp_rule, 1));
+    assert(!gw_store_rule_put(db, name, "socks5", 1080, socks_rule, 1));
+    json_object *rules = gw_store_rules(db, name);
+    assert(rules && json_object_array_length(rules) == 2);
+    json_object_put(rules);
+    assert(!gw_store_rule_set_enabled(db, name, "tcp", 2222, 0));
+    rules = gw_store_rules(db, name);
+    /* Rows are ordered by protocol, so find the tcp entry rather than assuming
+     * its index (socks5 sorts first). */
+    json_object *entry = NULL;
+    for (size_t i = 0; i < json_object_array_length(rules); ++i) {
+        json_object *candidate = json_object_array_get_idx(rules, i);
+        if (!strcmp(gw_string(candidate, "protocol"), "tcp"))
+            entry = candidate;
+    }
+    assert(entry && gw_integer(entry, "enabled") == 0);
+    json_object *payload = gw_get(entry, "rule");
+    assert(!strcmp(gw_string(payload, "appName"), "ssh"));
+    json_object_put(rules);
+    assert(!gw_store_rule_put(db, name, "tcp", 2222, "{\"appName\":\"ssh2\"}", 1));
+    rules = gw_store_rules(db, name);
+    assert(json_object_array_length(rules) == 2); /* upsert, not a third row */
+    json_object_put(rules);
+    assert(!gw_store_rule_delete(db, name, "tcp", 2222));
+    assert(gw_store_rule_delete(db, name, "tcp", 2222) == -1);
+    rules = gw_store_rules(db, name);
+    assert(json_object_array_length(rules) == 1);
+    json_object_put(rules);
+    assert(gw_store_rule_put(db, "not-a-node!", "tcp", 1, "{}", 1) == -1);
+    assert(gw_store_rule_put(db, name, "bogus", 1, "{}", 1) == -1);
     sqlite3_close(db);
     assert(!gw_store_open(&db, path));
     assert(gw_store_resolve(db, first, name) == 1 && !strcmp(name, original));

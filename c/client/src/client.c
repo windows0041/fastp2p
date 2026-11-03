@@ -1417,6 +1417,94 @@ static void report_apps(fastp2p_client *c) {
     ws_json(c, 6, 3, root);
     json_object_put(root);
 }
+static int rule_protocol(fastp2p_client *c, int index, const char *protocol) {
+    app *a = &c->apps[index];
+    if (!strcmp(protocol, "socks5"))
+        return a->socks;
+    if (!strcmp(protocol, "udp"))
+        return a->udp && !a->socks;
+    return !a->udp && !a->socks;
+}
+static void remove_rule(fastp2p_client *c, int index) {
+    app *a = &c->apps[index];
+    for (int i = 0; i < NO; ++i)
+        if (c->overlays[i].used && c->overlays[i].app_index == index)
+            close_overlay(c, i, 0);
+    if (a->tunnel_index >= 0)
+        close_tunnel(c, a->tunnel_index, "rule removed");
+    if (a->fd >= 0)
+        op_close(a->fd);
+    memset(a, 0, sizeof(*a));
+    a->fd = -1;
+    a->tunnel_index = -1;
+}
+static void apply_rule(fastp2p_client *c, json_object *j) {
+    uint64_t src = op_integer(j, "srcPort"), dst = op_integer(j, "dstPort");
+    int transport_tcp = (op_integer(j, "punchPriority") & 2) != 0;
+    const char *protocol = op_string(j, "protocol");
+    /* Re-applying a rule (edit, re-enable, or a fresh RULE_SYNC) replaces the
+     * one with the same identity rather than being rejected as a duplicate. */
+    if (src && src <= 65535 && *protocol)
+        for (int i = 0; i < NA; ++i)
+            if (c->apps[i].used && c->apps[i].local && c->apps[i].port == src &&
+                rule_protocol(c, i, protocol)) {
+                remove_rule(c, i);
+                break;
+            }
+    if (src && src <= 65535 && !strcmp(protocol, "socks5")) {
+            /* A SOCKS5 exit has no fixed destination: the target is chosen by each
+             * client request and resolved at the peer. The console still picks the
+             * local entry port, so honour it here instead of requiring dstPort. */
+            const char *user = op_string(j, "Username"), *password = op_string(j, "Password");
+            const char *bind = op_string(j, "whitelist");
+            fastp2p_socks5 proxy = {.struct_size = sizeof(proxy),
+                                   .name = op_string(j, "appName"),
+                                   .bind_ip = *bind ? bind : "127.0.0.1",
+                                   .local_port = (uint16_t)src,
+                                   .peer_node = op_string(j, "peerNode"),
+                                   .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
+                                                              : FASTP2P_TRANSPORT_QUIC,
+                                   .username = *user ? user : NULL,
+                                   .password = *password ? password : NULL};
+            if (!*user != !*password) {
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL,
+                     "SOCKS5 needs both a username and a password, or neither");
+            } else {
+                uint64_t id = 0;
+                int rv = fastp2p_client_add_socks5(c, &proxy, &id);
+                if (rv)
+                    emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add SOCKS5 forwarding rule");
+                else {
+                    /* add_socks5 predates named relays, so apply the console's
+                     * choice to the app it just created rather than widening the
+                     * public ABI. */
+                    const char *relay = op_string(j, "relayNode");
+                    if (*relay && valid_node(relay))
+                        for (int i = 0; i < NA; ++i)
+                            if (c->apps[i].used && c->apps[i].id == id) {
+                                copy_string(c->apps[i].relay_node,
+                                            sizeof(c->apps[i].relay_node), relay);
+                                break;
+                            }
+                }
+            }
+        } else if (src && src <= 65535 && dst && dst <= 65535) {
+            fastp2p_forward f = {.struct_size = sizeof(f),
+                              .name = op_string(j, "appName"),
+                              .local_port = (uint16_t)src,
+                              .peer_node = op_string(j, "peerNode"),
+                              .destination_host = op_string(j, "dstHost"),
+                              .destination_port = (uint16_t)dst,
+                              .protocol = op_string(j, "protocol"),
+                              .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
+                                                          : FASTP2P_TRANSPORT_QUIC,
+                              .relay_node = op_string(j, "relayNode")};
+            int rv = fastp2p_client_add_forward(c, &f, NULL);
+            if (rv)
+                emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add gateway forwarding rule");
+        }
+}
+
 static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, const uint8_t *data,
                             size_t len) {
     c->last_rx = mono();
@@ -1632,64 +1720,35 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 }
     } else if (main == 3 && sub == 7)
         report_apps(c);
-    else if (main == 3 && sub == 9) {
-        uint64_t src = op_integer(j, "srcPort"), dst = op_integer(j, "dstPort");
-        int transport_tcp = (op_integer(j, "punchPriority") & 2) != 0;
-        if (src && src <= 65535 && !strcmp(op_string(j, "protocol"), "socks5")) {
-            /* A SOCKS5 exit has no fixed destination: the target is chosen by each
-             * client request and resolved at the peer. The console still picks the
-             * local entry port, so honour it here instead of requiring dstPort. */
-            const char *user = op_string(j, "Username"), *password = op_string(j, "Password");
-            const char *bind = op_string(j, "whitelist");
-            fastp2p_socks5 proxy = {.struct_size = sizeof(proxy),
-                                   .name = op_string(j, "appName"),
-                                   .bind_ip = *bind ? bind : "127.0.0.1",
-                                   .local_port = (uint16_t)src,
-                                   .peer_node = op_string(j, "peerNode"),
-                                   .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
-                                                              : FASTP2P_TRANSPORT_QUIC,
-                                   .username = *user ? user : NULL,
-                                   .password = *password ? password : NULL};
-            if (!*user != !*password) {
-                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL,
-                     "SOCKS5 needs both a username and a password, or neither");
-            } else {
-                uint64_t id = 0;
-                int rv = fastp2p_client_add_socks5(c, &proxy, &id);
-                if (rv)
-                    emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add SOCKS5 forwarding rule");
-                else {
-                    /* add_socks5 predates named relays, so apply the console's
-                     * choice to the app it just created rather than widening the
-                     * public ABI. */
-                    const char *relay = op_string(j, "relayNode");
-                    if (*relay && valid_node(relay))
-                        for (int i = 0; i < NA; ++i)
-                            if (c->apps[i].used && c->apps[i].id == id) {
-                                copy_string(c->apps[i].relay_node,
-                                            sizeof(c->apps[i].relay_node), relay);
-                                break;
-                            }
-                }
+    else if (main == 3 && sub == 16) {
+        /* RULE_SYNC: the gateway is the source of truth. Drop every local rule
+         * first, then rebuild exactly the enabled set it persisted. */
+        json_object *rules = op_get(j, "Rules");
+        for (int i = 0; i < NA; ++i)
+            if (c->apps[i].used && c->apps[i].local)
+                remove_rule(c, i);
+        if (rules && json_object_is_type(rules, json_type_array))
+            for (size_t k = 0; k < json_object_array_length(rules); ++k) {
+                json_object *rule = json_object_array_get_idx(rules, k);
+                if (json_object_is_type(rule, json_type_object))
+                    apply_rule(c, rule);
             }
-        } else if (src && src <= 65535 && dst && dst <= 65535) {
-            fastp2p_forward f = {.struct_size = sizeof(f),
-                              .name = op_string(j, "appName"),
-                              .local_port = (uint16_t)src,
-                              .peer_node = op_string(j, "peerNode"),
-                              .destination_host = op_string(j, "dstHost"),
-                              .destination_port = (uint16_t)dst,
-                              .protocol = op_string(j, "protocol"),
-                              .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
-                                                          : FASTP2P_TRANSPORT_QUIC,
-                              .relay_node = op_string(j, "relayNode")};
-            int rv = fastp2p_client_add_forward(c, &f, NULL);
-            if (rv)
-                emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add gateway forwarding rule");
-        }
+    } else if (main == 3 && sub == 17) {
+        /* RULE_REMOVE: a rule was disabled, deleted, or had its key changed. */
+        const char *protocol = op_string(j, "protocol");
+        uint64_t port = op_integer(j, "srcPort");
+        for (int i = 0; i < NA; ++i)
+            if (c->apps[i].used && c->apps[i].local && c->apps[i].port == port &&
+                rule_protocol(c, i, protocol)) {
+                remove_rule(c, i);
+                break;
+            }
+    } else if (main == 3 && sub == 9) {
+        apply_rule(c, j);
     }
     json_object_put(j);
 }
+
 /* Seal one application frame into the tunnel.  Every frame that carries
  * application data or application control is authenticated and encrypted with
  * the session keys, so a relay hop only ever sees opaque bytes. */

@@ -25,4 +25,22 @@ json_object *gw_store_list(sqlite3 *db, const char *search, unsigned limit, unsi
 int gw_device_valid(const char *device);
 int gw_store_manual_status(sqlite3 *db, const char *name);
 int gw_store_resolve(sqlite3 *db, const char *device, char name[32]);
+
+/* Persistent per-node forwarding / SOCKS5 rules. The payload is the complete
+ * rule JSON as sent by the console; the gateway stores it verbatim so adding a
+ * field later does not require a schema change. Rules are keyed by the pair the
+ * console already uses: (protocol, srcPort). */
+int gw_store_rule_put(sqlite3 *db, const char *node, const char *protocol,
+                      unsigned src_port, const char *payload, int enabled);
+int gw_store_rule_delete(sqlite3 *db, const char *node, const char *protocol,
+                         unsigned src_port);
+int gw_store_rule_set_enabled(sqlite3 *db, const char *node, const char *protocol,
+                              unsigned src_port, int enabled);
+/* Returns a JSON array of {protocol, srcPort, enabled, payload} objects, or NULL
+ * on failure. The caller owns the returned reference. */
+json_object *gw_store_rules(sqlite3 *db, const char *node);
+/* A node becomes gateway-managed the first time the console writes a rule for
+ * it. That fact survives deleting the last rule, so a restart does not silently
+ * fall back to rules from a local config file. */
+int gw_store_rule_managed(sqlite3 *db, const char *node);
 #endif

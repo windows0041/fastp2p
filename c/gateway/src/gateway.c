@@ -205,6 +205,28 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         json_object *ack = json_object_new_object();
         send_json(c, 6, 7, ack);
         json_object_put(ack);
+        /* Restore persisted rules on (re)connection, but only for nodes the
+         * console has taken ownership of. A node that has never had a stored
+         * rule keeps whatever its local config file defines. */
+        json_object *stored = gw_store_rule_managed(g.db, c->node)
+                                  ? gw_store_rules(g.db, c->node) : NULL;
+        if (stored) {
+            json_object *sync = json_object_new_object(), *rules = json_object_new_array();
+            for (size_t i = 0; i < json_object_array_length(stored); ++i) {
+                json_object *entry = json_object_array_get_idx(stored, i);
+                if (!gw_integer(entry, "enabled"))
+                    continue;
+                json_object *rule = gw_get(entry, "rule");
+                if (rule) {
+                    json_object_get(rule);
+                    json_object_array_add(rules, rule);
+                }
+            }
+            json_object_object_add(sync, "Rules", rules);
+            send_json(c, 3, 16, sync); /* RULE_SYNC */
+            json_object_put(sync);
+            json_object_put(stored);
+        }
         json_object *online = json_object_new_object();
         gw_js(online, "node", c->node);
         for (unsigned i = 0; i < g.max_nodes; ++i)
@@ -451,15 +473,14 @@ static void http_error(struct connection *c, int status, unsigned code, const ch
     json_object_put(j);
 }
 static void capabilities(json_object *node) {
-    const char *os = gw_string(node, "os");
-    size_t length = strlen(os);
-    int c_client = length >= 2 && !strcmp(os + length - 2, "-c");
-    int active = gw_integer(node, "isActive") != 0;
+    /* Rules live in the gateway database, so listing, adding, editing, toggling
+     * and deleting work whether or not the node is online. Changes are applied
+     * immediately when connected, and on the next connection otherwise. */
     json_object *caps = json_object_new_object();
-    json_object_object_add(caps, "readApps", json_object_new_boolean(active));
-    json_object_object_add(caps, "addForward", json_object_new_boolean(active));
-    json_object_object_add(caps, "editForward", json_object_new_boolean(active && !c_client));
-    json_object_object_add(caps, "switchForward", json_object_new_boolean(active && !c_client));
+    json_object_object_add(caps, "readApps", json_object_new_boolean(1));
+    json_object_object_add(caps, "addForward", json_object_new_boolean(1));
+    json_object_object_add(caps, "editForward", json_object_new_boolean(1));
+    json_object_object_add(caps, "switchForward", json_object_new_boolean(1));
     json_object_object_add(node, "capabilities", caps);
 }
 static json_object *devices(void) {
@@ -751,34 +772,58 @@ static void handle_http(struct connection *c) {
     }
     const char *start = c->uri + prefix_len, *end = strchr(start, '/');
     char name[32];
-    if (!end || (size_t)(end - start) >= sizeof(name)) {
+    size_t length = end ? (size_t)(end - start) : strlen(start);
+    if (!end || length >= sizeof(name)) {
         http_error(c, 404, 1, "not found");
         return;
     }
-    memcpy(name, start, (size_t)(end - start));
-    name[end - start] = 0;
-    struct connection *target = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
-    if (!target) {
-        http_error(c, 200, 1, "device offline");
+    memcpy(name, start, length);
+    name[length] = 0;
+    if (!gw_node_valid(name)) {
+        http_error(c, 400, 1, "invalid node name");
         return;
     }
+    /* The database is the source of truth. A node does not have to be online
+     * for its rules to be listed, added, edited or removed; the change is simply
+     * queued by being stored and applied on the client's next connection. */
+    struct connection *target = find_node(gw_node_id(name));
+
     if (!c->post && !strcmp(end, "/apps")) {
-        if (target->pending_http) {
-            http_error(c, 409, 10, "request already pending");
+        json_object *list = gw_store_rules(g.db, name);
+        if (!list) {
+            http_error(c, 503, 1, "rule storage unavailable");
             return;
         }
-        if (send_json(target, 3, 7, NULL)) {
-            http_error(c, 503, 1, "device unavailable");
-            return;
+        /* Flatten the stored payloads into the shape the console already reads. */
+        json_object *apps = json_object_new_array();
+        for (size_t i = 0; i < json_object_array_length(list); ++i) {
+            json_object *entry = json_object_array_get_idx(list, i);
+            json_object *rule = gw_get(entry, "rule");
+            if (!rule)
+                continue;
+            json_object_get(rule);
+            if (!gw_get(rule, "enabled"))
+                gw_ju(rule, "enabled", gw_integer(entry, "enabled"));
+            if (!strcmp(gw_string(rule, "protocol"), "socks5")) {
+                /* Never send a stored SOCKS5 password back to the browser; tell
+                 * it whether one exists so editing can require re-entry. */
+                int has = *gw_string(rule, "Password") != 0;
+                json_object_object_del(rule, "Password");
+                gw_ju(rule, "hasPassword", (uint64_t)has);
+            }
+            json_object_object_add(rule, "isActive",
+                json_object_new_int(target && gw_integer(entry, "enabled") ? 1 : 0));
+            json_object_array_add(apps, rule);
         }
-        target->pending_http = c;
-        c->request_node = target;
-        c->deadline = gw_mono_ms() + 10000;
-        lws_set_timeout(c->wsi, PENDING_TIMEOUT_HTTP_CONTENT, 15);
+        json_object_put(list);
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "Apps", apps);
+        http_json(c, 200, root);
+        json_object_put(root);
         return;
     }
     if (!c->post && !strcmp(end, "/restart")) {
-        if (send_json(target, 3, 11, NULL))
+        if (!target || send_json(target, 3, 11, NULL))
             http_error(c, 503, 1, "device unavailable");
         else
             http_reply(c, 200, "{\"error\":0}", 11);
@@ -792,20 +837,124 @@ static void handle_http(struct connection *c) {
             http_error(c, 400, 1, "invalid JSON");
             return;
         }
-        size_t os_len = strlen(target->os);
-        int c_client = os_len >= 2 && !strcmp(target->os + os_len - 2, "-c");
-        if (c_client && (!strcmp(end, "/switchapp") || gw_integer(j, "srcPort0") ||
-                         *gw_string(j, "protocol0"))) {
+        const char *protocol = gw_string(j, "protocol");
+        uint64_t src = gw_integer(j, "srcPort");
+        int switching = !strcmp(end, "/switchapp");
+
+        /* switchapp only toggles an existing rule. */
+        if (switching) {
+            int enabled = gw_integer(j, "enabled") ? 1 : 0;
             json_object_put(j);
-            http_error(c, 501, 1, "this client supports querying and adding rules only");
+            if (!*protocol || !src || src > 65535 ||
+                gw_store_rule_set_enabled(g.db, name, protocol, (unsigned)src, enabled)) {
+                http_error(c, 404, 1, "rule not found");
+                return;
+            }
+            if (target) {
+                if (!enabled) {
+                    json_object *remove = json_object_new_object();
+                    gw_js(remove, "protocol", protocol);
+                    gw_ju(remove, "srcPort", src);
+                    send_json(target, 3, 17, remove); /* RULE_REMOVE */
+                    json_object_put(remove);
+                } else {
+                    json_object *list = gw_store_rules(g.db, name);
+                    if (list)
+                        for (size_t i = 0; i < json_object_array_length(list); ++i) {
+                            json_object *entry = json_object_array_get_idx(list, i);
+                            if (!strcmp(gw_string(entry, "protocol"), protocol) &&
+                                gw_integer(entry, "srcPort") == src) {
+                                send_json(target, 3, 9, gw_get(entry, "rule")); /* RULE_APPLY */
+                                break;
+                            }
+                        }
+                    if (list)
+                        json_object_put(list);
+                }
+            }
+            http_reply(c, 200, "", 0);
             return;
         }
-        int result = send_json(target, 3, !strcmp(end, "/app") ? 9 : 10, j);
-        json_object_put(j);
-        if (result)
-            http_error(c, 503, 1, "device unavailable");
-        else
+
+        /* /app with srcPort=0 removes the rule identified by protocol0/srcPort0. */
+        if (!src) {
+            const char *old_protocol = gw_string(j, "protocol0");
+            uint64_t old_port = gw_integer(j, "srcPort0");
+            json_object_put(j);
+            if (!*old_protocol || !old_port || old_port > 65535 ||
+                gw_store_rule_delete(g.db, name, old_protocol, (unsigned)old_port)) {
+                http_error(c, 404, 1, "rule not found");
+                return;
+            }
+            if (target) {
+                json_object *remove = json_object_new_object();
+                gw_js(remove, "protocol", old_protocol);
+                gw_ju(remove, "srcPort", old_port);
+                send_json(target, 3, 17, remove);
+                json_object_put(remove);
+            }
             http_reply(c, 200, "", 0);
+            return;
+        }
+        if (src > 65535 || !*protocol ||
+            (strcmp(protocol, "tcp") && strcmp(protocol, "udp") && strcmp(protocol, "socks5"))) {
+            json_object_put(j);
+            http_error(c, 400, 1, "invalid rule");
+            return;
+        }
+
+        /* Editing carries the identity of the old rule; remove that key first. */
+        const char *old_protocol = gw_string(j, "protocol0");
+        uint64_t old_port = gw_integer(j, "srcPort0");
+        int edited = *old_protocol && old_port;
+        if (edited && !strcmp(protocol, "socks5") && gw_integer(j, "keepPassword")) {
+            /* The browser never receives a stored password. When the user leaves
+             * the field blank while editing an authenticated proxy, keep the old
+             * credentials rather than silently turning authentication off. */
+            json_object *stored = gw_store_rules(g.db, name);
+            if (stored) {
+                for (size_t i = 0; i < json_object_array_length(stored); ++i) {
+                    json_object *entry = json_object_array_get_idx(stored, i);
+                    if (strcmp(gw_string(entry, "protocol"), old_protocol) ||
+                        gw_integer(entry, "srcPort") != old_port)
+                        continue;
+                    json_object *old = gw_get(entry, "rule");
+                    if (old) {
+                        gw_js(j, "Username", gw_string(old, "Username"));
+                        gw_js(j, "Password", gw_string(old, "Password"));
+                    }
+                    break;
+                }
+                json_object_put(stored);
+            }
+        }
+        if (edited) {
+            if (gw_store_rule_delete(g.db, name, old_protocol, (unsigned)old_port)) {
+                json_object_put(j);
+                http_error(c, 404, 1, "rule not found");
+                return;
+            }
+            if (target) {
+                json_object *remove = json_object_new_object();
+                gw_js(remove, "protocol", old_protocol);
+                gw_ju(remove, "srcPort", old_port);
+                send_json(target, 3, 17, remove);
+                json_object_put(remove);
+            }
+        }
+        /* Normalise the identity fields before storing the payload verbatim. */
+        gw_js(j, "protocol", protocol);
+        gw_ju(j, "srcPort", src);
+        const char *payload = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
+        int rv = gw_store_rule_put(g.db, name, protocol, (unsigned)src, payload, 1);
+        if (target && !rv)
+            send_json(target, 3, 9, j); /* RULE_APPLY */
+        json_object_put(j);
+        if (rv) {
+            http_error(c, 503, 1, "rule storage unavailable");
+            return;
+        }
+        http_reply(c, 200, "", 0);
         return;
     }
     http_error(c, 404, 1, "not found");

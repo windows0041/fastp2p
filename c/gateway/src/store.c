@@ -29,7 +29,7 @@ int gw_store_open(sqlite3 **out, const char *path) {
     sqlite3_int64 app = 0, version = 0, tables = 0;
     if (scalar(db, "PRAGMA application_id", &app) || scalar(db, "PRAGMA user_version", &version) ||
         scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &tables) ||
-        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 2)
+        (app != APP_ID && app != PREVIOUS_APP_ID && (app != 0 || tables != 0)) || version > 3)
         goto fail;
     /* One event-loop writer; rollback journaling also supports simple offline backups. */
     if (sql(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;") ||
@@ -46,7 +46,13 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "CREATE TABLE IF NOT EXISTS admin(id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL,"
                 "salt BLOB NOT NULL CHECK(length(salt)=16),password_hash BLOB NOT NULL CHECK(length(password_hash)=32),"
                 "iterations INTEGER NOT NULL,jwt_secret TEXT NOT NULL CHECK(length(jwt_secret)=64));"
-                "PRAGMA application_id=1179660880; PRAGMA user_version=2;"
+                "CREATE TABLE IF NOT EXISTS rules("
+                "node TEXT NOT NULL,protocol TEXT NOT NULL,src_port INTEGER NOT NULL,"
+                "payload TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN(0,1)),"
+                "PRIMARY KEY(node,protocol,src_port),"
+                "FOREIGN KEY(node) REFERENCES nodes(name) ON DELETE CASCADE);"
+                "CREATE TABLE IF NOT EXISTS rule_nodes(node TEXT PRIMARY KEY);"
+                "PRAGMA application_id=1179660880; PRAGMA user_version=3;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
     *out = db;
@@ -310,4 +316,115 @@ json_object *gw_store_list(sqlite3 *db, const char *search, unsigned limit, unsi
         return NULL;
     }
     return root;
+}
+
+/* --- Persistent per-node rules -------------------------------------------
+ * The gateway is the source of truth. It stores the console's rule JSON
+ * verbatim; only the identity fields (node, protocol, port) and the enabled
+ * flag are normalised into columns so editing and toggling are unambiguous. */
+static int rule_identity(const char *node, const char *protocol, unsigned src_port) {
+    return !gw_node_valid(node) || !protocol ||
+           (strcmp(protocol, "tcp") && strcmp(protocol, "udp") && strcmp(protocol, "socks5")) ||
+           !src_port || src_port > 65535;
+}
+int gw_store_rule_put(sqlite3 *db, const char *node, const char *protocol,
+                      unsigned src_port, const char *payload, int enabled) {
+    if (rule_identity(node, protocol, src_port) || !payload || !*payload)
+        return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO rules(node,protocol,src_port,payload,enabled) VALUES(?1,?2,?3,?4,?5) "
+        "ON CONFLICT(node,protocol,src_port) DO UPDATE SET payload=excluded.payload,"
+        "enabled=excluded.enabled", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, node, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, protocol, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 3, (int)src_port);
+    sqlite3_bind_text(s, 4, payload, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 5, enabled ? 1 : 0);
+    int ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_finalize(s);
+    if (!ok)
+        return -1;
+    /* Remember that this node's rules are owned by the gateway, even if every
+     * rule is later removed. */
+    sqlite3_stmt *marker = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO rule_nodes(node) VALUES(?1)",
+                           -1, &marker, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(marker, 1, node, -1, SQLITE_TRANSIENT);
+        sqlite3_step(marker);
+        sqlite3_finalize(marker);
+    }
+    return 0;
+}
+int gw_store_rule_managed(sqlite3 *db, const char *node) {
+    if (!gw_node_valid(node))
+        return 0;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM rule_nodes WHERE node=?1", -1, &s, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, node, -1, SQLITE_TRANSIENT);
+    int managed = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_finalize(s);
+    return managed;
+}
+int gw_store_rule_delete(sqlite3 *db, const char *node, const char *protocol,
+                         unsigned src_port) {
+    if (rule_identity(node, protocol, src_port))
+        return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM rules WHERE node=?1 AND protocol=?2 AND src_port=?3",
+                           -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, node, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, protocol, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 3, (int)src_port);
+    int ok = sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0;
+    sqlite3_finalize(s);
+    return ok ? 0 : -1;
+}
+int gw_store_rule_set_enabled(sqlite3 *db, const char *node, const char *protocol,
+                              unsigned src_port, int enabled) {
+    if (rule_identity(node, protocol, src_port))
+        return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE rules SET enabled=?4 WHERE node=?1 AND protocol=?2 "
+                           "AND src_port=?3", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(s, 1, node, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, protocol, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 3, (int)src_port);
+    sqlite3_bind_int(s, 4, enabled ? 1 : 0);
+    int ok = sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0;
+    sqlite3_finalize(s);
+    return ok ? 0 : -1;
+}
+json_object *gw_store_rules(sqlite3 *db, const char *node) {
+    if (!gw_node_valid(node))
+        return NULL;
+    json_object *list = json_object_new_array();
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT protocol,src_port,payload,enabled FROM rules "
+                           "WHERE node=?1 ORDER BY protocol,src_port", -1, &s, NULL) != SQLITE_OK) {
+        json_object_put(list);
+        return NULL;
+    }
+    sqlite3_bind_text(s, 1, node, -1, SQLITE_TRANSIENT);
+    int result;
+    while ((result = sqlite3_step(s)) == SQLITE_ROW) {
+        json_object *rule = json_object_new_object();
+        gw_js(rule, "protocol", (const char *)sqlite3_column_text(s, 0));
+        gw_ju(rule, "srcPort", (uint64_t)sqlite3_column_int(s, 1));
+        gw_ju(rule, "enabled", (uint64_t)sqlite3_column_int(s, 3));
+        /* Embed the stored JSON as an object so the client can apply it directly. */
+        json_object *payload = json_tokener_parse((const char *)sqlite3_column_text(s, 2));
+        json_object_object_add(rule, "rule", payload ? payload : json_object_new_object());
+        json_object_array_add(list, rule);
+    }
+    sqlite3_finalize(s);
+    if (result != SQLITE_DONE) {
+        json_object_put(list);
+        return NULL;
+    }
+    return list;
 }
