@@ -27,7 +27,7 @@ KINDS = {
         'fastp2p-gateway-linux-static-aarch64.tar.gz',
         'fastp2p-gateway-docker-amd64.tar.gz']),
     'client': ('fastp2p-client', 'c/client/CMakeLists.txt', [
-        'fastp2p-sdk-linux-x86_64.tar.gz', 'fastp2p-windows-x86_64.zip',
+        'fastp2p-sdk-linux-x86_64.tar.gz', 'fastp2p-windows-x86_64.exe',
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
         'fastp2p-android.apk',
         'fastp2p-linux-static-x86_64.tar.gz', 'fastp2p-linux-static-aarch64.tar.gz',

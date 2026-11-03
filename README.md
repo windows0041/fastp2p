@@ -10,25 +10,19 @@
 
 | 平台 | 客户端 | 自动运行 |
 | --- | --- | --- |
-| Windows x86_64 | `fastp2p-windows-x86_64.zip` | 当前用户登录后启动 |
+| Windows x86_64 | `fastp2p-windows-x86_64.exe` | Windows 服务（开机自启、失败自动重启） |
 | Linux（静态） | `fastp2p-linux-static-{x86_64,aarch64,armv7,i686,riscv64,s390x,ppc64le,mips64el}.tar.gz` | root 安装 systemd 服务 |
 | macOS ARM64 / x86_64 | `fastp2p-macos-{arm64,x86_64}.tar.gz` | 用户 LaunchAgent |
 | Android ARM64 / x86_64 | `fastp2p-android.apk` | 前台服务及开机恢复 |
 
-桌面客户端无需旁带项目 DLL/共享库，SDK 单独提供（`fastp2p-sdk-linux-x86_64.tar.gz` 是需要链接本项目的 C 应用用的开发包）。Linux 客户端只有一套静态 musl 构建：static-pie，不依赖目标机 libc，Debian、Ubuntu、Alpine 以及路由器和 NAS 用的是同一个文件。每个平台只发布压缩包，使用同一 Release 的 SHA256SUMS.txt 校验下载。
+桌面客户端无需旁带项目 DLL/共享库，Linux SDK 单独提供（`fastp2p-sdk-linux-x86_64.tar.gz` 是链接本项目的 C 应用用的开发包）。Linux 客户端只有一套静态 musl 构建：static-pie，不依赖目标机 libc，Debian、Ubuntu、Alpine 以及路由器和 NAS 用的是同一个文件。使用同一 Release 的 SHA256SUMS.txt 校验下载。
 
 在网关 Web 登录后取得 16 位数字安装 Token。专用客户端包已预置网关地址和公开 CA。客户端先校验证书链、主机名和网关登录，再保存配置。不要公开 Token。
 
-Windows：
-
-```powershell
-Expand-Archive fastp2p-windows-x86_64.zip -Destination C:\Tools
-C:\Tools\windows-x86_64\bin\fastp2p.exe install --token-file .\token.txt
-```
-
-安装器会先验证网关证书与主机名，再写入 `%LOCALAPPDATA%\fastp2p\`（配置为 DPAPI 加密）并在
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册名为 `fastp2p` 的自启项，最后在后台启动。
-加 `--no-service` 可只安装不要自启；升级时用新包再执行一次同样的 `install`，设备身份与节点名保持不变。
+Windows 下载的是一个 `fastp2p-windows-x86_64.exe`。**用安装 Token 给它重命名**（例如
+`fastp2p-9864596884675924.exe`），然后双击：系统弹出 UAC 授权框，确认后打开一个终端窗口显示安装进度，
+结束用弹窗报告结果，点「确定」终端自动关闭。安装器从文件名读取 Token，注册为 Windows 服务并设为开机自启。
+详见 [Windows 安装说明](c/client/WINDOWS-INSTALL-ZH.md)。
 
 Linux：
 

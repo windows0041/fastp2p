@@ -241,6 +241,7 @@ void fastp2p_install_note(const char *text) {
 }
 static int install_token(const char *token, const char *token_file, const char *profile,
                          const char *node, int no_service, int machine) {
+    if (machine) fastp2p_install_step("[1/5] 正在读取文件名中的安装密钥并准备环境…");
     if (!token && !token_file) token = getenv("FASTP2P_INSTALL_TOKEN");
     unsigned char *owned = NULL;
     if (token_file && !token) {
@@ -319,6 +320,7 @@ static int install_token(const char *token, const char *token_file, const char *
     if (*ca) json_object_object_add(root, "CACertFile", json_object_new_string(ca_path));
     fastp2p_client *client = NULL;
     verification result = {0};
+    if (machine) fastp2p_install_step("[2/5] 正在连接网关并校验证书与密钥（最多 25 秒）…");
     if (fastp2p_client_create_json(json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN),
                                   NULL, NULL, verified, &result, &client)) goto fail;
     int started = !fastp2p_client_start(client);
@@ -337,11 +339,13 @@ static int install_token(const char *token, const char *token_file, const char *
         if (previous && json_object_object_get_ex(previous, arrays[i], &value))
             json_object_object_add(root, arrays[i], json_object_get(value));
     }
+    if (machine) fastp2p_install_step("[3/5] 网关校验通过，正在写入加密配置…");
     const char *plain = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
     if ((machine ? fastp2p_profile_write_machine(profile, plain)
                  : fastp2p_profile_write(profile, plain))) goto fail;
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
     if (!no_service) {
+        if (machine) fastp2p_install_step("[4/5] 正在注册 Windows 服务并设为开机自启…");
         int installed = machine ? fastp2p_service_install(profile, custom_ca ? ca_path : NULL)
                                 : fastp2p_enable_autostart(profile, custom_ca ? ca_path : NULL);
         if (installed) {
@@ -350,6 +354,11 @@ static int install_token(const char *token, const char *token_file, const char *
         }
     }
     printf("fastp2p installed; gateway identity verified; node=%s\n", result.node);
+    if (machine) {
+        char done[160];
+        snprintf(done, sizeof(done), "[5/5] 安装完成，节点名：%s", result.node);
+        fastp2p_install_step(done);
+    }
     fastp2p_install_note("installed");
     return 0;
 fail:
@@ -405,7 +414,26 @@ int fastp2p_service_install_token(const char *token) {
      * elevated copy repeats this work, so report the hand-off rather than a
      * result this process never saw. */
     if (!fastp2p_service_elevated()) return fastp2p_service_elevate(NULL) == 0 ? 3 : 1;
+    /* The elevated copy gets its own progress terminal. */
+    fastp2p_installer_ui_begin();
     char profile[4096];
-    if (fastp2p_service_profile(profile)) return 1;
-    return install_token(token, NULL, profile, NULL, 0, 1) ? 1 : 0;
+    if (fastp2p_service_profile(profile)) {
+        fastp2p_installer_ui_result(0, "fastp2p 安装失败",
+            "无法定位系统配置目录（%ProgramData%）。\n请确认以管理员身份运行。");
+        return 1;
+    }
+    int rv = install_token(token, NULL, profile, NULL, 0, 1);
+    if (rv == 0) {
+        fastp2p_installer_ui_result(1, "fastp2p 安装完成",
+            "安装成功！\n\n服务已注册为开机自启，并会在异常退出时自动重启。\n"
+            "可在「服务」中查看 fastp2p，或用 sc query fastp2p 查询状态。");
+    } else {
+        fastp2p_installer_ui_result(0, "fastp2p 安装失败",
+            "安装未能完成。\n\n常见原因：\n"
+            "· 无法连接网关（网络不通或网关证书校验失败）\n"
+            "· 文件名中的 16 位安装密钥不正确\n"
+            "· C:\\ProgramData\\fastp2p 权限异常\n\n"
+            "详细信息已写入 %ProgramData%\\fastp2p\\install.log。");
+    }
+    return rv ? 1 : 0;
 }

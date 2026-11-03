@@ -255,18 +255,15 @@ int main(int argc, char **argv) {
         char token[17];
         int named = fastp2p_name_token(argv[0], token);
         if (named == -2)
-            fputs("The file name holds a 16-digit number, but not a valid key.\n", stderr);
+            fastp2p_installer_ui_result(0, "fastp2p 安装失败",
+                "文件名里有一串 16 位数字，但不是有效的安装密钥。\n\n"
+                "请确认文件名包含网关控制台提供的 16 位数字（不以 0 开头），且没有被改名工具改动。");
         if (named == 0) {
+            /* Unelevated: hand off to the system UAC prompt and exit silently. The
+             * elevated copy shows the progress terminal and the result dialog. */
             int rv = fastp2p_service_install_token(token);
-            if (rv == 0)
-                puts("fastp2p service installed; it starts with Windows and restarts if it stops.");
-            else if (rv == 3)
-                puts("Waiting for administrator approval; the installer continues in the new window.");
-            else
-                fputs("fastp2p could not be installed. Run it as an administrator, and make "
-                      "sure the file name still contains the 16-digit token.\n"
-                      "Details were written to %TEMP%\\fastp2p-install.log\n", stderr);
-            fastp2p_install_pause();
+            if (rv == 1)
+                fputs("fastp2p could not request administrator approval.\n", stderr);
             return rv == 3 ? 0 : rv;
         }
     }

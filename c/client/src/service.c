@@ -76,17 +76,6 @@ static void WINAPI service_main(DWORD argc, LPWSTR *argv) {
 
 int fastp2p_service_supported(void) { return 1; }
 
-void fastp2p_install_pause(void) {
-    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    if (input == INVALID_HANDLE_VALUE || input == NULL) return;
-    DWORD mode = 0;
-    if (!GetConsoleMode(input, &mode)) return; /* no console to hold open */
-    fputs("Press Enter to close.\n", stdout);
-    fflush(stdout);
-    char ignored[8];
-    (void)!fgets(ignored, sizeof(ignored), stdin);
-}
-
 int fastp2p_service_dispatch(const char *profile, int argc, char **argv,
                              int (*loop)(int, char **)) {
     if (!loop || !profile)
@@ -386,7 +375,6 @@ int fastp2p_service_elevate(const char *arguments) {
 #else /* POSIX: services are installed by the platform scripts, not this binary. */
 
 int fastp2p_service_supported(void) { return 0; }
-void fastp2p_install_pause(void) {}
 int fastp2p_service_dispatch(const char *profile, int argc, char **argv,
                              int (*loop)(int, char **)) {
     (void)profile;

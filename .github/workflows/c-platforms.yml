@@ -211,14 +211,18 @@ jobs:
           copy /y dist\windows-x86_64\bin\fastp2p.dll build\msvc\fastp2p.dll
           build\msvc\sdk-consumer.exe
           if errorlevel 1 exit /b 1
-      - name: Package Windows CLI and SDK
+      # Windows is shipped as one exe. It carries no token: users rename it with
+      # their 16-digit key after downloading, then double-click to install. The
+      # Windows SDK (dll/headers) is no longer a Release asset; developers can
+      # still get it from the cross job's windows-validation CI artifact.
+      - name: Package Windows installer exe
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/windows-x86_64 -DestinationPath dist/fastp2p-windows-x86_64.zip
+          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-windows-x86_64
-          path: dist/fastp2p-windows-x86_64.zip
+          path: dist/fastp2p-windows-x86_64.exe
   linux:
     runs-on: ubuntu-24.04
     container:
