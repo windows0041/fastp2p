@@ -48,6 +48,21 @@ int fastp2p_default_profile(char out[4096]) {
 #endif
     return size > 0 && size < 4096 ? 0 : -1;
 }
+#ifdef _WIN32
+/* The service runs as LocalSystem, which cannot read a per-user profile, so a
+ * machine install keeps its own copy under ProgramData. */
+int fastp2p_service_profile(char out[4096]) {
+    const char *base = getenv("ProgramData");
+    if (!base || !*base) return -1;
+    int size = snprintf(out, 4096, "%s/fastp2p/client.dat", base);
+    return size > 0 && size < 4096 ? 0 : -1;
+}
+#else
+int fastp2p_service_profile(char out[4096]) {
+    int size = snprintf(out, 4096, "/etc/fastp2p/client.json");
+    return size > 0 && size < 4096 ? 0 : -1;
+}
+#endif
 static unsigned char *read_file(const char *path, size_t maximum, size_t *length) {
 #ifdef _WIN32
     WCHAR name[4096];
@@ -149,6 +164,29 @@ static int ensure_ca(const char *path, const char *ca) {
     }
     return write_private(path, (const unsigned char *)ca, strlen(ca));
 }
+#ifdef _WIN32
+static int protect_and_write(const char *path, const char *text, DWORD scope) {
+    DATA_BLOB input = {(DWORD)strlen(text), (BYTE *)text}, output = {0};
+    if (!CryptProtectData(&input, L"fastp2p client profile", NULL, NULL, NULL,
+                          CRYPTPROTECT_UI_FORBIDDEN | scope, &output)) return -1;
+    unsigned char *data = malloc((size_t)output.cbData + 4);
+    if (!data) { LocalFree(output.pbData); return -1; }
+    memcpy(data, "FPD1", 4); memcpy(data + 4, output.pbData, output.cbData);
+    int result = write_private(path, data, (size_t)output.cbData + 4);
+    OPENSSL_cleanse(data, (size_t)output.cbData + 4); free(data);
+    SecureZeroMemory(output.pbData, output.cbData); LocalFree(output.pbData);
+    return result;
+}
+/* Bound to the machine instead of the user, so the service account can read it.
+ * The file still sits in a directory only administrators may open. */
+int fastp2p_profile_write_machine(const char *path, const char *text) {
+    return protect_and_write(path, text, CRYPTPROTECT_LOCAL_MACHINE);
+}
+#else
+int fastp2p_profile_write_machine(const char *path, const char *text) {
+    return fastp2p_profile_write(path, text);
+}
+#endif
 int fastp2p_profile_write(const char *path, const char *text) {
 #ifdef _WIN32
     DATA_BLOB input = {(DWORD)strlen(text), (BYTE *)text}, output = {0};
@@ -178,19 +216,8 @@ static const char *field(json_object *root, const char *key) {
     json_object *value = NULL;
     return json_object_object_get_ex(root, key, &value) ? json_object_get_string(value) : "";
 }
-int fastp2p_install_command(int argc, char **argv) {
-    const char *token = NULL, *token_file = NULL, *profile = NULL, *node = NULL;
-    int no_service = 0;
-    for (int i = 2; i < argc; ++i) {
-        if (!strcmp(argv[i], "--no-service")) { no_service = 1; continue; }
-        if (i + 1 >= argc) return 2;
-        const char *name = argv[i], *value = argv[++i];
-        if (!strcmp(name, "--token")) token = value;
-        else if (!strcmp(name, "--token-file")) token_file = value;
-        else if (!strcmp(name, "--config")) profile = value;
-        else if (!strcmp(name, "--node")) node = value;
-        else return 2;
-    }
+static int install_token(const char *token, const char *token_file, const char *profile,
+                         const char *node, int no_service, int machine) {
     if (!token && !token_file) token = getenv("FASTP2P_INSTALL_TOKEN");
     unsigned char *owned = NULL;
     if (token_file && !token) {
@@ -222,7 +249,12 @@ int fastp2p_install_command(int argc, char **argv) {
     if (owned) { OPENSSL_cleanse(owned, strlen((char *)owned)); free(owned); }
     if (!enrollment) { fputs("Invalid installation token or public gateway preset. Copy the 16-digit token from the gateway console.\n", stderr); return 2; }
     char default_path[4096], ca_path[4096], identity[33];
-    if (!profile) { if (fastp2p_default_profile(default_path)) { json_object_put(enrollment); return 2; } profile = default_path; }
+    if (!profile) {
+        int failed = machine ? fastp2p_service_profile(default_path) : fastp2p_default_profile(default_path);
+        if (failed) { json_object_put(enrollment); return 2; }
+        profile = default_path;
+    }
+    if (machine && fastp2p_service_prepare(profile)) { json_object_put(enrollment); return 1; }
     const char *ca = field(enrollment, "ca");
     int custom_ca = *ca != 0;
     unsigned char digest[32]; unsigned digest_length;
@@ -271,14 +303,70 @@ int fastp2p_install_command(int argc, char **argv) {
         if (previous && json_object_object_get_ex(previous, arrays[i], &value))
             json_object_object_add(root, arrays[i], json_object_get(value));
     }
-    if (fastp2p_profile_write(profile, json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN))) goto fail;
+    const char *plain = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    if ((machine ? fastp2p_profile_write_machine(profile, plain)
+                 : fastp2p_profile_write(profile, plain))) goto fail;
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
-    if (!no_service && fastp2p_enable_autostart(profile, custom_ca ? ca_path : NULL)) {
-        fputs("Gateway verified and profile saved; automatic startup could not be installed.\n", stderr); return 1;
+    if (!no_service) {
+        int installed = machine ? fastp2p_service_install(profile, custom_ca ? ca_path : NULL)
+                                : fastp2p_enable_autostart(profile, custom_ca ? ca_path : NULL);
+        if (installed) {
+            fputs("Gateway verified and profile saved; automatic startup could not be installed.\n", stderr);
+            return 1;
+        }
     }
     printf("fastp2p installed; gateway identity verified; node=%s\n", result.node);
     return 0;
 fail:
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
     return 1;
+}
+
+int fastp2p_install_command(int argc, char **argv) {
+    const char *token = NULL, *token_file = NULL, *profile = NULL, *node = NULL;
+    int no_service = 0, machine = 0;
+    for (int i = 2; i < argc; ++i) {
+        if (!strcmp(argv[i], "--no-service")) { no_service = 1; continue; }
+        if (!strcmp(argv[i], "--service")) { machine = 1; continue; }
+        if (i + 1 >= argc) return 2;
+        const char *name = argv[i], *value = argv[++i];
+        if (!strcmp(name, "--token")) token = value;
+        else if (!strcmp(name, "--token-file")) token_file = value;
+        else if (!strcmp(name, "--config")) profile = value;
+        else if (!strcmp(name, "--node")) node = value;
+        else return 2;
+    }
+    return install_token(token, token_file, profile, node, no_service, machine);
+}
+/* A 16-digit run in the file name is the key; that is what makes the download a
+ * single double-clickable file rather than a package plus a separate token. */
+int fastp2p_name_token(const char *path, char out[17]) {
+    const char *name = path ? path : "";
+    for (const char *p = name; *p; ++p)
+        if (*p == '/' || *p == '\\') name = p + 1;
+    const char *start = NULL;
+    int run = 0;
+    for (const char *p = name;; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            if (!run) start = p;
+            ++run;
+        } else {
+            if (run == 16) {
+                memcpy(out, start, 16);
+                out[16] = 0;
+                return fastp2p_install_key_valid(out) ? 0 : -1;
+            }
+            run = 0;
+        }
+        if (!*p) break;
+    }
+    return -1;
+}
+int fastp2p_service_install_token(const char *token) {
+    if (!fastp2p_service_supported() || !token || !*token) return 2;
+    /* Creating a service needs rights a plain double-click does not have. */
+    if (!fastp2p_service_elevated()) return fastp2p_service_elevate(NULL) == 0 ? 0 : 1;
+    char profile[4096];
+    if (fastp2p_service_profile(profile)) return 1;
+    return install_token(token, NULL, profile, NULL, 0, 1) ? 1 : 0;
 }

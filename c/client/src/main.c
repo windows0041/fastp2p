@@ -63,7 +63,8 @@ static int integer(const char *s, uint64_t *value) {
     return 0;
 }
 static void usage(void) {
-    puts("fastp2p install --token 16_DIGITS [--no-service] [--config FILE]\n"
+    puts("fastp2p install --token 16_DIGITS [--no-service] [--service] [--config FILE]\n"
+         "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
          "fastp2p stop [--config FILE]\n"
@@ -73,7 +74,7 @@ static void usage(void) {
          "FASTP2P_TOKEN overrides network.Token in the JSON configuration.\n"
          "--version prints the C library and ABI version; --licenses prints complete notices.");
 }
-int main(int argc, char **argv) {
+static int client_main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {
         return fwrite(fastp2p_notices, 1, sizeof(fastp2p_notices), stdout) == sizeof(fastp2p_notices) ? 0 : 1;
     }
@@ -244,4 +245,38 @@ done:
     fastp2p_runtime_end();
     json_object_put(root);
     return rv ? 1 : 0;
+}
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* Started from Explorer: no arguments. The key travels in the file name. */
+    if (argc == 1) {
+        char token[17];
+        if (!fastp2p_name_token(argv[0], token)) {
+            int rv = fastp2p_service_install_token(token);
+            if (rv == 0)
+                puts("fastp2p service installed; it starts with Windows and restarts if it stops.");
+            else
+                fputs("fastp2p could not be installed. Run it as an administrator, and make "
+                      "sure the file name still contains the 16-digit token.\n", stderr);
+            return rv;
+        }
+    }
+#endif
+    if (argc > 1 && !strcmp(argv[1], "service")) {
+        /* Started by the service manager; --config names the profile the installer wrote. */
+        char profile[4096];
+        const char *path = NULL;
+        for (int i = 2; i + 1 < argc; ++i)
+            if (!strcmp(argv[i], "--config"))
+                path = argv[i + 1];
+        if (!path) {
+            if (fastp2p_service_profile(profile))
+                return 2;
+            path = profile;
+        }
+        /* Drop the keyword so the rest reads like "run --config FILE". */
+        return fastp2p_service_dispatch(path, argc - 1, argv + 1, client_main);
+    }
+    return client_main(argc, argv);
 }
