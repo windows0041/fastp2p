@@ -39,7 +39,7 @@ static void notify(fastp2p_client *client, const fastp2p_event *event, void *use
         (*env)->DeleteLocalRef(env, message);
 }
 
-JNIEXPORT jlong JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_create(JNIEnv *env, jclass type,
+JNIEXPORT jlong JNICALL Java_top_fastp2p_cclient_NativeClient_create(JNIEnv *env, jclass type,
                                                                         jbyteArray json,
                                                                         jstring token, jstring ca,
                                                                         jobject listener) {
@@ -88,14 +88,14 @@ JNIEXPORT jlong JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_create(JNIEnv *
     return (jlong)(intptr_t)b;
 }
 
-JNIEXPORT jint JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_start(JNIEnv *env, jclass cls,
+JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_start(JNIEnv *env, jclass cls,
                                                                       jlong handle) {
     (void)env;
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
     return b ? fastp2p_client_start(b->client) : FASTP2P_EINVAL;
 }
-JNIEXPORT jint JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
+JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
                                                                      jlong handle) {
     (void)env;
     (void)cls;
@@ -105,7 +105,7 @@ JNIEXPORT jint JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_step(JNIEnv *env
     int rv = fastp2p_client_step(b->client, 10);
     return b->callback_failed ? FASTP2P_EIO : rv;
 }
-JNIEXPORT void JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
+JNIEXPORT void JNICALL Java_top_fastp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
                                                                         jlong handle) {
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
@@ -116,12 +116,12 @@ JNIEXPORT void JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_destroy(JNIEnv *
     (*env)->DeleteGlobalRef(env, b->listener);
     free(b);
 }
-JNIEXPORT jstring JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_version(JNIEnv *env,
+JNIEXPORT jstring JNICALL Java_top_fastp2p_cclient_NativeClient_version(JNIEnv *env,
                                                                            jclass cls) {
     (void)cls;
     return (*env)->NewStringUTF(env, fastp2p_version());
 }
-JNIEXPORT jstring JNICALL Java_cc_itq_fastp2p_cclient_NativeClient_bootstrap(JNIEnv *env, jclass cls) {
+JNIEXPORT jstring JNICALL Java_top_fastp2p_cclient_NativeClient_bootstrap(JNIEnv *env, jclass cls) {
     (void)cls;
     return (*env)->NewStringUTF(env, fastp2p_default_gateway());
 }

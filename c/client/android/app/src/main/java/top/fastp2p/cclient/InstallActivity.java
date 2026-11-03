@@ -1,4 +1,4 @@
-package cc.itq.fastp2p.cclient;
+package top.fastp2p.cclient;
 
 import android.Manifest;
 import android.app.Activity;

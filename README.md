@@ -43,7 +43,7 @@ Android 安装 APK 后，在设备浏览器打开网关“安装 Token → 安�
 
 ```sh
 adb install -r fastp2p-android.apk
-adb shell am start -n cc.itq.fastp2p.cclient/.InstallActivity --es token 'YOUR_16_DIGIT_TOKEN'
+adb shell am start -n top.fastp2p.cclient/.InstallActivity --es token 'YOUR_16_DIGIT_TOKEN'
 ```
 
 Android 无配置表单，保留系统要求的服务通知及停止入口。普通 APK 安装器不能附加业务 Token，需要随后调用接入入口。普通安装链接不能替换已有网关；迁移时先安装新网关专用的签名 APK，再由操作者携带 Token 和 `--ez migrate true` 调用同一接入入口。目标地址和 CA 只能来自 APK 内置配置，校验证书及登录成功后才保存，保留 DeviceID 和规则。同一网关更新 Token 无需迁移标记。

@@ -306,7 +306,7 @@
     finally { $('confirm-action').disabled = false; state.confirm = null; }
   });
   $('token-button').addEventListener('click', () => {
-    $('install-token').value = state.installToken; $('install-token').type = 'password'; $('android-install').href = 'intent://install?token=' + encodeURIComponent(state.installToken) + '#Intent;scheme=fastp2p;package=cc.itq.fastp2p.cclient;end'; text('reveal-token', '显示'); $('token-dialog').showModal();
+    $('install-token').value = state.installToken; $('install-token').type = 'password'; $('android-install').href = 'intent://install?token=' + encodeURIComponent(state.installToken) + '#Intent;scheme=fastp2p;package=top.fastp2p.cclient;end'; text('reveal-token', '显示'); $('token-dialog').showModal();
   });
   $('reveal-token').addEventListener('click', () => {
     const hidden = $('install-token').type === 'password'; $('install-token').type = hidden ? 'text' : 'password'; text('reveal-token', hidden ? '隐藏' : '显示');

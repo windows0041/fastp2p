@@ -5,17 +5,17 @@ def depsBase = providers.gradleProperty('fastp2pDepsBase').orElse(
 def signingFile = System.getenv('FASTP2P_ANDROID_KEYSTORE')
 
 android {
-    namespace 'cc.itq.fastp2p.cclient'
+    namespace 'top.fastp2p.cclient'
     compileSdk 36
     buildToolsVersion '36.0.0'
     ndkVersion '30.0.16248370'
     defaultConfig {
-        applicationId 'cc.itq.fastp2p.cclient'
+        applicationId 'top.fastp2p.cclient'
         minSdk 26
         targetSdk 36
         versionCode 20001
         versionName '2.0.1'
-        testInstrumentationRunner 'cc.itq.fastp2p.cclient.LiveInstrumentation'
+        testInstrumentationRunner 'top.fastp2p.cclient.LiveInstrumentation'
         ndk { abiFilters 'arm64-v8a', 'x86_64' }
         externalNativeBuild {
             cmake {

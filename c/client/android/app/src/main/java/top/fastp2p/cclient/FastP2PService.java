@@ -1,4 +1,4 @@
-package cc.itq.fastp2p.cclient;
+package top.fastp2p.cclient;
 
 import android.Manifest;
 import android.app.Notification;
@@ -18,7 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class FastP2PService extends Service {
-    static final String STOP = "cc.itq.fastp2p.cclient.STOP";
+    static final String STOP = "top.fastp2p.cclient.STOP";
     private static final String CHANNEL = "fastp2p-connection";
     static volatile boolean running;
     static volatile int state;

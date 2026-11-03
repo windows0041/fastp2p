@@ -1,4 +1,4 @@
-package cc.itq.fastp2p.cclient;
+package top.fastp2p.cclient;
 
 final class NativeClient {
     static { System.loadLibrary("fastp2p_jni"); }
