@@ -1,6 +1,5 @@
 #include "fastp2p.h"
 #include "bootstrap.h"
-#include "update.h"
 #include <jni.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -125,17 +124,4 @@ JNIEXPORT jstring JNICALL Java_top_fastp2p_cclient_NativeClient_version(JNIEnv *
 JNIEXPORT jstring JNICALL Java_top_fastp2p_cclient_NativeClient_bootstrap(JNIEnv *env, jclass cls) {
     (void)cls;
     return (*env)->NewStringUTF(env, fastp2p_default_gateway());
-}
-JNIEXPORT void JNICALL Java_top_fastp2p_cclient_NativeClient_setUpdateDir(JNIEnv *env, jclass cls,
-                                                                         jstring directory) {
-    (void)cls;
-    if (!directory)
-        return;
-    const char *text = (*env)->GetStringUTFChars(env, directory, NULL);
-    if (!text)
-        return;
-    /* Android cannot replace its own package, so the app supplies a writable
-     * directory for the library to stage a verified download. */
-    fp_update_set_dir(text);
-    (*env)->ReleaseStringUTFChars(env, directory, text);
 }

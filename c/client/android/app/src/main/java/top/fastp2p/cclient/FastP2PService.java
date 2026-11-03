@@ -65,10 +65,11 @@ public final class FastP2PService extends Service {
             String token = pending == null ? SecretStore.token(this) : pending.token;
             String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
             ca = TrustStore.resolve(this, ca);
-            // The library stages a downloaded upgrade here; Android then asks the
-            // user to confirm the install because an app cannot replace itself.
-            NativeClient.setUpdateDir(getCacheDir().getAbsolutePath());
-            handle = NativeClient.create(config.getBytes(StandardCharsets.UTF_8), token, ca, this);
+            // The library stages a downloaded upgrade in this directory; Android
+            // then asks the user to confirm the install. Kept out of the stored
+            // configuration because it is device state, not enrolment state.
+            String nativeConfig = withUpdateDir(config, getCacheDir().getAbsolutePath());
+            handle = NativeClient.create(nativeConfig.getBytes(StandardCharsets.UTF_8), token, ca, this);
             if (handle == 0) throw new IllegalArgumentException("接入配置无效");
             if (NativeClient.start(handle) != 0) throw new IllegalStateException();
             long deadline = SystemClock.elapsedRealtime() + 30000;
@@ -92,6 +93,18 @@ public final class FastP2PService extends Service {
                 if (failed && canNotify()) getSystemService(NotificationManager.class).notify(2, notification(false));
                 stopSelf();
             });
+        }
+    }
+    /** Adds the upgrade staging directory to the configuration handed to native code. */
+    private static String withUpdateDir(String config, String directory) {
+        try {
+            org.json.JSONObject object = new org.json.JSONObject(config);
+            object.put("UpdateDir", directory);
+            return object.toString();
+        } catch (org.json.JSONException error) {
+            // Without a staging directory an upgrade order simply fails; the
+            // client still runs with its original configuration.
+            return config;
         }
     }
     public void onNativeEvent(int type, int newState, int code, String id, String message) {

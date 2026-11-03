@@ -1,4 +1,5 @@
 #include "fastp2p.h"
+#include "update.h"
 #include "wire.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -74,6 +75,11 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
                        .on_event = callback,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
+    /* Android cannot replace its own package, so the embedding app names a
+     * writable directory here for staging a downloaded upgrade. */
+    const char *update_dir = op_string(root, "UpdateDir");
+    if (*update_dir)
+        fp_update_set_dir(update_dir);
     const char *device = op_string(network, "DeviceID");
     if (!rv && *device)
         rv = fastp2p_client_set_identity(*out, device);
