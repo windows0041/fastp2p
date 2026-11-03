@@ -161,7 +161,7 @@ def main():
                 results['uint64_token_mask_and_clear']=True
                 page.locator('#node-search').fill('no-match');expect(page.locator('#nodes-empty')).to_be_visible()
                 page.locator('#node-search').fill('web-c-node');expect(page.locator('#nodes tr')).to_have_count(1)
-                page.locator('#nodes').get_by_role('button').click();expect(page.locator('#rule-message')).to_contain_text('此 C 客户端')
+                page.locator('#nodes').get_by_role('button').click();expect(page.locator('#rule-message')).to_contain_text('尚未配置转发规则')
                 page.locator('#add-rule').click();page.locator('#rule-name').fill('浏览器测试转发');page.locator('#rule-source').fill('24567')
                 page.locator('#rule-peer').fill(go.name);page.locator('#rule-target').fill('80');page.locator('#rule-transport').select_option('tcp')
                 page.locator('#save-rule').click()
@@ -175,9 +175,25 @@ def main():
                     raise
                 if not args.client:assert any(sub==9 and body.get('punchPriority')==3 for sub,body in c.commands)
                 else:results['real_C_client_Chinese_rule_roundtrip']=True
-                expect(page.locator('#rules').get_by_role('button',name='编辑')).to_have_count(0)
+                # A C client now supports the full rule surface, so the console
+                # offers editing for it instead of pointing at the config file.
+                expect(page.locator('#rules').get_by_role('button',name='编辑')).to_have_count(1)
                 results['C_capabilities_and_add_forward']=True
                 page.locator('#node-search').fill('');page.locator('#nodes tr').filter(has_text=go.name).get_by_role('button').click()
+                # Rules are served from the gateway database, so seed the row the
+                # console will read instead of relying on a client-side report.
+                seeded=page.evaluate('''async ([name]) => {
+                    const session = JSON.parse(sessionStorage.getItem('fastp2p.console') || '{}');
+                    const r = await fetch('/api/v1/device/' + encodeURIComponent(name) + '/app', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + session.token},
+                        body: JSON.stringify({appName: '<img src=x onerror=globalThis.__xss=1>', protocol: 'tcp',
+                            srcPort: 23456, peerNode: 'web-c-node', dstHost: '127.0.0.1', dstPort: 22})
+                    });
+                    return r.status;
+                }''',[go.name])
+                assert seeded==200,seeded
+                page.locator('#refresh-apps').click()
                 expect(page.locator('#rules')).to_contain_text('<img src=x onerror=globalThis.__xss=1>')
                 assert page.evaluate('globalThis.__xss') is None
                 page.locator('#rules').get_by_role('button',name='编辑',exact=True).click();page.locator('#rule-name').fill('Go edited')
