@@ -807,7 +807,7 @@ static unsigned query_integer(struct lws *wsi, const char *name, unsigned limit,
 static int login_status(struct lws *wsi) {
     char uri[256], node[32], token[32];
     uint64_t value;
-    if (lws_get_vhost(wsi) != g.ws_vhost)
+    if (lws_get_vhost(wsi) != g.ws_vhost && lws_get_vhost(wsi) != g.ws_alt_vhost)
         return 404;
     if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) < 0 ||
         (strcmp(uri, "/api/v1/login") && strcmp(uri, "/fastp2p/v1/login")))
@@ -1077,7 +1077,7 @@ static void tick(lws_sorted_usec_list_t *sul) {
 }
 static void usage(void) {
     puts("fastp2p-gateway --cert FILE --key FILE [--bind IP] [--apibind IP]\n"
-         "  [--port 27183] [--apiport 10008] [--database FILE]\n"
+         "  [--port 27183] [--altwss 443] [--apiport 10008] [--database FILE]\n"
          "  [--max-clients 256] [--heartbeat-timeout 40] [--run-seconds N]\n"
          "  [--reset-admin] (stop the gateway before resetting its account)\n"
          "Set FASTP2P_USER, FASTP2P_PASSWORD and a 16-digit FASTP2P_TOKEN.\n"
@@ -1106,6 +1106,7 @@ static int options(int argc, char **argv) {
                                          {"apibind", required_argument, 0, 'a'},
                                          {"port", required_argument, 0, 'p'},
                                          {"apiport", required_argument, 0, 'q'},
+                                         {"altwss", required_argument, 0, 'x'},
                                          {"max-clients", required_argument, 0, 'm'},
                                          {"heartbeat-timeout", required_argument, 0, 't'},
                                          {"run-seconds", required_argument, 0, 'r'},
@@ -1150,18 +1151,21 @@ static int options(int argc, char **argv) {
             return 1;
         case 'p':
         case 'q':
+        case 'x':
         case 'm':
         case 't':
         case 'r':
             if (gw_decimal(optarg, &value) || value > 86400 || !value)
                 return -1;
-            if (option == 'p' || option == 'q') {
+            if (option == 'p' || option == 'q' || option == 'x') {
                 if (value > 65535)
                     return -1;
                 if (option == 'p')
                     g.ws_port = (unsigned)value;
-                else
+                else if (option == 'q')
                     g.api_port = (unsigned)value;
+                else
+                    g.alt_ws_port = (unsigned)value;
             } else if (option == 'm') {
                 if (value > GW_MAX_NODES)
                     return -1;
@@ -1177,7 +1181,9 @@ static int options(int argc, char **argv) {
             return -1;
         }
     }
-    if (optind != argc || g.ws_port == g.api_port || !*g.database)
+    if (optind != argc || g.ws_port == g.api_port ||
+        (g.alt_ws_port && (g.alt_ws_port == g.ws_port || g.alt_ws_port == g.api_port)) ||
+        !*g.database)
         return -1;
     if (!*g.api_bind)
         strcpy(g.api_bind, g.bind);
@@ -1290,6 +1296,17 @@ sqlite3_close(g.db);
     info.port = (int)g.ws_port;
     info.vhost_name = "fastp2p-wss";
     g.ws_vhost = lws_create_vhost(g.context, &info);
+    g.ws_alt_vhost = NULL;
+    if (g.alt_ws_port) {
+        info.iface = g.bind;
+        info.port = (int)g.alt_ws_port;
+        info.vhost_name = "fastp2p-wss-alt";
+        g.ws_alt_vhost = lws_create_vhost(g.context, &info);
+        if (!g.ws_alt_vhost) {
+            fputs("Cannot bind the alternate WSS port\n", stderr);
+            goto failed;
+        }
+    }
     info.iface = g.api_bind;
     info.port = (int)g.api_port;
     info.vhost_name = "fastp2p-api";
@@ -1299,8 +1316,8 @@ sqlite3_close(g.db);
         goto failed;
     }
     g.started_ms = gw_mono_ms();
-    printf("{\"event\":\"ready\",\"version\":\"%s\",\"wss\":%u,\"api\":%u}\n", GW_VERSION,
-           g.ws_port, g.api_port);
+    printf("{\"event\":\"ready\",\"version\":\"%s\",\"wss\":%u,\"wssAlt\":%u,"
+           "\"api\":%u}\n", GW_VERSION, g.ws_port, g.alt_ws_port, g.api_port);
     fflush(stdout);
     lws_sul_schedule(g.context, 0, &g.tick, tick, 10000);
     uint64_t end = g.run_seconds ? gw_mono_ms() + (uint64_t)g.run_seconds * 1000 : 0;

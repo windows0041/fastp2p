@@ -52,6 +52,10 @@ struct nat_state {
 struct gateway {
     struct lws_context *context;
     struct lws_vhost *ws_vhost, *api_vhost;
+    /* A second WSS listener, typically 443: mobile carriers reset TLS to
+     * non-standard ports, so the same gateway is reachable on both. */
+    struct lws_vhost *ws_alt_vhost;
+    unsigned alt_ws_port;
     lws_sorted_usec_list_t tick;
     struct connection *nodes[GW_MAX_NODES];
     uint64_t grants[GW_MAX_NODES][GW_MAX_NODES];
