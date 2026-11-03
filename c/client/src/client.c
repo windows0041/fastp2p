@@ -2586,6 +2586,16 @@ static void gateway_failed(fastp2p_client *c) {
          "WSS connection failed: check gateway address, CA, certificate hostname and token");
     close_gateway(c);
 }
+/* Same failure, but carrying the library's own reason. The generic message above
+ * cannot distinguish an unreachable host from an unreadable CA or a hostname
+ * mismatch, which is exactly what a reported failure usually needs. */
+static void gateway_failed_curl(fastp2p_client *c, CURLcode rv) {
+    char message[192];
+    snprintf(message, sizeof(message), "WSS connection failed: %s (curl %d)",
+             curl_easy_strerror(rv), (int)rv);
+    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
+    close_gateway(c);
+}
 static void connect_gateway(fastp2p_client *c) {
     c->ws = curl_easy_init();
     if (!c->ws) {
@@ -2650,8 +2660,11 @@ static void service_gateway(fastp2p_client *c) {
     while ((message = curl_multi_info_read(c->multi, &remaining))) {
         if (message->msg != CURLMSG_DONE || message->easy_handle != c->ws)
             continue;
-        if (message->data.result != CURLE_OK ||
-            curl_easy_getinfo(c->ws, CURLINFO_ACTIVESOCKET, &c->ws_socket) != CURLE_OK ||
+        if (message->data.result != CURLE_OK) {
+            gateway_failed_curl(c, message->data.result);
+            return;
+        }
+        if (curl_easy_getinfo(c->ws, CURLINFO_ACTIVESOCKET, &c->ws_socket) != CURLE_OK ||
             c->ws_socket == CURL_SOCKET_BAD) {
             gateway_failed(c);
             return;
@@ -2698,7 +2711,7 @@ static void service_gateway(fastp2p_client *c) {
         if (rv == CURLE_AGAIN)
             break;
         if (rv != CURLE_OK) {
-            gateway_failed(c);
+            gateway_failed_curl(c, rv);
             return;
         }
         if (!sent)
