@@ -181,7 +181,9 @@ int fp_open(fp_crypto *c, uint16_t sub, uint64_t overlay, const void *in, size_t
 void fp_join_proof(const uint64_t token, uint64_t session, uint64_t peer, uint8_t out[16]) {
     uint8_t key[32], message[16], digest[32], token_bytes[8];
     put64(token_bytes, token);
-    if (hkdf((const uint8_t *)"fastp2p2 relay", 15, token_bytes, sizeof(token_bytes), "join proof",
+    static const char relay_salt[] = "fastp2p2 relay";
+    if (hkdf((const uint8_t *)relay_salt, sizeof(relay_salt) - 1, token_bytes, sizeof(token_bytes),
+             "join proof",
              key)) {
         memset(out, 0, 16);
         return;

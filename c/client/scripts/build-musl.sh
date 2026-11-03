@@ -31,7 +31,14 @@ esac
 # The pinned archive, musl.cc and Bootlin are tried in that order by the
 # shared helper, so the gateway build uses exactly the same toolchain.
 toolchain=$(bash "$repository/c/client/scripts/fetch-musl-toolchain.sh" "$arch")
-compiler=$(ls "$toolchain"/bin/*-gcc | head -1)
+# A glob that matches nothing makes `ls` fail, which aborts the script before the
+# message on the next line under `set -e`; glob it directly instead.
+compiler=""
+for candidate in "$toolchain"/bin/*-gcc; do
+  [ -x "$candidate" ] || continue
+  compiler=$candidate
+  break
+done
 [[ -x $compiler ]] || { echo "no compiler in $toolchain" >&2; exit 1; }
 binutils=${compiler%-gcc}
 

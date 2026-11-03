@@ -445,15 +445,23 @@ static int direct_rounds_allowed(int hard_self, int hard_peer) {
     return hard_self || hard_peer ? 1 : 2;
 }
 /* Ports to hit when the peer's mapping shifts with every destination.  Returns
- * the first port of the window; the caller walks `count` steps in `direction`.
- * Zero means the peer has no predictable mapping, so only its observed port is
- * worth a packet. */
-static uint16_t sym_window_base(uint16_t observed, int up, uint16_t count) {
+ * the first port of the window; the caller walks the span in one direction.
+ * Zero span means the peer has no predictable mapping, or the window would run
+ * off the end of the port range, so only its observed port is worth a packet. */
+static uint16_t sym_window_span(uint16_t observed, int up, uint16_t count) {
     if (!count)
+        return 0;
+    /* Stop at the end of the range instead of wrapping onto unrelated ports. */
+    uint32_t room = up ? 65535u - (uint32_t)observed
+                       : (observed > 1 ? (uint32_t)observed - 1 : 0);
+    return (uint16_t)(room < count ? room : count);
+}
+static uint16_t sym_window_base(uint16_t observed, int up, uint16_t count) {
+    if (!sym_window_span(observed, up, count))
         return observed;
-    if (up)
-        return (uint16_t)(observed < 65535 - count ? observed + 1 : observed);
-    return (uint16_t)(observed > count ? observed - count : 1);
+    /* Both directions start next to the observed mapping: the caller walks up or
+     * down from here, so the window always covers the ports closest to it. */
+    return (uint16_t)(up ? observed + 1 : observed - 1);
 }
 /* Cap the window so a peer cannot make us send an unbounded burst. */
 static uint16_t sym_window_cap(uint16_t requested) {
@@ -1475,6 +1483,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
             }
             c->login_ok = 1;
+            /* A working login means the earlier failures were transient; without
+             * this the backoff would stay at its maximum for the rest of the run. */
+            c->reconnect_attempt = 0;
             if (c->report_ok)
                 set_state(c, FASTP2P_ONLINE, "gateway authenticated");
         }
@@ -2083,7 +2094,8 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             if (t->sym_count && !t->sym_sprayed) {
                 t->sym_sprayed = 1;
                 uint16_t start = sym_window_base(t->sym_base, t->sym_up, t->sym_count);
-                for (uint16_t k = 0; k < t->sym_count; ++k) {
+                uint16_t span = sym_window_span(t->sym_base, t->sym_up, t->sym_count);
+                for (uint16_t k = 0; k < span; ++k) {
                     struct sockaddr_in candidate = peer;
                     uint16_t port = t->sym_up ? (uint16_t)(start + k) : (uint16_t)(start - k);
                     if (!port)

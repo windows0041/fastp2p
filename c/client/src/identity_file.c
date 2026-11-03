@@ -110,6 +110,16 @@ int op_cli_identity(fastp2p_client *client, const char *file, const char *config
         if (ok) ok = !fsync(fd);
 #endif
         if (close(fd)) ok = 0;
+        if (!ok) {
+            /* A short file can never be read back, so every later start would
+             * fail; remove it while we still know it is ours. */
+#ifdef _WIN32
+            WCHAR name[4096];
+            if (!wide(path, name)) DeleteFileW(name);
+#else
+            unlink(path);
+#endif
+        }
         return ok ? 0 : -1;
     }
     if (errno != EEXIST)

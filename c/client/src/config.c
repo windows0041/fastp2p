@@ -82,7 +82,12 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
         rv = FASTP2P_EINVAL;
     for (size_t i = 0; !rv && apps && i < json_object_array_length(apps); ++i) {
         json_object *a = json_object_array_get_idx(apps, i);
-        if (op_get(a, "Enabled") && !op_integer(a, "Enabled"))
+        json_object *enabled = op_get(a, "Enabled");
+        /* JSON true is the natural spelling, and op_integer reads it as 0, which
+         * would silently disable the rule. */
+        if (enabled && !(json_object_is_type(enabled, json_type_boolean)
+                             ? json_object_get_boolean(enabled)
+                             : json_object_get_int64(enabled) != 0))
             continue;
         uint64_t local = op_integer(a, "SrcPort"), dst = op_integer(a, "DstPort");
         const char *transport = op_string(a, "UnderlayProtocol"), *bind_ip = op_string(a, "BindIP");

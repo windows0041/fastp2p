@@ -41,7 +41,11 @@ public final class InstallActivity extends Activity {
     private void startAgent() {
         Intent intent = new Intent(this, FastP2PService.class);
         if (token != null) intent.putExtra("token", token);
-        intent.putExtra("migrate", getIntent().getBooleanExtra("migrate", false));
+        // Migration replaces an existing enrollment, so only the installer path
+        // (adb shell or this app itself) may ask for it.
+        String caller = getCallingPackage();
+        boolean trusted = caller == null || "com.android.shell".equals(caller) || getPackageName().equals(caller);
+        intent.putExtra("migrate", trusted && getIntent().getBooleanExtra("migrate", false));
         SecretStore.preferences(this).edit().putBoolean("enabled", true).apply();
         startForegroundService(intent);
         finish();

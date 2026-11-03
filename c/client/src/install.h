@@ -18,6 +18,7 @@ void fastp2p_install_pause(void);
 int fastp2p_name_token(const char *path, char out[17]);
 int fastp2p_runtime_begin(const char *profile, int background);
 int fastp2p_runtime_stopping(void);
+void fastp2p_runtime_request_stop(void);
 void fastp2p_runtime_end(void);
 int fastp2p_enable_autostart(const char *profile, const char *ca);
 int fastp2p_stop_installed(const char *profile);
@@ -29,6 +30,8 @@ int fastp2p_service_installed(void);
 int fastp2p_service_prepare(const char *profile);
 int fastp2p_service_install(const char *profile, const char *ca);
 int fastp2p_service_remove(void);
+/* Removes the stored profile, its certificates and the installed copy. */
+int fastp2p_service_purge(void);
 int fastp2p_service_elevated(void);
 int fastp2p_service_elevate(const char *arguments);
 #endif

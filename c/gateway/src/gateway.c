@@ -61,8 +61,14 @@ static int enqueue(struct connection *c, uint16_t main, uint16_t sub, const void
     if (!c || !c->registered || c->closing || length > GW_FRAME_LIMIT)
         return -1;
     size_t size = length + 8;
-    if (c->count >= 64 || size > GW_QUEUE_LIMIT - c->queued || size > GW_TOTAL_QUEUED - g.queued) {
+    if (c->count >= 64 || size > GW_QUEUE_LIMIT - c->queued) {
+        /* This connection is the one falling behind, so it is the one to drop. */
         close_node(c);
+        return -1;
+    }
+    if (size > GW_TOTAL_QUEUED - g.queued) {
+        /* The budget is shared: closing a node here would let one sender knock
+         * unrelated peers offline, so the frame is dropped instead. */
         return -1;
     }
     struct packet *p = malloc(sizeof(*p) + LWS_PRE + size);
@@ -304,7 +310,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
          * report the pool and the reason each node was passed over.  Repeated
          * failures are rate limited; a successful choice is always recorded. */
         uint64_t now_ms = gw_mono_ms();
-        if (relay || now_ms - c->relay_log_ms >= 5000) {
+        if (now_ms - c->relay_log_ms >= 5000) {
             printf("{\"event\":\"relay-select\",\"from\":\"%s\",\"peer\":\"%s\","
                    "\"connected\":%u,\"skipped\":{\"self\":%u,\"peer\":%u,\"symmetric\":%u,"
                    "\"major\":%u,\"excluded\":%u},\"relay\":\"%s\",\"relayNat\":%u,"
@@ -1204,7 +1210,8 @@ static int options(int argc, char **argv) {
         g.public_host = strcmp(g.bind, "0.0.0.0") ? g.bind : "127.0.0.1";
     if (!fastp2p_enrollment_host_valid(g.public_host))
         return -1;
-    char automatic_ca[4096];
+    /* Kept across the call because the global below points at it. */
+    static char automatic_ca[4096];
     if (!g.enrollment_ca_file) {
         const char *slash = strrchr(g.cert, '/');
         size_t length = slash ? (size_t)(slash - g.cert + 1) : 0;

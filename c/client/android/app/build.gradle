@@ -76,6 +76,7 @@ android.sourceSets.main.assets.srcDir(noticeOutput)
 tasks.named('preBuild').configure { dependsOn nativeNotices }
 
 gradle.taskGraph.whenReady { graph ->
-    if (graph.allTasks.any { it.name.toLowerCase().contains('release') } && !signingFile)
+    if (graph.allTasks.any { it.name.toLowerCase().contains('release') } &&
+            (!signingFile || !System.getenv('FASTP2P_ANDROID_KEYSTORE_PASSWORD')))
         throw new GradleException('Release APK requires FASTP2P_ANDROID_KEYSTORE and FASTP2P_ANDROID_KEYSTORE_PASSWORD')
 }

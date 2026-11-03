@@ -119,6 +119,11 @@ static void udp_step(struct nat_state *s, int fd) {
         const char *text = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
         size_t length = strlen(text);
         unsigned char response[256];
+        /* The reply carries a fixed shape today, but the buffer is what enforces it. */
+        if (length > sizeof(response) - 8) {
+            json_object_put(j);
+            continue;
+        }
         gw_put32(response, (uint32_t)length);
         gw_put16(response + 4, 2);
         gw_put16(response + 6, (uint16_t)sub);
@@ -174,8 +179,11 @@ void gw_nat_step(struct nat_state *s) {
                 char ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &p->peer.sin_addr, ip, sizeof(ip));
                 p->offset = 0;
-                p->length = (size_t)snprintf(p->output, sizeof(p->output), "%s:%u", ip,
-                                             ntohs(p->peer.sin_port));
+                /* snprintf reports what it would have written; the buffer is the limit. */
+                int written = snprintf(p->output, sizeof(p->output), "%s:%u", ip,
+                                       ntohs(p->peer.sin_port));
+                p->length = written > 0 && (size_t)written < sizeof(p->output) ? (size_t)written
+                                                                             : sizeof(p->output) - 1;
                 p->deadline = now + 5000;
             } else if (n == 0 ||
                        (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))

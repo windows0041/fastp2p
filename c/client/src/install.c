@@ -219,11 +219,22 @@ static const char *field(json_object *root, const char *key) {
 /* The installer runs in its own console, which closes the moment it exits, so a
  * failure would otherwise leave no trace at all. */
 void fastp2p_install_note(const char *text) {
-    const char *temporary = getenv("TEMP");
-    if (!temporary || !*temporary) return;
-    char path[4096];
-    if (snprintf(path, sizeof(path), "%s/fastp2p-install.log", temporary) >= (int)sizeof(path)) return;
+    /* Written beside the machine profile, which the installer has already locked
+     * to SYSTEM and administrators. A shared temp directory would let another
+     * user aim this append at a file of their choosing. */
+    char profile[4096], path[4096];
+    if (fastp2p_service_profile(profile)) return;
+    char *slash = strrchr(profile, '/');
+    if (!slash) return;
+    *slash = 0;
+    if (snprintf(path, sizeof(path), "%s/install.log", profile) >= (int)sizeof(path)) return;
+#ifdef _WIN32
+    WCHAR wide_path[4096];
+    if (wide(path, wide_path)) return;
+    FILE *log = _wfopen(wide_path, L"a");
+#else
     FILE *log = fopen(path, "a");
+#endif
     if (!log) return;
     fprintf(log, "%s\n", text);
     fclose(log);
@@ -244,6 +255,11 @@ static int install_token(const char *token, const char *token_file, const char *
     if (fastp2p_install_key_valid(token)) {
         const char *preset = fastp2p_default_gateway();
         const char *override = getenv("FASTP2P_BOOTSTRAP_FILE");
+#ifdef _WIN32
+        /* The environment is under the invoking user's control; a privileged
+         * install must verify against the gateway compiled into this binary. */
+        if (override && *override && fastp2p_service_elevated()) override = NULL;
+#endif
         unsigned char *data = NULL;
         if (override && *override) { size_t length; data = read_file(override, FASTP2P_INSTALL_TOKEN_LIMIT, &length); preset = (const char *)data; }
         json_object *gateway = preset ? json_tokener_parse(preset) : NULL;
@@ -362,22 +378,24 @@ int fastp2p_name_token(const char *path, char out[17]) {
     for (const char *p = name; *p; ++p)
         if (*p == '/' || *p == '\\') name = p + 1;
     const char *start = NULL;
-    int run = 0;
+    int run = 0, saw_candidate = 0;
     for (const char *p = name;; ++p) {
         if (*p >= '0' && *p <= '9') {
             if (!run) start = p;
             ++run;
         } else {
+            /* Keep looking: a name can carry a build stamp as well as the key. */
             if (run == 16) {
                 memcpy(out, start, 16);
                 out[16] = 0;
-                return fastp2p_install_key_valid(out) ? 0 : -1;
+                if (fastp2p_install_key_valid(out)) return 0;
+                saw_candidate = 1;
             }
             run = 0;
         }
         if (!*p) break;
     }
-    return -1;
+    return saw_candidate ? -2 : -1;
 }
 int fastp2p_service_install_token(const char *token) {
     if (!fastp2p_service_supported() || !token || !*token) return 2;

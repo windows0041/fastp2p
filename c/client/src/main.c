@@ -253,7 +253,10 @@ int main(int argc, char **argv) {
     /* Started from Explorer: no arguments. The key travels in the file name. */
     if (argc == 1) {
         char token[17];
-        if (!fastp2p_name_token(argv[0], token)) {
+        int named = fastp2p_name_token(argv[0], token);
+        if (named == -2)
+            fputs("The file name holds a 16-digit number, but not a valid key.\n", stderr);
+        if (named == 0) {
             int rv = fastp2p_service_install_token(token);
             if (rv == 0)
                 puts("fastp2p service installed; it starts with Windows and restarts if it stops.");
@@ -276,7 +279,11 @@ int main(int argc, char **argv) {
             fputs("The fastp2p service could not be removed.\n", stderr);
             return 1;
         }
-        puts("fastp2p service removed.");
+        /* The service is gone; the token and the installed copy should not outlive
+         * it, so they are removed too. */
+        int leftover = fastp2p_service_purge();
+        puts(leftover ? "fastp2p service removed; some files could not be deleted."
+                      : "fastp2p service and its stored key removed.");
         return 0;
     }
 #endif

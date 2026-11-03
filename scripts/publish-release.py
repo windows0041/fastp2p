@@ -87,7 +87,7 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
     if stable:
         tag_sha = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
         paths = (['c/common','c/gateway/src','c/gateway/web','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
-                 ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/jni','c/client/android/app/build.gradle'])
+                 ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/app/src/androidTest','c/client/android/jni','c/client/android/app/build.gradle','c/client/android/build.gradle','c/client/android/settings.gradle','c/client/android/gradle.properties','c/client/android/gradle'])
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
     notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 x86_64 与 aarch64 静态可执行包（不依赖发行版运行库）和 amd64 Docker 镜像。' if kind == 'gateway' else

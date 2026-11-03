@@ -7,6 +7,10 @@
 #ifdef _WIN32
 #include <windows.h>
 static HANDLE stop_event;
+/* Set by the service control handler; the run loop reads it through
+ * fastp2p_runtime_stopping. The named event alone is not enough because a stop
+ * can arrive while the client is still starting up. */
+static volatile int stop_requested;
 static int wide(const char *text, WCHAR out[4096]) {
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, out, 4096) ? 0 : -1;
 }
@@ -22,9 +26,11 @@ static void event_name(const char *profile, WCHAR out[80]) {
 int fastp2p_runtime_begin(const char *profile, int background) {
     if (!profile) return 0;
     WCHAR name[80]; event_name(profile, name);
+    SetLastError(ERROR_SUCCESS);
     stop_event = CreateEventW(NULL, TRUE, FALSE, name);
     if (!stop_event) return -1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(stop_event); stop_event = NULL; return -1; }
+    stop_requested = 0;
     if (background) {
         DWORD owners[2];
         if (GetConsoleProcessList(owners, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE);
@@ -35,7 +41,14 @@ int fastp2p_runtime_begin(const char *profile, int background) {
     }
     return 0;
 }
-int fastp2p_runtime_stopping(void) { return stop_event && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0; }
+int fastp2p_runtime_stopping(void) {
+    if (stop_requested) return 1;
+    return stop_event && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0;
+}
+void fastp2p_runtime_request_stop(void) {
+    stop_requested = 1;
+    if (stop_event) SetEvent(stop_event);
+}
 void fastp2p_runtime_end(void) { if (stop_event) { CloseHandle(stop_event); stop_event = NULL; } }
 int fastp2p_stop_installed(const char *profile) {
     WCHAR name[80]; event_name(profile, name);
@@ -93,6 +106,7 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #endif
 int fastp2p_runtime_begin(const char *profile, int background) { (void)profile; (void)background; return 0; }
 int fastp2p_runtime_stopping(void) { return 0; }
+void fastp2p_runtime_request_stop(void) {}
 void fastp2p_runtime_end(void) {}
 static int execute(char *const arguments[]) {
     pid_t child = fork();

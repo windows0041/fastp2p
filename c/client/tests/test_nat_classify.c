@@ -27,12 +27,20 @@ int main(void) {
     assert(sym_window_cap(200) == SYM_WINDOW_MAX);
     assert(sym_window_cap(SYM_WINDOW_MAX) == SYM_WINDOW_MAX);
 
-    /* Incrementing window starts just above the observed port. */
-    assert(sym_window_base(65530, 1, 50) == 65530);
+    /* Incrementing window starts just above the observed port, and stops at
+     * the end of the range instead of wrapping onto unrelated ports. */
+    assert(sym_window_span(65530, 1, 50) == 5);
+    assert(sym_window_base(65530, 1, 50) == 65531);
+    /* Decrementing never reaches port 0. */
+    assert(sym_window_span(1, 0, 50) == 0);
+    assert(sym_window_base(1, 0, 50) == 1);
+    assert(sym_window_span(20, 0, 50) == 19);
+    /* Downward window starts at observed-1 and walks down, so it covers the
+     * ports nearest the observed mapping rather than a span below it. */
+    assert(sym_window_base(20, 0, 50) == 19);
+    assert(sym_window_base(40000, 0, 50) == 39999);
     /* Decrementing window starts count ports below it, never below 1. */
-    assert(sym_window_base(40000, 0, 50) == 39950);
     assert(sym_window_base(40000, 1, 50) == 40001);
-    assert(sym_window_base(20, 0, 50) == 1);
 
     /* Punch ladder budget: a hard symmetric side wastes the second round. */
     assert(direct_rounds_allowed(0, 0) == 2);
