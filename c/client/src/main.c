@@ -261,7 +261,9 @@ int main(int argc, char **argv) {
                 puts("Waiting for administrator approval; the installer continues in the new window.");
             else
                 fputs("fastp2p could not be installed. Run it as an administrator, and make "
-                      "sure the file name still contains the 16-digit token.\n", stderr);
+                      "sure the file name still contains the 16-digit token.\n"
+                      "Details were written to %TEMP%\\fastp2p-install.log\n", stderr);
+            fastp2p_install_pause();
             return rv == 3 ? 0 : rv;
         }
     }

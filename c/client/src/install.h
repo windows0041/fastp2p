@@ -11,6 +11,9 @@ int fastp2p_profile_write(const char *path, const char *text);
 int fastp2p_profile_write_machine(const char *path, const char *text);
 /* The double-clicked installer: takes the key from the file name. */
 int fastp2p_service_install_token(const char *token);
+void fastp2p_install_note(const char *text);
+/* Keeps a double-clicked installer's window open long enough to read. */
+void fastp2p_install_pause(void);
 /* Returns 0 and fills out with 16 digits when the name carries an install key. */
 int fastp2p_name_token(const char *path, char out[17]);
 int fastp2p_runtime_begin(const char *profile, int background);

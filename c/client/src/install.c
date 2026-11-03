@@ -216,6 +216,18 @@ static const char *field(json_object *root, const char *key) {
     json_object *value = NULL;
     return json_object_object_get_ex(root, key, &value) ? json_object_get_string(value) : "";
 }
+/* The installer runs in its own console, which closes the moment it exits, so a
+ * failure would otherwise leave no trace at all. */
+void fastp2p_install_note(const char *text) {
+    const char *temporary = getenv("TEMP");
+    if (!temporary || !*temporary) return;
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/fastp2p-install.log", temporary) >= (int)sizeof(path)) return;
+    FILE *log = fopen(path, "a");
+    if (!log) return;
+    fprintf(log, "%s\n", text);
+    fclose(log);
+}
 static int install_token(const char *token, const char *token_file, const char *profile,
                          const char *node, int no_service, int machine) {
     if (!token && !token_file) token = getenv("FASTP2P_INSTALL_TOKEN");
@@ -296,7 +308,11 @@ static int install_token(const char *token, const char *token_file, const char *
     while (started && !result.online && !result.failed && op_monotonic_ns() < deadline && fastp2p_client_state(client) != FASTP2P_STOPPED)
         if (fastp2p_client_step(client, 10)) break;
     fastp2p_client_destroy(client);
-    if (!result.online) { fputs("Gateway certificate, hostname or installation key could not be verified.\n", stderr); goto fail; }
+    if (!result.online) {
+        fputs("Gateway certificate, hostname or installation key could not be verified.\n", stderr);
+        fastp2p_install_note("failed: the gateway could not be verified (network, certificate or token)");
+        goto fail;
+    }
     const char *arrays[] = {"apps", "socks5"};
     for (unsigned i = 0; i < 2; ++i) {
         json_object *value = NULL;
@@ -316,6 +332,7 @@ static int install_token(const char *token, const char *token_file, const char *
         }
     }
     printf("fastp2p installed; gateway identity verified; node=%s\n", result.node);
+    fastp2p_install_note("installed");
     return 0;
 fail:
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
