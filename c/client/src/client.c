@@ -1634,7 +1634,45 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         report_apps(c);
     else if (main == 3 && sub == 9) {
         uint64_t src = op_integer(j, "srcPort"), dst = op_integer(j, "dstPort");
-        if (src && src <= 65535 && dst && dst <= 65535) {
+        int transport_tcp = (op_integer(j, "punchPriority") & 2) != 0;
+        if (src && src <= 65535 && !strcmp(op_string(j, "protocol"), "socks5")) {
+            /* A SOCKS5 exit has no fixed destination: the target is chosen by each
+             * client request and resolved at the peer. The console still picks the
+             * local entry port, so honour it here instead of requiring dstPort. */
+            const char *user = op_string(j, "Username"), *password = op_string(j, "Password");
+            const char *bind = op_string(j, "whitelist");
+            fastp2p_socks5 proxy = {.struct_size = sizeof(proxy),
+                                   .name = op_string(j, "appName"),
+                                   .bind_ip = *bind ? bind : "127.0.0.1",
+                                   .local_port = (uint16_t)src,
+                                   .peer_node = op_string(j, "peerNode"),
+                                   .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
+                                                              : FASTP2P_TRANSPORT_QUIC,
+                                   .username = *user ? user : NULL,
+                                   .password = *password ? password : NULL};
+            if (!*user != !*password) {
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL,
+                     "SOCKS5 needs both a username and a password, or neither");
+            } else {
+                uint64_t id = 0;
+                int rv = fastp2p_client_add_socks5(c, &proxy, &id);
+                if (rv)
+                    emit(c, FASTP2P_EVENT_ERROR, 0, rv, "could not add SOCKS5 forwarding rule");
+                else {
+                    /* add_socks5 predates named relays, so apply the console's
+                     * choice to the app it just created rather than widening the
+                     * public ABI. */
+                    const char *relay = op_string(j, "relayNode");
+                    if (*relay && valid_node(relay))
+                        for (int i = 0; i < NA; ++i)
+                            if (c->apps[i].used && c->apps[i].id == id) {
+                                copy_string(c->apps[i].relay_node,
+                                            sizeof(c->apps[i].relay_node), relay);
+                                break;
+                            }
+                }
+            }
+        } else if (src && src <= 65535 && dst && dst <= 65535) {
             fastp2p_forward f = {.struct_size = sizeof(f),
                               .name = op_string(j, "appName"),
                               .local_port = (uint16_t)src,
@@ -1642,9 +1680,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                               .destination_host = op_string(j, "dstHost"),
                               .destination_port = (uint16_t)dst,
                               .protocol = op_string(j, "protocol"),
-                              .transport = (op_integer(j, "punchPriority") & 2)
-                                               ? FASTP2P_TRANSPORT_TCP
-                                               : FASTP2P_TRANSPORT_QUIC,
+                              .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
+                                                          : FASTP2P_TRANSPORT_QUIC,
                               .relay_node = op_string(j, "relayNode")};
             int rv = fastp2p_client_add_forward(c, &f, NULL);
             if (rv)

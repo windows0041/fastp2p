@@ -214,9 +214,22 @@
     text('confirm-title', title); text('confirm-description', description); state.confirm = action;
     $('confirm-dialog').showModal();
   }
+  function syncRuleFields() {
+    const socks = $('rule-protocol').value === 'socks5';
+    $('destination-field').hidden = socks;
+    $('socks-field').hidden = !socks;
+    // A SOCKS5 exit resolves its target per request, so the fixed destination
+    // is not applicable and must not be required by the form.
+    for (const id of ['rule-destination', 'rule-target']) {
+      $(id).required = !socks;
+      if (socks) $(id).value = '';
+    }
+    if (socks) $('rule-destination').value = '127.0.0.1';
+  }
   function openRule(app = null) {
     if (!state.selected) return;
     state.editing = app; $('rule-form').reset(); $('rule-error').hidden = true;
+    $('rule-socks-user').value = ''; $('rule-socks-password').value = '';
     text('rule-dialog-title', app ? '编辑转发规则' : '添加转发');
     $('rule-name').value = app?.appName || ''; $('rule-protocol').value = app?.protocol || 'tcp';
     $('rule-source').value = app?.srcPort || ''; $('rule-peer').value = app?.peerNode || '';
@@ -224,7 +237,8 @@
     $('rule-transport').value = app && (Number(app.punchPriority) & 2) ? 'tcp' : 'quic';
     $('rule-whitelist').value = app ? app.whitelist || '' : '127.0.0.1';
     $('whitelist-field').hidden = !state.selected.capabilities?.editForward;
-    text('rule-help', state.selected.capabilities?.editForward ? '规则保存行为由客户端能力决定。' : 'C 客户端新增规则仅在本次进程中生效，入口绑定 127.0.0.1。需要持久化时同步修改客户端配置。');
+    text('rule-help', state.selected.capabilities?.editForward ? '规则保存行为由客户端能力决定。' :
+      'C 客户端新增规则仅在本次进程中生效，入口绑定 127.0.0.1。SOCKS5 代理的目标由每次请求动态指定，可自定义本地端口；已有 SOCKS5 规则需修改客户端配置。需要持久化时同步修改客户端配置。');
     $('peer-names').replaceChildren(...state.nodes.filter(n => n.name !== state.selected.name).map(n => {
       const option = element('option'); option.value = n.name; return option;
     }));
@@ -239,8 +253,10 @@
       option.value = n.name; relay.append(option);
     }
     relay.value = app?.relayNode || '';
+    syncRuleFields();
     $('rule-dialog').showModal();
   }
+  $('rule-protocol').addEventListener('change', syncRuleFields);
   $('login-form').addEventListener('submit', async event => {
     event.preventDefault(); $('login-submit').disabled = true; $('login-error').hidden = true;
     try {
@@ -275,19 +291,33 @@
     $('save-rule').disabled = true; $('rule-error').hidden = true;
     const node = state.selected, old = state.editing;
     try {
+      const socks = $('rule-protocol').value === 'socks5';
       const app = {appName: $('rule-name').value.trim(), protocol: $('rule-protocol').value,
         srcPort: Number($('rule-source').value), peerNode: $('rule-peer').value.trim(),
-        dstHost: $('rule-destination').value.trim(), dstPort: Number($('rule-target').value),
         punchPriority: $('rule-transport').value === 'tcp' ? 3 : 0};
+      if (socks) {
+        // The exit selects the destination per SOCKS5 request, so no fixed
+        // target is sent. Credentials are optional but must come as a pair.
+        app.Username = $('rule-socks-user').value.trim();
+        app.Password = $('rule-socks-password').value;
+        if (Boolean(app.Username) !== Boolean(app.Password))
+          throw new Error('SOCKS5 用户名和密码必须同时填写，或同时留空。');
+      } else {
+        app.dstHost = $('rule-destination').value.trim();
+        app.dstPort = Number($('rule-target').value);
+      }
       const relay = $('rule-relay').value;
       if (relay) {
         if (relay === app.peerNode) throw new Error('中继节点不能是对端节点本身。');
         if (relay === node.name) throw new Error('中继节点不能是本节点本身。');
         app.relayNode = relay;
       }
-      if (!app.appName || !app.dstHost || app.peerNode === node.name) throw new Error('请填写有效名称、目标地址和其他对端节点。');
+      if (!app.appName || app.peerNode === node.name ||
+          (!socks && !app.dstHost)) throw new Error('请填写有效名称、对端节点' + (socks ? '' : '和目标地址') + '。');
       if (!node.capabilities?.editForward && (new TextEncoder().encode(app.appName).length > 63 ||
-          new TextEncoder().encode(app.dstHost).length > 255)) throw new Error('名称或目标地址过长，请缩短后重试。');
+          (!socks && new TextEncoder().encode(app.dstHost).length > 255) ||
+          (socks && new TextEncoder().encode(app.Username).length > 255)))
+        throw new Error('名称、目标地址或用户名过长，请缩短后重试。');
       if (state.apps.some(a => a !== old && a.protocol === app.protocol && Number(a.srcPort) === app.srcPort))
         throw new Error('此应用协议和入口端口已被使用。');
       if (node.capabilities?.editForward) app.whitelist = $('rule-whitelist').value.trim();
