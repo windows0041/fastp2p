@@ -73,6 +73,12 @@
     <div class="form-grid"><div><label for="rule-transport">P2P 隧道</label><select id="rule-transport"><option value="quic">QUIC / UDP 优先</option><option value="tcp">TCP 打洞</option></select></div><div><label for="rule-relay">中继节点</label><select id="rule-relay"><option value="">自动选择（按 NAT 质量）</option></select></div><div id="whitelist-field"><label for="rule-whitelist">入口限制（Whitelist）</label><input id="rule-whitelist" value="127.0.0.1" maxlength="255"></div></div>
     <p id="rule-help" class="muted form-help"></p><p id="rule-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button id="cancel-rule" class="button" type="button">取消</button><button id="save-rule" class="button primary" type="submit">发送到客户端</button></div>
   </form></dialog>
+  <dialog id="config-dialog"><form id="config-form"><div class="dialog-heading"><h2 id="config-title">客户端配置</h2></div>
+    <p class="muted form-help">填写需要覆盖的 JSON 字段。未下发的键保留；对象逐层合并，数组整体替换。客户端保存到 config/fastp2p.conf 后自动重载，连接可能短暂中断；启动失败时恢复旧配置。这里显示网关管理的字段，不包含设备上所有本地字段。</p>
+    <label for="config-fields">下发字段（JSON 对象）</label><textarea id="config-fields" rows="15" spellcheck="false" required></textarea>
+    <p id="config-status" class="form-help" role="status"></p><p id="config-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions"><button id="close-config" class="button" type="button">关闭</button><button id="save-config" class="button primary" type="submit">按字段下发并重载</button></div>
+  </form></dialog>
   <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><h2>账号设置</h2></div>
     <p class="muted">修改后需要重新登录，客户端连接不受影响。</p>
     <label for="account-user">管理账号</label><input id="account-user" autocomplete="username" maxlength="256" required>

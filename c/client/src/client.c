@@ -187,6 +187,9 @@ struct fastp2p_client {
     size_t ws_remaining;
     op_buffer ws_rx, ws_tx;
     fastp2p_event_fn callback;
+    fastp2p_config_handler config_handler;
+    void *config_user;
+    int validate_only;
     void *user;
     tunnel tunnels[NT];
     app apps[NA];
@@ -1750,6 +1753,20 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 remove_rule(c, i);
                 break;
             }
+    } else if (main == 3 && sub == 19) {
+        json_object *fields=op_get(j,"fields");uint64_t revision=op_integer(j,"revision");
+        int result=FASTP2P_EINVAL;
+        if(c->login_ok && c->report_ok && revision && json_object_is_type(fields,json_type_object) && c->config_handler) {
+            c->in_callback=1;
+            result=c->config_handler(json_object_to_json_string_ext(fields,JSON_C_TO_STRING_PLAIN),revision,c->config_user);
+            c->in_callback=0;
+        }
+        json_object *ack=json_object_new_object();
+        json_object_object_add(ack,"revision",json_object_new_uint64(revision));
+        json_object_object_add(ack,"error",json_object_new_int(result<0));
+        json_object_object_add(ack,"state",json_object_new_string(result<0?"failed":result?"saved":"applied"));
+        ws_json(c,6,8,ack);json_object_put(ack);
+        if(result<0)emit(c,FASTP2P_EVENT_ERROR,revision,result,"gateway configuration rejected or could not be saved");
     } else if (main == 3 && sub == 18) {
         /* UPDATE: the operator asked for this node to be upgraded. Download,
          * verify, then hand over to the new build. */
@@ -2849,6 +2866,7 @@ static void service_gateway(fastp2p_client *c) {
         op_js(j, "version", WIRE_VERSION);
         op_js(j, "lanIP", c->local_ip);
         op_ju(j, "publicIPPort", c->public_port);
+        op_ju(j, "configPush", c->config_handler != NULL);
         ws_json(c, 6, 0, j);
         json_object_put(j);
         send_heartbeat(c);
@@ -3069,6 +3087,11 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     *out = c;
     return FASTP2P_OK;
 }
+void fp_client_validation_mode(fastp2p_client *c) { if(c)c->validate_only=1; }
+int fastp2p_client_set_config_handler(fastp2p_client *c,fastp2p_config_handler handler,void *user) {
+    if(!c || c->running || c->in_callback)return FASTP2P_ESTATE;
+    c->config_handler=handler;c->config_user=user;return FASTP2P_OK;
+}
 int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint64_t *id) {
     /* relay_node is appended to the struct, so callers built against the
      * earlier layout stay valid and simply have no opinion on the relay. */
@@ -3110,7 +3133,8 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
             a->udp = !strcmp(f->protocol, "udp");
             a->transport = f->transport;
             a->local = a->used = 1;
-            a->fd = socket_bound(a->udp, a->bind_ip, a->port, 0);
+            a->fd = c->validate_only ? -1 : socket_bound(a->udp, a->bind_ip, a->port, 0);
+            if(c->validate_only) {if(id)*id=a->id;return FASTP2P_OK;}
             if (a->fd < 0 || (!a->udp && op_listen(a->fd, 64))) {
                 if (a->fd >= 0)
                     op_close(a->fd);
@@ -3124,7 +3148,7 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
     return FASTP2P_ELIMIT;
 }
 int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64_t *id) {
-    if (!p || p->struct_size < sizeof(*p))
+    if (!p || p->struct_size < offsetof(fastp2p_socks5,relay_node))
         return FASTP2P_EINVAL;
     const char *user = p->username ? p->username : "", *password = p->password ? p->password : "";
     if (strlen(user) > 255 || strlen(password) > 255 || (!*user != !*password))
@@ -3137,7 +3161,8 @@ int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64
                       .destination_host = "127.0.0.1",
                       .destination_port = 1,
                       .protocol = "tcp",
-                      .transport = p->transport};
+                      .transport = p->transport,
+                      .relay_node = p->struct_size >= sizeof(*p) ? p->relay_node : NULL};
     uint64_t aid;
     int rv = fastp2p_client_add_forward(c, &f, &aid);
     if (rv)

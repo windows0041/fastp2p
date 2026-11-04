@@ -11,6 +11,7 @@ static HANDLE stop_event;
  * fastp2p_runtime_stopping. The named event alone is not enough because a stop
  * can arrive while the client is still starting up. */
 static volatile int stop_requested;
+int fastp2p_runtime_prepare(const char *profile) { (void)profile; return 0; }
 static int wide(const char *text, WCHAR out[4096]) {
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, out, 4096) ? 0 : -1;
 }
@@ -120,6 +121,7 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <grp.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -127,6 +129,20 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+int fastp2p_runtime_prepare(const char *profile) {
+#if defined(__linux__)
+    /* Managed configuration is writable by the service for gateway updates.
+     * An interactive root CLI must run it with the same unprivileged identity. */
+    if (!geteuid() && profile && !strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf")) {
+        struct passwd *account=getpwnam("fastp2p");
+        if (!account || !account->pw_uid || setgroups(0,NULL) ||
+            setgid(account->pw_gid) || setuid(account->pw_uid)) return -1;
+    }
+#else
+    (void)profile;
+#endif
+    return 0;
+}
 int fastp2p_runtime_begin(const char *profile, int background) { (void)profile; (void)background; return 0; }
 int fastp2p_runtime_stopping(void) { return 0; }
 void fastp2p_runtime_request_stop(void) {}
@@ -153,7 +169,7 @@ int fastp2p_remove_autostart(const char *profile) {
     (void)fastp2p_stop_installed(profile);
     return 0;
 #else
-    if (geteuid() || strcmp(profile, "/etc/fastp2p/client.json")) return -1;
+    if (geteuid() || strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf")) return -1;
     return fastp2p_linux_uninstall(1);
 #endif
 }
@@ -236,7 +252,7 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     return execute(load);
 #else
     (void)ca;
-    if (geteuid() || strcmp(profile, "/etc/fastp2p/client.json") || !linux_controller_ready()) {
+    if (geteuid() || strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf") || !linux_controller_ready()) {
         fputs("Install the Linux service using the script downloaded from the gateway.\n", stderr);
         return -1;
     }

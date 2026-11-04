@@ -1,4 +1,5 @@
 #include "wire.h"
+#include "../../common/utf8.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -120,12 +121,12 @@ int op_frame_take(op_buffer *b, uint16_t *main, uint16_t *sub, uint8_t **body, s
     return 1;
 }
 json_object *op_json(const void *data, size_t len) {
-    if (len > OP_FRAME_LIMIT || len > INT_MAX)
+    if (!data || len > OP_FRAME_LIMIT || len > INT_MAX || !fp_utf8_valid(data,len))
         return NULL;
     json_tokener *t = json_tokener_new();
     if (!t)
         return NULL;
-    json_tokener_set_flags(t, JSON_TOKENER_STRICT);
+    json_tokener_set_flags(t, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
     errno = 0;
     json_object *o = json_tokener_parse_ex(t, data, (int)len);
     int range_error = errno == ERANGE;

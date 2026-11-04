@@ -78,6 +78,18 @@ for name,item in manifest.items():
         if extracted!=destination: extracted.rename(destination)
     paths[name]=destination
 
+# json-c 0.18 compares a signed char with 0x1f in strict string parsing,
+# incorrectly classifying UTF-8 high bytes as control characters. Keep strict
+# parsing and fix that byte comparison, deterministically for every target.
+tokener=paths['json-c']/'json_tokener.c'
+text=tokener.read_text()
+old='(tok->flags & JSON_TOKENER_STRICT) && c <= 0x1f'
+fixed='(tok->flags & JSON_TOKENER_STRICT) && (unsigned char)c <= 0x1f'
+if text.count(old)==1:
+    tokener.write_text(text.replace(old,fixed))
+elif text.count(fixed)!=1:
+    raise SystemExit('Unexpected json-c strict UTF-8 parser source')
+
 environment=os.environ.copy()
 environment['PKG_CONFIG_LIBDIR']=str(prefix/'lib/pkgconfig')
 environment['PKG_CONFIG_PATH']=str(prefix/'lib/pkgconfig')

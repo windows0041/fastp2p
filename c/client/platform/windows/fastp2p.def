@@ -4,6 +4,7 @@ EXPORTS
     fastp2p_version
     fastp2p_client_create
     fastp2p_client_create_json
+    fastp2p_client_set_config_handler
     fastp2p_client_set_identity
     fastp2p_client_device_id
     fastp2p_client_node

@@ -20,6 +20,7 @@ int fastp2p_installer_ui_result(int ok, const char *title, const char *detail);
 /* Returns 0 and fills out with 16 digits when the name carries an install key. */
 int fastp2p_name_token(const char *path, char out[17]);
 int fastp2p_runtime_begin(const char *profile, int background);
+int fastp2p_runtime_prepare(const char *profile);
 int fastp2p_runtime_stopping(void);
 void fastp2p_runtime_request_stop(void);
 void fastp2p_runtime_end(void);

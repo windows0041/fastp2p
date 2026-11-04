@@ -46,6 +46,12 @@ typedef struct {
     const char *message; /* Borrowed, valid only during the callback. No secrets. */
 } fastp2p_event;
 typedef void (*fastp2p_event_fn)(fastp2p_client *, const fastp2p_event *, void *user);
+/* Authenticated gateway configuration. Borrowed JSON may contain secrets: never
+ * log it. Return 0=applied, 1=saved/reload pending, negative=rejected. Handler is
+ * called on the owning step thread and must not reenter the client. The library
+ * never writes configuration files; the embedding host owns persistence. */
+typedef int (*fastp2p_config_handler)(const char *fields_json, uint64_t revision, void *user);
+FASTP2P_API int fastp2p_client_set_config_handler(fastp2p_client *, fastp2p_config_handler, void *user);
 typedef struct {
     size_t struct_size;
     uint32_t abi_version;
@@ -91,6 +97,7 @@ typedef struct {
     fastp2p_transport transport;
     const char *username; /* NULL/empty and password empty = no authentication. */
     const char *password; /* If supplied, both strings must be 1..255 bytes. */
+    const char *relay_node; /* Optional; appended compatibly to ABI 1. */
 } fastp2p_socks5;
 
 /* All functions for an instance are called on one owning thread. No worker

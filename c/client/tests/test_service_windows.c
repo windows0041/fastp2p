@@ -68,7 +68,15 @@ int main(int argc, char **argv) {
         file = fopen(profile, "rb"); assert(file);
         char saved[32] = {0}; assert(fread(saved, 1, sizeof(saved)-1, file) == 16); fclose(file);
         assert(!strcmp(saved, "identity-fixture"));
-        assert(DeleteFileA(installed)); /* old process has really released the executable */
+        /* A virus scanner may briefly hold the stopped image too. Production
+         * replacement retries for this; verify release with the same tolerance. */
+        int removed=0;
+        for(int attempt=0;attempt<50;++attempt) {
+            if(DeleteFileA(installed)) {removed=1;break;}
+            Sleep(100);
+        }
+        if(!removed)fprintf(stderr,"Stopped image could not be removed, Win32 error %lu\n",(unsigned long)GetLastError());
+        assert(removed);
         DeleteFileA(marker);
     }
     assert(!fastp2p_service_remove());

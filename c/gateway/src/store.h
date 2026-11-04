@@ -49,6 +49,10 @@ int gw_store_rule_managed(sqlite3 *db, const char *node);
 int gw_store_update_key_valid(const char *platform, const char *version);
 int gw_store_package_key_valid(const char *platform, const char *version);
 int gw_store_package_lease(sqlite3 *db, const char *platform, const char *version, uint64_t expires);
+json_object *gw_store_config(sqlite3 *db,const char *node);
+int gw_store_config_put(sqlite3 *db,const char *node,json_object *fields);
+int gw_store_config_ack(sqlite3 *db,const char *node,uint64_t revision,const char *state);
+int gw_store_config_rules(sqlite3 *db,const char *node);
 void gw_store_release_version(sqlite3 *db, char version[32]);
 int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
                         const char *sha256, uint64_t size, const char *filename);

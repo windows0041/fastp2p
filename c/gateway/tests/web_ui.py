@@ -124,13 +124,20 @@ def main():
                     time.sleep(.1)
             if args.client:
                 client_log=(root/'client.log').open('w')
+                (root/'config').mkdir()
+                client_config={'product':'fastp2p','network':{'Node':'web-c-node','ServerHost':'127.0.0.1','ServerPort':37183,'Token':token},
+                    'CACertFile':remote+'/certs/ca.crt' if args.wsl else str(root/'certs/ca.crt'),
+                    'custom':{'nested':{'keep':42,'update':1}},'apps':[],'socks5':[]}
+                (root/'config/fastp2p.conf').write_text(json.dumps(client_config))
                 if args.wsl:
                     (root/'launch-client.sh').write_text('#!/bin/bash\nset -e\necho $$ > "$1/client.pid"\nshift\nexec "$@"\n',newline='\n')
                     client_command=['wsl.exe','-d','Debian','-u','maoyu','--','bash',remote+'/launch-client.sh',remote,args.client,
-                        '--cacert',remote+'/certs/ca.crt']
-                else:client_command=[str(Path(args.client).resolve()),'--cacert',str(root/'certs/ca.crt')]
-                client_command+=['--node','web-c-node','--serverhost','127.0.0.1','--port','37183','--run-seconds','600']
-                client=subprocess.Popen(client_command,env=env,stdout=client_log,stderr=subprocess.STDOUT)
+                        '--config',remote+'/config/fastp2p.conf']
+                else:client_command=[str(Path(args.client).resolve()),'--config',str(root/'config/fastp2p.conf')]
+                client_command+=['--run-seconds','600']
+                client_env=env.copy();client_env.pop('FASTP2P_TOKEN',None)
+                client_env['WSLENV']=':'.join(item for item in client_env.get('WSLENV','').split(':') if item.split('/')[0]!='FASTP2P_TOKEN')
+                client=subprocess.Popen(client_command,env=client_env,stdout=client_log,stderr=subprocess.STDOUT)
                 c=SimpleNamespace(name='web-c-node')
             else:
                 c=Peer('web-c-node','linux-c',token,root/'certs/ca.crt');peers.append(c)
@@ -163,7 +170,7 @@ def main():
                 results['uint64_token_mask_and_clear']=True
                 page.locator('#node-search').fill('no-match');expect(page.locator('#nodes-empty')).to_be_visible()
                 page.locator('#node-search').fill('web-c-node');expect(page.locator('#nodes tr')).to_have_count(1)
-                page.locator('#nodes').get_by_role('button').click();expect(page.locator('#rule-message')).to_contain_text('尚未配置转发规则')
+                page.get_by_role('button',name='查看 web-c-node 的规则',exact=True).click();expect(page.locator('#rule-message')).to_contain_text('尚未配置转发规则')
                 page.locator('#add-rule').click();page.locator('#rule-name').fill('浏览器测试转发');page.locator('#rule-source').fill('24567')
                 page.locator('#rule-peer').fill(go.name);page.locator('#rule-target').fill('80');page.locator('#rule-transport').select_option('tcp')
                 page.locator('#save-rule').click()
@@ -181,6 +188,27 @@ def main():
                 # offers editing for it instead of pointing at the config file.
                 expect(page.locator('#rules').get_by_role('button',name='编辑')).to_have_count(1)
                 results['C_capabilities_and_add_forward']=True
+                if args.client:
+                    page.get_by_role('button',name='配置节点 web-c-node',exact=True).click()
+                    expect(page.locator('#config-fields')).to_have_value(__import__('re').compile(r'"apps"'))
+                    page.locator('#config-fields').fill(json.dumps({'custom':{'nested':{'update':2},'web':True}}))
+                    page.locator('#save-config').click()
+                    deadline=time.monotonic()+45
+                    while '客户端已确认配置生效' not in page.locator('#config-status').inner_text():
+                        assert '未能应用' not in page.locator('#config-status').inner_text(),'Client rejected browser configuration; inspect fixture logs'
+                        assert time.monotonic()<deadline,'Configuration confirmation timed out'
+                        time.sleep(.15)
+                    # Windows can briefly cache a DrvFs directory entry across
+                    # the WSL client's atomic rename; wait for the new file view.
+                    deadline=time.monotonic()+5
+                    while True:
+                        saved=json.loads((root/'config/fastp2p.conf').read_text(encoding='utf-8'))
+                        if saved['custom']=={'nested':{'keep':42,'update':2},'web':True} and saved['apps']:break
+                        assert time.monotonic()<deadline,'Confirmed config was not persisted'
+                        time.sleep(.1)
+                    page.screenshot(path=str(args.output/'config-field-merge.png'),full_page=True)
+                    page.locator('#close-config').click()
+                    results['configuration_dialog_field_merge_and_real_C_reload_confirmation']=True
                 page.locator('#node-search').fill('');page.locator('#nodes tr').filter(has_text=go.name).get_by_role('button').click()
                 # Rules are served from the gateway database, so seed the row the
                 # console will read instead of relying on a client-side report.
@@ -208,7 +236,7 @@ def main():
                 page.locator('#rules').get_by_role('button',name='删除',exact=True).click();page.locator('#confirm-action').click()
                 expect(page.locator('#rules tr')).to_have_count(0)
                 results['capability_fixture_edit_switch_delete_and_XSS_escaping']=True
-                page.set_viewport_size({'width':390,'height':844});page.locator('#nodes tr').filter(has_text=c.name).get_by_role('button').click()
+                page.set_viewport_size({'width':390,'height':844});page.get_by_role('button',name='查看 '+c.name+' 的规则',exact=True).click()
                 expect(page.locator('#rules')).to_contain_text('浏览器测试转发')
                 if not page.evaluate('document.documentElement.scrollWidth <= innerWidth'):
                     results['mobile_overflow']=page.evaluate('Array.from(document.querySelectorAll("body *")).filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(e=>[e.id,e.className,Math.round(e.getBoundingClientRect().width),Math.round(e.getBoundingClientRect().right)])')
@@ -306,6 +334,7 @@ def main():
             assert all(peer.error is None for peer in peers)
             results['success']=True
         finally:
+            client_failure=False
             if client and client.poll() is None:
                 if args.wsl and (root/'client.pid').exists():
                     subprocess.run(['wsl.exe','-d','Debian','-u','maoyu','--','kill','-TERM',(root/'client.pid').read_text().strip()],check=True)
@@ -314,8 +343,9 @@ def main():
                 except subprocess.TimeoutExpired:client.kill();client.wait()
             if client_log:
                 client_log.close()
-                diagnostic=(root/'client.log').read_text(errors='replace')
-                assert client.returncode==0 and 'Sanitizer' not in diagnostic and 'runtime error:' not in diagnostic,'C client failure'
+                diagnostic=(root/'client.log').read_text(encoding='utf-8',errors='replace')
+                client_failure=client.returncode!=0 or 'Sanitizer' in diagnostic or 'runtime error:' in diagnostic
+                (args.output/'client.log').write_text(diagnostic.replace(token,'<redacted>').replace(password,'<redacted>'),encoding='utf-8')
             for peer in peers:peer.close()
             if process and process.poll() is None:
                 if args.wsl and (root/'gateway.pid').exists():
@@ -324,9 +354,17 @@ def main():
                 try:process.wait(timeout=10)
                 except subprocess.TimeoutExpired:process.kill();process.wait()
             log.close()
+            if args.client and not results.get('success'):
+                current=json.loads((root/'config/fastp2p.conf').read_text(encoding='utf-8'))
+                with closing(sqlite3.connect(root/'nodes.sqlite3')) as db:
+                    row=db.execute("SELECT fields FROM node_configs WHERE node='web-c-node'").fetchone()
+                # Test-only fixture token, no production data; keep diagnostics
+                # outside Git and never print the candidate configuration.
+                (args.output/'config-diagnostic.json').write_text(json.dumps({'current':current,'fields':json.loads(row[0]) if row else {}},ensure_ascii=False),encoding='utf-8')
             diagnostic=(root/'gateway.log').read_text(errors='replace')
             assert process is None or process.returncode==0,'Gateway did not shut down cleanly'
             assert 'Sanitizer' not in diagnostic and 'runtime error:' not in diagnostic,'Sanitizer failure'
             (args.output/'result.json').write_text(json.dumps(results,indent=2)+'\n')
             print(json.dumps(results,indent=2))
+            assert not client_failure,'C client failure; inspect the saved sanitized client.log'
 if __name__=='__main__':main()

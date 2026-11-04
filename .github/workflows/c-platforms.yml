@@ -200,6 +200,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python c/client/tests/enrollment_integration.py --client build/windows/fastp2p.exe --gateway c/client/tests/gateway_fixture.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/config_sync.py --client build/windows/fastp2p.exe --gateway c/client/tests/gateway_fixture.py --profile-probe build/windows/test-profile-probe.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python c/client/tests/socks_integration.py --client build/windows/fastp2p.exe --gateway c/client/tests/gateway_fixture.py --logs build/windows/socks
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: MSVC consumer of the C DLL
@@ -258,6 +260,8 @@ jobs:
           python3 c/client/tests/enrollment_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway
       - name: Linux installer, filename enrollment, init branches and rollback in namespaces
         run: python3 c/client/tests/linux_installer.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway
+      - name: Gateway field merge, config reload and rollback
+        run: unshare --net sh -c 'ip link set lo up && python3 c/client/tests/config_sync.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway'
       - name: C relay fallback over TCP and QUIC
         run: |
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \

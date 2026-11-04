@@ -97,6 +97,12 @@
       button.type = 'button'; button.setAttribute('aria-label', '查看 ' + n.name + ' 的规则');
       button.addEventListener('click', event => { event.stopPropagation(); selectNode(n); });
       action.append(button);
+      if (n.capabilities?.configPush || (!active && String(n.os).endsWith('-c') && !String(n.os).startsWith('android') && compareVersions(n.version, '2.0.4') >= 0)) {
+        const config = element('button', 'link-button', '配置'); config.type = 'button';
+        config.setAttribute('aria-label', '配置节点 ' + n.name);
+        config.addEventListener('click', event => { event.stopPropagation(); openConfig(n); });
+        action.append(config);
+      }
       const latest = latestFor(platformForOs(n.os));
       if (active && latest && compareVersions(n.version, latest) < 0) {
         const upgrade = element('button', 'link-button', '升级到 ' + latest); upgrade.type = 'button';
@@ -333,6 +339,48 @@
       text('update-message', error.message);
     } finally { button.disabled = false; }
   }
+  let configNode = null, configTimer;
+  const configLabels = {none: '尚未下发配置。', queued: '已保存到网关，等待客户端上线接收。',
+    saved: '客户端已保存配置，正在重载并验证连接…', applied: '客户端已确认配置生效。',
+    failed: '客户端未能应用此配置。旧配置已保留；请检查字段或客户端日志后重新下发。'};
+  async function openConfig(node) {
+    clearTimeout(configTimer); configNode = node.name;
+    text('config-title', node.name + ' · 配置'); $('config-error').hidden = true;
+    $('save-config').disabled = true; $('config-fields').value = '{}';
+    text('config-status', '正在读取网关配置…'); $('config-dialog').showModal();
+    try {
+      const result = await api('/api/v1/device/' + encodeURIComponent(node.name) + '/config');
+      if (configNode !== node.name || !$('config-dialog').open) return;
+      $('config-fields').value = JSON.stringify(result.fields, null, 2);
+      text('config-status', configLabels[result.state] || '');
+    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
+    finally { $('save-config').disabled = false; }
+  }
+  async function pollConfig(node, revision, until) {
+    if (!state.token || configNode !== node || !$('config-dialog').open) return;
+    try {
+      const result = await api('/api/v1/device/' + encodeURIComponent(node) + '/config');
+      if (configNode !== node || !$('config-dialog').open) return;
+      text('config-status', configLabels[result.state] || '');
+      if (result.revision >= revision && ['applied', 'failed'].includes(result.state)) return;
+      if (Date.now() < until) configTimer = setTimeout(() => pollConfig(node, revision, until), 1500);
+      else text('config-status', '仍在等待客户端确认；可稍后重新打开配置查看状态。');
+    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
+  }
+  $('close-config').addEventListener('click', () => $('config-dialog').close());
+  $('config-dialog').addEventListener('close', () => { clearTimeout(configTimer); configNode = null; $('config-fields').value = ''; });
+  $('config-form').addEventListener('submit', async event => {
+    event.preventDefault(); $('config-error').hidden = true; $('save-config').disabled = true;
+    const node = configNode;
+    try {
+      const fields = JSON.parse($('config-fields').value);
+      if (!fields || Array.isArray(fields) || typeof fields !== 'object') throw new Error('请填写 JSON 对象。');
+      const result = await api('/api/v1/device/' + encodeURIComponent(node) + '/config', {fields});
+      text('config-status', configLabels[result.state] || '配置已排队。');
+      clearTimeout(configTimer); pollConfig(node, result.revision, Date.now() + 120000);
+    } catch (error) { $('config-error').hidden = false; text('config-error', error.message); }
+    finally { $('save-config').disabled = false; }
+  });
   let syncTimer;
   async function syncRelease(start = false) {
     const token = state.token;

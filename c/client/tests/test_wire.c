@@ -47,6 +47,16 @@ int main(void) {
     assert(!op_json(overflow, strlen(overflow)));
     assert(!op_json("{\"id\":1}garbage", 15));
     assert(!op_json("{\"id\":", 6));
+    const char *unicode="{\"name\":\"\xe4\xb8\xad\xe6\x96\x87\"}";
+    j=op_json(unicode,strlen(unicode));
+    assert(j&&!strcmp(op_string(j,"name"),"\xe4\xb8\xad\xe6\x96\x87"));json_object_put(j);
+    const char *bad_utf8="{\"name\":\"\xff\"}",*bad_control="{\"name\":\"line\nfeed\"}";
+    assert(!op_json(bad_utf8,strlen(bad_utf8)));
+    assert(!op_json(bad_control,strlen(bad_control)));
+    const char *invalid_utf8[]={"{\"x\":\"\xc0\xaf\"}","{\"x\":\"\xe0\x80\x80\"}",
+        "{\"x\":\"\xed\xa0\x80\"}","{\"x\":\"\xf4\x90\x80\x80\"}","{\"x\":\"\xc2\"}"};
+    for(unsigned i=0;i<sizeof(invalid_utf8)/sizeof(invalid_utf8[0]);++i)
+        assert(!op_json(invalid_utf8[i],strlen(invalid_utf8[i])));
     /* Deterministic malformed stream exercise under ASan/UBSan. */
     uint32_t seed = 12345;
     for (int i = 0; i < 10000; ++i) {

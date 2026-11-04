@@ -1,6 +1,7 @@
 #include "fastp2p.h"
 #include "identity_file.h"
 #include "install.h"
+#include "config_sync.h"
 #include "notices.h"
 #include "update.h"
 #include <errno.h>
@@ -23,8 +24,10 @@ static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     (void)c;
     (void)user;
     static const char *types[] = {"state", "error", "tunnel", "forward", "heartbeat"};
-    if (e->state == FASTP2P_ONLINE)
+    if (e->state == FASTP2P_ONLINE && e->type == FASTP2P_EVENT_STATE) {
         was_online = 1;
+        fp_config_sync_online();
+    }
     json_object *j = json_object_new_object();
     json_object_object_add(j, "event", json_object_new_string(types[e->type]));
     json_object_object_add(j, "state", json_object_new_int(e->state));
@@ -77,6 +80,8 @@ static void usage(void) {
          "--version prints the C library and ABI version; --licenses prints complete notices.");
 }
 static int client_main(int argc, char **argv) {
+    optind = 1;
+    was_online = 0;
     char **original_argv = argv;
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {
         return fwrite(fastp2p_notices, 1, sizeof(fastp2p_notices), stdout) == sizeof(fastp2p_notices) ? 0 : 1;
@@ -165,6 +170,9 @@ static int client_main(int argc, char **argv) {
         if (fastp2p_default_profile(default_profile)) return 2;
         config_file = default_profile;
     }
+    if (fastp2p_runtime_prepare(config_file)) {
+        fputs("Cannot use the managed service account.\n", stderr); return 1;
+    }
     json_object *root = config_file ? fastp2p_profile_read(config_file) : json_object_new_object();
     if (errno == ERANGE || !root || !json_object_is_type(root, json_type_object)) {
         fputs("Invalid JSON configuration\n", stderr);
@@ -175,6 +183,9 @@ static int client_main(int argc, char **argv) {
     json_object *network = field(root, "network");
     uint64_t token = number(network, "Token");
     const char *env = getenv("FASTP2P_TOKEN");
+    /* Explicit CLI/environment overrides are for foreground/debug embedding;
+     * only file-driven sessions can truthfully acknowledge managed reloads. */
+    int managed_config = config_file && !host && !node && !ca && !port && !public_port && !env;
     if (env && integer(env, &token)) {
         fputs("Invalid FASTP2P_TOKEN\n", stderr);
         json_object_put(root);
@@ -211,6 +222,7 @@ static int client_main(int argc, char **argv) {
         json_object_object_add(network, "PublicIPPort", json_object_new_uint64(public_port));
     /* Override strings may refer to root; copy CA before replacing any field. */
     fastp2p_client *client = NULL;
+    fp_config_sync_bind(NULL,managed_config?config_file:NULL,root);
     int rv = fastp2p_client_create_json(json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN),
                                      env, ca, event, NULL, &client);
     if (rv) {
@@ -218,6 +230,7 @@ static int client_main(int argc, char **argv) {
         json_object_put(root);
         return 2;
     }
+    fp_config_sync_bind(client,managed_config?config_file:NULL,root);
     const char *configured_identity = string(network, "DeviceID");
     const char *effective_host = string(network, "ServerHost");
     if ((!configured_identity || !*configured_identity) &&
@@ -243,11 +256,12 @@ static int client_main(int argc, char **argv) {
         rv = fastp2p_client_step(client, 10);
         if (rv)
             break;
+        if (fp_config_sync_tick()) {rv=FP_CONFIG_RELOAD;break;}
     }
-    if (!was_online && !interrupted)
+    if (!was_online && !interrupted && rv != FP_CONFIG_RELOAD)
         rv = FASTP2P_EIO;
 done:
-    if (rv)
+    if (rv && rv != FP_CONFIG_RELOAD)
         fprintf(stderr, "Client failed (%d): %s\n", rv, fastp2p_client_last_error(client));
     fastp2p_client_destroy(client);
     /* Install a verified upgrade package only after a clean shutdown: the run
@@ -257,7 +271,15 @@ done:
     if (fp_update_run_pending(original_argv))
         rv = FASTP2P_EIO;
     json_object_put(root);
-    return rv ? 1 : 0;
+    return rv == FP_CONFIG_RELOAD ? rv : rv ? 1 : 0;
+}
+static int client_loop(int argc,char **argv) {
+    int result;
+    do {
+        result=client_main(argc,argv);
+        if(result && result!=FP_CONFIG_RELOAD && !interrupted && fp_config_sync_failed())result=FP_CONFIG_RELOAD;
+    } while(result==FP_CONFIG_RELOAD && !interrupted && !fastp2p_runtime_stopping());
+    fp_config_sync_close();return result==FP_CONFIG_RELOAD?0:result;
 }
 
 int main(int argc, char **argv) {
@@ -306,7 +328,7 @@ int main(int argc, char **argv) {
             path = profile;
         }
         /* Drop the keyword so the rest reads like "run --config FILE". */
-        return fastp2p_service_dispatch(path, argc - 1, argv + 1, client_main);
+        return fastp2p_service_dispatch(path, argc - 1, argv + 1, client_loop);
     }
-    return client_main(argc, argv);
+    return client_loop(argc, argv);
 }

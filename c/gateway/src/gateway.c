@@ -28,6 +28,14 @@ static pid_t release_cleanup_pid;
 static time_t release_cleanup_at;
 static int start_release_worker(int cleanup_only);
 static void upload_unlock(struct connection *c);
+static int send_json(struct connection *,uint16_t,uint16_t,json_object *);
+static int push_config(struct connection *node) {
+    if(!node||!node->config_supported)return 0;
+    json_object *config=gw_store_config(g.db,node->node);
+    if(!config)return -1;
+    int result=gw_integer(config,"revision")?send_json(node,3,19,config):0;
+    json_object_put(config);return result;
+}
 static const char *release_sync_status = "idle";
 static void signal_stop(int signal) {
     (void)signal;
@@ -211,6 +219,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             return -1;
         }
         c->public_port = (unsigned)port;
+        c->config_supported = gw_integer(j,"configPush") != 0;
         c->major = major_version(c->version);
         if (gw_store_save(g.db, c, 1)) {
             json_object_put(j);
@@ -222,7 +231,12 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
         /* Restore persisted rules on (re)connection, but only for nodes the
          * console has taken ownership of. A node that has never had a stored
          * rule keeps whatever its local config file defines. */
-        json_object *stored = gw_store_rule_managed(g.db, c->node)
+        if(c->config_supported) {
+            if(gw_store_config_rules(g.db,c->node)||push_config(c)) {
+                json_object_put(j);return -1;
+            }
+        }
+        json_object *stored = !c->config_supported && gw_store_rule_managed(g.db, c->node)
                                   ? gw_store_rules(g.db, c->node) : NULL;
         if (stored) {
             json_object *sync = json_object_new_object(), *rules = json_object_new_array();
@@ -247,6 +261,10 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             if (g.nodes[i])
                 send_json(g.nodes[i], 3, 15, online);
         json_object_put(online);
+    } else if (main == 6 && sub == 8) {
+        if(c->config_supported && gw_store_config_ack(g.db,c->node,gw_integer(j,"revision"),gw_string(j,"state"))) {
+            json_object_put(j);return -1;
+        }
     } else if (main == 6 && sub == 3 && c->pending_http) {
         struct connection *http = c->pending_http;
         c->pending_http = NULL;
@@ -499,6 +517,8 @@ static void capabilities(json_object *node) {
     json_object_object_add(caps, "addForward", json_object_new_boolean(1));
     json_object_object_add(caps, "editForward", json_object_new_boolean(1));
     json_object_object_add(caps, "switchForward", json_object_new_boolean(1));
+    struct connection *live=find_node(gw_node_id(gw_string(node,"name")));
+    json_object_object_add(caps,"configPush",json_object_new_boolean(live&&live->config_supported));
     json_object_object_add(node, "capabilities", caps);
 }
 static json_object *devices(void) {
@@ -1265,6 +1285,23 @@ static void handle_http(struct connection *c) {
      * queued by being stored and applied on the client's next connection. */
     struct connection *target = find_node(gw_node_id(name));
 
+    if(!strcmp(end,"/config")) {
+        if(c->post) {
+            if(target&&!target->config_supported) {http_error(c,501,1,"client does not support configuration updates");return;}
+            json_object *body=gw_json(c->request,c->request_length);
+            json_object *fields=body?gw_get(body,"fields"):NULL;
+            if(!json_object_is_type(fields,json_type_object)||gw_store_config_put(g.db,name,fields)) {
+                if(body)json_object_put(body);
+                http_error(c,400,1,"invalid configuration fields");return;
+            }
+            json_object_put(body);
+            if(push_config(target)) {http_error(c,503,1,"configuration queued; node busy");return;}
+        } else if(c->put||c->deleting) {http_error(c,405,1,"method not allowed");return;}
+        json_object *config=gw_store_config(g.db,name);
+        if(!config) {http_error(c,503,1,"configuration storage unavailable");return;}
+        http_json(c,200,config);json_object_put(config);return;
+    }
+
     if (!c->post && !strcmp(end, "/apps")) {
         json_object *list = gw_store_rules(g.db, name);
         if (!list) {
@@ -1279,6 +1316,7 @@ static void handle_http(struct connection *c) {
             if (!rule)
                 continue;
             json_object_get(rule);
+            json_object_object_del(rule,"_config");
             if (!gw_get(rule, "enabled"))
                 gw_ju(rule, "enabled", gw_integer(entry, "enabled"));
             if (!strcmp(gw_string(rule, "protocol"), "socks5")) {
@@ -1371,7 +1409,7 @@ static void handle_http(struct connection *c) {
                 http_error(c, 404, 1, "rule not found");
                 return;
             }
-            if (target) {
+            if (target && !target->config_supported) {
                 if (!enabled) {
                     json_object *remove = json_object_new_object();
                     gw_js(remove, "protocol", protocol);
@@ -1393,6 +1431,7 @@ static void handle_http(struct connection *c) {
                         json_object_put(list);
                 }
             }
+            if(gw_store_config_rules(g.db,name)||push_config(target)) {http_error(c,503,1,"configuration storage unavailable");return;}
             http_reply(c, 200, "", 0);
             return;
         }
@@ -1405,13 +1444,14 @@ static void handle_http(struct connection *c) {
                 http_error(c, 404, 1, "rule not found");
                 return;
             }
-            if (target) {
+            if (target && !target->config_supported) {
                 json_object *remove = json_object_new_object();
                 gw_js(remove, "protocol", old_protocol);
                 gw_ju(remove, "srcPort", old_port);
                 send_json(target, 3, 17, remove);
                 json_object_put(remove);
             }
+            if(gw_store_config_rules(g.db,name)||push_config(target)) {http_error(c,503,1,"configuration storage unavailable");return;}
             http_reply(c, 200, "", 0);
             return;
         }
@@ -1451,7 +1491,7 @@ static void handle_http(struct connection *c) {
                 http_error(c, 404, 1, "rule not found");
                 return;
             }
-            if (target) {
+            if (target && !target->config_supported) {
                 json_object *remove = json_object_new_object();
                 gw_js(remove, "protocol", old_protocol);
                 gw_ju(remove, "srcPort", old_port);
@@ -1468,13 +1508,14 @@ static void handle_http(struct connection *c) {
         gw_ju(j, "srcPort", src);
         const char *payload = json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN);
         int rv = gw_store_rule_put(g.db, name, protocol_copy, (unsigned)src, payload, 1);
-        if (target && !rv)
+        if (target && !target->config_supported && !rv)
             send_json(target, 3, 9, j); /* RULE_APPLY */
         json_object_put(j);
         if (rv) {
             http_error(c, 503, 1, "rule storage unavailable");
             return;
         }
+        if(gw_store_config_rules(g.db,name)||push_config(target)) {http_error(c,503,1,"configuration storage unavailable");return;}
         http_reply(c, 200, "", 0);
         return;
     }

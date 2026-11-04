@@ -64,3 +64,9 @@ Web 右上角“账号设置”可修改账号和密码，需要输入当前密�
 Linux 的控制台下载接口返回带 16 位 Token 文件名的自包含 shell 安装脚本，包含选中架构的原始 ELF 与独立的系统服务脚本。Token 只放在下载文件名，不进入共享缓存。客户端远程升级接口仍提供原始可执行文件；无需把发行版安装逻辑加入 C 网络核心。修改安装脚本后须重新构建网关（Docker 构建上下文使用仓库根目录）。
 
 专用客户端包通过 c/common/bootstrap.json 预置本网关地址和公开 CA，用户只需输入 16 位数字 Token。更换服务器 CA 或地址后需要重新构建专用客户端。
+
+## 客户端配置下发
+
+新版 Linux/Windows/macOS CLI 的「配置」按钮可编辑网关管理的 JSON 字段，按键值递归合并到客户端 config/fastp2p.conf，未下发字段保留，数组整体替换。客户端自动重载，确认新连接成功才显示 applied；失败会恢复原配置并反馈 failed。Windows 保持 DPAPI 加密。SDK/Android 需由宿主注册配置处理回调后才支持此功能。
+
+接口为登录后 GET/POST `/api/v1/device/<节点名>/config`，POST 请求体 `{ "fields": { "network": { "PublicIPPort": 12345 } } }`。SQLite 的 node_configs 记录期望字段、版本及状态，离线时排队，上线后重发。转发规则和文件配置共用同一份期望状态；删除离线节点也会清理其规则及下发配置。

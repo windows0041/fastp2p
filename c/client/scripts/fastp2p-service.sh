@@ -3,9 +3,9 @@
 set -eu
 umask 077
 prefix=/usr/local/fastp2p
-state=/var/lib/fastp2p/client
+state=/var/lib/fastp2p/config
 binary=$prefix/bin/fastp2p
-profile=/etc/fastp2p/client.json
+profile=$state/fastp2p.conf
 service=fastp2p-client
 fail() { printf '%s\n' "fastp2p: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || fail '服务管理需要 root 权限。'
@@ -23,10 +23,15 @@ detect_init() {
 manager=$(detect_init)
 transaction=false
 locked=false
+config_metadata=
 finish() {
     status=$?
     set +e
     if $transaction && [ "$status" -ne 0 ]; then rollback; fi
+    if [ "$status" -ne 0 ] && [ -n "$config_metadata" ]; then
+        owner=${config_metadata%:*}; mode=${config_metadata##*:}
+        chown "$owner" "$state"; chmod "$mode" "$state"
+    fi
     if $locked; then rm -f /var/run/fastp2p-service.lock/pid; rmdir /var/run/fastp2p-service.lock; fi
     exit "$status"
 }
@@ -133,7 +138,7 @@ STOP=10
 USE_PROCD=1
 start_service() {
     procd_open_instance
-    procd_set_param command /usr/local/fastp2p/bin/fastp2p run --config /etc/fastp2p/client.json
+    procd_set_param command /usr/local/fastp2p/bin/fastp2p run --config /var/lib/fastp2p/config/fastp2p.conf
     procd_set_param user fastp2p
     procd_set_param no_new_privs 1
     procd_set_param respawn 3600 3 0
@@ -173,6 +178,7 @@ install_service() {
         esac
     done
     [ -f "$source_binary" ] || fail '找不到已校验的客户端程序。'
+    [ ! -L "$state" ] && [ ! -L "$profile" ] || fail '配置路径不能是符号链接。'
     account_ready
     [ ! -L "$prefix" ] || fail '安装目录不能是符号链接。'
     mkdir -p "$prefix"
@@ -181,6 +187,8 @@ install_service() {
     mkdir -p "$prefix/.backups"; chown 0:0 "$prefix/.backups"; chmod 700 "$prefix/.backups"
     backup=$prefix/.backups/$(date +%Y%m%dT%H%M%S).$$
     mkdir "$backup"; chmod 700 "$backup"
+    config_metadata=$(stat -c '%u:%g:%a' "$state")
+    chown 0:0 "$state"; chmod 700 "$state"
     # Stage before uninstalling; /proc/PARENT/exe can refer to an installed image.
     cp "$source_binary" "$backup/incoming"; chmod 755 "$backup/incoming"
     for pair in "bin/fastp2p:runtime" "fastp2p-service:controller"; do
@@ -190,6 +198,12 @@ install_service() {
     if [ -f /usr/local/bin/fastp2p ]; then cp -p /usr/local/bin/fastp2p "$backup/cli"; fi
     if [ -f /var/lib/fastp2p-client/fastp2p ]; then cp -p /var/lib/fastp2p-client/fastp2p "$backup/legacy-runtime"; fi
     if [ -f /var/lib/fastp2p-client/fastp2p.old ]; then cp -p /var/lib/fastp2p-client/fastp2p.old "$backup/legacy-runtime.old"; fi
+    if [ -f /etc/fastp2p/client.json ]; then
+        cp -p /etc/fastp2p/client.json "$backup/legacy-profile.json"
+        for ca in /etc/fastp2p/client.json.ca.*.pem; do
+            [ ! -f "$ca" ] || cp -p "$ca" "$backup/${ca##*/}"
+        done
+    fi
     if [ -f "/etc/systemd/system/$service.service" ]; then cp -p "/etc/systemd/system/$service.service" "$backup/unit"; fi
     if [ -d "/etc/systemd/system/$service.service.d" ]; then cp -a "/etc/systemd/system/$service.service.d" "$backup/dropins"; fi
     if [ -f /etc/init.d/fastp2p ]; then cp -p /etc/init.d/fastp2p "$backup/init"; fi
@@ -206,6 +220,8 @@ install_service() {
                 systemctl enable "$service.service" >/dev/null 2>&1 || true ;;
             *) if [ -f "$backup/init" ]; then cp -p "$backup/init" /etc/init.d/fastp2p; else rm -f /etc/init.d/fastp2p; fi ;;
         esac
+        owner=${config_metadata%:*}; mode=${config_metadata##*:}
+        chown "$owner" "$state"; chmod "$mode" "$state"
     }
     transaction=true
     printf '%s\n' "服务管理方式：$manager；正在探测并卸载旧服务，保留配置。"
@@ -216,20 +232,24 @@ install_service() {
     # Do not transfer ownership of a co-located gateway's database directory.
     # Only the client subdirectory is writable by the client account.
     chmod o+x /var/lib/fastp2p
-    chown "fastp2p:$group" "$prefix/bin" "$state"; chmod 700 "$prefix/bin" "$state"
+    chown "fastp2p:$group" "$prefix/bin"; chmod 700 "$prefix/bin"
     cp "$backup/incoming" "$backup/runtime.new"; chmod 755 "$backup/runtime.new"; mv -fT "$backup/runtime.new" "$binary"
     cp "$backup/incoming" "$backup/cli.new"; chmod 755 "$backup/cli.new"; mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
     cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"; mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
-    chown "0:$group" /etc/fastp2p "$profile"; chmod 750 /etc/fastp2p; chmod 640 "$profile"
-    for ca in /etc/fastp2p/client.json.ca.*.pem; do
-        [ -f "$ca" ] || continue; chown "0:$group" "$ca"; chmod 640 "$ca"
+    chown "fastp2p:$group" "$profile"; chmod 600 "$profile"
+    for ca in "$state"/fastp2p.conf.ca.*.pem; do
+        [ -f "$ca" ] || continue
+        [ ! -L "$ca" ] && [ "$(stat -c %h "$ca")" -eq 1 ] || fail '证书文件不能是符号链接或硬链接。'
+        chown "0:$group" "$ca"; chmod 640 "$ca"
     done
+    chown "fastp2p:$group" "$state"; chmod 700 "$state"
     write_service
     start_service
     printf '%s\n' "$manager" > "$prefix/init"
     transaction=false
     rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old
     rmdir /var/lib/fastp2p-client 2>/dev/null || true
+    rm -f /etc/fastp2p/client.json /etc/fastp2p/client.json.identity /etc/fastp2p/client.json.ca.*.pem
     printf '%s\n' "服务安装完成，回滚备份：$backup"
 }
 case "${1:-}" in
@@ -245,7 +265,7 @@ case "${1:-}" in
         remove_service
         if [ "${2:-}" != --keep-config ]; then
             rm -f "$binary" "$binary.old" /usr/local/bin/fastp2p "$prefix/fastp2p-service"
-            rm -f "$profile" "$profile.identity" /etc/fastp2p/client.json.ca.*.pem
+            rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
             # Only this root-owned, installer-created backup directory is purged.
             if [ -d "$prefix/.backups" ] && [ ! -L "$prefix/.backups" ]; then rm -rf -- "$prefix/.backups"; fi
             rmdir "$prefix/bin" "$state" /var/lib/fastp2p 2>/dev/null || true

@@ -33,7 +33,7 @@ struct packet {
 };
 struct connection {
     struct lws *wsi;
-    int slot, registered, closing;
+    int slot, registered, closing, config_supported;
     char node[32], ip[64], ipv6[128], os[128], mac[128], lan[64], version[64];
     uint64_t id, last_rx, relay_time, active_wall;
     uint64_t last_seen_wall, next_store;

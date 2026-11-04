@@ -138,7 +138,7 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             assert result.returncode == expected, result.stderr.decode(errors='replace').replace(key, '[redacted]')
             assert key.encode() not in result.stdout+result.stderr
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
-        profile = Path('/etc/fastp2p/client.json')
+        profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
@@ -177,10 +177,13 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
                 assert ('respawn 3600 3 0' if manager == 'procd' else 'supervisor="supervise-daemon"') in unit
             legacy=Path('/var/lib/fastp2p-client'); legacy.mkdir(exist_ok=True)
             (legacy/'fastp2p').write_bytes(payload)
+            old_profile=Path('/etc/fastp2p/client.json')
+            old_profile.write_bytes(profile.read_bytes()); profile.unlink()
             gateway_db=Path('/var/lib/fastp2p/nodes.sqlite3'); gateway_db.write_bytes(b'gateway-fixture')
             gateway_owner=gateway_db.parent.stat().st_uid
             run()
-            assert not legacy.exists() and Path('/var/lib/fastp2p/client').stat().st_uid != 0
+            assert not legacy.exists() and not old_profile.exists()
+            assert Path('/var/lib/fastp2p/config').stat().st_uid != 0
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.parent.stat().st_uid == gateway_owner
             saved = json.loads(profile.read_text())
             assert saved['network']['DeviceID'] == identity and saved['customSetting'] == first['customSetting']

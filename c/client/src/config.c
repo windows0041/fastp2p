@@ -1,5 +1,6 @@
 #include "fastp2p.h"
 #include "update.h"
+#include "config_internal.h"
 #include "wire.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -19,8 +20,8 @@ static int decimal_token(const char *s, uint64_t *value) {
     *value = (uint64_t)v;
     return FASTP2P_OK;
 }
-int fastp2p_client_create_json(const char *text, const char *token_text, const char *ca,
-                            fastp2p_event_fn callback, void *user, fastp2p_client **out) {
+static int create_json(const char *text, const char *token_text, const char *ca,
+                       fastp2p_event_fn callback, void *user, fastp2p_client **out, int validate) {
     if (!out)
         return FASTP2P_EINVAL;
     *out = NULL;
@@ -45,6 +46,11 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
             json_object_put(root);
             return FASTP2P_EINVAL;
         }
+    }
+    const char *ports[]={"ServerPort","PublicIPPort"};
+    for(unsigned i=0;i<2;++i) {
+        json_object *value=op_get(network,ports[i]);
+        if(value&&(!json_object_is_type(value,json_type_int)||json_object_get_int64(value)<0)) {json_object_put(root);return FASTP2P_EINVAL;}
     }
     uint64_t token = op_integer(network, "Token"), port = op_integer(network, "ServerPort"),
              public_port = op_integer(network, "PublicIPPort");
@@ -75,20 +81,34 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
                        .on_event = callback,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
+    if (!rv && validate) fp_client_validation_mode(*out);
     /* Android cannot replace its own package, so the embedding app names a
      * writable directory here for staging a downloaded upgrade. */
+#ifdef __ANDROID__
     const char *update_dir = op_string(root, "UpdateDir");
-    if (*update_dir)
-        fp_update_set_dir(update_dir);
+    if (*update_dir && !validate) fp_update_set_dir(update_dir);
+#endif
     const char *device = op_string(network, "DeviceID");
-    if (!rv && *device)
+    if (!rv && *device && (!cfg.node || !*cfg.node))
         rv = fastp2p_client_set_identity(*out, device);
     json_object *apps = op_get(root, "apps");
     if (!rv && apps && !json_object_is_type(apps, json_type_array))
         rv = FASTP2P_EINVAL;
     for (size_t i = 0; !rv && apps && i < json_object_array_length(apps); ++i) {
         json_object *a = json_object_array_get_idx(apps, i);
+        if(!json_object_is_type(a,json_type_object)) {rv=FASTP2P_EINVAL;break;}
+        const char *strings[]={"AppName","BindIP","PeerNode","DstHost","Protocol","UnderlayProtocol","RelayNode"};
+        for(unsigned k=0;k<sizeof(strings)/sizeof(strings[0]);++k) {
+            json_object *value=NULL;
+            if(json_object_object_get_ex(a,strings[k],&value)&&
+               (!json_object_is_type(value,json_type_string)||(size_t)json_object_get_string_len(value)!=strlen(json_object_get_string(value)))) {
+                rv=FASTP2P_EINVAL;break;
+            }
+        }
+        if(rv)break;
         json_object *enabled = op_get(a, "Enabled");
+        if(json_object_object_get_ex(a,"Enabled",&enabled)&&
+           !json_object_is_type(enabled,json_type_boolean)&&!json_object_is_type(enabled,json_type_int)) {rv=FASTP2P_EINVAL;break;}
         /* JSON true is the natural spelling, and op_integer reads it as 0, which
          * would silently disable the rule. */
         if (enabled && !(json_object_is_type(enabled, json_type_boolean)
@@ -138,7 +158,10 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
         }
         if (rv)
             break;
-        if (op_get(p, "Enabled") && !json_object_get_boolean(op_get(p, "Enabled")))
+        json_object *enabled=NULL;
+        if(json_object_object_get_ex(p,"Enabled",&enabled)&&
+           !json_object_is_type(enabled,json_type_boolean)&&!json_object_is_type(enabled,json_type_int)) {rv=FASTP2P_EINVAL;break;}
+        if (enabled && !json_object_get_boolean(enabled))
             continue;
         const char *transport = op_string(p, "UnderlayProtocol"), *bind_ip = op_string(p, "BindIP");
         uint64_t port = op_integer(p, "SrcPort");
@@ -163,7 +186,8 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
                              .transport = !strcmp(transport, "tcp") ? FASTP2P_TRANSPORT_TCP
                                                                     : FASTP2P_TRANSPORT_QUIC,
                              .username = op_string(p, "Username"),
-                             .password = password};
+                             .password = password,
+                             .relay_node = op_string(p,"RelayNode")};
         rv = fastp2p_client_add_socks5(*out, &proxy, NULL);
     }
     json_object_put(root);
@@ -172,4 +196,14 @@ int fastp2p_client_create_json(const char *text, const char *token_text, const c
         *out = NULL;
     }
     return rv;
+}
+int fastp2p_client_create_json(const char *text,const char *token,const char *ca,
+                              fastp2p_event_fn callback,void *user,fastp2p_client **out) {
+    return create_json(text,token,ca,callback,user,out,0);
+}
+int fp_config_validate_json(const char *text) {
+    fastp2p_client *client=NULL;
+    int result=create_json(text,NULL,NULL,NULL,NULL,&client,1);
+    if(client)fastp2p_client_destroy(client);
+    return result;
 }

@@ -2,6 +2,7 @@ _fastp2p_abi_version
 _fastp2p_version
 _fastp2p_client_create
 _fastp2p_client_create_json
+_fastp2p_client_set_config_handler
 _fastp2p_client_set_identity
 _fastp2p_client_device_id
 _fastp2p_client_node

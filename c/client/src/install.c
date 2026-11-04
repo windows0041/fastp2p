@@ -4,6 +4,7 @@
 #include "identity_file.h"
 #include "platform.h"
 #include "bootstrap.h"
+#include "config_internal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <openssl/crypto.h>
@@ -36,13 +37,13 @@ int fastp2p_default_profile(char out[4096]) {
     int size;
 #ifdef _WIN32
     base = getenv("LOCALAPPDATA");
-    size = base ? snprintf(out, 4096, "%s/fastp2p/client.dat", base) : -1;
+    size = base ? snprintf(out, 4096, "%s/fastp2p/config/fastp2p.conf", base) : -1;
 #elif defined(__APPLE__)
     base = getenv("HOME");
     size = base ? snprintf(out, 4096, "%s/Library/Application Support/fastp2p/client.json", base) : -1;
 #else
     base = getenv("XDG_CONFIG_HOME");
-    if (geteuid() == 0) size = snprintf(out, 4096, "/etc/fastp2p/client.json");
+    if (geteuid() == 0) size = snprintf(out, 4096, "/var/lib/fastp2p/config/fastp2p.conf");
     else if (base && *base) size = snprintf(out, 4096, "%s/fastp2p/client.json", base);
     else { base = getenv("HOME"); size = base ? snprintf(out, 4096, "%s/.config/fastp2p/client.json", base) : -1; }
 #endif
@@ -54,12 +55,12 @@ int fastp2p_default_profile(char out[4096]) {
 int fastp2p_service_profile(char out[4096]) {
     const char *base = getenv("ProgramData");
     if (!base || !*base) return -1;
-    int size = snprintf(out, 4096, "%s/fastp2p/client.dat", base);
+    int size = snprintf(out, 4096, "%s/fastp2p/config/fastp2p.conf", base);
     return size > 0 && size < 4096 ? 0 : -1;
 }
 #else
 int fastp2p_service_profile(char out[4096]) {
-    int size = snprintf(out, 4096, "/etc/fastp2p/client.json");
+    int size = snprintf(out, 4096, "/var/lib/fastp2p/config/fastp2p.conf");
     return size > 0 && size < 4096 ? 0 : -1;
 }
 #endif
@@ -295,6 +296,9 @@ static int install_token(const char *token, const char *token_file, const char *
     int size = snprintf(ca_path, sizeof(ca_path), "%s.ca.%s.pem", profile, fingerprint);
     if (size < 0 || (size_t)size >= sizeof(ca_path)) { json_object_put(enrollment); return 2; }
     json_object *previous = fastp2p_profile_read(profile), *root = json_object_new_object();
+#ifdef _WIN32
+    char legacy_profile[4096]="";
+#endif
     /* Never silently replace an existing unreadable identity. */
     if (!previous) {
 #ifdef _WIN32
@@ -310,10 +314,24 @@ static int install_token(const char *token, const char *token_file, const char *
         }
     }
 #ifdef _WIN32
-    if (!previous && machine) {
-        char user_profile[4096];
-        if (!fastp2p_default_profile(user_profile) && strcmp(user_profile, profile))
-            previous = fastp2p_profile_read(user_profile);
+    if (!previous) {
+        char expected[4096], candidate[4096];
+        int managed = !(machine ? fastp2p_service_profile(expected) : fastp2p_default_profile(expected)) && !strcmp(profile, expected);
+        const char *bases[] = {machine ? getenv("ProgramData") : getenv("LOCALAPPDATA"),
+                               machine ? getenv("LOCALAPPDATA") : NULL,machine ? getenv("LOCALAPPDATA") : NULL};
+        for (unsigned i = 0; managed && !previous && i < 3; ++i) {
+            if (!bases[i] || !*bases[i]) continue;
+            if (snprintf(candidate, sizeof(candidate),i==1?"%s/fastp2p/config/fastp2p.conf":"%s/fastp2p/client.dat",bases[i]) >= (int)sizeof(candidate)) continue;
+            if(!strcmp(candidate,profile))continue;
+            WCHAR old_path[4096];
+            if (wide(candidate, old_path) || GetFileAttributesW(old_path) == INVALID_FILE_ATTRIBUTES) continue;
+            previous = fastp2p_profile_read(candidate);
+            if (!previous) {
+                fputs("Legacy profile cannot be decrypted; refusing identity loss.\n", stderr);
+                json_object_put(root); json_object_put(enrollment); return 1;
+            }
+            snprintf(legacy_profile,sizeof(legacy_profile),"%s",candidate);
+        }
     }
 #endif
     json_object *old_network = NULL;
@@ -377,6 +395,17 @@ static int install_token(const char *token, const char *token_file, const char *
         else json_object_object_del(saved, "CACertFile");
         json_object_put(root); root = saved;
     }
+    if(fp_config_validate_json(json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN))) {
+        fputs("Existing forwarding or network settings are invalid; previous service retained.\n",stderr);goto fail;
+    }
+#ifdef _WIN32
+    if(*legacy_profile) {
+        char backup[4096];
+        if(snprintf(backup,sizeof(backup),"%s.migrated",profile)>=(int)sizeof(backup))goto fail;
+        const char *old=json_object_to_json_string_ext(previous,JSON_C_TO_STRING_PLAIN);
+        if(machine?fastp2p_profile_write_machine(backup,old):fastp2p_profile_write(backup,old))goto fail;
+    }
+#endif
     /* Use the new installer's uninstall command: old releases do not understand
      * --keep-config and may delete the identity or schedule the new EXE for
      * deletion at reboot. Verify first so a bad token leaves the old service. */
@@ -386,7 +415,10 @@ static int install_token(const char *token, const char *token_file, const char *
         if (machine) {
             char *remove[] = {"fastp2p", "uninstall", "--keep-config", NULL};
             if (fastp2p_uninstall_command(3, remove)) goto fail;
-        } else if (fastp2p_remove_autostart(profile)) goto fail;
+        } else {
+            if(*legacy_profile&&fastp2p_remove_autostart(legacy_profile))goto fail;
+            if(fastp2p_remove_autostart(profile))goto fail;
+        }
 #else
         if (fastp2p_remove_autostart(profile)) goto fail;
 #endif
@@ -405,6 +437,13 @@ static int install_token(const char *token, const char *token_file, const char *
             return 1;
         }
     }
+#ifdef _WIN32
+    if(*legacy_profile) {
+        WCHAR old_path[4096];
+        if(!wide(legacy_profile,old_path)&&!DeleteFileW(old_path))
+            fastp2p_install_note("installed; legacy profile cleanup deferred");
+    }
+#endif
     printf("fastp2p installed; gateway identity verified; node=%s\n", result.node);
     if (machine) {
         char done[160];
@@ -445,6 +484,9 @@ int fastp2p_uninstall_command(int argc, char **argv) {
     if (fastp2p_service_profile(profile) || fastp2p_service_remove()) return 1;
     char user_profile[4096];
     if (!fastp2p_default_profile(user_profile) && fastp2p_remove_autostart(user_profile)) return 1;
+    const char *home=getenv("LOCALAPPDATA");
+    if(home&&snprintf(user_profile,sizeof(user_profile),"%s/fastp2p/client.dat",home)<(int)sizeof(user_profile)&&
+       fastp2p_remove_autostart(user_profile))return 1;
     if (!keep && fastp2p_service_purge()) {
         fputs("fastp2p removed; an in-use file may need removal after this process exits.\n", stderr);
     }
@@ -510,7 +552,7 @@ int fastp2p_service_install_token(const char *token) {
             "· 无法连接网关（网络不通或网关证书校验失败）\n"
             "· 文件名中的 16 位安装密钥不正确\n"
             "· C:\\ProgramData\\fastp2p 权限异常\n\n"
-            "详细信息已写入 %ProgramData%\\fastp2p\\install.log。");
+            "详细信息已写入 %ProgramData%\\fastp2p\\config\\install.log。");
     }
     return rv ? 1 : 0;
 }

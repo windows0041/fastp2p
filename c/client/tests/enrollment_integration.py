@@ -75,6 +75,21 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
             current=trust.stat()
             return (current.st_ino,current.st_uid,current.st_gid,current.st_mode)==(trust_stat.st_ino,trust_stat.st_uid,trust_stat.st_gid,trust_stat.st_mode)
         original=profile.read_bytes()
+        if os.name=='nt':
+            # Default-path migration is isolated from the real user's profile and
+            # never installs or removes a service/autostart entry.
+            appdata=root/'legacy-user';old=appdata/'fastp2p/client.dat';old.parent.mkdir(parents=True)
+            old.write_bytes(original)
+            migration_env=dict(client_environment,LOCALAPPDATA=str(appdata))
+            migrated=old.parent/'config/fastp2p.conf'
+            completed=subprocess.run([str(Path(args.client).resolve()),'install','--token-file',str(token_file),'--no-service'],
+                env=migration_env,capture_output=True,timeout=40)
+            assert completed.returncode==0 and not old.exists() and migrated.read_bytes().startswith(b'FPD1')
+            assert Path(str(migrated)+'.migrated').is_file() and token.encode() not in migrated.read_bytes()
+            completed=subprocess.run([str(Path(args.client).resolve()),'run','--config',str(migrated),'--run-seconds','3'],
+                env=migration_env,capture_output=True,timeout=20)
+            assert completed.returncode==0 and b'gateway authenticated' in completed.stdout
+            result['legacy_windows_DPAPI_profile_migrates_to_config_fastp2p_conf']=True
         if os.name=='nt':assert original.startswith(b'FPD1') and payload['key'].encode() not in original
         else:assert profile.stat().st_mode & 0o077==0
         install();assert same_trust_file();result['verified_private_profile_and_repeat_install']=True

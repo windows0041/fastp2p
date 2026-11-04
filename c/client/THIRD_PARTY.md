@@ -31,6 +31,10 @@ Source URLs and checksums are recorded in deps.lock.json. SDK packages include
 the corresponding complete upstream licenses in licenses/. Sources are fetched
 into the out-of-tree dependency cache, not vendored into this repository.
 
+The json-c 0.18 build applies a one-line unsigned-byte fix in strict string
+parsing so literal UTF-8 is not mistaken for a control character. The verified
+upstream archive and this deterministic patch are handled by scripts/build-deps.py.
+
 The OpenSSL QUIC adapter follows ngtcp2's public crypto_ossl interface and MIT
 examples: https://github.com/ngtcp2/ngtcp2/tree/v1.22.1/examples
 

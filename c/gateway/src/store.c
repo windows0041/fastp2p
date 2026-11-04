@@ -66,6 +66,8 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "CREATE TABLE IF NOT EXISTS package_leases("
                 "platform TEXT NOT NULL,version TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(platform,version));"
                 "CREATE TABLE IF NOT EXISTS package_gc(filename TEXT PRIMARY KEY);"
+                "CREATE TABLE IF NOT EXISTS node_configs(node TEXT PRIMARY KEY,fields TEXT NOT NULL,"
+                "revision INTEGER NOT NULL,state TEXT NOT NULL,ack_revision INTEGER NOT NULL);"
                 "PRAGMA application_id=1179660880; PRAGMA user_version=4;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
@@ -99,13 +101,27 @@ int gw_device_valid(const char *text) {
 }
 int gw_store_delete_offline(sqlite3 *db, const char *name) {
     sqlite3_stmt *s = NULL;
-    if (!gw_node_valid(name) || sqlite3_prepare_v2(db, "DELETE FROM nodes WHERE name=? AND online=0", -1, &s, NULL) != SQLITE_OK)
+    if (!gw_node_valid(name) || sql(db,"BEGIN IMMEDIATE"))return -1;
+    if (sqlite3_prepare_v2(db, "DELETE FROM nodes WHERE name=? AND online=0", -1, &s, NULL) != SQLITE_OK) {
+        sql(db,"ROLLBACK");
         return -1;
+    }
     sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
     int ok = sqlite3_step(s) == SQLITE_DONE, changed = sqlite3_changes(db);
     sqlite3_finalize(s);
-    if (!ok) return -1;
-    if (changed) return 0;
+    if (!ok) {sql(db,"ROLLBACK");return -1;}
+    if (changed) {
+        const char *tables[]={"rules","rule_nodes","node_configs"};
+        for(unsigned i=0;i<3;++i) {
+            char query[100];snprintf(query,sizeof(query),"DELETE FROM %s WHERE node=?",tables[i]);
+            if(sqlite3_prepare_v2(db,query,-1,&s,NULL)!=SQLITE_OK){sql(db,"ROLLBACK");return -1;}
+            sqlite3_bind_text(s,1,name,-1,SQLITE_TRANSIENT);ok=sqlite3_step(s)==SQLITE_DONE;sqlite3_finalize(s);
+            if(!ok){sql(db,"ROLLBACK");return -1;}
+        }
+        if(sql(db,"COMMIT")){sql(db,"ROLLBACK");return -1;}
+        return 0;
+    }
+    if(sql(db,"COMMIT")){sql(db,"ROLLBACK");return -1;}
     if (sqlite3_prepare_v2(db, "SELECT online FROM nodes WHERE name=?", -1, &s, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
     int row = sqlite3_step(s);

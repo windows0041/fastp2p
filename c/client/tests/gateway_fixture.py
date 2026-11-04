@@ -27,7 +27,12 @@ for name in ['cert','key','bind','apibind','enrollment-ca','database']:
     p.add_argument('--'+name,'-'+name,default='127.0.0.1' if name in ['bind','apibind'] else None)
 p.add_argument('--port',type=int,default=27183);p.add_argument('--apiport',type=int,default=10008)
 args=p.parse_args();key=int(os.environ['FASTP2P_TOKEN']);user=os.environ['FASTP2P_USER'];password=os.environ['FASTP2P_PASSWORD']
-nodes={};lock=threading.RLock();stopped=threading.Event();jwt=secrets.token_urlsafe(32)
+nodes={};configs={};lock=threading.RLock();stopped=threading.Event();jwt=secrets.token_urlsafe(32)
+def merge(base,fields):
+    result=json.loads(json.dumps(base))
+    for name,value in fields.items():
+        result[name]=merge(result.get(name,{}) if isinstance(result.get(name),dict) else {},value) if isinstance(value,dict) else value
+    return result
 def crc(text):
     value=2**64-1
     for byte in text.encode():
@@ -69,6 +74,14 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         except (ValueError,TypeError):self.reply({},400);return
         if self.path=='/api/v1/user/login' and body=={'user':user,'password':password}:
             self.reply({'token':jwt,'installToken':str(key),'gateway':{'host':'127.0.0.1','port':args.port,'ca':Path(args.enrollment_ca).read_text() if args.enrollment_ca else ''},'error':0})
+        elif self.path.startswith('/api/v1/device/') and self.path.endswith('/config') and self.headers.get('Authorization','')=='Bearer '+jwt:
+            name=self.path.split('/')[4]
+            if not isinstance(body.get('fields'),dict):self.reply({},400);return
+            with lock:
+                old=configs.get(name,{'fields':{},'revision':0});value={'fields':merge(old['fields'],body['fields']),'revision':old['revision']+1,'state':'queued','error':0}
+                configs[name]=value;peer=nodes.get(name)
+            if peer:peer.send(packet(3,19,value))
+            self.reply(value)
         else:self.reply({},401)
     def do_GET(self):
         path=urlsplit(self.path);query=parse_qs(path.query)
@@ -108,6 +121,9 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         if path.path in ['/api/v1/devices','/api/v1/nodes']:
             with lock:result=[{'name':n,'isActive':1,'lanip':client.metadata.get('lanIP',''),'os':client.metadata.get('os',''),'version':'1.0.0'} for n,client in nodes.items()]
             self.reply({'nodes':result,'total':len(result)})
+        elif path.path.startswith('/api/v1/device/') and path.path.endswith('/config'):
+            with lock:value=configs.get(path.path.split('/')[4],{'fields':{},'revision':0,'state':'none','error':0})
+            self.reply(value)
         else:self.reply({},404)
     def exact(self,length):
         data=self.rfile.read(length)
@@ -128,7 +144,13 @@ class HTTP(http.server.BaseHTTPRequestHandler):
                 except OSError:pass
             self.send(packet(3,0,{'error':0 if peer else 1}));return
         body=json.loads(data)
-        if main==6 and sub==0:self.metadata=body;self.send(packet(6,7,{}))
+        if main==6 and sub==0:
+            self.metadata=body;self.send(packet(6,7,{}))
+            with lock:config=configs.get(self.node)
+            if config:self.send(packet(3,19,config))
+        elif main==6 and sub==8:
+            with lock:
+                if self.node in configs and configs[self.node]['revision']==body.get('revision'):configs[self.node]['state']=body['state']
         elif main==7 and sub==0:
             with lock:peer=nodes.get(body.get('peerNode'))
             if not peer:self.send(packet(7,1,{'online':0}));return
