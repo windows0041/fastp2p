@@ -51,6 +51,7 @@
         <section class="panel updates-panel"><div class="panel-heading"><div><span class="eyebrow">CLIENT UPDATES</span><h2>客户端升级</h2><p>同步 GitHub 稳定版或上传安装包，然后选择下载或下发升级。</p></div><div class="rule-toolbar"><button id="sync-release" class="button" type="button">同步 GitHub 最新版</button><button id="refresh-updates" class="button" type="button">刷新</button><button id="upload-update" class="button" type="button">上传安装包</button><button id="upgrade-all" class="button primary" type="button">升级所有旧版本</button></div></div>
           <p id="sync-message" class="inline-message" role="status"></p>
           <p id="update-message" class="inline-message" role="status">尚无安装包。</p>
+          <p id="upgrade-message" class="form-help" role="status" aria-live="polite" hidden></p>
           <div class="table-scroll"><table class="rules-table"><thead><tr><th>平台</th><th>版本</th><th>大小</th><th>SHA256</th><th>入库时间</th><th>下载</th></tr></thead><tbody id="updates"></tbody></table></div>
         </section>
         <footer class="main-footer"><span>FastP2P C Gateway</span><span>数据在客户端之间传输，网关负责连接协调。</span></footer>

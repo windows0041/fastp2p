@@ -39,4 +39,10 @@ int fp_update_run_pending(char *const argv[]);
  * staged over target, then restarts the service. */
 int fp_update_swap(const char *staged, const char *target, const char *service);
 
+#ifdef _WIN32
+#include <wchar.h>
+/* Internal Windows helper: wait for a stopped process to release its image. */
+int fp_update_replace_file(const wchar_t *source, const wchar_t *target);
+#endif
+
 #endif

@@ -957,6 +957,7 @@ static void handle_http(struct connection *c) {
             return;
         }
         json_object *queued = json_object_new_array();
+        json_object *skipped = json_object_new_array();
         for (unsigned i = 0; i < g.max_nodes; ++i) {
             struct connection *node = g.nodes[i];
             if (!node)
@@ -971,24 +972,43 @@ static void handle_http(struct connection *c) {
                 for (size_t k = 0; k < json_object_array_length(available); ++k) {
                     json_object *row = json_object_array_get_idx(available, k);
                     const char *candidate = gw_string(row, "platform"), *version = gw_string(row, "version");
-                    if ((!strcmp(platform, candidate) || !strcmp(architecture, candidate)) &&
+                    /* Old Linux/macOS clients report no architecture. Include
+                     * the family only to explain why they need a manual first
+                     * upgrade; never select an arbitrary architecture's file. */
+                    int unknown_arch = architecture == platform &&
+                        (!strcmp(platform, "linux") || !strcmp(platform, "macos"));
+                    if ((!strcmp(platform, candidate) || !strcmp(architecture, candidate) ||
+                         (unknown_arch && !strncmp(candidate, platform, strlen(platform)) &&
+                          candidate[strlen(platform)] == '-')) &&
                         (!target_version || version_compare(version, target_version) > 0))
                         target_version = version;
                 }
             if (!target_version || version_compare(node->version, target_version) >= 0)
                 continue;
-            if (push_update(node, target_version))
-                continue;
+            char sha[65], filename[260], package_variant[16];
+            uint64_t size = 0;
+            const char *reason = NULL;
+            if (!find_node_package(node, target_version, sha, filename, &size, package_variant))
+                reason = architecture == platform && (!strcmp(platform, "linux") || !strcmp(platform, "macos"))
+                    ? "architecture_not_reported" : "package_unavailable";
+            else if (push_update(node, target_version))
+                reason = "dispatch_failed";
             json_object *item = json_object_new_object();
             gw_js(item, "node", node->node);
             gw_js(item, "from", node->version);
             gw_js(item, "to", target_version);
-            json_object_array_add(queued, item);
+            if (reason) {
+                gw_js(item, "reason", reason);
+                json_object_array_add(skipped, item);
+            } else {
+                json_object_array_add(queued, item);
+            }
         }
         json_object_put(available);
         json_object *root = json_object_new_object();
         gw_ju(root, "error", 0);
         json_object_object_add(root, "queued", queued);
+        json_object_object_add(root, "skipped", skipped);
         http_json(c, 200, root);
         json_object_put(root);
         return;

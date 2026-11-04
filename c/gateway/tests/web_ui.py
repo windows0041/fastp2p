@@ -6,11 +6,13 @@ exceptions apply only to this isolated fixture context, never to the product.
 """
 import argparse
 import base64
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -69,7 +71,7 @@ class Peer:
                 if opcode not in (0,2):continue
                 length,main,sub=struct.unpack('<IHH',payload[:8]);assert length==len(payload)-8
                 if main!=3:continue
-                if sub not in (7,9,10):continue
+                if sub not in (7,9,10,18):continue
                 body=json.loads(payload[8:]);self.commands.append((sub,body))
                 if sub==7:self.send(frame(6,3,{'Apps':self.apps}))
                 elif sub==9:
@@ -262,7 +264,43 @@ def main():
                 expect(page.locator('#account-name')).to_have_text('custom-web-admin')
                 expect(page.locator('#online-count')).to_have_text('1')
                 results['custom_account_current_password_and_sign_in_again']=True
+                # Exercise actual batch selection and the browser's distinction
+                # between a queued order, a skipped node, and a reported upgrade.
+                legacy=Peer('web-legacy-mac','darwin-c',token,root/'certs/ca.crt');peers.append(legacy)
+                windows=Peer('web-update-win','windows-c',token,root/'certs/ca.crt');peers.append(windows)
+                uploaded=page.evaluate('''async () => {
+                    const session=JSON.parse(sessionStorage.getItem('fastp2p.console'));
+                    const statuses=[];
+                    for (const [platform,bytes] of [['windows',[77,90,0,0]],['macos',[207,250,237,254]]]) {
+                        const r=await fetch('/api/v1/update?platform='+platform+'&version=9.9.9', {
+                            method:'PUT',headers:{Authorization:'Bearer '+session.token},body:new Uint8Array(bytes)});
+                        statuses.push(r.status);
+                    }
+                    return statuses;
+                }''')
+                assert uploaded==[200,200],uploaded
+                with closing(sqlite3.connect(root/'nodes.sqlite3',timeout=5)) as db, db:
+                    db.execute("INSERT INTO release_packages SELECT 'macos-arm64',version,sha256,size,filename,uploaded_at FROM updates WHERE platform='macos'")
+                    db.execute("DELETE FROM updates WHERE platform='macos'")
+                page.locator('#node-search').fill('');page.locator('#refresh').click()
+                expect(page.locator('#online-count')).to_have_text('3')
+                page.locator('#upgrade-all').click()
+                with page.expect_response(lambda r:r.url.endswith('/api/v1/upgrades')) as pending:
+                    page.locator('#confirm-action').click()
+                order=pending.value.json()
+                assert [item['node'] for item in order['queued']]==[windows.name],order
+                assert any(item['node']==legacy.name and item['reason']=='architecture_not_reported'
+                           for item in order['skipped']),order
+                expect(page.locator('#upgrade-message')).to_contain_text('等待客户端重启并上报新版本')
+                expect(page.locator('#upgrade-message')).to_contain_text('旧客户端未上报架构')
+                expect(page.get_by_role('button',name='升级节点 '+windows.name+' 到 9.9.9')).to_be_disabled()
+                assert not any(sub==18 for sub,_ in legacy.commands)
+                windows.send(frame(6,0,{'os':'windows-c','version':'9.9.9','lanIP':'192.0.2.8'}))
+                page.locator('#refresh').click()
+                expect(page.locator('#upgrade-message')).to_contain_text(windows.name+'：已升级到 9.9.9',timeout=15000)
+                results['upgrade_pending_completion_and_skipped_architecture_visible']=True
                 page.locator('#logout').click();expect(page.locator('#login-screen')).to_be_visible()
+                expect(page.locator('#upgrade-message')).to_be_hidden()
                 assert not errors,errors
                 context.close();browser.close()
             assert all(peer.error is None for peer in peers)

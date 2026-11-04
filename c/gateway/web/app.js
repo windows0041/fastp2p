@@ -3,7 +3,7 @@
   const $ = id => document.getElementById(id);
   const state = {token: '', installToken: '', nodes: [], selected: null, apps: [], updates: [],
     refreshing: false, loadingApps: false, selection: 0, editing: null, confirm: null,
-    offset: 0, total: 0, registered: 0};
+    offset: 0, total: 0, registered: 0, upgrades: new Map(), skippedUpgrades: []};
   /* The console keeps its session in sessionStorage: it survives a reload, but
    * it dies with the tab and is never shared with another tab. */
   const STORE = 'fastp2p.console';
@@ -31,6 +31,7 @@
   }
   function logout(expired = false) {
     state.token = state.installToken = ''; state.nodes = []; state.apps = []; state.selected = null;
+    state.upgrades.clear(); state.skippedUpgrades = []; renderUpgradeProgress();
     persist();
     state.selection++; $('console').hidden = true; $('login-screen').hidden = false;
     state.offset = state.total = state.registered = 0; $('node-search').value = '';
@@ -60,6 +61,7 @@
           504: '客户端响应超时，请检查节点是否仍在线。', 501: '此客户端暂不支持该操作。'};
         const details = {'device offline':'节点已离线。','node is online':'节点已上线，不能删除。',
           'node not found':'节点记录已不存在。','current password incorrect':'当前密码不正确。',
+          'no package for this platform and version':'没有适合此节点平台和架构的安装包，请先手动安装新版客户端。',
           'invalid account settings':'请填写有效账号和至少 8 位的新密码。'};
         throw new Error(details[body.detail] || known[response.status] || '网关未能完成请求。');
       }
@@ -99,10 +101,13 @@
       if (active && latest && compareVersions(n.version, latest) < 0) {
         const upgrade = element('button', 'link-button', '升级到 ' + latest); upgrade.type = 'button';
         upgrade.setAttribute('aria-label', '升级节点 ' + n.name + ' 到 ' + latest);
+        const pending = state.upgrades.get(n.name);
+        if (pending?.status === 'pending') { upgrade.disabled = true; upgrade.textContent = '等待升级完成…'; }
         upgrade.addEventListener('click', event => {
           event.stopPropagation();
           confirm('升级客户端', `${n.name}：${n.version || '未知版本'} → ${latest}。客户端会从网关下载、校验并重启，连接会短暂中断。`, async () => {
             await api('/api/v1/device/' + encodeURIComponent(n.name) + '/upgrade', {version: latest});
+            trackUpgrades([{node: n.name, from: n.version, to: latest}], []);
             await new Promise(resolve => setTimeout(resolve, 800));
             await refresh();
             return '升级指令已发送到 ' + n.name + '。';
@@ -147,6 +152,7 @@
       if (state.token !== token || offset !== state.offset || query !== $('node-search').value.trim()) return;
       text('gateway-label', '网关在线'); $('gateway-status').classList.remove('offline');
       state.nodes = Array.isArray(devices.nodes) ? devices.nodes : [];
+      renderUpgradeProgress();
       state.total = Number(devices.total) || 0; state.registered = Number(status.totalNodes) || 0;
       text('online-count', status.online); text('capacity', '/ ' + status.capacity);
       text('uptime', uptime(status.uptimeSeconds)); text('queue', bytes(status.queuedBytes));
@@ -226,6 +232,30 @@
     }
   }
   /* --- Client upgrades ---------------------------------------------------- */
+  function trackUpgrades(queued, skipped) {
+    for (const item of queued)
+      state.upgrades.set(item.node, {...item, started: Date.now(), status: 'pending'});
+    state.skippedUpgrades = skipped;
+    renderUpgradeProgress(); renderNodes();
+  }
+  function renderUpgradeProgress() {
+    const messages = [];
+    for (const [name, item] of state.upgrades) {
+      const node = state.nodes.find(n => n.name === name);
+      if (node && compareVersions(node.version, item.to) >= 0) item.status = 'complete';
+      else if (item.status === 'pending' && Date.now() - item.started > 360000) item.status = 'unconfirmed';
+      messages.push(name + '：' + (item.status === 'complete' ? '已升级到 ' + item.to :
+        item.status === 'unconfirmed' ? '尚未确认升级完成，请检查客户端日志或手动安装。' :
+        '已下发 ' + item.to + '，等待客户端重启并上报新版本…' +
+          (String(node?.os || '').startsWith('android') ? '请在手机通知中确认安装。' : '')));
+    }
+    const reasons = {architecture_not_reported: '旧客户端未上报架构，请先手动安装一次新版。',
+      package_unavailable: '没有匹配平台和架构的安装包。', dispatch_failed: '升级指令下发失败，请稍后重试。'};
+    for (const item of state.skippedUpgrades)
+      messages.push(item.node + '：未下发，' + (reasons[item.reason] || '客户端暂不支持升级。'));
+    text('upgrade-message', messages.join('；'));
+    $('upgrade-message').hidden = !messages.length;
+  }
   function platformForOs(os) {
     const value = String(os || '');
     if (!value.endsWith('-c')) return '';
@@ -507,8 +537,11 @@
     async () => {
       const body = await api('/api/v1/upgrades', {});
       const queued = Array.isArray(body.queued) ? body.queued : [];
+      const skipped = Array.isArray(body.skipped) ? body.skipped : [];
+      trackUpgrades(queued, skipped);
       await new Promise(resolve => setTimeout(resolve, 800)); await refresh();
-      return queued.length ? '已向 ' + queued.length + ' 个节点下发升级。' : '没有需要升级的在线节点。';
+      return queued.length ? '已向 ' + queued.length + ' 个节点下发升级' + (skipped.length ? '，另有 ' + skipped.length + ' 个节点未下发，原因见客户端升级面板。' : '，正在等待客户端上报新版本。') :
+        skipped.length ? skipped.length + ' 个节点无法自动升级，原因见客户端升级面板。' : '没有需要升级的在线节点。';
     }));
   $('confirm-form').addEventListener('submit', async event => {
     event.preventDefault(); $('confirm-action').disabled = true;

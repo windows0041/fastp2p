@@ -256,6 +256,21 @@ static int start_service(SC_HANDLE service) {
     return -1;
 }
 
+int fp_update_replace_file(const wchar_t *source, const wchar_t *target) {
+    /* SERVICE_STOPPED may be reported before the outgoing process has released
+     * its mapped executable. A single rename can therefore fail even after a
+     * successful stop. Keep the replacement and backup intact while waiting. */
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (MoveFileExW(source, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return 0;
+        DWORD error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED)
+            return -1;
+        Sleep(100);
+    }
+    return -1;
+}
+
 int fp_update_swap(const char *staged, const char *target, const char *service) {
     wchar_t wide_staged[4096], wide_target[4096], wide_service[256];
     if (wide(staged, wide_staged, 4096) || wide(target, wide_target, 4096) ||
@@ -272,11 +287,11 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
          * replacement so the running file never has to be moved. */
         int replaced = CopyFileW(wide_target, previous, FALSE) &&
                        CopyFileW(wide_staged, replacement, FALSE) &&
-                       MoveFileExW(replacement, wide_target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                       !fp_update_replace_file(replacement, wide_target);
         if (replaced && !start_service(handle)) {
             ok = 1;
         } else if (!replaced || (!stop_service(handle) &&
-                   MoveFileExW(previous, wide_target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))) {
+                   !fp_update_replace_file(previous, wide_target))) {
             (void)start_service(handle);
         }
         DeleteFileW(replacement);

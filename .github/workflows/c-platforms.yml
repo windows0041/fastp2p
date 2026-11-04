@@ -181,6 +181,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-platform.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-update-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-secure.exe
