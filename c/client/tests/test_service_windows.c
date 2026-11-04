@@ -42,7 +42,10 @@ int main(int argc, char **argv) {
     assert(GetTempPathA(sizeof(temp), temp));
     snprintf(root, sizeof(root), "%sfastp2p-service-ci-%lu", temp, (unsigned long)GetCurrentProcessId());
     assert(CreateDirectoryA(root, NULL));
-    assert(SetEnvironmentVariableA("ProgramFiles", root));
+    /* getenv() reads the CRT environment, not just the Win32 environment block.
+     * Verify isolation before any installation can touch the machine paths. */
+    assert(!_putenv_s("ProgramFiles", root));
+    assert(!strcmp(getenv("ProgramFiles"),root));
     snprintf(profile, sizeof(profile), "%s/config/client.dat", root);
     assert(!fastp2p_service_prepare(profile));
     FILE *file = fopen(profile, "wb"); assert(file); fputs("identity-fixture", file); fclose(file);
