@@ -162,7 +162,11 @@ esac
         named = root/('fastp2p-'+key); named.write_bytes(installer)
         def run(path=named, expected=0, shell='sh'):
             result = subprocess.run([shell, str(path)], env=environment, capture_output=True, timeout=50)
-            assert result.returncode == expected, result.stderr.decode(errors='replace').replace(key, '[redacted]')
+            if result.returncode != expected:
+                diagnostic=result.stderr.decode(errors='replace')
+                checks=list(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'))
+                if checks:diagnostic+='\n'+max(checks,key=lambda p:p.stat().st_mtime_ns).read_text(errors='replace')[-8000:]
+                raise AssertionError(diagnostic.replace(key,'[redacted]'))
             assert key.encode() not in result.stdout+result.stderr
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
         profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
