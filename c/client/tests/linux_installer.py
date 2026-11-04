@@ -161,7 +161,14 @@ esac
             assert db.execute('SELECT expires_at FROM package_leases WHERE platform="linux"').fetchone()[0] > time.time()
         named = root/('fastp2p-'+key); named.write_bytes(installer)
         def run(path=named, expected=0, shell='sh'):
-            result = subprocess.run([shell, str(path)], env=environment, capture_output=True, timeout=50)
+            # The real managed-profile probe drops UID/GID. Some container
+            # kernels prevent LeakSanitizer from attaching to that process on
+            # exit. ASan/UBSan remain active; standalone client/protocol tests
+            # and the gateway retain their normal leak checks.
+            installer_env=dict(environment)
+            prior=installer_env.get('ASAN_OPTIONS','')
+            installer_env['ASAN_OPTIONS']=(prior+':' if prior else '')+'detect_leaks=0'
+            result = subprocess.run([shell, str(path)], env=installer_env, capture_output=True, timeout=50)
             if result.returncode != expected:
                 diagnostic=result.stderr.decode(errors='replace')
                 checks=list(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'))
