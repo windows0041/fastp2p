@@ -6,8 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static volatile LONG stopping;
-void fastp2p_runtime_request_stop(void) { InterlockedExchange(&stopping, 1); }
 int fastp2p_service_profile(char path[4096]) { (void)path; return -1; } /* purge is never used */
 int fastp2p_private_parents(const char *path) {
     WCHAR wide[4096];
@@ -21,13 +19,16 @@ int fastp2p_private_parents(const char *path) {
 }
 static int loop(int argc, char **argv) {
     (void)argc;
+    Sleep(200); /* A STOP delivered during startup must survive runtime_begin. */
+    if(fastp2p_runtime_begin(argv[3],0))return 1;
     char marker[4096]; snprintf(marker, sizeof(marker), "%s.ready", argv[3]);
     FILE *file = fopen(marker, "wb"); if (!file) return 1;
     fputs("ready", file); fclose(file);
-    while (!InterlockedCompareExchange(&stopping, 0, 0)) Sleep(10);
+    while (!fastp2p_runtime_stopping()) Sleep(10);
     /* Reporting STOPPED happens before process teardown; removal must also wait
      * for the image handle to close, tested by replacing it immediately below. */
     Sleep(400);
+    fastp2p_runtime_end();
     return 0;
 }
 static DWORD WINAPI close_service_later(void *service) {

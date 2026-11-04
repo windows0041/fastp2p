@@ -247,8 +247,8 @@ static int client_main(int argc, char **argv) {
         fastp2p_client_destroy(client); json_object_put(root); return 1;
     }
     signal(SIGTERM, signal_stop);
-    rv = fastp2p_client_start(client);
-    if (rv)
+    rv = fastp2p_runtime_stopping() ? 0 : fastp2p_client_start(client);
+    if (rv || fastp2p_runtime_stopping())
         goto done;
     time_t deadline = run_seconds ? time(NULL) + (time_t)run_seconds : 0;
     while (!interrupted && !fastp2p_runtime_stopping() && (!deadline || time(NULL) < deadline) &&
@@ -258,7 +258,7 @@ static int client_main(int argc, char **argv) {
             break;
         if (fp_config_sync_tick()) {rv=FP_CONFIG_RELOAD;break;}
     }
-    if (!was_online && !interrupted && rv != FP_CONFIG_RELOAD)
+    if (!was_online && !interrupted && !fastp2p_runtime_stopping() && rv != FP_CONFIG_RELOAD)
         rv = FASTP2P_EIO;
 done:
     if (rv && rv != FP_CONFIG_RELOAD)

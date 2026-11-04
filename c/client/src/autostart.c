@@ -31,7 +31,8 @@ int fastp2p_runtime_begin(const char *profile, int background) {
     stop_event = CreateEventW(NULL, TRUE, FALSE, name);
     if (!stop_event) return -1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(stop_event); stop_event = NULL; return -1; }
-    stop_requested = 0;
+    /* A service STOP may arrive before this event exists. Keep the in-process
+     * request; configuration reloads must not clear a real SCM shutdown either. */
     if (background) {
         DWORD owners[2];
         if (GetConsoleProcessList(owners, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE);
