@@ -20,7 +20,7 @@ Linux 从网关控制台下载带 Token 文件名的自包含脚本，用 `sh �
 
 安装和保活逻辑在独立的 `scripts/linux-installer.sh`、`scripts/fastp2p-service.sh` 中，C 核心不包含发行版判断。脚本根据实际服务管理器选择 Debian/Ubuntu/CentOS 等的 systemd、OpenWrt 的 procd、Alpine 的 OpenRC，使用独立非 root 账号，开启开机启动和崩溃重启；未检测到支持的管理器时明确报错。下载时仍需选择设备对应的 CPU 架构；没有对应编译包的设备需要另行移植。进程由容器管理时，使用原始可执行文件前台运行及容器重启策略。
 
-Linux x86_64 设备先用 `uname -m` 确认输出为 `x86_64`，在网关控制台选择 `linux-x86_64` 的「下载安装包」。保留下载文件名，将下面引号内的示例替换为实际文件名执行；Token 会自动读取，无需额外输入：
+Linux x86_64 设备先用 `uname -m` 确认输出为 `x86_64`，在网关控制台选择 `linux-x86_64` 的「下载安装脚本」。保留下载文件名，将下面引号内的示例替换为实际文件名执行；Token 会自动读取，无需额外输入：
 
 ```sh
 sudo sh './fastp2p-<下载文件名中的16位数字>'

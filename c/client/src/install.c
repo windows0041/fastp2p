@@ -388,7 +388,10 @@ static int install_token(const char *token, const char *token_file, const char *
         json_object_put(previous); json_object_put(root); json_object_put(enrollment);
         fputs("Refusing to replace an unrelated configuration file.\n", stderr); return 2;
     }
-    if (!node && old_network && *field(old_network, "Node")) node = field(old_network, "Node");
+    json_object *old_automatic = NULL;
+    int automatic = old_network && json_object_object_get_ex(old_network,"AutoNode",&old_automatic) &&
+                    json_object_is_type(old_automatic,json_type_boolean) && json_object_get_boolean(old_automatic);
+    if (!node && !automatic && old_network && *field(old_network, "Node")) node = field(old_network, "Node");
     unsigned char bytes[16];
     if (RAND_bytes(bytes, sizeof(bytes)) != 1) { json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous); return 1; }
     for (unsigned i = 0; i < sizeof(bytes); ++i) snprintf(identity + 2*i, 3, "%02x", bytes[i]);

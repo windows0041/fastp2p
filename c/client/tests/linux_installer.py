@@ -164,6 +164,7 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             run(shell='bash' if manager.startswith('systemd') else 'sh')
             first = json.loads(profile.read_text()); identity = first['network']['DeviceID']
             first['customSetting'] = {'preserve': True}; first['network']['UDPPort'] = 29887
+            first['network']['Node'] = 'ignored-stale-node'
             profile.write_text(json.dumps(first)); before = profile.read_bytes()
             binary = Path('/usr/local/fastp2p/bin/fastp2p')
             assert binary.read_bytes() == payload and Path('/usr/local/bin/fastp2p').read_bytes() == payload
@@ -211,6 +212,7 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             assert gateway_db.parent.stat().st_uid == 0 and not gateway_db.parent.stat().st_mode & 0o022
             saved = json.loads(profile.read_text())
             assert saved['network']['DeviceID'] == identity and saved['customSetting'] == first['customSetting']
+            assert saved['network']['AutoNode'] is True and 'Node' not in saved['network']
             assert saved['network']['UDPPort'] == 29887
             assert saved['CACertFile'].startswith(str(profile)+'.ca.') and Path(saved['CACertFile']).read_bytes() == (root/'tls/ca.crt').read_bytes()
             assert 'stop' in events.read_text() and 'start' in events.read_text()
