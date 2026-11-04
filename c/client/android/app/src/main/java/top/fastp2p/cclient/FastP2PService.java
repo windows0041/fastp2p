@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class FastP2PService extends Service {
     static final String STOP = "top.fastp2p.cclient.STOP";
     private static final String CHANNEL = "fastp2p-connection";
-    private static final String UPDATE_CHANNEL = "fastp2p-update";
+    static final String UPDATE_CHANNEL = "fastp2p-update";
     static volatile boolean running;
     static volatile int state;
     static volatile String status = "未连接";

@@ -215,10 +215,49 @@ static void relay_requests_are_shared_and_expire(void) {
     dispose(c);
 }
 
+static void failed_relay_can_be_reselected(void) {
+    fastp2p_client *c = fixture();
+    c->state = FASTP2P_ONLINE; c->force_relay = c->running = 1;
+    c->ws = (CURL *)(uintptr_t)1;
+    app *a = &c->apps[0];
+    a->used = a->local = 1;
+    a->fd = -1;
+    a->transport = FASTP2P_TRANSPORT_TCP;
+    strcpy(a->peer, "sender-node");
+    int ti = relay_tunnel(c, a, "relay-node", a->peer, 1);
+    assert(ti >= 0);
+    a->tunnel_index = ti;
+    close_tunnel(c, ti, NULL);
+
+    uint64_t now = a->retry;
+    tick_apps(c, now);
+    uint16_t main, sub;
+    uint8_t *body;
+    size_t length;
+    assert(op_frame_take(&c->ws_tx, &main, &sub, &body, &length) > 0);
+    assert(main == 5 && sub == 0);
+    json_object *request = op_json(body, length);
+    json_object *exclude = op_get(request, "exclude");
+    assert(exclude && !strcmp(json_object_get_string(json_object_array_get_idx(exclude, 0)), "relay-node"));
+    json_object_put(request);
+    free(body);
+
+    tick_apps(c, now + 32 * NS);
+    assert(op_frame_take(&c->ws_tx, &main, &sub, &body, &length) > 0);
+    assert(main == 5 && sub == 0);
+    request = op_json(body, length);
+    assert(request && !op_get(request, "exclude"));
+    json_object_put(request);
+    free(body);
+    c->ws = NULL;
+    dispose(c);
+}
+
 int main(void) {
     relay_cannot_steal_direct_rule();
     relay_endpoint_shares_only_with_the_logical_peer();
     relay_requests_are_shared_and_expire();
+    failed_relay_can_be_reselected();
     exact_connection();
     reordered_and_duplicate_keys();
     acknowledgement_and_certificate();

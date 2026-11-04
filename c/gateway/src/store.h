@@ -46,6 +46,9 @@ int gw_store_rule_managed(sqlite3 *db, const char *node);
 
 /* Client upgrade packages hosted by the gateway. Files are stored content
  * addressed next to the database; only metadata lives in SQLite. */
+int gw_store_update_key_valid(const char *platform, const char *version);
+int gw_store_package_key_valid(const char *platform, const char *version);
+void gw_store_release_version(sqlite3 *db, char version[32]);
 int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
                         const char *sha256, uint64_t size, const char *filename);
 /* JSON array of {platform, version, sha256, size, uploadedAt}, newest first. */

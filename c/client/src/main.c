@@ -77,6 +77,7 @@ static void usage(void) {
          "--version prints the C library and ABI version; --licenses prints complete notices.");
 }
 static int client_main(int argc, char **argv) {
+    char **original_argv = argv;
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {
         return fwrite(fastp2p_notices, 1, sizeof(fastp2p_notices), stdout) == sizeof(fastp2p_notices) ? 0 : 1;
     }
@@ -252,13 +253,24 @@ done:
     /* Install a verified upgrade package only after a clean shutdown: the run
      * loop then returns success, so a service manager sees a normal stop instead
      * of a failure it would answer with a restart of the old image. */
-    fp_update_run_pending();
     fastp2p_runtime_end();
+    if (fp_update_run_pending(original_argv))
+        rv = FASTP2P_EIO;
     json_object_put(root);
     return rv ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
+#if !defined(_WIN32)
+    if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--no-service"))) {
+        char token[17];
+        if (fastp2p_name_token(argv[0], token) == 0) {
+            char *install[] = {argv[0], "install", "--token", token,
+                               argc == 2 ? argv[1] : NULL, NULL};
+            return fastp2p_install_command(argc + 3, install);
+        }
+    }
+#endif
 #ifdef _WIN32
     /* Started from Explorer: no arguments. The key travels in the file name. */
     if (argc == 1) {

@@ -10,9 +10,11 @@ import http.client
 import json
 import os
 from pathlib import Path
+import pwd
 import secrets
 import shutil
 import socket
+import sqlite3
 import ssl
 import subprocess
 import tempfile
@@ -44,15 +46,20 @@ def wait(action, timeout=90, what='condition'):
 
 with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
     root = Path(temporary)
+    # The service owns its state directory, while the rest of the installation
+    # is controlled by root. Run the client without root's write privileges.
+    service_user = pwd.getpwnam('nobody') if os.geteuid() == 0 else None
+    if service_user:
+        root.chmod(0o711)
     try:
         # The certificate helper lives beside the other integration tests.
         from certificates import create_certificates
-        create_certificates(root / 'certs', '127.0.0.1')
+        create_certificates(root / 'certs', '127.0.0.1', '127.0.0.2')
 
         env = os.environ.copy()
         env.update(FASTP2P_USER='update-admin',
                    FASTP2P_PASSWORD=secrets.token_urlsafe(24),
-                   FASTP2P_TOKEN='9999999999999999')
+                   FASTP2P_TOKEN='9999999999999999', FASTP2P_PUBLIC_HOST='127.0.0.2')
         ctx = ssl.create_default_context(cafile=str(root / 'certs' / 'ca.crt'))
 
         def start(command, name):
@@ -61,14 +68,16 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
             f = (logs / (name + '.log')).open('a')
             files.append(f)
             child = subprocess.Popen([str(x) for x in command], cwd=directory, env=env,
-                                     stdout=f, stderr=subprocess.STDOUT)
+                                     stdout=f, stderr=subprocess.STDOUT,
+                                     user=service_user.pw_uid if service_user and name == 'client' else None,
+                                     group=service_user.pw_gid if service_user and name == 'client' else None)
             children.append(child)
             return child
 
-        start([Path(args.gateway).resolve(), '--bind', '127.0.0.1', '--apibind', '127.0.0.1',
+        start([Path(args.gateway).resolve(), '--bind', '127.0.0.2', '--apibind', '127.0.0.1',
                '--cert', root / 'certs' / 'server.crt', '--key', root / 'certs' / 'server.key'],
               'gateway')
-        wait(lambda: socket.create_connection(('127.0.0.1', 27183), timeout=1).close() is None,
+        wait(lambda: socket.create_connection(('127.0.0.2', 27183), timeout=1).close() is None,
              what='gateway wss')
 
         # Run the client from a private copy: the upgrade replaces this file.
@@ -78,12 +87,16 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         shutil.copy2(Path(args.client).resolve(), installed)
         installed.chmod(0o755)
         config = install_dir / 'config.json'
-        config.write_text(json.dumps({'network': {'Node': 'update-node-1', 'ServerHost': '127.0.0.1'},
+        config.write_text(json.dumps({'network': {'Node': 'update-node-1', 'ServerHost': '127.0.0.2'},
                                       'CACertFile': str(root / 'certs' / 'ca.crt'), 'apps': []}))
-        start([installed, '--config', config], 'client')
+        if service_user:
+            os.chown(install_dir, service_user.pw_uid, service_user.pw_gid)
+            install_dir.chmod(0o700)
+        client = start([installed, 'run', '--config', config], 'client')
 
-        def api(path, body=None, token=None, method=None, raw=None):
-            conn = http.client.HTTPSConnection('127.0.0.1', 10008, context=ctx, timeout=60)
+        def api(path, body=None, token=None, method=None, raw=None, public=False):
+            host, port = ('127.0.0.2', 27183) if public else ('127.0.0.1', 10008)
+            conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=60)
             headers = {'Content-Type': 'application/json'}
             if token:
                 headers['Authorization'] = 'Bearer ' + token
@@ -100,6 +113,11 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
                            {'user': env['FASTP2P_USER'], 'password': env['FASTP2P_PASSWORD']})
         assert status == 200, (status, body)
         token = body['token']
+        assert api('/', public=True)[0] == 404
+        assert api('/api/v1/updates', token=token, public=True)[0] == 404
+        assert api('/api/v1/update?platform=linux&version=9.9.9', token=token,
+                   method='PUT', raw=b'test', public=True)[0] == 404
+        results['web_and_upload_stay_on_private_port'] = True
 
         def online():
             status, body = api('/api/v1/nodes?query=update-node&limit=50', token=token)
@@ -126,6 +144,20 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         assert status == 200, (status, body)
         wait(lambda: listening(rule_port), what='rule listening before the upgrade')
         results['rule_listening_before_upgrade'] = True
+
+        # A malformed file is rejected at upload. An ELF-looking but unusable
+        # package can reach the client and must be rejected before shutdown.
+        original = installed.read_bytes()
+        assert api('/api/v1/update?platform=linux&version=9.9.8', token=token,
+                   method='PUT', raw=b'not an executable')[0] == 400
+        assert api('/api/v1/update?platform=linux&version=9.9.8', token=token,
+                   method='PUT', raw=b'\x7fELF-invalid-program')[0] == 200
+        assert api('/api/v1/device/update-node-1/upgrade', {'version': '9.9.8'}, token)[0] == 200
+        wait(lambda: 'package cannot run as a fastp2p executable' in (logs / 'client.log').read_text(),
+             what='invalid executable rejected before swapping')
+        assert client.poll() is None and installed.read_bytes() == original
+        assert online() and listening(rule_port)
+        results['bad_package_does_not_replace_or_stop_client'] = True
 
         # --- Upload a package. It is a real executable so the swap is realistic.
         package = install_dir / 'package.bin'
@@ -157,10 +189,26 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
 
         # --- The download endpoint refuses a wrong token and unknown packages.
         assert api('/api/v1/update/download?platform=linux&version=9.9.9&token=1111111111111111',
-                   token=token)[0] == 401
+                   token=token, public=True)[0] == 401
         assert api('/api/v1/update/download?platform=linux&version=0.0.1&token=9999999999999999',
                    token=token)[0] == 404
         results['download_requires_the_install_token'] = True
+
+        # Populate the mirror catalog with the verified executable and a newer
+        # package for an incompatible architecture. Only the native one may win.
+        database = root / 'gateway/nodes.sqlite3'
+        with sqlite3.connect(database, timeout=5) as db:
+            sha, size, filename, uploaded = db.execute(
+                "SELECT sha256,size,filename,uploaded_at FROM updates WHERE platform='linux' AND version='9.9.9'"
+            ).fetchone()
+            native = next(row for row in api('/api/v1/nodes', token=token)[1]['nodes']
+                          if row['name'] == 'update-node-1')['os'].removesuffix('-c')
+            other = 'linux-aarch64' if native != 'linux-aarch64' else 'linux-x86_64'
+            db.executemany('INSERT INTO release_packages VALUES(?,?,?,?,?,?)', [
+                (native, '9.9.9', sha, size, filename, uploaded),
+                (other, '99.9.9', sha, size, filename, uploaded),
+            ])
+            db.execute("DELETE FROM updates WHERE platform='linux' AND version='9.9.9'")
 
         # --- Batch upgrade finds the outdated node and orders it.
         status, body = api('/api/v1/upgrades', {}, token)
@@ -168,12 +216,14 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         assert any(item['node'] == 'update-node-1' and item['to'] == '9.9.9'
                    for item in body['queued']), body
         results['batch_upgrade_queues_outdated_nodes'] = True
+        results['batch_upgrade_selects_only_the_matching_architecture'] = True
 
         def replaced():
             if not installed.is_file():
                 return False
             return hashlib.sha256(installed.read_bytes()).hexdigest() == digest
         wait(replaced, timeout=90, what='client to replace its executable')
+        assert installed.with_name('fastp2p.old').read_bytes() == original
         results['client_installed_the_new_build'] = True
 
         # The re-exec keeps the same supervisor running, so the node must return.

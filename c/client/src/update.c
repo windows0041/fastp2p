@@ -11,6 +11,10 @@
 #include <windows.h>
 #include <winsvc.h>
 #else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -108,7 +112,7 @@ int fp_update_download(const char *url, const char *ca, const char *dest,
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_cleanup(curl);
-    fclose(file);
+    int close_error = fclose(file);
 
     if (result != CURLE_OK) {
         EVP_MD_CTX_free(digest);
@@ -120,6 +124,12 @@ int fp_update_download(const char *url, const char *ca, const char *dest,
         EVP_MD_CTX_free(digest);
         remove(dest);
         set_error(error, error_length, "the gateway refused the download");
+        return -1;
+    }
+    if (close_error) {
+        EVP_MD_CTX_free(digest);
+        remove(dest);
+        set_error(error, error_length, "cannot finish writing the staging file");
         return -1;
     }
     unsigned char raw[EVP_MAX_MD_SIZE];
@@ -139,6 +149,15 @@ int fp_update_download(const char *url, const char *ca, const char *dest,
         return -1;
     }
     return 0;
+}
+
+static int is_fastp2p_version(const char *output) {
+    if (strncmp(output, "fastp2p ", 8))
+        return 0;
+    const char *version = output + 8;
+    size_t length = strspn(version, "0123456789.");
+    return length > 0 && !strncmp(version + length, " ABI ", 5) &&
+           version[length + 5] >= '0' && version[length + 5] <= '9';
 }
 
 #ifdef _WIN32
@@ -174,6 +193,69 @@ static int service_state(SC_HANDLE service, DWORD *state) {
     *state = status.dwCurrentState;
     return 0;
 }
+static int probe_executable(const wchar_t *path) {
+    SECURITY_ATTRIBUTES inheritable = {.nLength = sizeof(inheritable), .bInheritHandle = TRUE};
+    HANDLE input, output;
+    if (!CreatePipe(&input, &output, &inheritable, 0))
+        return -1;
+    wchar_t command[4200];
+    STARTUPINFOW startup = {.cb = sizeof(startup), .dwFlags = STARTF_USESTDHANDLES,
+                            .hStdOutput = output, .hStdError = output};
+    PROCESS_INFORMATION process;
+    int ok = 0;
+    if (SetHandleInformation(input, HANDLE_FLAG_INHERIT, 0) &&
+        swprintf(command, 4200, L"\"%ls\" --version", path) > 0 &&
+        CreateProcessW(path, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL,
+                       &startup, &process)) {
+        DWORD code = 1, available = 0, read = 0;
+        char version[128];
+        if (WaitForSingleObject(process.hProcess, 5000) != WAIT_OBJECT_0) {
+            TerminateProcess(process.hProcess, 1);
+        } else if (GetExitCodeProcess(process.hProcess, &code) && code == 0 &&
+                   PeekNamedPipe(input, NULL, 0, NULL, &available, NULL) && available &&
+                   ReadFile(input, version, available < sizeof(version) ? available : sizeof(version) - 1,
+                            &read, NULL)) {
+            version[read] = 0;
+            ok = is_fastp2p_version(version);
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    CloseHandle(output);
+    CloseHandle(input);
+    return ok ? 0 : -1;
+}
+
+static int stop_service(SC_HANDLE service) {
+    SERVICE_STATUS ignored;
+    ControlService(service, SERVICE_CONTROL_STOP, &ignored);
+    for (int i = 0; i < 60; ++i) {
+        DWORD state;
+        if (service_state(service, &state))
+            return -1;
+        if (state == SERVICE_STOPPED)
+            return 0;
+        Sleep(500);
+    }
+    return -1;
+}
+
+static int start_service(SC_HANDLE service) {
+    if (!StartServiceW(service, 0, NULL))
+        return -1;
+    for (int i = 0; i < 60; ++i) {
+        DWORD state;
+        if (service_state(service, &state) || state == SERVICE_STOPPED)
+            return -1;
+        if (state == SERVICE_RUNNING) {
+            Sleep(1000);
+            return service_state(service, &state) || state != SERVICE_RUNNING ? -1 : 0;
+        }
+        Sleep(500);
+    }
+    return -1;
+}
+
 int fp_update_swap(const char *staged, const char *target, const char *service) {
     wchar_t wide_staged[4096], wide_target[4096], wide_service[256];
     if (wide(staged, wide_staged, 4096) || wide(target, wide_target, 4096) ||
@@ -182,20 +264,23 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
     SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     SC_HANDLE handle = manager ? OpenServiceW(manager, wide_service, SERVICE_STOP | SERVICE_START |
                                               SERVICE_QUERY_STATUS) : NULL;
-    /* Give the outgoing service time to release the image before replacing it. */
-    if (handle) {
-        for (int i = 0; i < 60; ++i) {
-            DWORD state = 0;
-            if (service_state(handle, &state) || state == SERVICE_STOPPED)
-                break;
-            SERVICE_STATUS ignored;
-            ControlService(handle, SERVICE_CONTROL_STOP, &ignored);
-            Sleep(500);
+    int ok = 0;
+    wchar_t previous[4200], replacement[4200];
+    if (handle && swprintf(previous, 4200, L"%ls.old", wide_target) > 0 &&
+        swprintf(replacement, 4200, L"%ls.new", wide_staged) > 0 && !stop_service(handle)) {
+        /* The helper is running the staged image. Use a separate copy for the
+         * replacement so the running file never has to be moved. */
+        int replaced = CopyFileW(wide_target, previous, FALSE) &&
+                       CopyFileW(wide_staged, replacement, FALSE) &&
+                       MoveFileExW(replacement, wide_target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (replaced && !start_service(handle)) {
+            ok = 1;
+        } else if (!replaced || (!stop_service(handle) &&
+                   MoveFileExW(previous, wide_target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))) {
+            (void)start_service(handle);
         }
+        DeleteFileW(replacement);
     }
-    int ok = CopyFileW(wide_staged, wide_target, FALSE) != 0;
-    if (ok && handle)
-        StartServiceW(handle, 0, NULL);
     if (handle)
         CloseServiceHandle(handle);
     if (manager)
@@ -215,11 +300,32 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
         set_error(error, error_length, "cannot prepare the update");
         return -1;
     }
+    SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    SC_HANDLE service = manager ? OpenServiceW(manager, L"" FP_UPDATE_SERVICE, SERVICE_QUERY_STATUS) : NULL;
+    SERVICE_STATUS_PROCESS status;
+    DWORD used;
+    int managed = service && QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                     (BYTE *)&status, sizeof(status), &used) && status.dwProcessId == GetCurrentProcessId();
+    if (service)
+        CloseServiceHandle(service);
+    if (manager)
+        CloseServiceHandle(manager);
+    if (!managed) {
+        set_error(error, error_length, "Windows remote upgrade requires the fastp2p service");
+        return -1;
+    }
+    if (probe_executable(wide_staged)) {
+        set_error(error, error_length, "package cannot run as a fastp2p executable");
+        return -1;
+    }
     /* The running image cannot be overwritten, so a detached copy of the new
      * build performs the swap once this service has stopped. */
-    wchar_t command[8192];
-    swprintf(command, 8192, L"\"%ls\" --apply-update \"%ls\" \"%ls\" \"%ls\"",
-             wide_staged, wide_staged, wide_self, L"" FP_UPDATE_SERVICE);
+    wchar_t command[12500];
+    if (swprintf(command, 12500, L"\"%ls\" --apply-update \"%ls\" \"%ls\" \"%ls\"",
+                 wide_staged, wide_staged, wide_self, L"" FP_UPDATE_SERVICE) < 0) {
+        set_error(error, error_length, "update helper command is too long");
+        return -1;
+    }
     STARTUPINFOW startup;
     PROCESS_INFORMATION information;
     memset(&startup, 0, sizeof(startup));
@@ -235,7 +341,7 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
     CloseHandle(information.hProcess);
     return 0;
 }
-int fp_update_run_pending(void) { return 0; } /* Windows installs from the helper. */
+int fp_update_run_pending(char *const argv[]) { (void)argv; return 0; }
 #else
 int fp_update_own_path(char *out, size_t length) {
 #ifdef __APPLE__
@@ -282,15 +388,105 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
 }
 /* Recorded by fp_update_apply and installed once the client has shut down. */
 static char pending_update[4200];
+static int probe_executable(const char *path) {
+    int output[2];
+    if (pipe(output))
+        return -1;
+    if (fcntl(output[0], F_SETFL, O_NONBLOCK) < 0) {
+        close(output[0]);
+        close(output[1]);
+        return -1;
+    }
+    pid_t child = fork();
+    if (!child) {
+        close(output[0]);
+        if (dup2(output[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        if (output[1] != STDOUT_FILENO)
+            close(output[1]);
+        char *const arguments[] = {(char *)path, "--version", NULL};
+        execv(path, arguments);
+        _exit(127);
+    }
+    close(output[1]);
+    int ok = 0;
+    if (child > 0) {
+        int status;
+        for (int i = 0; i < 100; ++i) {
+            pid_t result = waitpid(child, &status, WNOHANG);
+            if (result == child) {
+                char version[128];
+                ssize_t length = read(output[0], version, sizeof(version) - 1);
+                if (length > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                    version[length] = 0;
+                    ok = is_fastp2p_version(version);
+                }
+                child = -1;
+                break;
+            }
+            if (result < 0 && errno != EINTR) {
+                child = -1;
+                break;
+            }
+            const struct timespec delay = {.tv_nsec = 50000000};
+            nanosleep(&delay, NULL);
+        }
+        if (child > 0) {
+            kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    close(output[0]);
+    return ok ? 0 : -1;
+}
+
 int fp_update_apply(const char *staged, char *error, size_t error_length) {
     if (chmod(staged, 0755)) {
         set_error(error, error_length, "cannot make the new build executable");
         return -1;
     }
+    if (probe_executable(staged)) {
+        set_error(error, error_length, "package cannot run as a fastp2p executable");
+        return -1;
+    }
     snprintf(pending_update, sizeof(pending_update), "%s", staged);
     return 0;
 }
-int fp_update_run_pending(void) {
+
+static int backup_executable(const char *source, const char *backup) {
+    if (!link(source, backup))
+        return 0;
+    /* Linux can deny hard links to a root-owned executable even when its
+     * directory belongs to the service. Copy it into that directory instead. */
+    FILE *input = fopen(source, "rb");
+    if (!input)
+        return -1;
+    int fd = open(backup, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0755);
+    FILE *output = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!output) {
+        if (fd >= 0)
+            close(fd);
+        fclose(input);
+        return -1;
+    }
+    char buffer[65536];
+    size_t count;
+    int ok = 1;
+    while ((count = fread(buffer, 1, sizeof(buffer), input)) != 0) {
+        if (fwrite(buffer, 1, count, output) != count) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(input) || fflush(output) || fchmod(fd, 0755) || fsync(fd))
+        ok = 0;
+    if (fclose(output))
+        ok = 0;
+    fclose(input);
+    return ok ? 0 : -1;
+}
+
+int fp_update_run_pending(char *const argv[]) {
     if (!pending_update[0])
         return 0;
     char staged[4200];
@@ -300,40 +496,26 @@ int fp_update_run_pending(void) {
     char own[4096];
     if (fp_update_own_path(own, sizeof(own)))
         return -1;
-    /* Keep the previous build until the replacement is in place. */
-    char previous[4200];
+    /* Keep the installed path present throughout the swap. Save the old image
+     * before the staged file atomically replaces it. */
+    char previous[4200], backup[4240];
     snprintf(previous, sizeof(previous), "%s.old", own);
-    remove(previous);
-    if (rename(own, previous)) {
+    snprintf(backup, sizeof(backup), "%s.backup", staged);
+    if (backup_executable(own, backup) || rename(backup, previous) || rename(staged, own)) {
+        perror("fastp2p update swap failed");
+        remove(backup);
         remove(staged);
-        return -1;
+    } else {
+        execv(own, argv);
+        perror("fastp2p update start failed");
+        if (rename(previous, own)) {
+            perror("fastp2p update rollback failed");
+            execv(previous, argv);
+            return -1;
+        }
     }
-    if (rename(staged, own)) {
-        rename(previous, own);
-        return -1;
-    }
-    /* Re-exec so the process keeps running the same command line under whatever
-     * supervisor started it, without a visible restart. Every socket is already
-     * closed at this point, so the new image can bind its ports again. */
-    char command[4096];
-    FILE *cmdline = fopen("/proc/self/cmdline", "rb");
-    size_t used = 0;
-    if (cmdline) {
-        used = fread(command, 1, sizeof(command) - 1, cmdline);
-        fclose(cmdline);
-    }
-    if (used < 2)
-        return 0; /* No command line to reuse: let the supervisor restart us. */
-    command[used] = 0;
-    char *argv[64];
-    int argc = 0;
-    for (size_t i = 0; i < used && argc < 63;) {
-        argv[argc++] = command + i;
-        i += strlen(command + i) + 1;
-    }
-    argv[argc] = NULL;
     execv(own, argv);
-    /* execv only returns on failure; the supervisor will restart the service. */
-    _exit(1);
+    perror("fastp2p previous executable could not restart");
+    return -1;
 }
 #endif

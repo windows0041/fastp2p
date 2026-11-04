@@ -26,6 +26,9 @@ final class UpdateInstaller {
     static void install(Context context, String path) {
         if (path == null || path.isEmpty()) return;
         File packageFile = new File(path);
+        // The launcher activity is exported. Only accept the verified cache
+        // file from the native updater, never a path supplied by another app.
+        if (!packageFile.equals(new File(context.getCacheDir(), "fastp2p-update.apk"))) return;
         if (!packageFile.isFile()) {
             android.util.Log.w(TAG, "update package missing: " + path);
             return;
@@ -43,16 +46,19 @@ final class UpdateInstaller {
             PackageInfo staged = context.getPackageManager().getPackageArchiveInfo(path, 0);
             PackageInfo current = context.getPackageManager()
                     .getPackageInfo(context.getPackageName(), 0);
-            if (staged != null) {
-                long next = Build.VERSION.SDK_INT >= 28 ? staged.getLongVersionCode() : staged.versionCode;
-                long installed = Build.VERSION.SDK_INT >= 28
-                        ? current.getLongVersionCode() : current.versionCode;
-                if (next <= installed) {
-                    android.util.Log.w(TAG, "update package versionCode " + next
-                            + " is not newer than installed " + installed + "; ignoring");
-                    packageFile.delete();
-                    return;
-                }
+            if (staged == null || !context.getPackageName().equals(staged.packageName)) {
+                android.util.Log.w(TAG, "update package is not a fastp2p APK");
+                packageFile.delete();
+                return;
+            }
+            long next = Build.VERSION.SDK_INT >= 28 ? staged.getLongVersionCode() : staged.versionCode;
+            long installed = Build.VERSION.SDK_INT >= 28
+                    ? current.getLongVersionCode() : current.versionCode;
+            if (next <= installed) {
+                android.util.Log.w(TAG, "update package versionCode " + next
+                        + " is not newer than installed " + installed + "; ignoring");
+                packageFile.delete();
+                return;
             }
         } catch (Exception error) {
             android.util.Log.w(TAG, "cannot compare update package versions", error);

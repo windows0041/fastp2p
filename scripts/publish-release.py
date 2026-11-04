@@ -86,12 +86,12 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
     api = GitHub(repository, token)
     if stable:
         tag_sha = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
-        paths = (['c/common','c/gateway/src','c/gateway/web','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
+        paths = (['c/common','c/gateway/src','c/gateway/web','c/gateway/deploy','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
                  ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/app/src/androidTest','c/client/android/jni','c/client/android/app/build.gradle','c/client/android/build.gradle','c/client/android/settings.gradle','c/client/android/gradle.properties','c/client/android/gradle'])
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
     notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 x86_64 与 aarch64 静态可执行包（不依赖发行版运行库）和 amd64 Docker 镜像。' if kind == 'gateway' else
-             'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。Linux 提供 x86_64、aarch64、armv7、i686、riscv64、s390x、ppc64le、mips64el 八种架构的静态可执行包，另有 Windows 压缩包、macOS 两种架构压缩包、签名 Android APK 和 Linux C SDK。所有产物均为压缩包，解压后使用。')
+             'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。Linux 提供 x86_64、aarch64、armv7、i686、riscv64、s390x、ppc64le、mips64el 八种架构的静态可执行包，另有 Windows EXE、macOS 两种架构压缩包、签名 Android APK 和 Linux C SDK。Windows EXE 和 Android APK 可直接使用，tar.gz 包解压后使用。')
 
     body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。专用客户端包含网关地址和公开 CA；账号、接入 Token 和私钥不在发行包中。'
     metadata = {'tag_name': tag, 'target_commitish': sha,

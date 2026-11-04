@@ -8,9 +8,31 @@
 #elif defined(_WIN32)
 #define FASTP2P_PLATFORM_OS "windows-c"
 #elif defined(__APPLE__)
-#define FASTP2P_PLATFORM_OS "darwin-c"
+#if defined(__aarch64__) || defined(__arm64__)
+#define FASTP2P_PLATFORM_OS "darwin-arm64-c"
+#else
+#define FASTP2P_PLATFORM_OS "darwin-x86_64-c"
+#endif
+#else
+#if defined(__x86_64__)
+#define FASTP2P_PLATFORM_OS "linux-x86_64-c"
+#elif defined(__aarch64__)
+#define FASTP2P_PLATFORM_OS "linux-aarch64-c"
+#elif defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 7
+#define FASTP2P_PLATFORM_OS "linux-armv7-c"
+#elif defined(__i386__)
+#define FASTP2P_PLATFORM_OS "linux-i686-c"
+#elif defined(__riscv) && __riscv_xlen == 64
+#define FASTP2P_PLATFORM_OS "linux-riscv64-c"
+#elif defined(__s390x__)
+#define FASTP2P_PLATFORM_OS "linux-s390x-c"
+#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define FASTP2P_PLATFORM_OS "linux-ppc64le-c"
+#elif (defined(__mips64) || defined(__mips64__)) && defined(__MIPSEL__)
+#define FASTP2P_PLATFORM_OS "linux-mips64el-c"
 #else
 #define FASTP2P_PLATFORM_OS "linux-c"
+#endif
 #endif
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

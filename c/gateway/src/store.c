@@ -57,6 +57,12 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "version TEXT NOT NULL,sha256 TEXT NOT NULL CHECK(length(sha256)=64),"
                 "size INTEGER NOT NULL,filename TEXT NOT NULL,uploaded_at INTEGER NOT NULL,"
                 "PRIMARY KEY(platform,version));"
+                "CREATE TABLE IF NOT EXISTS release_packages("
+                "platform TEXT NOT NULL,version TEXT NOT NULL,sha256 TEXT NOT NULL CHECK(length(sha256)=64),"
+                "size INTEGER NOT NULL,filename TEXT NOT NULL,uploaded_at INTEGER NOT NULL,"
+                "PRIMARY KEY(platform,version));"
+                "CREATE TABLE IF NOT EXISTS release_sync("
+                "id INTEGER PRIMARY KEY CHECK(id=1),version TEXT NOT NULL,release_id INTEGER NOT NULL);"
                 "PRAGMA application_id=1179660880; PRAGMA user_version=4;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
@@ -394,9 +400,26 @@ static int update_version_valid(const char *version) {
     }
     return 1;
 }
+int gw_store_update_key_valid(const char *platform, const char *version) {
+    return update_platform_valid(platform) && update_version_valid(version);
+}
+int gw_store_package_key_valid(const char *platform, const char *version) {
+    static const char *const architectures[] = {
+        "linux-x86_64", "linux-aarch64", "linux-armv7", "linux-i686", "linux-riscv64",
+        "linux-s390x", "linux-ppc64le", "linux-mips64el", "macos-x86_64", "macos-arm64"
+    };
+    if (!platform || !update_version_valid(version))
+        return 0;
+    if (update_platform_valid(platform))
+        return 1;
+    for (size_t i = 0; i < sizeof(architectures) / sizeof(architectures[0]); ++i)
+        if (!strcmp(platform, architectures[i]))
+            return 1;
+    return 0;
+}
 int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
                         const char *sha256, uint64_t size, const char *filename) {
-    if (!update_platform_valid(platform) || !update_version_valid(version) ||
+    if (!gw_store_update_key_valid(platform, version) ||
         !sha256 || strlen(sha256) != 64 || !filename || !*filename || !size)
         return -1;
     sqlite3_stmt *s = NULL;
@@ -419,7 +442,9 @@ int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
 json_object *gw_store_updates(sqlite3 *db) {
     json_object *list = json_object_new_array();
     sqlite3_stmt *s = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT platform,version,sha256,size,uploaded_at FROM updates "
+    if (sqlite3_prepare_v2(db, "SELECT platform,version,sha256,size,uploaded_at,0 AS mirrored FROM updates "
+                           "UNION ALL SELECT platform,version,sha256,size,uploaded_at,1 FROM release_packages r "
+                           "WHERE NOT EXISTS(SELECT 1 FROM updates u WHERE u.platform=r.platform AND u.version=r.version) "
                            "ORDER BY platform,uploaded_at DESC", -1, &s, NULL) != SQLITE_OK) {
         json_object_put(list);
         return NULL;
@@ -432,6 +457,7 @@ json_object *gw_store_updates(sqlite3 *db) {
         gw_js(row, "sha256", (const char *)sqlite3_column_text(s, 2));
         gw_ju(row, "size", (uint64_t)sqlite3_column_int64(s, 3));
         gw_ju(row, "uploadedAt", (uint64_t)sqlite3_column_int64(s, 4));
+        gw_ju(row, "github", (uint64_t)sqlite3_column_int(s, 5));
         json_object_array_add(list, row);
     }
     sqlite3_finalize(s);
@@ -443,11 +469,12 @@ json_object *gw_store_updates(sqlite3 *db) {
 }
 int gw_store_update_find(sqlite3 *db, const char *platform, const char *version,
                          char sha256[65], char filename[260], uint64_t *size) {
-    if (!update_platform_valid(platform) || !update_version_valid(version))
+    if (!gw_store_package_key_valid(platform, version))
         return -1;
     sqlite3_stmt *s = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT sha256,size,filename FROM updates "
-                           "WHERE platform=?1 AND version=?2", -1, &s, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, "SELECT sha256,size,filename FROM updates WHERE platform=?1 AND version=?2 "
+                           "UNION ALL SELECT sha256,size,filename FROM release_packages "
+                           "WHERE platform=?1 AND version=?2 LIMIT 1", -1, &s, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text(s, 1, platform, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, version, -1, SQLITE_TRANSIENT);
@@ -460,6 +487,14 @@ int gw_store_update_find(sqlite3 *db, const char *platform, const char *version,
     }
     sqlite3_finalize(s);
     return found;
+}
+void gw_store_release_version(sqlite3 *db, char version[32]) {
+    sqlite3_stmt *s = NULL;
+    version[0] = 0;
+    if (sqlite3_prepare_v2(db, "SELECT version FROM release_sync WHERE id=1", -1, &s, NULL) == SQLITE_OK &&
+        sqlite3_step(s) == SQLITE_ROW)
+        snprintf(version, 32, "%s", (const char *)sqlite3_column_text(s, 0));
+    sqlite3_finalize(s);
 }
 int gw_store_rule_delete(sqlite3 *db, const char *node, const char *protocol,
                          unsigned src_port) {

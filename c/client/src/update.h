@@ -33,7 +33,7 @@ int fp_update_apply(const char *staged, char *error, size_t error_length);
 
 /* POSIX: performs a deferred install. Does not return on success. A no-op when
  * nothing is pending or on Windows. */
-int fp_update_run_pending(void);
+int fp_update_run_pending(char *const argv[]);
 
 /* Detached-helper entry point: waits for the old image to be released, installs
  * staged over target, then restarts the service. */

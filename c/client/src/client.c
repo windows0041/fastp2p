@@ -112,7 +112,10 @@ typedef struct {
     uint64_t peer_nat, link_deadline;
     /* Relays that already failed for this rule; the gateway is asked to skip
      * them so one unreachable candidate cannot pin the link forever. */
-    char relay_failed[4][32];
+    struct {
+        char node[32];
+        uint64_t until;
+    } relay_failed[4];
     int relay_failed_count;
     char peer_lan[INET_ADDRSTRLEN];
     /* The current attempt's session; relay offers create a fresh session. */
@@ -604,12 +607,15 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             c->apps[i].retry = mono() + 2 * NS;
             if (failed_relay[0] && c->apps[i].local && !was_synced) {
                 app *a = &c->apps[i];
-                int known = 0;
-                for (int k = 0; k < a->relay_failed_count; ++k)
-                    if (!strcmp(a->relay_failed[k], failed_relay))
-                        known = 1;
-                if (!known && a->relay_failed_count < 4)
-                    copy_string(a->relay_failed[a->relay_failed_count++], 32, failed_relay);
+                int k = 0;
+                while (k < a->relay_failed_count && strcmp(a->relay_failed[k].node, failed_relay))
+                    ++k;
+                if (k < 4) {
+                    if (k == a->relay_failed_count)
+                        ++a->relay_failed_count;
+                    copy_string(a->relay_failed[k].node, sizeof(a->relay_failed[k].node), failed_relay);
+                    a->relay_failed[k].until = mono() + 30 * NS;
+                }
             }
             if (!c->apps[i].local)
                 memset(&c->apps[i], 0, sizeof(c->apps[i]));
@@ -2606,10 +2612,16 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             a->relay_requested = 1;
                             json_object *j = json_object_new_object();
                             op_js(j, "peerNode", a->peer);
+                            for (int k = 0; k < a->relay_failed_count;) {
+                                if (now >= a->relay_failed[k].until)
+                                    a->relay_failed[k] = a->relay_failed[--a->relay_failed_count];
+                                else
+                                    ++k;
+                            }
                             if (a->relay_failed_count) {
                                 json_object *skip = json_object_new_array();
                                 for (int k = 0; k < a->relay_failed_count; ++k)
-                                    json_object_array_add(skip, json_object_new_string(a->relay_failed[k]));
+                                    json_object_array_add(skip, json_object_new_string(a->relay_failed[k].node));
                                 json_object_object_add(j, "exclude", skip);
                             }
                             ws_json(c, 5, 0, j);

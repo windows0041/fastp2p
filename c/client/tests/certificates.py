@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
-def create_certificates(directory, hostname):
+def create_certificates(directory, hostname, *additional_hosts):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     executable = os.environ.get('OPENSSL_EXE') or shutil.which('openssl')
@@ -22,10 +22,13 @@ def create_certificates(directory, hostname):
         '-addext', 'subjectKeyIdentifier=hash', '-addext', 'authorityKeyIdentifier=keyid:always')
     run('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
         '-keyout', 'server.key', '-out', 'server.csr', '-subj', '/CN=FastP2P Test Gateway')
-    try:
-        san = 'IP:' + str(ipaddress.ip_address(hostname))
-    except ValueError:
-        san = 'DNS:' + hostname
+    names = []
+    for host in (hostname, *additional_hosts):
+        try:
+            names.append('IP:' + str(ipaddress.ip_address(host)))
+        except ValueError:
+            names.append('DNS:' + host)
+    san = ','.join(names)
     (directory/'server.ext').write_text('subjectAltName='+san+'\nbasicConstraints=critical,CA:FALSE\n'
         'keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n'
         'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -55,6 +56,19 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
             assert b'Sanitizer' not in completed.stderr and b'runtime error:' not in completed.stderr
             return completed
         initial=install();assert b'gateway identity verified' in initial.stdout
+        if sys.platform.startswith('linux') and os.geteuid() != 0:
+            named = root / ('fastp2p-linux-v2.0.2-' + token)
+            shutil.copy2(args.client, named)
+            named_environment = dict(client_environment, XDG_CONFIG_HOME=str(root / 'named-config'))
+            completed = subprocess.run([str(named), '--no-service'], cwd=root, env=named_environment,
+                                       capture_output=True, timeout=40)
+            assert completed.returncode == 0 and b'gateway identity verified' in completed.stdout
+            assert token.encode() not in completed.stdout + completed.stderr
+            named_profile = root / 'named-config/fastp2p/client.json'
+            completed = subprocess.run([str(Path(args.client).resolve()), 'run', '--config', str(named_profile),
+                                        '--run-seconds', '3'], env=named_environment, capture_output=True, timeout=20)
+            assert completed.returncode == 0 and b'gateway authenticated' in completed.stdout
+            result['filename_token_enrolls_without_token_arguments'] = True
         trust=next(root.glob(profile.name+'.ca.*.pem'))
         trust_stat=trust.stat()
         def same_trust_file():

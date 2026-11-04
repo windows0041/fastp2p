@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "2.0.1"
+#define FASTP2P_VERSION "2.0.2"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)

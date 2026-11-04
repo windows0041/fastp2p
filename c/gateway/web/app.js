@@ -230,6 +230,9 @@
     const value = String(os || '');
     if (!value.endsWith('-c')) return '';
     if (value.startsWith('windows')) return 'windows';
+    if (/^linux-(x86_64|aarch64|armv7|i686|riscv64|s390x|ppc64le|mips64el)-c$/.test(value))
+      return value.slice(0, -2);
+    if (/^darwin-(arm64|x86_64)-c$/.test(value)) return 'macos' + value.slice(6, -2);
     if (value.startsWith('linux')) return 'linux';
     if (value.startsWith('android')) return 'android';
     if (value.startsWith('darwin')) return 'macos';
@@ -246,7 +249,8 @@
   function latestFor(platform) {
     let best = '';
     for (const update of state.updates)
-      if (update.platform === platform && (!best || compareVersions(update.version, best) > 0))
+      if ((update.platform === platform || update.platform === platform.split('-')[0]) &&
+          (!best || compareVersions(update.version, best) > 0))
         best = update.version;
     return best;
   }
@@ -259,10 +263,66 @@
         element('td', 'mono', String(update.sha256 || '').slice(0, 16) + '…'),
         element('td', 'mono', update.uploadedAt
           ? new Date(update.uploadedAt * 1000).toLocaleString('zh-CN', {hour12: false}) : '—'));
+      const cell = element('td', '');
+      const button = element('button', 'button', '下载安装包');
+      button.type = 'button';
+      button.addEventListener('click', () => downloadInstaller(update, button));
+      cell.append(button);
+      row.append(cell);
       $('updates').append(row);
     }
     $('update-message').classList.remove('error');
-    text('update-message', state.updates.length ? '' : '尚未上传安装包。');
+    text('update-message', state.updates.length ? '' : '尚无安装包。');
+  }
+  async function downloadInstaller(update, button) {
+    const token = state.token;
+    button.disabled = true;
+    try {
+      const params = new URLSearchParams({platform: update.platform, version: update.version});
+      const response = await fetch('/api/v1/update/install?' + params, {
+        headers: {Authorization: 'Bearer ' + token}, cache: 'no-store',
+        credentials: 'omit', referrerPolicy: 'no-referrer'});
+      if (response.status === 401 && state.token === token) logout(true);
+      if (!response.ok) throw new Error('下载安装包失败，请刷新列表后重试。');
+      const filename = /filename="([A-Za-z0-9_.-]+)"/i.exec(response.headers.get('Content-Disposition') || '');
+      if (!filename) throw new Error('网关未返回安装包文件名。');
+      const blob = await response.blob();
+      if (state.token !== token) return;
+      const url = URL.createObjectURL(blob);
+      const link = element('a', '');
+      link.href = url;
+      link.download = filename[1];
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (update.platform === 'android') text('update-message', '安装 APK 后，在客户端安装 Token 对话框中点「安卓接入」。');
+    } catch (error) {
+      $('update-message').classList.add('error');
+      text('update-message', error.message);
+    } finally { button.disabled = false; }
+  }
+  let syncTimer;
+  async function syncRelease(start = false) {
+    const token = state.token;
+    clearTimeout(syncTimer);
+    if (!token) return;
+    $('sync-release').disabled = true;
+    try {
+      const result = await api('/api/v1/releases/sync', start ? {} : undefined);
+      if (state.token !== token) return;
+      if (result.status === 'running') {
+        text('sync-message', '正在下载并校验 GitHub 安装包…');
+        syncTimer = setTimeout(syncRelease, 2000);
+        return;
+      }
+      text('sync-message', result.status === 'failed' ? '同步失败，请查看网关服务日志。' :
+        result.version ? '已同步 GitHub 稳定版 ' + result.version : '');
+      if (result.status === 'complete') await loadUpdates();
+    } catch (error) {
+      if (start) text('sync-message', error.message);
+    }
+    $('sync-release').disabled = false;
   }
   async function loadUpdates() {
     try {
@@ -340,6 +400,7 @@
       state.token = login.token; state.installToken = login.installToken; $('password').value = '';
     persist();
       $('login-screen').hidden = true; $('console').hidden = false; message(''); await refresh();
+      syncRelease();
     } catch (error) { text('login-error', error.message); $('login-error').hidden = false; }
     finally { $('login-submit').disabled = false; }
   });
@@ -416,6 +477,7 @@
   $('close-update-dialog').addEventListener('click', () => $('update-dialog').close());
   $('cancel-update').addEventListener('click', () => $('update-dialog').close());
   $('refresh-updates').addEventListener('click', loadUpdates);
+  $('sync-release').addEventListener('click', () => syncRelease(true));
   $('update-form').addEventListener('submit', async event => {
     event.preventDefault();
     const file = $('update-file').files[0];
@@ -487,6 +549,7 @@
       state.installToken = typeof saved.installToken === 'string' ? saved.installToken : '';
       $('login-screen').hidden = true; $('console').hidden = false;
       refresh();
+      syncRelease();
     }
   } catch { try { sessionStorage.removeItem(STORE); } catch { /* ignore */ } }
 })();

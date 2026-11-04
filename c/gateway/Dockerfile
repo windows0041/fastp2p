@@ -11,7 +11,7 @@ RUN cmake -S c/gateway -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TES
 
 FROM debian:12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libwebsockets17 libjson-c5 libssl3 libsqlite3-0 ca-certificates \
+    libwebsockets17 libjson-c5 libssl3 libsqlite3-0 ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/fastp2p /opt/fastp2p
 RUN install -d -o 65532 -g 65532 -m 700 /var/lib/fastp2p
