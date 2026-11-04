@@ -5,6 +5,7 @@ Init commands are fixtures, not the host's service manager. Payload, enrollment,
 certificate checks, filename token, filesystem changes and rollback are real.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import http.client
 import json
@@ -39,7 +40,7 @@ def command(*values):
 
 command('mount', '--make-rprivate', '/')
 command('ip', 'link', 'set', 'lo', 'up')
-with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary:
+with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary, ExitStack() as mounts:
     root = Path(temporary)
     root.chmod(0o700)
     etc = root / 'etc'; etc.mkdir()
@@ -57,6 +58,10 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary:
     command('mount', '--bind', str(etc), '/etc')
     original_local=root/'original-local'; original_local.mkdir()
     command('mount', '--bind', '/usr/local', str(original_local))
+    command('mount', '-o', 'remount,bind,ro', str(original_local))
+    # Always detach borrowed mounts BEFORE TemporaryDirectory traverses its tree.
+    # A read-only source is a second guard against deletion of host files.
+    mounts.callback(command, 'umount', '-l', str(original_local))
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/local')
     # Official Python containers keep their stdlib here. Preserve it while
     # isolating product paths and /usr/local/bin from the host installation.
