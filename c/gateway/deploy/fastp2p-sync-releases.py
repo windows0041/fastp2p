@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -28,36 +29,71 @@ ASSETS = {
 }
 
 
+GITHUB_HOSTS = {'github.com', 'api.github.com', 'release-assets.githubusercontent.com',
+                'objects.githubusercontent.com', 'github-releases.githubusercontent.com'}
+ACCELERATOR_HOSTS = {'gh-proxy.com', 'gh-proxy.org'}
+
+
 def version_key(version):
     return tuple(map(int, version.split('.')))
 
 
 class GitHubRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, accelerated=False):
+        self.allowed_hosts = GITHUB_HOSTS | (ACCELERATOR_HOSTS if accelerated else set())
+
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         parsed = urllib.parse.urlsplit(newurl)
-        if parsed.scheme != 'https' or parsed.hostname not in {
-                'github.com', 'api.github.com', 'release-assets.githubusercontent.com',
-                'objects.githubusercontent.com', 'github-releases.githubusercontent.com'}:
+        if (parsed.scheme != 'https' or parsed.hostname not in self.allowed_hosts or
+                parsed.username is not None or parsed.password is not None or parsed.port not in (None, 443)):
             raise ValueError('unexpected GitHub download redirect')
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
-def fetch(url, accept='application/vnd.github+json'):
+def fetch(url, accept='application/vnd.github+json', accelerated=False):
     request = urllib.request.Request(url, headers={'User-Agent': 'FastP2P-gateway', 'Accept': accept})
-    return urllib.request.build_opener(GitHubRedirect).open(request, timeout=20)
+    handlers = [GitHubRedirect(accelerated)]
+    if accelerated:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers).open(request, timeout=20)
 
 
-def latest(repository):
+def validate_download_prefix(prefix):
+    if not prefix:
+        return ''
+    parsed = urllib.parse.urlsplit(prefix)
+    if (parsed.scheme != 'https' or parsed.netloc not in ACCELERATOR_HOSTS or
+            parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+        raise ValueError('download prefix must be https://gh-proxy.com/ or https://gh-proxy.org/')
+    return prefix.rstrip('/') + '/'
+
+
+def release_page(url, download_prefix):
+    routes = [(url, False)]
+    if download_prefix:
+        routes.insert(0, (download_prefix + url, True))
+    for source, accelerated in routes:
+        try:
+            with fetch(source, accelerated=accelerated) as response:
+                data = response.read(4 * 1024 * 1024 + 1)
+            if len(data) > 4 * 1024 * 1024:
+                raise ValueError('GitHub release list is too large')
+            rows = json.loads(data)
+            if not isinstance(rows, list):
+                raise ValueError('invalid GitHub release list')
+            return rows
+        except (OSError, ValueError) as error:
+            if not accelerated:
+                raise
+            print(f'Accelerated release lookup failed; retrying GitHub API: {error}',
+                  file=sys.stderr, flush=True)
+
+
+def latest(repository, download_prefix=''):
     releases = []
     for page in range(1, 6):
         url = f'https://api.github.com/repos/{repository}/releases?per_page=100&page={page}'
-        with fetch(url) as response:
-            data = response.read(4 * 1024 * 1024 + 1)
-        if len(data) > 4 * 1024 * 1024:
-            raise ValueError('GitHub release list is too large')
-        rows = json.loads(data)
-        if not isinstance(rows, list):
-            raise ValueError('invalid GitHub release list')
+        rows = release_page(url, download_prefix)
         for release in rows:
             match = TAG.fullmatch(release['tag_name'])
             if match and not release['draft'] and not release['prerelease']:
@@ -89,7 +125,7 @@ def copy_checked(source, path, size, expected=None):
     return actual
 
 
-def download(repository, release, asset, path, expected=None):
+def download(repository, release, asset, path, expected=None, download_prefix=''):
     name = asset['name']
     url = f"https://github.com/{repository}/releases/download/{release['tag_name']}/{name}"
     asset_id = asset['id']
@@ -104,11 +140,27 @@ def download(repository, release, asset, path, expected=None):
         if expected and github_digest != 'sha256:' + expected:
             raise ValueError('GitHub digest differs from SHA256SUMS.txt')
         expected = github_digest[7:]
-    try:
-        with fetch(api + f'?download=1&ts={time.time_ns()}', 'application/octet-stream') as response:
-            return copy_checked(response, path, asset['size'], expected)
-    except (OSError, ValueError) as error:
-        raise ValueError(f'{name}: {error}') from error
+    if path.exists():
+        raise ValueError('download destination already exists')
+    routes = [(api + f'?download=1&ts={time.time_ns()}', False)]
+    # Accelerate the checksum file only when GitHub has supplied its digest.
+    # The trust anchor is always independent of the accelerator.
+    prefix = validate_download_prefix(download_prefix)
+    if prefix and expected:
+        routes.insert(0, (prefix + url, True))
+    for source, accelerated in routes:
+        try:
+            with fetch(source, 'application/octet-stream', accelerated) as response:
+                digest = copy_checked(response, path, asset['size'], expected)
+            if accelerated:
+                print(f'Verified accelerated download: {name}', flush=True)
+            return digest
+        except (OSError, ValueError) as error:
+            path.unlink(missing_ok=True)
+            if not accelerated:
+                raise ValueError(f'{name}: {error}') from error
+            print(f'Accelerated download failed for {name}; retrying GitHub API: {error}',
+                  file=sys.stderr, flush=True)
 
 
 def extract(asset, member, output):
@@ -129,8 +181,9 @@ def extract(asset, member, output):
     raise ValueError('executable missing from release archive')
 
 
-def sync(database, repository):
-    version, release = latest(repository)
+def sync(database, repository, download_prefix=''):
+    download_prefix = validate_download_prefix(download_prefix)
+    version, release = latest(repository, download_prefix)
     assets = {asset['name']: asset for asset in release['assets']}
     checksum = assets['SHA256SUMS.txt']
     if not 0 < checksum['size'] <= 65536:
@@ -158,7 +211,7 @@ def sync(database, repository):
         with tempfile.TemporaryDirectory(prefix='.github-', dir=directory) as tmp:
             staging = Path(tmp)
             manifest = staging / checksum['name']
-            download(repository, release, checksum, manifest)
+            download(repository, release, checksum, manifest, download_prefix=download_prefix)
             sums = {}
             for line in manifest.read_text(encoding='ascii').splitlines():
                 match = re.fullmatch(r'([0-9a-f]{64})\s+([A-Za-z0-9_.-]+)', line)
@@ -168,7 +221,7 @@ def sync(database, repository):
             packages = []
             for platform, (name, member) in selected.items():
                 path = staging / name
-                digest = download(repository, release, assets[name], path, sums[name])
+                digest = download(repository, release, assets[name], path, sums[name], download_prefix)
                 if member:
                     output = staging / platform
                     digest = extract(path, member, output)
@@ -197,11 +250,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--database', type=Path, required=True)
     parser.add_argument('--repository', default='windows0041/fastp2p')
+    parser.add_argument('--download-prefix', default=os.environ.get('FASTP2P_RELEASE_DOWNLOAD_PREFIX', ''))
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository):
         parser.error('repository must be owner/name')
     try:
-        version = sync(args.database.absolute(), args.repository)
+        version = sync(args.database.absolute(), args.repository, args.download_prefix)
     except (OSError, ValueError, KeyError, sqlite3.Error, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f'GitHub client release sync failed: {error}', file=sys.stderr)
         return 1
