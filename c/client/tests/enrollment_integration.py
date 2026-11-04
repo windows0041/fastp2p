@@ -10,6 +10,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,32 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
         preset=root/'public-gateway.json';preset.write_text(json.dumps({k:payload[k] for k in ['host','port','ca']}))
         client_environment['FASTP2P_BOOTSTRAP_FILE']=str(preset)
         result['sixteen_digits_with_trusted_public_gateway_preset']=True
+        if Path(args.gateway).suffix == '.py':
+            # The 16-bit extended length may itself equal 127. It must not be
+            # reinterpreted as the 64-bit sentinel (some CI hostnames hit this).
+            with context.wrap_socket(socket.create_connection(('127.0.0.1',37183),timeout=5),server_hostname='127.0.0.1') as ws:
+                nonce=base64.b64encode(secrets.token_bytes(16)).decode()
+                ws.sendall(('GET /api/v1/login?node=frame-127-test&protocol=fastp2p2&token='+token+' HTTP/1.1\r\n'
+                    'Host: 127.0.0.1:37183\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                    'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: '+nonce+'\r\n\r\n').encode())
+                stream=ws.makefile('rb')
+                assert stream.readline().split()[1]==b'101'
+                while stream.readline()!=b'\r\n':pass
+                def frame():
+                    first,second=stream.read(2);length=second&127
+                    if length==126:length=struct.unpack('!H',stream.read(2))[0]
+                    elif length==127:length=struct.unpack('!Q',stream.read(8))[0]
+                    assert first==0x82 and length<=1048584
+                    return stream.read(length)
+                assert struct.unpack_from('<HH',frame(),4)==(0,0)
+                empty=json.dumps({'padding':''},separators=(',',':')).encode()
+                body=json.dumps({'padding':'x'*(127-8-len(empty))},separators=(',',':')).encode()
+                packet=struct.pack('<IHH',len(body),6,0)+body;assert len(packet)==127
+                mask=secrets.token_bytes(4)
+                ws.sendall(b'\x82\xfe'+struct.pack('!H',127)+mask+bytes(byte^mask[i%4] for i,byte in enumerate(packet)))
+                assert struct.unpack_from('<HH',frame(),4)==(6,7)
+                stream.close()
+            result['portable_fixture_accepts_127_byte_extended_frame']=True
         profile=root/'client.profile';token_file=root/'install.token';token_file.write_text(token)
         def install(expected=0):
             completed=subprocess.run([str(Path(args.client).resolve()),'install','--token-file',str(token_file),

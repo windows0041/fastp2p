@@ -101,7 +101,7 @@ class HTTP(http.server.BaseHTTPRequestHandler):
                 while True:
                     first,second=self.exact(2);length=second&127
                     if length==126:length=struct.unpack('!H',self.exact(2))[0]
-                    if length==127:length=struct.unpack('!Q',self.exact(8))[0]
+                    elif length==127:length=struct.unpack('!Q',self.exact(8))[0]
                     if length>1048584:return
                     mask=self.exact(4) if second&128 else b'';payload=self.exact(length)
                     if mask:payload=bytes(byte^mask[i%4] for i,byte in enumerate(payload))

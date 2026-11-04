@@ -64,7 +64,7 @@ class Peer:
             while not self.stop.is_set():
                 first,second=self.exact(2);n=second&127
                 if n==126:n=struct.unpack('!H',self.exact(2))[0]
-                if n==127:n=struct.unpack('!Q',self.exact(8))[0]
+                elif n==127:n=struct.unpack('!Q',self.exact(8))[0]
                 payload=self.exact(n);opcode=first&15
                 if opcode==8:return
                 if opcode==9:self.send(payload,10);continue

@@ -112,7 +112,7 @@ class WS:
         while True:
             first,second=self.exact(2);n=second&127
             if n==126:n=struct.unpack('>H',self.exact(2))[0]
-            if n==127:n=struct.unpack('>Q',self.exact(8))[0]
+            elif n==127:n=struct.unpack('>Q',self.exact(8))[0]
             assert not second&0x80 and n<=2*1024*1024
             data=self.exact(n);opcode=first&15
             if opcode==8:
