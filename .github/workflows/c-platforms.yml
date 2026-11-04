@@ -183,6 +183,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-update-windows.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-service-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-secure.exe
@@ -254,6 +256,8 @@ jobs:
           bash c/client/scripts/check-socks.sh
           python3 c/client/tests/quic_native.py --binary build/c/quic-interop
           python3 c/client/tests/enrollment_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway
+      - name: Linux installer, filename enrollment, init branches and rollback in namespaces
+        run: python3 c/client/tests/linux_installer.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway
       - name: C relay fallback over TCP and QUIC
         run: |
           FASTP2P_C_BUILD_DIR="$PWD/build/c" \

@@ -47,6 +47,7 @@ struct connection {
     char uri[256];
     int post, deleting, authorized, status, headers_sent, handled;
     int put;
+    int upload_cache_lock; /* fd + 1, so a zero-initialized connection owns none */
     /* Upgrade packages are far larger than the in-memory HTTP limit, so an
      * upload streams straight to a temporary file while its digest is computed. */
     FILE *upload;

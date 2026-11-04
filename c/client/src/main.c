@@ -65,7 +65,7 @@ static int integer(const char *s, uint64_t *value) {
 }
 static void usage(void) {
     puts("fastp2p install --token 16_DIGITS [--no-service] [--service] [--config FILE]\n"
-         "fastp2p uninstall   (removes the Windows service)\n"
+         "fastp2p uninstall [--keep-config]   (removes service; keep-config prepares a reinstall)\n"
          "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
@@ -290,22 +290,9 @@ int main(int argc, char **argv) {
         }
     }
 #endif
-#ifdef _WIN32
     if (argc > 1 && !strcmp(argv[1], "uninstall")) {
-        if (fastp2p_service_installed() && !fastp2p_service_elevated())
-            return fastp2p_service_elevate("uninstall") == 0 ? 0 : 1;
-        if (fastp2p_service_remove()) {
-            fputs("The fastp2p service could not be removed.\n", stderr);
-            return 1;
-        }
-        /* The service is gone; the token and the installed copy should not outlive
-         * it, so they are removed too. */
-        int leftover = fastp2p_service_purge();
-        puts(leftover ? "fastp2p service removed; some files could not be deleted."
-                      : "fastp2p service and its stored key removed.");
-        return 0;
+        return fastp2p_uninstall_command(argc, argv);
     }
-#endif
     if (argc > 1 && !strcmp(argv[1], "service")) {
         /* Started by the service manager; --config names the profile the installer wrote. */
         char profile[4096];

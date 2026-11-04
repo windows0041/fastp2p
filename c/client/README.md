@@ -5,7 +5,7 @@ C11 核心提供 WSS 协调、QUIC、TCP 打洞、中继回退、TCP/UDP 转发�
 ## 安装与运行
 
 ```sh
-fastp2p install --token-file token.txt
+sh fastp2p-<16位Token>
 fastp2p run
 fastp2p stop
 fastp2p --version
@@ -14,9 +14,13 @@ fastp2p --licenses
 
 安装 Token 为 16 位数字，网关地址、端口和公开 CA 已预置于专用客户端包。安装先完成 TLS 主机名校验及网关认证，成功后原子保存配置。错误凭据不会替换旧配置。支持 `--token`、`FASTP2P_INSTALL_TOKEN`、`--node`、`--config`、`--no-service`。
 
-Windows 安装到 `%LOCALAPPDATA%/fastp2p`，DPAPI 加密配置，HKCU Run 随用户登录启动。Linux root 安装到 `/usr/local/bin/fastp2p`，配置 `/etc/fastp2p/client.json`，使用独立 `fastp2p` 用户的 systemd 服务。非 root 使用 `--no-service` 后手动 `run`。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。
+Linux 从网关控制台下载带 Token 文件名的自包含脚本，用 `sh 文件名` 或 `bash 文件名` 安装。程序安装到 `/usr/local/fastp2p/bin/fastp2p`，配置在 `/etc/fastp2p/client.json`；无需在设备上安装 curl、Python 或 Bash。脚本先校验内置程序及网关，再卸载旧服务、保留节点身份与配置、替换程序，失败时恢复旧文件。不要改动文件名中的 Token。
 
-高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则目前只在运行进程中生效，持久化请更新配置。
+安装和保活逻辑在独立的 `scripts/linux-installer.sh`、`scripts/fastp2p-service.sh` 中，C 核心不包含发行版判断。脚本根据实际服务管理器选择 Debian/Ubuntu/CentOS 等的 systemd、OpenWrt 的 procd、Alpine 的 OpenRC，使用独立非 root 账号，开启开机启动和崩溃重启；未检测到支持的管理器时明确报错。下载时仍需选择设备对应的 CPU 架构；没有对应编译包的设备需要另行移植。进程由容器管理时，使用原始可执行文件前台运行及容器重启策略。
+
+Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p`。高级 CLI 仍可选择当前用户安装。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
+
+高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则保存在网关数据库，节点重连后恢复。
 
 设置 `FASTP2P_FORCE_RELAY=1` 可跳过打洞直接请求中继，用于验证中继链路；它只影响带该变量启动的进程，不写入配置。
 

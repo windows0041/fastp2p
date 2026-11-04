@@ -294,7 +294,7 @@
         element('td', 'mono', update.uploadedAt
           ? new Date(update.uploadedAt * 1000).toLocaleString('zh-CN', {hour12: false}) : '—'));
       const cell = element('td', '');
-      const button = element('button', 'button', '下载安装包');
+      const button = element('button', 'button', update.platform.startsWith('linux') ? '下载安装脚本' : '下载安装包');
       button.type = 'button';
       button.addEventListener('click', () => downloadInstaller(update, button));
       cell.append(button);
@@ -327,6 +327,7 @@
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       if (update.platform === 'android') text('update-message', '安装 APK 后，在客户端安装 Token 对话框中点「安卓接入」。');
+      else if (update.platform.startsWith('linux')) text('update-message', '执行 sh ' + filename[1] + '（也可用 bash）。脚本会保留节点身份与配置，替换旧服务，安装到 /usr/local/fastp2p 并设置开机启动。请勿修改文件名中的 Token。');
     } catch (error) {
       $('update-message').classList.add('error');
       text('update-message', error.message);
@@ -347,7 +348,7 @@
         return;
       }
       text('sync-message', result.status === 'failed' ? '同步失败，请查看网关服务日志。' :
-        result.version ? '已同步 GitHub 稳定版 ' + result.version : '');
+        result.version ? '已同步 GitHub 稳定版 ' + result.version + '；较低版本缓存会自动清理（含手动上传包），正在使用的旧包延后清理。' : '');
       if (result.status === 'complete') await loadUpdates();
     } catch (error) {
       if (start) text('sync-message', error.message);

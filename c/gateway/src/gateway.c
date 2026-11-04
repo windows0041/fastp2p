@@ -1,9 +1,11 @@
 #include "gateway.h"
 #include "web_assets.h"
 #include "enrollment.h"
+#include "linux_installer.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -12,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -21,6 +24,10 @@
 static struct gateway g;
 static volatile sig_atomic_t stopping;
 static pid_t release_sync_pid;
+static pid_t release_cleanup_pid;
+static time_t release_cleanup_at;
+static int start_release_worker(int cleanup_only);
+static void upload_unlock(struct connection *c);
 static const char *release_sync_status = "idle";
 static void signal_stop(int signal) {
     (void)signal;
@@ -452,6 +459,7 @@ static void clear_http(struct connection *c) {
         upload_abort(c);
 }
 static void http_reply(struct connection *c, int status, const void *data, size_t len) {
+    upload_unlock(c);
     if (c->handled || len > GW_FRAME_LIMIT)
         return;
     if (len > GW_TOTAL_QUEUED - g.queued) {
@@ -607,6 +615,7 @@ static void update_hex(const unsigned char *digest, unsigned length, char *out) 
     out[length * 2] = 0;
 }
 static void upload_abort(struct connection *c) {
+    upload_unlock(c);
     if (c->upload)
         fclose(c->upload);
     if (c->upload_digest)
@@ -617,6 +626,19 @@ static void upload_abort(struct connection *c) {
     c->upload_digest = NULL;
     c->upload_size = 0;
     c->upload_tmp[0] = 0;
+}
+static void upload_unlock(struct connection *c) {
+    if (c->upload_cache_lock) {
+        close(c->upload_cache_lock-1);
+        c->upload_cache_lock=0;
+    }
+}
+static int upload_lock(struct connection *c) {
+    char path[700];snprintf(path,sizeof(path),"%s/.release.lock",g.update_dir);
+    int descriptor=open(path,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(descriptor<0) return -1;
+    if(flock(descriptor,LOCK_EX|LOCK_NB)) { close(descriptor);return -1; }
+    c->upload_cache_lock=descriptor+1;return 0;
 }
 static int package_format_matches(FILE *file, const char *platform) {
     unsigned char magic[4];
@@ -708,6 +730,8 @@ static int push_update(struct connection *node, const char *version) {
     const char *platform = find_node_package(node, version, sha, filename, &size, variant);
     if (!platform)
         return 1;
+    if (gw_store_package_lease(g.db,platform,version,(uint64_t)time(NULL)+600))
+        return 1;
     json_object *j = json_object_new_object();
     gw_js(j, "version", version);
     gw_js(j, "sha256", sha);
@@ -725,17 +749,29 @@ static int push_update(struct connection *node, const char *version) {
 }
 
 static void poll_release_sync(void) {
-    if (!release_sync_pid)
-        return;
     int status;
-    pid_t result = waitpid(release_sync_pid, &status, WNOHANG);
-    if (result == release_sync_pid || (result < 0 && errno == ECHILD)) {
-        release_sync_pid = 0;
-        release_sync_status = result > 0 && WIFEXITED(status) && !WEXITSTATUS(status) ? "complete" : "failed";
+    time_t now=time(NULL);
+    if (release_sync_pid) {
+        pid_t result=waitpid(release_sync_pid,&status,WNOHANG);
+        if (result==release_sync_pid || (result<0 && errno==ECHILD)) {
+            release_sync_pid=0;
+            release_sync_status=result>0 && WIFEXITED(status) && !WEXITSTATUS(status)?"complete":"failed";
+            release_cleanup_at=now+60;
+        }
+    }
+    if (release_cleanup_pid) {
+        pid_t result=waitpid(release_cleanup_pid,&status,WNOHANG);
+        if(result==release_cleanup_pid || (result<0 && errno==ECHILD)) release_cleanup_pid=0;
+    }
+    if (!release_cleanup_at) release_cleanup_at=now+60;
+    if (!release_sync_pid && !release_cleanup_pid && now>=release_cleanup_at) {
+        release_cleanup_at=now+60;
+        char version[32];gw_store_release_version(g.db,version);
+        if(*version) (void)start_release_worker(1);
     }
 }
 
-static int start_release_sync(void) {
+static int start_release_worker(int cleanup_only) {
     char worker[4096];
     ssize_t size = readlink("/proc/self/exe", worker, sizeof(worker) - 1);
     if (size <= 0 || (size_t)size >= sizeof(worker) - 1)
@@ -761,12 +797,15 @@ static int start_release_sync(void) {
             _exit(1);
         for (int fd = 3; fd < limit; ++fd)
             close(fd);
-        execl("/usr/bin/python3", "python3", worker, "--database", g.database,
-              "--repository", repository, (char *)NULL);
+        if(cleanup_only)
+            execl("/usr/bin/python3","python3",worker,"--database",g.database,"--cleanup-only",(char *)NULL);
+        else
+            execl("/usr/bin/python3", "python3", worker, "--database", g.database,
+                  "--repository", repository, (char *)NULL);
         _exit(127);
     }
-    release_sync_pid = child;
-    release_sync_status = "running";
+    if(cleanup_only) release_cleanup_pid=child;
+    else { release_sync_pid=child;release_sync_status="running"; }
     return 0;
 }
 
@@ -785,7 +824,7 @@ static void handle_http(struct connection *c) {
             return;
         }
         poll_release_sync();
-        if (c->post && !release_sync_pid && start_release_sync()) {
+        if (c->post && !release_sync_pid && start_release_worker(0)) {
             http_error(c, 503, 1, "release sync requires the installed sync script and Python 3");
             return;
         }
@@ -830,6 +869,11 @@ static void handle_http(struct connection *c) {
         if (!package_format_matches(c->upload, c->upload_platform)) {
             upload_abort(c);
             http_error(c, 400, 1, "package does not match the selected platform");
+            return;
+        }
+        if (upload_lock(c)) {
+            upload_abort(c);
+            http_error(c,409,1,"package publication is busy; retry shortly");
             return;
         }
         int close_error = fclose(c->upload);
@@ -922,9 +966,25 @@ static void handle_http(struct connection *c) {
             http_error(c, 404, 1, "package not found");
             return;
         }
+        if (gw_store_package_lease(g.db,platform,version,(uint64_t)time(NULL)+600)) {
+            http_error(c,503,1,"package changed during cleanup; retry the download");
+            return;
+        }
         update_path(path, sizeof(path), filename);
         char headers[256] = "";
         if (installer) {
+            int is_linux = !strcmp(platform,"linux") || !strncmp(platform,"linux-",6);
+            if (is_linux) {
+                char generated[700];
+                if (gw_linux_installer(g.update_dir,path,sha,size,generated)) {
+                    http_error(c,503,1,"cannot prepare Linux installer; retry after synchronization");
+                    return;
+                }
+                snprintf(headers,sizeof(headers),"Content-Disposition: attachment; filename=\"fastp2p-%" PRIu64 "\"\r\nCache-Control: no-store\r\n",g.token);
+                if (lws_serve_http_file(c->wsi,generated,"application/octet-stream",headers,(int)strlen(headers))<0)
+                    http_error(c,503,1,"cannot serve Linux installer");
+                return;
+            }
             const char *extension = !strcmp(platform, "windows") ? ".exe" :
                                     !strcmp(platform, "android") ? ".apk" : "";
             snprintf(headers, sizeof(headers),
@@ -2112,6 +2172,10 @@ sqlite3_close(g.db);
     if (release_sync_pid) {
         kill(release_sync_pid, SIGTERM);
         while (waitpid(release_sync_pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
+    if (release_cleanup_pid) {
+        kill(release_cleanup_pid,SIGTERM);
+        while(waitpid(release_cleanup_pid,NULL,0)<0 && errno==EINTR) {}
     }
     lws_sul_cancel(&g.tick);
     lws_context_destroy(g.context);

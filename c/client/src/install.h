@@ -2,6 +2,7 @@
 #define FASTP2P_INSTALL_H
 #include <json-c/json.h>
 int fastp2p_install_command(int argc, char **argv);
+int fastp2p_uninstall_command(int argc, char **argv);
 int fastp2p_default_profile(char out[4096]);
 /* Machine-wide profile, used when the client runs as a Windows service and the
  * per-user location is not readable by the account the service runs under. */
@@ -23,6 +24,9 @@ int fastp2p_runtime_stopping(void);
 void fastp2p_runtime_request_stop(void);
 void fastp2p_runtime_end(void);
 int fastp2p_enable_autostart(const char *profile, const char *ca);
+/* Stop and unregister this installation while retaining its private profile. */
+int fastp2p_remove_autostart(const char *profile);
+int fastp2p_linux_uninstall(int keep_config);
 int fastp2p_stop_installed(const char *profile);
 /* Windows service plumbing; the POSIX builds answer "unsupported". */
 int fastp2p_service_supported(void);

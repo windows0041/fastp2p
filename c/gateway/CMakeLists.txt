@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(fastp2p_c_gateway VERSION 2.0.4 LANGUAGES C)
+project(fastp2p_c_gateway VERSION 2.0.5 LANGUAGES C)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "The gateway targets Linux; use WSL on Windows")
 endif()
@@ -15,6 +15,14 @@ find_package(OpenSSL 3.0 REQUIRED)
 find_package(SQLite3 3.24 REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(WEB_HEADER "${CMAKE_CURRENT_BINARY_DIR}/web_assets.h")
+set(LINUX_INSTALLER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/linux_installer_assets.h")
+add_custom_command(OUTPUT "${LINUX_INSTALLER_HEADER}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed-linux-installer.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../client/scripts/linux-installer.sh"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../client/scripts/fastp2p-service.sh"
+          "${LINUX_INSTALLER_HEADER}"
+  DEPENDS scripts/embed-linux-installer.py ../client/scripts/linux-installer.sh ../client/scripts/fastp2p-service.sh
+  VERBATIM)
 add_custom_command(OUTPUT "${WEB_HEADER}"
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed-web.py"
           "${CMAKE_CURRENT_SOURCE_DIR}/web" "${WEB_HEADER}"
@@ -32,7 +40,7 @@ target_include_directories(gateway_protocol PUBLIC src ../common)
 target_link_libraries(gateway_protocol PUBLIC PkgConfig::JSON OpenSSL::Crypto)
 add_library(gateway_store STATIC src/store.c src/account.c)
 target_link_libraries(gateway_store PUBLIC gateway_protocol SQLite::SQLite3 PkgConfig::LWS)
-add_executable(fastp2p-gateway src/gateway.c src/nat.c "${WEB_HEADER}")
+add_executable(fastp2p-gateway src/gateway.c src/nat.c src/linux_installer.c "${WEB_HEADER}" "${LINUX_INSTALLER_HEADER}")
 target_include_directories(fastp2p-gateway PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(fastp2p-gateway PRIVATE gateway_store PkgConfig::LWS OpenSSL::SSL)
 include(GNUInstallDirs)
@@ -48,4 +56,5 @@ if(BUILD_TESTING)
   target_compile_options(test-gateway-protocol PRIVATE -UNDEBUG)
   add_test(NAME gateway-protocol COMMAND test-gateway-protocol)
   add_test(NAME release-downloads COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_release_downloads.py)
+  add_test(NAME package-cleanup COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_package_cleanup.py)
 endif()

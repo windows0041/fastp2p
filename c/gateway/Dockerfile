@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY c/common ./c/common
+COPY c/client/scripts/linux-installer.sh c/client/scripts/fastp2p-service.sh ./c/client/scripts/
 COPY c/gateway ./c/gateway
 RUN cmake -S c/gateway -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
     && cmake --build /build --parallel 2 \

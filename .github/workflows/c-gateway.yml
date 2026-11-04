@@ -3,7 +3,7 @@ on:
   push:
     tags: ['fastp2p-gateway-v*']
     branches: ['**']
-    paths: ['c/gateway/**', 'c/common/**', 'scripts/tls/**', 'c/client/src/**', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml', 'scripts/publish-release.py', 'scripts/test-publish-release.py']
+    paths: ['c/gateway/**', 'c/common/**', 'scripts/tls/**', 'c/client/src/**', 'c/client/scripts/linux-installer.sh', 'c/client/scripts/fastp2p-service.sh', 'c/client/tests/integration.py', '.github/workflows/c-gateway.yml', 'scripts/publish-release.py', 'scripts/test-publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read

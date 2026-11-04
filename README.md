@@ -11,7 +11,7 @@
 | 平台 | 客户端 | 自动运行 |
 | --- | --- | --- |
 | Windows x86_64 | `fastp2p-windows-x86_64.exe` | Windows 服务（开机自启、失败自动重启） |
-| Linux（静态） | `fastp2p-linux-static-{x86_64,aarch64,armv7,i686,riscv64,s390x,ppc64le,mips64el}.tar.gz` | root 安装 systemd 服务 |
+| Linux（静态） | `fastp2p-linux-static-{x86_64,aarch64,armv7,i686,riscv64,s390x,ppc64le,mips64el}.tar.gz`；网关提供带 Token 文件名的自包含安装脚本 | 脚本适配 systemd / procd / OpenRC |
 | macOS ARM64 / x86_64 | `fastp2p-macos-{arm64,x86_64}.tar.gz` | 用户 LaunchAgent |
 | Android ARM64 / x86_64 | `fastp2p-android.apk` | 前台服务及开机恢复 |
 

@@ -2,8 +2,8 @@
 
 | 平台 | 核心与入口 | 自动运行 |
 | --- | --- | --- |
-| Linux x86_64 (glibc) | C11 / CLI / C SDK | root 安装 systemd；普通用户手动 run |
-| Linux 静态 musl（8 个架构 `fastp2p-linux-static-<arch>`） | C11 / CLI | root 安装 systemd；普通用户手动 run |
+| Linux x86_64 (glibc) | C11 / CLI / C SDK | 网关脚本安装到 /usr/local/fastp2p；普通用户可手动 run |
+| Linux 静态 musl（8 个架构 `fastp2p-linux-static-<arch>`） | C11 / CLI | 脚本按实际 init 选择 systemd / procd / OpenRC；需要对应 CPU 包 |
 | Windows x86_64 | C11 / 单文件 EXE / C DLL SDK | 当前用户 HKCU Run，后台进程 |
 | macOS 13+ ARM64/x86_64 | C11 / CLI / dylib SDK | 用户 LaunchAgent |
 | Android 8+ ARM64/x86_64 | C 核心 + JNI/Java 前台服务 | 系统通知、开机恢复 |

@@ -63,6 +63,9 @@ int gw_store_open(sqlite3 **out, const char *path) {
                 "PRIMARY KEY(platform,version));"
                 "CREATE TABLE IF NOT EXISTS release_sync("
                 "id INTEGER PRIMARY KEY CHECK(id=1),version TEXT NOT NULL,release_id INTEGER NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS package_leases("
+                "platform TEXT NOT NULL,version TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(platform,version));"
+                "CREATE TABLE IF NOT EXISTS package_gc(filename TEXT PRIMARY KEY);"
                 "PRAGMA application_id=1179660880; PRAGMA user_version=4;"
                 "UPDATE nodes SET online=0; COMMIT;"))
         goto fail;
@@ -72,6 +75,19 @@ fail:
     if (db)
         sqlite3_close(db);
     return -1;
+}
+int gw_store_package_lease(sqlite3 *db, const char *platform, const char *version, uint64_t expires) {
+    if (!gw_store_package_key_valid(platform, version)) return -1;
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT INTO package_leases SELECT ?1,?2,?3 WHERE EXISTS("
+        "SELECT 1 FROM updates WHERE platform=?1 AND version=?2 UNION ALL "
+        "SELECT 1 FROM release_packages WHERE platform=?1 AND version=?2) "
+        "ON CONFLICT(platform,version) DO UPDATE SET expires_at=max(expires_at,excluded.expires_at)",
+        -1,&statement,NULL)!=SQLITE_OK) return -1;
+    sqlite3_bind_text(statement,1,platform,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement,2,version,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement,3,(sqlite3_int64)expires);
+    int ok=sqlite3_step(statement)==SQLITE_DONE && sqlite3_changes(db)>0;sqlite3_finalize(statement);return ok?0:-1;
 }
 int gw_device_valid(const char *text) {
     if (!text || strlen(text) != 32)

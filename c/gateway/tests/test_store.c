@@ -94,6 +94,13 @@ int main(void) {
     uint64_t found_size = 0;
     assert(!gw_store_update_find(db, "linux", "2.0.2", found_sha, found_file, &found_size));
     assert(!strcmp(found_sha, sha) && found_size == 1234 && !strcmp(found_file, "linux-2.0.2-abc"));
+    assert(!gw_store_package_lease(db, "linux", "2.0.2", 900));
+    assert(!gw_store_package_lease(db, "linux", "2.0.2", 800));
+    sqlite3_stmt *lease;
+    assert(!sqlite3_prepare_v2(db, "SELECT expires_at FROM package_leases WHERE platform='linux'", -1, &lease, NULL));
+    assert(sqlite3_step(lease) == SQLITE_ROW && sqlite3_column_int64(lease, 0) == 900);
+    sqlite3_finalize(lease);
+    assert(gw_store_package_lease(db, "linux", "9.9.9", 900) == -1);
     json_object *updates = gw_store_updates(db);
     assert(updates && json_object_array_length(updates) == 1);
     json_object *row = json_object_array_get_idx(updates, 0);

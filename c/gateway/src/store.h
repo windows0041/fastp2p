@@ -48,6 +48,7 @@ int gw_store_rule_managed(sqlite3 *db, const char *node);
  * addressed next to the database; only metadata lives in SQLite. */
 int gw_store_update_key_valid(const char *platform, const char *version);
 int gw_store_package_key_valid(const char *platform, const char *version);
+int gw_store_package_lease(sqlite3 *db, const char *platform, const char *version, uint64_t expires);
 void gw_store_release_version(sqlite3 *db, char version[32]);
 int gw_store_update_put(sqlite3 *db, const char *platform, const char *version,
                         const char *sha256, uint64_t size, const char *filename);

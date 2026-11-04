@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Import verified client executables from a stable GitHub Release."""
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import tarfile
 import tempfile
@@ -36,6 +39,98 @@ ACCELERATOR_HOSTS = {'gh-proxy.com', 'gh-proxy.org'}
 
 def version_key(version):
     return tuple(map(int, version.split('.')))
+
+
+@contextlib.contextmanager
+def cache_lock(directory, name='.release.lock', shared=False):
+    descriptor = os.open(directory / name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        while chunk := source.read(65536):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def older(version, latest):
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,3}', version):
+        return False
+    return (version_key(version) + (0,) * 4)[:4] < (version_key(latest) + (0,) * 4)[:4]
+
+
+def cleanup(database, now=None):
+    """Prune committed obsolete metadata, then unlink only owned cache files.
+
+    Optional coordination tables preserve compatibility with the core schema.
+    A tombstone survives a failed unlink, so the periodic worker can retry it.
+    """
+    directory = database.parent / 'updates'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    now = int(time.time()) if now is None else now
+    raw_pattern = re.compile(r'(?:github-)?(?:windows|android|linux(?:-[a-z0-9_]+)?|macos(?:-[a-z0-9_]+)?)-'
+                             r'([0-9]+(?:\.[0-9]+){0,3})-[0-9a-f]{64}')
+    installer_pattern = re.compile(r'installer-[0-9a-f]{64}-([0-9a-f]{64})\.sh')
+    result = {'records': 0, 'files': 0, 'deferred': 0}
+    with cache_lock(directory), sqlite3.connect(database.as_uri() + '?mode=rw', uri=True, timeout=5) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS package_leases(platform TEXT,version TEXT,expires_at INTEGER,PRIMARY KEY(platform,version))')
+        db.execute('CREATE TABLE IF NOT EXISTS package_gc(filename TEXT PRIMARY KEY)')
+        latest = db.execute('SELECT version FROM release_sync WHERE id=1').fetchone()
+        if not latest:
+            return result
+        with db:
+            db.execute('DELETE FROM package_leases WHERE expires_at<=?', (now,))
+            deleted = set()
+            for table in ('release_packages', 'updates'):
+                for platform, version, filename in db.execute(f'SELECT platform,version,filename FROM {table}').fetchall():
+                    if not older(version, latest[0]):
+                        continue
+                    if db.execute('SELECT 1 FROM package_leases WHERE platform=? AND version=? AND expires_at>?',
+                                  (platform, version, now)).fetchone():
+                        result['deferred'] += 1
+                        continue
+                    db.execute(f'DELETE FROM {table} WHERE platform=? AND version=?', (platform, version))
+                    result['records'] += 1
+                    deleted.add(filename)
+            referenced = {row[0] for row in db.execute('SELECT filename FROM updates UNION SELECT filename FROM release_packages')}
+            digests = {row[0] for row in db.execute('SELECT sha256 FROM updates UNION SELECT sha256 FROM release_packages')}
+            for path in directory.iterdir():
+                name = path.name
+                match = raw_pattern.fullmatch(name)
+                installer = installer_pattern.fullmatch(name)
+                if name not in referenced and ((match and older(match[1], latest[0])) or
+                                               (installer and installer[1] not in digests)):
+                    deleted.add(name)
+            for name in deleted - referenced:
+                # A corrupt DB entry must never turn cleanup into a path traversal.
+                if raw_pattern.fullmatch(name) or installer_pattern.fullmatch(name):
+                    db.execute('INSERT OR IGNORE INTO package_gc VALUES(?)', (name,))
+        for (name,) in db.execute('SELECT filename FROM package_gc').fetchall():
+            if name in referenced:
+                db.execute('DELETE FROM package_gc WHERE filename=?', (name,))
+                continue
+            if not (raw_pattern.fullmatch(name) or installer_pattern.fullmatch(name)):
+                db.execute('DELETE FROM package_gc WHERE filename=?', (name,))
+                continue
+            try:
+                path = directory / name
+                if path.exists() and stat.S_ISDIR(path.lstat().st_mode):
+                    raise OSError('cache entry is a directory')
+                path.unlink(missing_ok=True)  # Unlink the entry, never a symlink's target.
+            except OSError as error:
+                result['deferred'] += 1
+                print(f'Old package cleanup deferred for {name}: {error}', file=sys.stderr, flush=True)
+            else:
+                result['files'] += 1
+                db.execute('DELETE FROM package_gc WHERE filename=?', (name,))
+        db.commit()
+    return result
 
 
 class GitHubRedirect(urllib.request.HTTPRedirectHandler):
@@ -182,6 +277,16 @@ def extract(asset, member, output):
 
 
 def sync(database, repository, download_prefix=''):
+    directory = database.parent / 'updates'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    with cache_lock(directory, '.sync.lock'):
+        version = import_release(database, repository, download_prefix)
+        result = cleanup(database)
+        print('Old client packages cleaned: ' + json.dumps(result), flush=True)
+        return version
+
+
+def import_release(database, repository, download_prefix=''):
     download_prefix = validate_download_prefix(download_prefix)
     version, release = latest(repository, download_prefix)
     assets = {asset['name']: asset for asset in release['assets']}
@@ -201,12 +306,13 @@ def sync(database, repository, download_prefix=''):
         saved = db.execute('SELECT version,release_id FROM release_sync WHERE id=1').fetchone()
         if saved and version_key(saved[0]) > version_key(version):
             raise ValueError('GitHub stable version is older than the cached release')
-        cached = db.execute('SELECT platform,size,filename FROM release_packages WHERE version=?',
+        cached = db.execute('SELECT platform,size,filename,sha256 FROM release_packages WHERE version=?',
                             (version,)).fetchall()
-        if (saved == (version, release['id']) and {row[0] for row in cached} == selected.keys() and
-                all((directory / name).is_file() and (directory / name).stat().st_size == size
-                    for _, size, name in cached)):
-            return version
+        with cache_lock(directory, shared=True):
+            if (saved == (version, release['id']) and {row[0] for row in cached} == selected.keys() and
+                    all((directory / name).is_file() and (directory / name).stat().st_size == size and
+                        file_digest(directory / name) == sha for _, size, name, sha in cached)):
+                return version
 
         with tempfile.TemporaryDirectory(prefix='.github-', dir=directory) as tmp:
             staging = Path(tmp)
@@ -233,16 +339,17 @@ def sync(database, repository, download_prefix=''):
 
             # Files are prepared and verified before SQLite publishes any row.
             # Content-based names keep downloads of the previous release valid.
-            for path, row in packages:
-                path.replace(directory / row[4])
-            with db:
-                db.executemany('INSERT INTO release_packages VALUES(?,?,?,?,?,?) '
-                               'ON CONFLICT(platform,version) DO UPDATE SET sha256=excluded.sha256,'
-                               'size=excluded.size,filename=excluded.filename,uploaded_at=excluded.uploaded_at',
-                               [row for _, row in packages])
-                db.execute('INSERT INTO release_sync VALUES(1,?,?) ON CONFLICT(id) '
-                           'DO UPDATE SET version=excluded.version,release_id=excluded.release_id',
-                           (version, release['id']))
+            with cache_lock(directory):
+                for path, row in packages:
+                    path.replace(directory / row[4])
+                with db:
+                    db.executemany('INSERT INTO release_packages VALUES(?,?,?,?,?,?) '
+                                   'ON CONFLICT(platform,version) DO UPDATE SET sha256=excluded.sha256,'
+                                   'size=excluded.size,filename=excluded.filename,uploaded_at=excluded.uploaded_at',
+                                   [row for _, row in packages])
+                    db.execute('INSERT INTO release_sync VALUES(1,?,?) ON CONFLICT(id) '
+                               'DO UPDATE SET version=excluded.version,release_id=excluded.release_id',
+                               (version, release['id']))
     return version
 
 
@@ -251,10 +358,14 @@ def main():
     parser.add_argument('--database', type=Path, required=True)
     parser.add_argument('--repository', default='windows0041/fastp2p')
     parser.add_argument('--download-prefix', default=os.environ.get('FASTP2P_RELEASE_DOWNLOAD_PREFIX', ''))
+    parser.add_argument('--cleanup-only', action='store_true')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository):
         parser.error('repository must be owner/name')
     try:
+        if args.cleanup_only:
+            print('Old client packages cleaned: ' + json.dumps(cleanup(args.database.absolute())), flush=True)
+            return 0
         version = sync(args.database.absolute(), args.repository, args.download_prefix)
     except (OSError, ValueError, KeyError, sqlite3.Error, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f'GitHub client release sync failed: {error}', file=sys.stderr)

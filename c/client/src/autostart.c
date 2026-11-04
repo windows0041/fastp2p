@@ -56,6 +56,29 @@ int fastp2p_stop_installed(const char *profile) {
     if (!event) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
     int ok = SetEvent(event) != 0; CloseHandle(event); return ok ? 0 : -1;
 }
+int fastp2p_remove_autostart(const char *profile) {
+    if (fastp2p_stop_installed(profile)) return -1;
+    WCHAR name[80]; event_name(profile, name);
+    /* Closing our handle lets disappearance mean the old runtime released its
+     * event; retaining it here would keep the named event alive ourselves. */
+    for (int attempt = 0; ; ++attempt) {
+        HANDLE old = OpenEventW(SYNCHRONIZE, FALSE, name);
+        if (!old) {
+            if (GetLastError() != ERROR_FILE_NOT_FOUND) return -1;
+            break;
+        }
+        CloseHandle(old);
+        if (attempt == 300) return -1;
+        Sleep(100);
+    }
+    HKEY key;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                                0, KEY_SET_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) return 0;
+    if (result != ERROR_SUCCESS) return -1;
+    result = RegDeleteValueW(key, L"fastp2p"); RegCloseKey(key);
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND ? 0 : -1;
+}
 int fastp2p_enable_autostart(const char *profile, const char *ca) {
     (void)ca;
     WCHAR signal[80]; event_name(profile, signal);
@@ -122,9 +145,38 @@ int fastp2p_stop_installed(const char *profile) {
     char service[80]; snprintf(service, sizeof(service), "gui/%lu/top.fastp2p", (unsigned long)getuid());
     char *const stop[] = {"/bin/launchctl", "bootout", service, NULL}; return execute(stop);
 #else
-    char *const stop[] = {"/usr/bin/systemctl", "stop", "fastp2p-client.service", NULL}; return execute(stop);
+    char *const stop[] = {"/usr/local/fastp2p/fastp2p-service", "stop", NULL}; return execute(stop);
 #endif
 }
+int fastp2p_remove_autostart(const char *profile) {
+#ifdef __APPLE__
+    (void)fastp2p_stop_installed(profile);
+    return 0;
+#else
+    if (geteuid() || strcmp(profile, "/etc/fastp2p/client.json")) return -1;
+    return fastp2p_linux_uninstall(1);
+#endif
+}
+#if defined(__linux__)
+static int linux_controller_ready(void) {
+    struct stat directory, script;
+    return !lstat("/usr/local/fastp2p", &directory) && S_ISDIR(directory.st_mode) &&
+           directory.st_uid == 0 && !(directory.st_mode & 0022) &&
+           !lstat("/usr/local/fastp2p/fastp2p-service", &script) && S_ISREG(script.st_mode) &&
+           script.st_uid == 0 && !(script.st_mode & 0022) &&
+           !access("/usr/local/fastp2p/fastp2p-service", X_OK);
+}
+int fastp2p_linux_uninstall(int keep_config) {
+    if (!linux_controller_ready()) {
+        fputs("Use the Linux installer script from the gateway to manage this installation.\n", stderr);
+        return -1;
+    }
+    char *const command[] = {"/usr/local/fastp2p/fastp2p-service", "uninstall",
+                             keep_config ? "--keep-config" : NULL, NULL};
+    return execute(command);
+}
+#endif
+#ifdef __APPLE__
 static int copy_binary(const char *target) {
     char source[4096];
 #ifdef __APPLE__
@@ -160,6 +212,7 @@ static int copy_binary(const char *target) {
     if (!ok) unlink(temporary);
     return ok ? 0 : -1;
 }
+#endif
 int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #ifdef __APPLE__
     (void)profile; (void)ca;
@@ -182,41 +235,15 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     char *const load[] = {"/bin/launchctl", "bootstrap", domain, plist, NULL};
     return execute(load);
 #else
-    if (geteuid() || strcmp(profile, "/etc/fastp2p/client.json")) return -1;
-    struct passwd *user = getpwnam("fastp2p");
-    if (!user) {
-        char *const add[] = {"/usr/sbin/useradd", "--system", "--user-group", "--home-dir", "/var/lib/fastp2p",
-                             "--shell", "/usr/sbin/nologin", "fastp2p", NULL};
-        if (execute(add)) return -1;
-        user = getpwnam("fastp2p");
-    }
-    if (!user || strcmp(user->pw_dir, "/var/lib/fastp2p") || copy_binary("/usr/local/bin/fastp2p")) return -1;
-    const char *state = "/var/lib/fastp2p-client";
-    struct stat directory;
-    if ((mkdir(state, 0700) && errno != EEXIST) ||
-        lstat(state, &directory) || !S_ISDIR(directory.st_mode) ||
-        (directory.st_uid != 0 && directory.st_uid != user->pw_uid) ||
-        chmod(state, 0700) || chown(state, user->pw_uid, user->pw_gid) ||
-        copy_binary("/var/lib/fastp2p-client/fastp2p"))
+    (void)ca;
+    if (geteuid() || strcmp(profile, "/etc/fastp2p/client.json") || !linux_controller_ready()) {
+        fputs("Install the Linux service using the script downloaded from the gateway.\n", stderr);
         return -1;
-    if (chown("/etc/fastp2p", 0, user->pw_gid) || chmod("/etc/fastp2p", 0750) ||
-        chown(profile, 0, user->pw_gid) || chmod(profile, 0640) ||
-        (ca && (chown(ca, 0, user->pw_gid) || chmod(ca, 0640)))) return -1;
-    const char *unit = "[Unit]\nDescription=fastp2p client\nAfter=network-online.target\nWants=network-online.target\n"
-                       "[Service]\nUser=fastp2p\nGroup=fastp2p\n"
-                       "ExecStart=/var/lib/fastp2p-client/fastp2p run --config /etc/fastp2p/client.json\n"
-                       "Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nPrivateTmp=true\n"
-                       "ProtectSystem=strict\nProtectHome=true\nStateDirectory=fastp2p-client\n"
-                       "StateDirectoryMode=0700\n[Install]\nWantedBy=multi-user.target\n";
-    FILE *file = fopen("/etc/systemd/system/fastp2p-client.service", "wb");
-    if (!file) return -1;
-    int ok = fwrite(unit, 1, strlen(unit), file) == strlen(unit);
-    if (fclose(file)) ok = 0;
-    if (!ok) return -1;
-    char *const reload[] = {"/usr/bin/systemctl", "daemon-reload", NULL};
-    char *const enable[] = {"/usr/bin/systemctl", "enable", "fastp2p-client.service", NULL};
-    char *const restart[] = {"/usr/bin/systemctl", "restart", "fastp2p-client.service", NULL};
-    return execute(reload) || execute(enable) || execute(restart) ? -1 : 0;
+    }
+    char source[80]; snprintf(source, sizeof(source), "/proc/%lu/exe", (unsigned long)getpid());
+    char *const install[] = {"/usr/local/fastp2p/fastp2p-service", "install", "--binary", source,
+                             "--config", (char *)profile, NULL};
+    return execute(install);
 #endif
 }
 #endif

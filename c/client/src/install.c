@@ -295,6 +295,27 @@ static int install_token(const char *token, const char *token_file, const char *
     int size = snprintf(ca_path, sizeof(ca_path), "%s.ca.%s.pem", profile, fingerprint);
     if (size < 0 || (size_t)size >= sizeof(ca_path)) { json_object_put(enrollment); return 2; }
     json_object *previous = fastp2p_profile_read(profile), *root = json_object_new_object();
+    /* Never silently replace an existing unreadable identity. */
+    if (!previous) {
+#ifdef _WIN32
+        WCHAR existing[4096];
+        int exists = !wide(profile, existing) && GetFileAttributesW(existing) != INVALID_FILE_ATTRIBUTES;
+#else
+        struct stat existing;
+        int exists = !lstat(profile, &existing);
+#endif
+        if (exists) {
+            fputs("Existing profile cannot be read; repair it before reinstalling.\n", stderr);
+            json_object_put(root); json_object_put(enrollment); return 1;
+        }
+    }
+#ifdef _WIN32
+    if (!previous && machine) {
+        char user_profile[4096];
+        if (!fastp2p_default_profile(user_profile) && strcmp(user_profile, profile))
+            previous = fastp2p_profile_read(user_profile);
+    }
+#endif
     json_object *old_network = NULL;
     if (previous) json_object_object_get_ex(previous, "network", &old_network);
     if (previous && strcmp(field(previous, "product"), "fastp2p")) {
@@ -316,7 +337,7 @@ static int install_token(const char *token, const char *token_file, const char *
     json_object_object_add(network, "Token", json_object_new_string(field(enrollment, "key")));
     json_object_object_add(network, "AutoNode", json_object_new_boolean(!node || !*node));
     if (node && *node) json_object_object_add(network, "Node", json_object_new_string(node));
-    else json_object_object_add(network, "DeviceID", json_object_new_string(identity));
+    json_object_object_add(network, "DeviceID", json_object_new_string(identity));
     if (*ca) json_object_object_add(root, "CACertFile", json_object_new_string(ca_path));
     fastp2p_client *client = NULL;
     verification result = {0};
@@ -333,11 +354,42 @@ static int install_token(const char *token, const char *token_file, const char *
         fastp2p_install_note("failed: the gateway could not be verified (network, certificate or token)");
         goto fail;
     }
-    const char *arrays[] = {"apps", "socks5"};
-    for (unsigned i = 0; i < 2; ++i) {
+    /* Keep forwarding rules and user settings, but only after verification:
+     * running a second copy of the old listeners would conflict with the service. */
+    if (previous) {
+        json_object *saved = NULL, *saved_network = NULL;
+        if (json_object_deep_copy(previous, &saved, NULL)) goto fail;
+        if (!json_object_object_get_ex(saved, "network", &saved_network) ||
+            !json_object_is_type(saved_network, json_type_object)) {
+            saved_network = json_object_new_object();
+            json_object_object_add(saved, "network", saved_network);
+        }
+        const char *keys[] = {"ServerHost", "ServerPort", "Token", "AutoNode", "Node", "DeviceID"};
+        for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            json_object *value = NULL;
+            if (json_object_object_get_ex(network, keys[i], &value))
+                json_object_object_add(saved_network, keys[i], json_object_get(value));
+            else json_object_object_del(saved_network, keys[i]);
+        }
         json_object *value = NULL;
-        if (previous && json_object_object_get_ex(previous, arrays[i], &value))
-            json_object_object_add(root, arrays[i], json_object_get(value));
+        if (json_object_object_get_ex(root, "CACertFile", &value))
+            json_object_object_add(saved, "CACertFile", json_object_get(value));
+        else json_object_object_del(saved, "CACertFile");
+        json_object_put(root); root = saved;
+    }
+    /* Use the new installer's uninstall command: old releases do not understand
+     * --keep-config and may delete the identity or schedule the new EXE for
+     * deletion at reboot. Verify first so a bad token leaves the old service. */
+    if (!no_service) {
+        if (machine) fastp2p_install_step("正在探测并卸载旧服务，保留节点身份与配置…");
+#ifdef _WIN32
+        if (machine) {
+            char *remove[] = {"fastp2p", "uninstall", "--keep-config", NULL};
+            if (fastp2p_uninstall_command(3, remove)) goto fail;
+        } else if (fastp2p_remove_autostart(profile)) goto fail;
+#else
+        if (fastp2p_remove_autostart(profile)) goto fail;
+#endif
     }
     if (machine) fastp2p_install_step("[3/5] 网关校验通过，正在写入加密配置…");
     const char *plain = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
@@ -381,6 +433,31 @@ int fastp2p_install_command(int argc, char **argv) {
         else return 2;
     }
     return install_token(token, token_file, profile, node, no_service, machine);
+}
+
+int fastp2p_uninstall_command(int argc, char **argv) {
+    int keep = argc == 3 && !strcmp(argv[2], "--keep-config");
+    if (argc != 2 && !keep) return 2;
+    char profile[4096];
+#ifdef _WIN32
+    if (!fastp2p_service_elevated())
+        return fastp2p_service_elevate(keep ? "uninstall --keep-config" : "uninstall") ? 1 : 0;
+    if (fastp2p_service_profile(profile) || fastp2p_service_remove()) return 1;
+    char user_profile[4096];
+    if (!fastp2p_default_profile(user_profile) && fastp2p_remove_autostart(user_profile)) return 1;
+    if (!keep && fastp2p_service_purge()) {
+        fputs("fastp2p removed; an in-use file may need removal after this process exits.\n", stderr);
+    }
+#elif defined(__linux__)
+    if (geteuid()) { fputs("Run fastp2p uninstall as root.\n", stderr); return 1; }
+    (void)profile;
+    return fastp2p_linux_uninstall(keep) ? 1 : 0;
+#else
+    fputs("This platform does not provide the system uninstall command.\n", stderr); return 2;
+#endif
+    puts(keep ? "Previous fastp2p service removed; configuration retained for reinstall."
+              : "fastp2p service and client configuration removed.");
+    return 0;
 }
 /* A 16-digit run in the file name is the key; that is what makes the download a
  * single double-clickable file rather than a package plus a separate token. */

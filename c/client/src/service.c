@@ -15,7 +15,11 @@
 #include <accctrl.h>
 #include <aclapi.h>
 
+#ifdef FASTP2P_SERVICE_TEST
+#define SERVICE_TITLE L"fastp2p-installer-ci"
+#else
 #define SERVICE_TITLE L"fastp2p"
+#endif
 
 static SERVICE_STATUS_HANDLE status_handle;
 static DWORD status_checkpoint;
@@ -227,9 +231,14 @@ int fastp2p_service_install(const char *profile, const char *ca) {
     SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!manager)
         return -1;
-    SC_HANDLE service = CreateServiceW(manager, SERVICE_TITLE, SERVICE_TITLE, SERVICE_ALL_ACCESS,
-                                       SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
-                                       SERVICE_ERROR_NORMAL, command, NULL, NULL, NULL, NULL, NULL);
+    SC_HANDLE service = NULL;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        service = CreateServiceW(manager, SERVICE_TITLE, SERVICE_TITLE, SERVICE_ALL_ACCESS,
+                                  SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+                                  SERVICE_ERROR_NORMAL, command, NULL, NULL, NULL, NULL, NULL);
+        if (service || GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE) break;
+        Sleep(100);
+    }
     if (!service && GetLastError() == ERROR_SERVICE_EXISTS)
         service = OpenServiceW(manager, SERVICE_TITLE, SERVICE_ALL_ACCESS);
     if (!service) {
@@ -265,14 +274,22 @@ int fastp2p_service_remove(void) {
         CloseServiceHandle(manager);
         return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST ? 0 : -1;
     }
-    SERVICE_STATUS status = {0};
-    if (ControlService(service, SERVICE_CONTROL_STOP, &status))
-        for (int i = 0; i < 50 && status.dwCurrentState != SERVICE_STOPPED; ++i) {
-            Sleep(100);
-            if (!QueryServiceStatus(service, &status))
-                break;
-        }
-    int removed = DeleteService(service) != 0;
+    SERVICE_STATUS_PROCESS status = {0}; DWORD used = 0;
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (BYTE *)&status, sizeof(status), &used)) {
+        CloseServiceHandle(service); CloseServiceHandle(manager); return -1;
+    }
+    HANDLE process = status.dwProcessId ? OpenProcess(SYNCHRONIZE, FALSE, status.dwProcessId) : NULL;
+    SERVICE_STATUS ignored;
+    if (status.dwCurrentState != SERVICE_STOPPED) ControlService(service, SERVICE_CONTROL_STOP, &ignored);
+    int stopped = status.dwCurrentState == SERVICE_STOPPED;
+    for (int i = 0; !stopped && i < 300; ++i) {
+        Sleep(100);
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (BYTE *)&status, sizeof(status), &used)) break;
+        stopped = status.dwCurrentState == SERVICE_STOPPED;
+    }
+    if (stopped && process) stopped = WaitForSingleObject(process, 10000) == WAIT_OBJECT_0;
+    if (process) CloseHandle(process);
+    int removed = stopped && DeleteService(service) != 0;
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
     return removed ? 0 : -1;
@@ -326,13 +343,10 @@ int fastp2p_service_purge(void) {
             (int)sizeof(installed)) {
             WCHAR wide_installed[4096];
             if (!wide(installed, wide_installed)) {
-                /* Running this very image locks it. Schedule the delete for the
-                 * next boot instead of leaving the file behind. */
+                /* Never schedule this fixed pathname for deletion at reboot:
+                 * a subsequent reinstall could already put a new EXE there. */
                 if (!DeleteFileW(wide_installed) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-                    if (MoveFileExW(wide_installed, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
-                        puts("The installed copy is in use; it will be removed at the next restart.");
-                    else
-                        leftover = 1;
+                    leftover = 1;
                 }
             }
         }

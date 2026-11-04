@@ -13,8 +13,8 @@ android {
         applicationId 'top.fastp2p.cclient'
         minSdk 26
         targetSdk 36
-        versionCode 20003
-        versionName '2.0.3'
+        versionCode 20004
+        versionName '2.0.4'
         testInstrumentationRunner 'top.fastp2p.cclient.LiveInstrumentation'
         ndk { abiFilters 'arm64-v8a', 'x86_64' }
         externalNativeBuild {
