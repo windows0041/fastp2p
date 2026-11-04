@@ -53,6 +53,16 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
                 '--config',str(profile),'--no-service'],env=client_environment,cwd=root,capture_output=True,timeout=40)
             if completed.returncode != expected:
                 diagnostic = completed.stdout.decode(errors='replace') + completed.stderr.decode(errors='replace')
+                # The installer intentionally keeps normal event logging quiet.
+                # Reproduce only in this private test directory using the same
+                # gateway identity, so CI failures expose the transport reason.
+                probe=root/'failed-install-probe.json'
+                probe.write_text(json.dumps({'product':'fastp2p','network':{'AutoNode':True,
+                    'ServerHost':payload['host'],'ServerPort':payload['port'],'Token':payload['key']},
+                    'CACertFile':str(root/'tls/ca.crt')}))
+                trace=subprocess.run([str(Path(args.client).resolve()),'run','--config',str(probe),'--run-seconds','3'],
+                    env=client_environment,capture_output=True,timeout=15)
+                diagnostic += trace.stdout.decode(errors='replace') + trace.stderr.decode(errors='replace')
                 if Path(args.gateway).suffix == '.py':
                     diagnostic += (root/'gateway.log').read_text(errors='replace')[-4000:]
                 raise AssertionError((completed.returncode, diagnostic.replace(token,'[fixture-key]').replace(payload['key'],'[fixture-key]')))
