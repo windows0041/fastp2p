@@ -125,6 +125,9 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
         assert key.encode() not in installer, 'shared installer must not contain token'
         prefix, extracted = installer.split(b'__FASTP2P_PAYLOAD__\n', 1)
         assert extracted == payload and hashlib.sha256(extracted).hexdigest().encode() in prefix
+        cached=next((root/'updates').glob('installer-*.sh'))
+        cached.write_bytes(installer[:-1]+bytes([installer[-1]^1]))
+        assert api('/api/v1/update/install?platform=linux&version=2.0.4')[2] == installer
         raw = api('/api/v1/update/download?platform=linux&version=2.0.4&token='+key)[2]
         assert raw == payload, 'remote upgrades must continue to receive raw ELF'
         with sqlite3.connect(root/'nodes.sqlite3') as db:

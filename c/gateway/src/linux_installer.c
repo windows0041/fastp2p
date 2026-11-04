@@ -16,6 +16,32 @@ static void hex(const unsigned char digest[32], char output[65]) {
     for (unsigned i=0;i<32;i++) { output[2*i]=digits[digest[i]>>4];output[2*i+1]=digits[digest[i]&15]; }
     output[64]=0;
 }
+static int cached_valid(const char *path, const char *prefix, size_t length,
+                        const char *sha, uint64_t size) {
+    int descriptor=open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(descriptor<0)return 0;
+    FILE *file=fdopen(descriptor,"rb");
+    if(!file){close(descriptor);return 0;}
+    EVP_MD_CTX *hash=EVP_MD_CTX_new();
+    int ok=hash && EVP_DigestInit_ex(hash,EVP_sha256(),NULL)==1;
+    char buffer[65536];size_t offset=0,used;uint64_t total=0;
+    while(ok && offset<length){
+        size_t count=length-offset;if(count>sizeof(buffer))count=sizeof(buffer);
+        used=fread(buffer,1,count,file);
+        if(used!=count || memcmp(buffer,prefix+offset,count)){ok=0;break;}
+        offset+=count;
+    }
+    while(ok && (used=fread(buffer,1,sizeof(buffer),file))){
+        total+=used;
+        if(total>size || EVP_DigestUpdate(hash,buffer,used)!=1)ok=0;
+    }
+    unsigned char digest[32];unsigned count=0;char actual[65];
+    if(ok && !ferror(file) && total==size && EVP_DigestFinal_ex(hash,digest,&count)==1 && count==32){
+        hex(digest,actual);ok=!strcmp(actual,sha);
+    }else ok=0;
+    if(hash)EVP_MD_CTX_free(hash);
+    fclose(file);return ok;
+}
 int gw_linux_installer(const char *directory, const char *payload, const char *sha,
                        uint64_t size, char path[700]) {
     if (!sha || strlen(sha)!=64 || strspn(sha,"0123456789abcdef")!=64 || !size || size>128u*1024u*1024u)
@@ -41,7 +67,8 @@ int gw_linux_installer(const char *directory, const char *payload, const char *s
     int lock=open(lock_path,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
     if (lock<0 || flock(lock,LOCK_EX|LOCK_NB)) { if(lock>=0)close(lock);free(prefix);return -1; }
     struct stat metadata;
-    if (!lstat(path,&metadata) && S_ISREG(metadata.st_mode) && (uint64_t)metadata.st_size==length+size) {
+    if (!lstat(path,&metadata) && S_ISREG(metadata.st_mode) && (uint64_t)metadata.st_size==length+size &&
+        cached_valid(path,prefix,length,sha,size)) {
         close(lock);free(prefix);return 0;
     }
     int input=open(payload,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);

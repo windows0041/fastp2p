@@ -285,6 +285,11 @@ int fastp2p_service_remove(void) {
     for (int i = 0; !stopped && i < 300; ++i) {
         Sleep(100);
         if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (BYTE *)&status, sizeof(status), &used)) break;
+        /* START_PENDING does not accept STOP. Retry once the SCM reports that
+         * the service can accept it, rather than leaving it running on reinstall. */
+        if (status.dwCurrentState != SERVICE_STOPPED && (status.dwControlsAccepted & SERVICE_ACCEPT_STOP))
+            ControlService(service, SERVICE_CONTROL_STOP, &ignored);
+        if (!process && status.dwProcessId) process=OpenProcess(SYNCHRONIZE,FALSE,status.dwProcessId);
         stopped = status.dwCurrentState == SERVICE_STOPPED;
     }
     if (stopped && process) stopped = WaitForSingleObject(process, 10000) == WAIT_OBJECT_0;
