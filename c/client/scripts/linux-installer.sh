@@ -39,7 +39,7 @@ printf '%s  %s\n' "$expected_sha" "$work/fastp2p" | sha256sum -c - >/dev/null ||
 chmod 700 "$work/fastp2p"
 version=$("$work/fastp2p" --version) || fail "程序无法在 $(uname -m) 上运行，请选择对应架构的安装脚本。"
 case "$version" in 'fastp2p '*" ABI "*) ;; *) fail '安装包不是有效的 fastp2p 程序。' ;; esac
-[ "$("$work/fastp2p" --installer-abi 2>/dev/null)" = 1 ] || fail '该安装脚本需要支持配置迁移的 fastp2p 客户端（2.0.4 或更新版本）。'
+[ "$("$work/fastp2p" --installer-abi 2>/dev/null)" = 2 ] || fail '该安装脚本需要支持配置迁移和启动验证的 fastp2p 客户端（2.0.4 或更新版本）。'
 @@FASTP2P_CONTROLLER@@
 chmod 700 "$work/fastp2p-service"
 # Validate the init implementation and account tools before touching the old app.

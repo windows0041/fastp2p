@@ -82,7 +82,7 @@ static void usage(void) {
 static int client_main(int argc, char **argv) {
     optind = 1;
     was_online = 0;
-    if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("1");return 0;}
+    if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("2");return 0;}
     if(argc==4&&!strcmp(argv[1],"--relocate-profile"))return fastp2p_profile_relocate(argv[2],argv[3])?1:0;
     char **original_argv = argv;
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {
@@ -105,7 +105,7 @@ static int client_main(int argc, char **argv) {
     const char *config_file = NULL, *host = NULL, *node = NULL, *ca = NULL;
     const char *identity_file = NULL;
     int explicit_node = 0;
-    int background = 0;
+    int background = 0, verify_start = 0;
     char default_profile[4096];
     uint64_t port = 0, public_port = 0, run_seconds = 0;
     static const struct option options[] = {{"config", required_argument, 0, 'c'},
@@ -117,6 +117,7 @@ static int client_main(int argc, char **argv) {
                                             {"port", required_argument, 0, 'p'},
                                             {"publicipport", required_argument, 0, 'P'},
                                             {"run-seconds", required_argument, 0, 'r'},
+                                            {"verify-start", no_argument, 0, 'V'},
                                             {"version", no_argument, 0, 'v'},
                                             {"help", no_argument, 0, 'h'},
                                             {0, 0, 0, 0}};
@@ -124,6 +125,7 @@ static int client_main(int argc, char **argv) {
     while ((opt = getopt_long_only(argc, argv, "", options, NULL)) != -1) {
         switch (opt) {
         case 'b': background = 1; break;
+        case 'V': verify_start = 1; break;
         case 'c':
             config_file = optarg;
             break;
@@ -172,6 +174,14 @@ static int client_main(int argc, char **argv) {
         if (fastp2p_default_profile(default_profile)) return 2;
         config_file = default_profile;
     }
+    /* Installer preflight uses the exact installed profile and service account.
+     * It binds the real listeners and authenticates without accepting remote
+     * configuration changes or installing an upgrade during this short probe. */
+    if (verify_start) {
+        if (!config_file || host || explicit_node || ca || port || public_port ||
+            identity_file || background || run_seconds) return 2;
+        run_seconds = 25;
+    }
     if (fastp2p_runtime_prepare(config_file)) {
         fputs("Cannot use the managed service account.\n", stderr); return 1;
     }
@@ -184,10 +194,10 @@ static int client_main(int argc, char **argv) {
     }
     json_object *network = field(root, "network");
     uint64_t token = number(network, "Token");
-    const char *env = getenv("FASTP2P_TOKEN");
+    const char *env = verify_start ? NULL : getenv("FASTP2P_TOKEN");
     /* Explicit CLI/environment overrides are for foreground/debug embedding;
      * only file-driven sessions can truthfully acknowledge managed reloads. */
-    int managed_config = config_file && !host && !node && !ca && !port && !public_port && !env;
+    int managed_config = !verify_start && config_file && !host && !node && !ca && !port && !public_port && !env;
     if (env && integer(env, &token)) {
         fputs("Invalid FASTP2P_TOKEN\n", stderr);
         json_object_put(root);
@@ -258,11 +268,15 @@ static int client_main(int argc, char **argv) {
         rv = fastp2p_client_step(client, 10);
         if (rv)
             break;
+        if (verify_start && was_online)
+            break;
         if (fp_config_sync_tick()) {rv=FP_CONFIG_RELOAD;break;}
     }
     if (!was_online && !interrupted && !fastp2p_runtime_stopping() && rv != FP_CONFIG_RELOAD)
         rv = FASTP2P_EIO;
 done:
+    if (verify_start && !was_online)
+        rv = FASTP2P_EIO;
     if (rv && rv != FP_CONFIG_RELOAD)
         fprintf(stderr, "Client failed (%d): %s\n", rv, fastp2p_client_last_error(client));
     fastp2p_client_destroy(client);
@@ -270,7 +284,7 @@ done:
      * loop then returns success, so a service manager sees a normal stop instead
      * of a failure it would answer with a restart of the old image. */
     fastp2p_runtime_end();
-    if (fp_update_run_pending(original_argv))
+    if (!verify_start && fp_update_run_pending(original_argv))
         rv = FASTP2P_EIO;
     json_object_put(root);
     return rv == FP_CONFIG_RELOAD ? rv : rv ? 1 : 0;

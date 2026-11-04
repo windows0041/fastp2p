@@ -80,18 +80,41 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     environment = dict(os.environ, PATH=str(tools)+':/usr/bin:/bin', FIXTURE=str(root))
     def executable(path, content):
         path.write_text('#!/bin/sh\nset -eu\n'+content); path.chmod(0o755)
+    executable(tools / 'service-fixture', '''
+manager=$1; action=$2
+case "$action" in
+    status|is-active) test -e "$FIXTURE/client-running"; exit ;;
+    enabled|is-enabled) test -e "$FIXTURE/client-enabled"; exit ;;
+esac
+echo "$manager $action" >> "$FIXTURE/events"
+case "$action" in
+    start)
+        if [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-start"; exit 1; fi
+        if [ -e "$FIXTURE/fail-after-start" ]; then
+            rm -f "$FIXTURE/fail-after-start" "$FIXTURE/client-running"; exit 0
+        fi
+        touch "$FIXTURE/client-running" ;;
+    stop) rm -f "$FIXTURE/client-running" ;;
+    enable) touch "$FIXTURE/client-enabled" ;;
+    disable) rm -f "$FIXTURE/client-enabled" ;;
+esac
+''')
     executable(tools / 'systemctl', '''
 if [ "$1" = --version ]; then echo "systemd ${FIXTURE_SYSTEMD:-252}"; exit; fi
 if [ "$1" = cat ]; then test -f /etc/systemd/system/fastp2p-client.service; exit; fi
-if [ "$1" = is-active ]; then test -e "$FIXTURE/gateway-active"; exit; fi
-echo "systemd $*" >> "$FIXTURE/events"
-if [ "$1" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-start"; exit 1; fi
+if [ "$1" = is-active ] && [ "${3:-}" != fastp2p-client.service ]; then test -e "$FIXTURE/gateway-active"; exit; fi
+exec "$FIXTURE/tools/service-fixture" systemd "$1"
 ''')
     executable(tools / 'rc-service', '''
-echo "openrc $*" >> "$FIXTURE/events"
-if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-start"; exit 1; fi
+exec "$FIXTURE/tools/service-fixture" openrc "$2"
 ''')
-    executable(tools / 'rc-update', 'echo "openrc-enable $*" >> "$FIXTURE/events"\n')
+    executable(tools / 'rc-update', '''
+case "$1" in
+    show) if [ -e "$FIXTURE/client-enabled" ]; then echo ' fastp2p | default'; fi ;;
+    add) exec "$FIXTURE/tools/service-fixture" openrc-boot enable ;;
+    del) exec "$FIXTURE/tools/service-fixture" openrc-boot disable ;;
+esac
+''')
     env = dict(environment, FASTP2P_USER='installer-admin', FASTP2P_PASSWORD=secrets.token_urlsafe(24),
                FASTP2P_TOKEN='9999999999999999')
     create_certificates(root / 'tls', '127.0.0.1')
@@ -146,6 +169,8 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
+            for name in ('client-running', 'client-enabled', 'fail-start', 'fail-after-start'):
+                (root/name).unlink(missing_ok=True)
             for folder in ('/usr/local/fastp2p', '/etc/systemd/system', '/etc/init.d'):
                 shutil.rmtree(folder, ignore_errors=True); Path(folder).mkdir(parents=True)
             for file in (profile, Path('/etc/openwrt_release'), Path('/etc/rc.common'), Path('/sbin/openrc-run')):
@@ -156,12 +181,12 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             elif manager == 'procd':
                 Path('/etc/openwrt_release').touch()
                 executable(Path('/etc/rc.common'), '''
-echo "procd ${2:-}" >> "$FIXTURE/events"
-if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-start"; exit 1; fi
+exec "$FIXTURE/tools/service-fixture" procd "$2"
 ''')
             else: executable(Path('/sbin/openrc-run'), 'exit 0\n')
             events.write_text('')
             run(shell='bash' if manager.startswith('systemd') else 'sh')
+            assert (root/'client-running').exists() and (root/'client-enabled').exists()
             first = json.loads(profile.read_text()); identity = first['network']['DeviceID']
             first['customSetting'] = {'preserve': True}; first['network']['UDPPort'] = 29887
             first['network']['Node'] = 'ignored-stale-node'
@@ -204,6 +229,7 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             assert old_profile.read_bytes() == before and not profile.exists()
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
             assert (legacy/'fastp2p').read_bytes() == payload
+            assert (root/'client-running').exists() and (root/'client-enabled').exists()
             if manager.startswith('systemd'): assert (dropin/'20-remote-upgrade.conf').exists()
             run()
             assert not legacy.exists() and not old_profile.exists()
@@ -223,6 +249,37 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             run(expected=1)
             assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
             assert controller.read_bytes() == old_controller and 'start' in events.read_text()
+            assert (root/'client-running').exists() and (root/'client-enabled').exists()
+            # A successful start command does not guarantee a live service.
+            # Detect the failed native status and restore both runtime and boot links.
+            events.write_text(''); (root/'fail-after-start').touch(); run(expected=1)
+            assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
+            assert controller.read_bytes() == old_controller
+            assert (root/'client-running').exists() and (root/'client-enabled').exists()
+            # Preserve an explicitly disabled old service's boot state too.
+            (root/'client-enabled').unlink(); events.write_text(''); (root/'fail-start').touch()
+            run(expected=1)
+            assert not (root/'client-enabled').exists() and (root/'client-running').exists()
+            assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
+            (root/'client-enabled').touch()
+            # The pre-commit runtime probe binds real forwarding ports. An
+            # unrelated listener must fail it before installing the new service.
+            with socket.socket() as occupied:
+                occupied.bind(('127.0.0.1',0)); occupied.listen()
+                blocked=json.loads(before)
+                blocked['apps']=[{'AppName':'installer-bind-check','Protocol':'tcp',
+                    'SrcPort':occupied.getsockname()[1],'PeerNode':'offline-peer-node',
+                    'DstHost':'127.0.0.1','DstPort':22,'UnderlayProtocol':'tcp'}]
+                profile.write_text(json.dumps(blocked)); blocked_bytes=profile.read_bytes(); events.write_text('')
+                run(expected=1)
+                assert profile.read_bytes()==blocked_bytes and binary.read_bytes()==payload+b'old-marker'
+                assert controller.read_bytes()==old_controller
+                assert (root/'client-running').exists() and (root/'client-enabled').exists()
+                assert sum(line.endswith(' start') for line in events.read_text().splitlines())==1
+                check_log=max(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'),key=lambda p:p.stat().st_mtime_ns)
+                assert check_log.stat().st_uid==0 and check_log.stat().st_mode&0o077==0
+                assert key.encode() not in check_log.read_bytes()
+            profile.write_bytes(before)
             # Corrupt payload, missing/ambiguous filename token, bad key and an
             # unreadable profile must not reach the service teardown.
             for content, filename in ((installer[:-1]+bytes([installer[-1]^1]), named.name),
@@ -244,6 +301,7 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
         subprocess.run(['/usr/local/bin/fastp2p','uninstall'], env=environment, check=True, stdout=subprocess.DEVNULL)
         assert not profile.exists() and not controller.exists() and adjacent.read_text() == 'keep'
         assert not Path('/usr/local/bin/fastp2p').exists()
+        assert not (root/'client-enabled').exists() and not (root/'client-running').exists()
         results['installer_lock_and_full_uninstall_preserve_adjacent_gateway_files'] = True
         print(json.dumps(results, indent=2))
     finally:

@@ -69,6 +69,34 @@ start_service() {
         openrc) rc-service fastp2p start ;;
     esac
 }
+service_running() {
+    case "$manager" in
+        systemd) systemctl is-active --quiet "$service.service" ;;
+        procd) /etc/init.d/fastp2p status ;;
+        openrc) rc-service fastp2p status ;;
+    esac
+}
+service_enabled() {
+    case "$manager" in
+        systemd) systemctl is-enabled --quiet "$service.service" ;;
+        procd) /etc/init.d/fastp2p enabled ;;
+        openrc) rc-update show default | awk '$1 == "fastp2p" { found=1 } END { exit !found }' ;;
+    esac
+}
+enable_service() {
+    case "$manager" in
+        systemd) systemctl enable "$service.service" ;;
+        procd) /etc/init.d/fastp2p enable ;;
+        openrc) rc-update add fastp2p default ;;
+    esac
+}
+disable_service() {
+    case "$manager" in
+        systemd) systemctl disable "$service.service" ;;
+        procd) if [ -x /etc/init.d/fastp2p ]; then /etc/init.d/fastp2p disable; fi ;;
+        openrc) rc-update del fastp2p default ;;
+    esac
+}
 stop_service() {
     case "$manager" in
         systemd)
@@ -237,6 +265,8 @@ install_service() {
         systemd) if systemctl cat "$service.service" >/dev/null 2>&1; then old_service=true; fi ;;
         *) if [ -f /etc/init.d/fastp2p ]; then old_service=true; fi ;;
     esac
+    old_enabled=false
+    if $old_service && service_enabled >/dev/null 2>&1; then old_enabled=true; fi
     config_changed=false
     parent_changed=false
     restore_metadata() {
@@ -248,6 +278,9 @@ install_service() {
     }
     rollback() {
         stop_service >/dev/null 2>&1 || true
+        # Remove the replacement's boot links, including fresh-install failures.
+        # Restoring an init file alone does not restore procd/OpenRC autostart.
+        disable_service >/dev/null 2>&1 || true
         if $config_changed; then
             chown -h 0:0 "$state"; chmod 700 "$state"
             rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
@@ -262,14 +295,14 @@ install_service() {
             systemd)
                 if [ -f "$backup/unit" ]; then cp -p "$backup/unit" "/etc/systemd/system/$service.service"; else rm -f "/etc/systemd/system/$service.service"; fi
                 if [ -d "$backup/dropins" ]; then mkdir -p "/etc/systemd/system/$service.service.d"; cp -a "$backup/dropins/." "/etc/systemd/system/$service.service.d/"; fi
-                systemctl daemon-reload >/dev/null 2>&1 || true
-                if $old_service; then systemctl enable "$service.service" >/dev/null 2>&1 || true; fi ;;
+                systemctl daemon-reload >/dev/null 2>&1 || true ;;
             *) if [ -f "$backup/init" ]; then cp -p "$backup/init" /etc/init.d/fastp2p; else rm -f /etc/init.d/fastp2p; fi ;;
         esac
         if $parent_changed; then
             restore_metadata "$state" "$config_metadata"
             restore_metadata "$parent" "$parent_metadata"
         fi
+        if $old_enabled; then enable_service >/dev/null 2>&1 || true; fi
         if $old_service; then start_service >/dev/null 2>&1 || true; fi
     }
     transaction=true
@@ -306,8 +339,19 @@ install_service() {
         chown "0:$group" "$ca"; chmod 640 "$ca"
     done
     chown "fastp2p:$group" "$state"; chmod 700 "$state"
+    # Pure schema checks cannot detect occupied ports or account permissions.
+    # Probe the full runtime as the service account before committing the upgrade.
+    if ! "$backup/incoming" run --config "$profile" --verify-start > "$backup/startup-check.log" 2>&1; then
+        fail "客户端启动检查失败，正在恢复旧服务。诊断日志：$backup/startup-check.log"
+    fi
     write_service
     start_service
+    # Native init start commands may succeed before the child actually starts.
+    # Catch an immediate exit/crash while rollback files are still authoritative.
+    for check in 1 2 3; do
+        sleep 1
+        service_running >/dev/null 2>&1 || fail '客户端服务未持续运行，正在恢复旧服务。'
+    done
     printf '%s\n' "$manager" > "$prefix/init"
     transaction=false
     rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old

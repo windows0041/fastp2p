@@ -116,6 +116,11 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
             current=trust.stat()
             return (current.st_ino,current.st_uid,current.st_gid,current.st_mode)==(trust_stat.st_ino,trust_stat.st_uid,trust_stat.st_gid,trust_stat.st_mode)
         original=profile.read_bytes()
+        checked=subprocess.run([str(Path(args.client).resolve()),'run','--config',str(profile),'--verify-start'],
+            env=client_environment,capture_output=True,timeout=35)
+        assert checked.returncode==0 and b'gateway authenticated' in checked.stdout
+        assert profile.read_bytes()==original and token.encode() not in checked.stdout+checked.stderr
+        result['startup_probe_authenticates_without_rewriting_profile']=True
         if os.name=='nt':
             # Default-path migration is isolated from the real user's profile and
             # never installs or removes a service/autostart entry.
