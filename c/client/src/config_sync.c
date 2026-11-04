@@ -67,7 +67,9 @@ static int receive(const char *fields,uint64_t revision,void *user) {
     json_object *meta=get(current,META);
     if(integer(meta,"rejectedRevision")==revision&&!strcmp(string(meta,"rejectedDigest"),hash))goto done;
     if(fp_config_merge(current,patch,&next))goto done;
-    if(get(next,"product")&&strcmp(string(next,"product"),"fastp2p"))goto done;
+    json_object *product=NULL;
+    if(json_object_object_get_ex(next,"product",&product)&&
+       (!json_object_is_type(product,json_type_string)||strcmp(json_object_get_string(product),"fastp2p")))goto done;
     result=fp_config_validate_json(json_object_to_json_string_ext(next,JSON_C_TO_STRING_PLAIN));
     if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if(json_object_equal(next,sync_state.active)) {result=0;goto done;}

@@ -90,10 +90,13 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
         revision=push({'network':{'ServerPort':'invalid'}})
         wait(lambda:api(endpoint)[1]['state']=='failed')
         assert read_config()==before and listening(changed)
+        revision=push({'network':{'ServerPort':37183},'product':None})
+        wait(lambda:api(endpoint)[1]['state']=='failed')
+        assert read_config()==before and listening(changed)
         # Fix desired schema, then force a real bind failure after validation.
         with socket.socket() as occupied:
             occupied.bind(('0.0.0.0',0));occupied.listen()
-            revision=push({'network':{'ServerPort':37183,'PublicIPPort':occupied.getsockname()[1]}})
+            revision=push({'product':'fastp2p','network':{'ServerPort':37183,'PublicIPPort':occupied.getsockname()[1]}})
             wait(lambda:api(endpoint)[1]['state']=='failed')
             wait(lambda:listening(changed))
             assert read_config()['network']['PublicIPPort']==old_port

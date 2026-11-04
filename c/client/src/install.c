@@ -233,7 +233,9 @@ static void verified(fastp2p_client *client, const fastp2p_event *event, void *c
 }
 static const char *field(json_object *root, const char *key) {
     json_object *value = NULL;
-    return json_object_object_get_ex(root, key, &value) ? json_object_get_string(value) : "";
+    const char *text = root && json_object_is_type(root,json_type_object) && json_object_object_get_ex(root,key,&value)
+                           ? json_object_get_string(value) : NULL;
+    return text ? text : "";
 }
 /* The installer runs in its own console, which closes the moment it exits, so a
  * failure would otherwise leave no trace at all. */
