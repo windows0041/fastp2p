@@ -223,6 +223,34 @@ int fastp2p_profile_write(const char *path, const char *text) {
 #endif
 }
 typedef struct { int online, failed; char node[32]; } verification;
+int fastp2p_profile_relocate(const char *source,const char *destination) {
+    json_object *root=fastp2p_profile_read(source),*value=NULL;
+    int result=-1;
+    if(!root||!json_object_object_get_ex(root,"product",&value)||!json_object_is_type(value,json_type_string)||
+       strcmp(json_object_get_string(value),"fastp2p")||
+       fp_config_validate_json(json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN)))goto done;
+    if(json_object_object_get_ex(root,"CACertFile",&value)&&json_object_is_type(value,json_type_string)&&*json_object_get_string(value)) {
+        size_t length=0;unsigned char *ca=read_file(json_object_get_string(value),16384,&length);
+        unsigned char hash[32];unsigned count=0;char fingerprint[65],path[4096];
+        if(!ca)goto done;
+        if(!EVP_Digest(ca,length,hash,&count,EVP_sha256(),NULL)||count!=32) {free(ca);goto done;}
+        for(unsigned i=0;i<32;++i)snprintf(fingerprint+2*i,3,"%02x",hash[i]);
+        int size=snprintf(path,sizeof(path),"%s.ca.%s.pem",destination,fingerprint);
+        int failed=size<0||size>=(int)sizeof(path)||memchr(ca,0,length)||ensure_ca(path,(const char *)ca);
+        free(ca);if(failed)goto done;
+        json_object_object_add(root,"CACertFile",json_object_new_string(path));
+    }
+    const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
+#ifdef _WIN32
+    char machine[4096];
+    result=!fastp2p_service_profile(machine)&&!strcmp(machine,destination)?fastp2p_profile_write_machine(destination,text):fastp2p_profile_write(destination,text);
+#else
+    result=fastp2p_profile_write(destination,text);
+#endif
+done:
+    if(root)json_object_put(root);
+    return result;
+}
 static void verified(fastp2p_client *client, const fastp2p_event *event, void *context) {
     verification *result = context;
     if (event->type == FASTP2P_EVENT_ERROR && strstr(event->message, "WSS connection failed")) result->failed = 1;

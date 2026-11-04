@@ -47,6 +47,9 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     for name in ('passwd', 'group', 'nsswitch.conf', 'hosts', 'resolv.conf', 'ld.so.cache'):
         if (Path('/etc') / name).is_file(): shutil.copyfile(Path('/etc') / name, etc / name)
     # A private non-root account, without touching the host passwd/group files.
+    for name in ('passwd', 'group'):
+        path = etc / name
+        path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True) if not line.startswith('fastp2p:')))
     with (etc / 'passwd').open('a') as f: f.write('\nfastp2p:x:32123:32123:fixture:/nonexistent:/bin/false\n')
     with (etc / 'group').open('a') as f: f.write('\nfastp2p:x:32123:\n')
     (etc / 'fastp2p').mkdir()
@@ -80,6 +83,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     executable(tools / 'systemctl', '''
 if [ "$1" = --version ]; then echo "systemd ${FIXTURE_SYSTEMD:-252}"; exit; fi
 if [ "$1" = cat ]; then test -f /etc/systemd/system/fastp2p-client.service; exit; fi
+if [ "$1" = is-active ]; then test -e "$FIXTURE/gateway-active"; exit; fi
 echo "systemd $*" >> "$FIXTURE/events"
 if [ "$1" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-start"; exit 1; fi
 ''')
@@ -180,14 +184,35 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             old_profile=Path('/etc/fastp2p/client.json')
             old_profile.write_bytes(profile.read_bytes()); profile.unlink()
             gateway_db=Path('/var/lib/fastp2p/nodes.sqlite3'); gateway_db.write_bytes(b'gateway-fixture')
-            gateway_owner=gateway_db.parent.stat().st_uid
+            os.chown(gateway_db, 32123, 32123)
+            os.chown(gateway_db.parent, 12345, 12345)
+            events.write_text(''); run(expected=1)
+            assert events.read_text() == '' and old_profile.read_bytes() == before
+            os.chown(gateway_db.parent, 32123, 32123); gateway_db.parent.chmod(0o700)
+            if manager.startswith('systemd'):
+                (root/'gateway-active').touch(); events.write_text(''); run(expected=1)
+                assert events.read_text() == '' and gateway_db.parent.stat().st_uid == 32123
+                (root/'gateway-active').unlink()
+            # A real legacy StateDirectory is service-owned. Both its metadata
+            # and its neighbouring gateway database must survive failed setup.
+            config_metadata = (profile.parent.stat().st_uid, profile.parent.stat().st_gid, profile.parent.stat().st_mode & 0o777)
+            events.write_text(''); (root/'fail-start').touch(); run(expected=1)
+            assert gateway_db.parent.stat().st_uid == 32123 and gateway_db.parent.stat().st_mode & 0o777 == 0o700
+            actual_metadata = (profile.parent.stat().st_uid, profile.parent.stat().st_gid, profile.parent.stat().st_mode & 0o777)
+            assert actual_metadata == config_metadata, (manager, actual_metadata, config_metadata)
+            assert old_profile.read_bytes() == before and not profile.exists()
+            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
+            assert (legacy/'fastp2p').read_bytes() == payload
+            if manager.startswith('systemd'): assert (dropin/'20-remote-upgrade.conf').exists()
             run()
             assert not legacy.exists() and not old_profile.exists()
             assert Path('/var/lib/fastp2p/config').stat().st_uid != 0
-            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.parent.stat().st_uid == gateway_owner
+            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
+            assert gateway_db.parent.stat().st_uid == 0 and not gateway_db.parent.stat().st_mode & 0o022
             saved = json.loads(profile.read_text())
             assert saved['network']['DeviceID'] == identity and saved['customSetting'] == first['customSetting']
             assert saved['network']['UDPPort'] == 29887
+            assert saved['CACertFile'].startswith(str(profile)+'.ca.') and Path(saved['CACertFile']).read_bytes() == (root/'tls/ca.crt').read_bytes()
             assert 'stop' in events.read_text() and 'start' in events.read_text()
             if manager.startswith('systemd'): assert not (dropin/'20-remote-upgrade.conf').exists()
             # Real startup failure must roll back old image, controller and profile.

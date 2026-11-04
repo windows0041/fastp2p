@@ -23,15 +23,10 @@ detect_init() {
 manager=$(detect_init)
 transaction=false
 locked=false
-config_metadata=
 finish() {
     status=$?
     set +e
     if $transaction && [ "$status" -ne 0 ]; then rollback; fi
-    if [ "$status" -ne 0 ] && [ -n "$config_metadata" ]; then
-        owner=${config_metadata%:*}; mode=${config_metadata##*:}
-        chown "$owner" "$state"; chmod "$mode" "$state"
-    fi
     if $locked; then rm -f /var/run/fastp2p-service.lock/pid; rmdir /var/run/fastp2p-service.lock; fi
     exit "$status"
 }
@@ -169,17 +164,48 @@ EOF
 }
 install_service() {
     source_binary=
+    source_profile=$profile
     shift
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --binary) [ "$#" -ge 2 ] || fail '缺少程序路径。'; source_binary=$2; shift 2 ;;
             --config) [ "$#" -ge 2 ] && [ "$2" = "$profile" ] || fail '服务配置路径无效。'; shift 2 ;;
+            --profile-source) [ "$#" -ge 2 ] || fail '缺少已校验配置路径。'; source_profile=$2; shift 2 ;;
             *) fail '未知服务安装参数。' ;;
         esac
     done
     [ -f "$source_binary" ] || fail '找不到已校验的客户端程序。'
+    [ -f "$source_profile" ] && [ ! -L "$source_profile" ] || fail '找不到已校验的客户端配置。'
     [ ! -L "$state" ] && [ ! -L "$profile" ] || fail '配置路径不能是符号链接。'
     account_ready
+    parent=/var/lib/fastp2p
+    [ ! -L "$parent" ] || fail '数据目录不能是符号链接。'
+    parent_metadata=
+    config_metadata=
+    if [ -e "$parent" ]; then
+        [ -d "$parent" ] || fail '数据路径不是目录。'
+        parent_metadata=$(stat -c '%u:%g:%a' "$parent")
+        parent_uid=$(stat -c %u "$parent")
+        [ "$parent_uid" -eq 0 ] || [ "$parent_uid" -eq "$(id -u fastp2p)" ] || fail '数据目录属于其他用户，未卸载原服务。'
+        if [ "$parent_uid" -ne 0 ]; then
+            # An old co-located gateway may still need to write this directory.
+            # Never take it away from a running gateway during client migration.
+            if [ "$manager" = systemd ]; then
+                for unit in fastp2p-gateway fastp2p-c-gateway openp2p-c-gateway; do
+                    if systemctl is-active --quiet "$unit.service"; then fail '请先迁移使用旧数据目录的网关，再升级客户端。'; fi
+                done
+            fi
+            if command -v pidof >/dev/null 2>&1; then
+                for process in fastp2p-gateway fastp2p-c-gateway openp2p-c-gateway; do
+                    if pidof "$process" >/dev/null 2>&1; then fail '检测到运行中的旧网关，请先迁移网关数据目录。'; fi
+                done
+            fi
+        fi
+    fi
+    if [ -e "$state" ]; then
+        [ -d "$state" ] || fail '配置路径不是目录。'
+        config_metadata=$(stat -c '%u:%g:%a' "$state")
+    fi
     [ ! -L "$prefix" ] || fail '安装目录不能是符号链接。'
     mkdir -p "$prefix"
     chown 0:0 "$prefix"; chmod 755 "$prefix"
@@ -187,10 +213,9 @@ install_service() {
     mkdir -p "$prefix/.backups"; chown 0:0 "$prefix/.backups"; chmod 700 "$prefix/.backups"
     backup=$prefix/.backups/$(date +%Y%m%dT%H%M%S).$$
     mkdir "$backup"; chmod 700 "$backup"
-    config_metadata=$(stat -c '%u:%g:%a' "$state")
-    chown 0:0 "$state"; chmod 700 "$state"
     # Stage before uninstalling; /proc/PARENT/exe can refer to an installed image.
     cp "$source_binary" "$backup/incoming"; chmod 755 "$backup/incoming"
+    cp "$source_profile" "$backup/desired-config"; chmod 600 "$backup/desired-config"
     for pair in "bin/fastp2p:runtime" "fastp2p-service:controller"; do
         path=${pair%:*}; label=${pair#*:}
         if [ -f "$prefix/$path" ]; then cp -p "$prefix/$path" "$backup/$label"; fi
@@ -207,8 +232,29 @@ install_service() {
     if [ -f "/etc/systemd/system/$service.service" ]; then cp -p "/etc/systemd/system/$service.service" "$backup/unit"; fi
     if [ -d "/etc/systemd/system/$service.service.d" ]; then cp -a "/etc/systemd/system/$service.service.d" "$backup/dropins"; fi
     if [ -f /etc/init.d/fastp2p ]; then cp -p /etc/init.d/fastp2p "$backup/init"; fi
+    old_service=false
+    case "$manager" in
+        systemd) if systemctl cat "$service.service" >/dev/null 2>&1; then old_service=true; fi ;;
+        *) if [ -f /etc/init.d/fastp2p ]; then old_service=true; fi ;;
+    esac
+    config_changed=false
+    parent_changed=false
+    restore_metadata() {
+        target=$1; metadata=$2
+        if [ -n "$metadata" ]; then
+            owner=${metadata%:*}; mode=${metadata##*:}
+            chown -h "$owner" "$target"; chmod "$mode" "$target"
+        else rmdir "$target" 2>/dev/null || true; fi
+    }
     rollback() {
         stop_service >/dev/null 2>&1 || true
+        if $config_changed; then
+            chown -h 0:0 "$state"; chmod 700 "$state"
+            rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
+            for saved in "$backup/config/"*; do
+                [ ! -f "$saved" ] || cp -p "$saved" "$state/${saved##*/}"
+            done
+        fi
         if [ -f "$backup/runtime" ]; then cp -p "$backup/runtime" "$backup/runtime.restore"; mv -fT "$backup/runtime.restore" "$binary"; else rm -f "$binary"; fi
         if [ -f "$backup/cli" ]; then cp -p "$backup/cli" "$backup/cli.restore"; mv -fT "$backup/cli.restore" /usr/local/bin/fastp2p; else rm -f /usr/local/bin/fastp2p; fi
         if [ -f "$backup/controller" ]; then cp -p "$backup/controller" "$backup/controller.restore"; mv -fT "$backup/controller.restore" "$prefix/fastp2p-service"; else rm -f "$prefix/fastp2p-service"; fi
@@ -217,25 +263,42 @@ install_service() {
                 if [ -f "$backup/unit" ]; then cp -p "$backup/unit" "/etc/systemd/system/$service.service"; else rm -f "/etc/systemd/system/$service.service"; fi
                 if [ -d "$backup/dropins" ]; then mkdir -p "/etc/systemd/system/$service.service.d"; cp -a "$backup/dropins/." "/etc/systemd/system/$service.service.d/"; fi
                 systemctl daemon-reload >/dev/null 2>&1 || true
-                systemctl enable "$service.service" >/dev/null 2>&1 || true ;;
+                if $old_service; then systemctl enable "$service.service" >/dev/null 2>&1 || true; fi ;;
             *) if [ -f "$backup/init" ]; then cp -p "$backup/init" /etc/init.d/fastp2p; else rm -f /etc/init.d/fastp2p; fi ;;
         esac
-        owner=${config_metadata%:*}; mode=${config_metadata##*:}
-        chown "$owner" "$state"; chmod "$mode" "$state"
+        if $parent_changed; then
+            restore_metadata "$state" "$config_metadata"
+            restore_metadata "$parent" "$parent_metadata"
+        fi
+        if $old_service; then start_service >/dev/null 2>&1 || true; fi
     }
     transaction=true
     printf '%s\n' "服务管理方式：$manager；正在探测并卸载旧服务，保留配置。"
     remove_service
     group=$(id -gn fastp2p)
-    [ ! -L "$prefix/bin" ] && [ ! -L /var/lib/fastp2p ] && [ ! -L "$state" ] || return 1
-    mkdir -p "$prefix/bin" "$state" /usr/local/bin
-    # Do not transfer ownership of a co-located gateway's database directory.
-    # Only the client subdirectory is writable by the client account.
-    chmod o+x /var/lib/fastp2p
+    [ ! -L "$prefix/bin" ] && [ ! -L "$parent" ] && [ ! -L "$state" ] || return 1
+    mkdir -p "$prefix/bin" "$parent" /usr/local/bin
+    # Stop StateDirectory users before changing ownership: systemd may chown it
+    # again on restart. Only the config child is writable by the new client.
+    parent_changed=true
+    chown -h 0:0 "$parent"; chmod 711 "$parent"
+    mkdir -p "$state"
+    chown -h 0:0 "$state"
+    [ -d "$state" ] && [ ! -L "$state" ] || fail '配置目录在迁移时发生变化。'
+    chmod 700 "$state"
+    mkdir "$backup/config"
+    for file in "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            [ -f "$file" ] && [ ! -L "$file" ] && [ "$(stat -c %h "$file")" -eq 1 ] || fail '配置文件不能是符号链接、硬链接或其他类型。'
+            cp -p "$file" "$backup/config/${file##*/}"
+        fi
+    done
+    config_changed=true
     chown "fastp2p:$group" "$prefix/bin"; chmod 700 "$prefix/bin"
     cp "$backup/incoming" "$backup/runtime.new"; chmod 755 "$backup/runtime.new"; mv -fT "$backup/runtime.new" "$binary"
     cp "$backup/incoming" "$backup/cli.new"; chmod 755 "$backup/cli.new"; mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
     cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"; mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
+    "$backup/incoming" --relocate-profile "$backup/desired-config" "$profile"
     chown "fastp2p:$group" "$profile"; chmod 600 "$profile"
     for ca in "$state"/fastp2p.conf.ca.*.pem; do
         [ -f "$ca" ] || continue

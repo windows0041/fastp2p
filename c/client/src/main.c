@@ -82,6 +82,8 @@ static void usage(void) {
 static int client_main(int argc, char **argv) {
     optind = 1;
     was_online = 0;
+    if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("1");return 0;}
+    if(argc==4&&!strcmp(argv[1],"--relocate-profile"))return fastp2p_profile_relocate(argv[2],argv[3])?1:0;
     char **original_argv = argv;
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {
         return fwrite(fastp2p_notices, 1, sizeof(fastp2p_notices), stdout) == sizeof(fastp2p_notices) ? 0 : 1;

@@ -16,6 +16,8 @@ fastp2p --licenses
 
 Linux 从网关控制台下载带 Token 文件名的自包含脚本，用 `sh 文件名` 或 `bash 文件名` 安装。程序安装到 `/usr/local/fastp2p/bin/fastp2p`，配置为 `/var/lib/fastp2p/config/fastp2p.conf`；无需在设备上安装 curl、Python 或 Bash。脚本先校验内置程序及网关，再卸载旧服务、迁移旧配置及证书、保留节点身份与规则、替换程序，失败时恢复旧文件。不要改动文件名中的 Token。
 
+该脚本要求客户端 2.0.4 或更新版本：先在私有临时目录验证接入和合并配置，旧服务通过后才停止。旧客户端持有的数据父目录会安全迁移为 root 持有，配置子目录仍由客户端账号持有；失败时还原目录权限及旧服务。同目录的其他文件（例如停用网关的数据库）保持内容与文件所有者不变。若旧网关仍在使用该目录，请先迁移网关，安装器会在卸载客户端前报错。
+
 安装和保活逻辑在独立的 `scripts/linux-installer.sh`、`scripts/fastp2p-service.sh` 中，C 核心不包含发行版判断。脚本根据实际服务管理器选择 Debian/Ubuntu/CentOS 等的 systemd、OpenWrt 的 procd、Alpine 的 OpenRC，使用独立非 root 账号，开启开机启动和崩溃重启；未检测到支持的管理器时明确报错。下载时仍需选择设备对应的 CPU 架构；没有对应编译包的设备需要另行移植。进程由容器管理时，使用原始可执行文件前台运行及容器重启策略。
 
 Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p/config/fastp2p.conf`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%/fastp2p/config/fastp2p.conf`，使用当前用户 DPAPI。旧 `client.dat` 会迁移，备份保存在新配置目录。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
