@@ -126,7 +126,7 @@
         remove.setAttribute('aria-label', '删除离线节点 ' + n.name);
         remove.addEventListener('click', event => {
           event.stopPropagation();
-          confirm('删除离线节点', `删除 ${n.name} 的登记记录和名称保留。设备持有接入 Token 时，再次上线会重新登记。`, async () => {
+          confirm('删除离线节点', `删除 ${n.name} 的登记记录、转发规则和网关下发配置。设备持有接入 Token 时，再次上线会重新登记。`, async () => {
             await api('/api/v1/nodes/' + encodeURIComponent(n.name), undefined, 'DELETE');
             if (state.selected?.name === n.name) selectNode(null);
             state.offset = 0; await refresh();

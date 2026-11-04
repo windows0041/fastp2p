@@ -143,8 +143,10 @@ static int restrict_directory(const char *file) {
         goto done;
     /* The directory may have been pre-created by another user, whose implicit
      * WRITE_DAC as owner would undo this, so the owner is set as well. */
-    SetNamedSecurityInfoW(wide_directory, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, admins_sid, NULL,
-                          NULL, NULL);
+    if(SetNamedSecurityInfoW(wide_directory, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, admins_sid, NULL,
+                             NULL, NULL)!=ERROR_SUCCESS) {
+        LocalFree(acl);goto done;
+    }
     if (SetNamedSecurityInfoW(wide_directory, SE_FILE_OBJECT,
                               DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL,
                               acl, NULL) != ERROR_SUCCESS) {
