@@ -14,7 +14,7 @@ fastp2p --licenses
 
 安装 Token 为 16 位数字，网关地址、端口和公开 CA 已预置于专用客户端包。安装先完成 TLS 主机名校验及网关认证，成功后原子保存配置。错误凭据不会替换旧配置。支持 `--token`、`FASTP2P_INSTALL_TOKEN`、`--node`、`--config`、`--no-service`。
 
-Linux 从网关控制台下载带 Token 文件名的自包含脚本，用 `sh 文件名` 或 `bash 文件名` 安装。程序安装到 `/usr/local/fastp2p/bin/fastp2p`，配置在 `/etc/fastp2p/client.json`；无需在设备上安装 curl、Python 或 Bash。脚本先校验内置程序及网关，再卸载旧服务、保留节点身份与配置、替换程序，失败时恢复旧文件。不要改动文件名中的 Token。
+Linux 从网关控制台下载带 Token 文件名的自包含脚本，用 `sh 文件名` 或 `bash 文件名` 安装。程序安装到 `/usr/local/fastp2p/bin/fastp2p`，数据目录为 `/var/lib/fastp2p/client`，配置在 `/etc/fastp2p/client.json`；无需在设备上安装 curl、Python 或 Bash。脚本先校验内置程序及网关，再卸载旧服务、保留节点身份与配置、替换程序，失败时恢复旧文件。不要改动文件名中的 Token。
 
 安装和保活逻辑在独立的 `scripts/linux-installer.sh`、`scripts/fastp2p-service.sh` 中，C 核心不包含发行版判断。脚本根据实际服务管理器选择 Debian/Ubuntu/CentOS 等的 systemd、OpenWrt 的 procd、Alpine 的 OpenRC，使用独立非 root 账号，开启开机启动和崩溃重启；未检测到支持的管理器时明确报错。下载时仍需选择设备对应的 CPU 架构；没有对应编译包的设备需要另行移植。进程由容器管理时，使用原始可执行文件前台运行及容器重启策略。
 

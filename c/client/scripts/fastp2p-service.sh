@@ -3,6 +3,7 @@
 set -eu
 umask 077
 prefix=/usr/local/fastp2p
+state=/var/lib/fastp2p/client
 binary=$prefix/bin/fastp2p
 profile=/etc/fastp2p/client.json
 service=fastp2p-client
@@ -47,15 +48,15 @@ account_ready() {
         return
     fi
     if command -v useradd >/dev/null 2>&1; then
-        useradd --system --user-group --home-dir "$prefix/state" --shell /bin/false fastp2p
+        useradd --system --user-group --home-dir "$state" --shell /bin/false fastp2p
     elif [ "$manager" = procd ] && [ -f /lib/functions.sh ]; then
         # OpenWrt's own locked passwd/group helpers also work without adduser.
         ( set +u; . /lib/functions.sh
           gid=$(group_add_next fastp2p)
-          user_add fastp2p '' "$gid" fastp2p "$prefix/state" /bin/false )
+          user_add fastp2p '' "$gid" fastp2p "$state" /bin/false )
     elif command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
         addgroup -S fastp2p
-        adduser -S -D -H -h "$prefix/state" -s /bin/false -G fastp2p fastp2p
+        adduser -S -D -H -h "$state" -s /bin/false -G fastp2p fastp2p
     else
         fail '缺少系统用户管理工具，请安装 shadow/useradd 或 BusyBox adduser 后重试。'
     fi
@@ -116,7 +117,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=$protection
 ProtectHome=true
-ReadWriteDirectories=$prefix/bin $prefix/state
+ReadWriteDirectories=$prefix/bin $state
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -187,6 +188,8 @@ install_service() {
         if [ -f "$prefix/$path" ]; then cp -p "$prefix/$path" "$backup/$label"; fi
     done
     if [ -f /usr/local/bin/fastp2p ]; then cp -p /usr/local/bin/fastp2p "$backup/cli"; fi
+    if [ -f /var/lib/fastp2p-client/fastp2p ]; then cp -p /var/lib/fastp2p-client/fastp2p "$backup/legacy-runtime"; fi
+    if [ -f /var/lib/fastp2p-client/fastp2p.old ]; then cp -p /var/lib/fastp2p-client/fastp2p.old "$backup/legacy-runtime.old"; fi
     if [ -f "/etc/systemd/system/$service.service" ]; then cp -p "/etc/systemd/system/$service.service" "$backup/unit"; fi
     if [ -d "/etc/systemd/system/$service.service.d" ]; then cp -a "/etc/systemd/system/$service.service.d" "$backup/dropins"; fi
     if [ -f /etc/init.d/fastp2p ]; then cp -p /etc/init.d/fastp2p "$backup/init"; fi
@@ -208,9 +211,12 @@ install_service() {
     printf '%s\n' "服务管理方式：$manager；正在探测并卸载旧服务，保留配置。"
     remove_service
     group=$(id -gn fastp2p)
-    [ ! -L "$prefix/bin" ] && [ ! -L "$prefix/state" ] || return 1
-    mkdir -p "$prefix/bin" "$prefix/state" /usr/local/bin
-    chown "fastp2p:$group" "$prefix/bin" "$prefix/state"; chmod 700 "$prefix/bin" "$prefix/state"
+    [ ! -L "$prefix/bin" ] && [ ! -L /var/lib/fastp2p ] && [ ! -L "$state" ] || return 1
+    mkdir -p "$prefix/bin" "$state" /usr/local/bin
+    # Do not transfer ownership of a co-located gateway's database directory.
+    # Only the client subdirectory is writable by the client account.
+    chmod o+x /var/lib/fastp2p
+    chown "fastp2p:$group" "$prefix/bin" "$state"; chmod 700 "$prefix/bin" "$state"
     cp "$backup/incoming" "$backup/runtime.new"; chmod 755 "$backup/runtime.new"; mv -fT "$backup/runtime.new" "$binary"
     cp "$backup/incoming" "$backup/cli.new"; chmod 755 "$backup/cli.new"; mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
     cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"; mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
@@ -222,6 +228,8 @@ install_service() {
     start_service
     printf '%s\n' "$manager" > "$prefix/init"
     transaction=false
+    rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old
+    rmdir /var/lib/fastp2p-client 2>/dev/null || true
     printf '%s\n' "服务安装完成，回滚备份：$backup"
 }
 case "${1:-}" in
@@ -240,7 +248,7 @@ case "${1:-}" in
             rm -f "$profile" "$profile.identity" /etc/fastp2p/client.json.ca.*.pem
             # Only this root-owned, installer-created backup directory is purged.
             if [ -d "$prefix/.backups" ] && [ ! -L "$prefix/.backups" ]; then rm -rf -- "$prefix/.backups"; fi
-            rmdir "$prefix/bin" "$prefix/state" 2>/dev/null || true
+            rmdir "$prefix/bin" "$state" /var/lib/fastp2p 2>/dev/null || true
             rm -f "$prefix/init"; rmdir "$prefix" 2>/dev/null || true
         fi
         printf '%s\n' '旧服务已卸载。' ;;

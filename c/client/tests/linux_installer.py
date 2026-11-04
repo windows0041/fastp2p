@@ -70,6 +70,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
         command('mount', '--bind', str(original_local/'lib'), '/usr/local/lib')
         command('mount', '-o', 'remount,bind,ro', '/usr/local/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/run')
+    command('mount', '-t', 'tmpfs', 'tmpfs', '/var/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/sbin')
     tools = root / 'tools'; tools.mkdir()
     events = root / 'events'
@@ -171,7 +172,13 @@ if [ "${2:-}" = start ] && [ -e "$FIXTURE/fail-start" ]; then rm "$FIXTURE/fail-
             else:
                 unit = Path('/etc/init.d/fastp2p').read_text()
                 assert ('respawn 3600 3 0' if manager == 'procd' else 'supervisor="supervise-daemon"') in unit
+            legacy=Path('/var/lib/fastp2p-client'); legacy.mkdir(exist_ok=True)
+            (legacy/'fastp2p').write_bytes(payload)
+            gateway_db=Path('/var/lib/fastp2p/nodes.sqlite3'); gateway_db.write_bytes(b'gateway-fixture')
+            gateway_owner=gateway_db.parent.stat().st_uid
             run()
+            assert not legacy.exists() and Path('/var/lib/fastp2p/client').stat().st_uid != 0
+            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.parent.stat().st_uid == gateway_owner
             saved = json.loads(profile.read_text())
             assert saved['network']['DeviceID'] == identity and saved['customSetting'] == first['customSetting']
             assert saved['network']['UDPPort'] == 29887
