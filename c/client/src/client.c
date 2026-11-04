@@ -2910,7 +2910,11 @@ static void service_gateway(fastp2p_client *c) {
         CURLcode rv = curl_ws_recv(c->ws, bytes, sizeof(bytes), &received, &meta);
         if (rv == CURLE_AGAIN)
             break;
-        if (rv != CURLE_OK || !meta || (meta->flags & CURLWS_CLOSE)) {
+        if (rv != CURLE_OK) {
+            gateway_failed_curl(c, rv);
+            return;
+        }
+        if (!meta || (meta->flags & CURLWS_CLOSE)) {
             close_gateway(c);
             return;
         }

@@ -106,6 +106,7 @@ class HTTP(http.server.BaseHTTPRequestHandler):
                     mask=self.exact(4) if second&128 else b'';payload=self.exact(length)
                     if mask:payload=bytes(byte^mask[i%4] for i,byte in enumerate(payload))
                     opcode=first&15
+                    print('fixture client frame: opcode=%d bytes=%d' % (opcode,len(payload)),flush=True)
                     if opcode==8:return
                     if opcode==9:self.send(payload,10);continue
                     if opcode!=2:continue
@@ -114,7 +115,8 @@ class HTTP(http.server.BaseHTTPRequestHandler):
                         size,main,sub=struct.unpack_from('<IHH',payload,offset);offset+=8
                         if size>len(payload)-offset:return
                         self.dispatch(main,sub,payload[offset:offset+size]);offset+=size
-            except (OSError,EOFError,ValueError,KeyError,TypeError):pass
+            except (OSError,EOFError,ValueError,KeyError,TypeError) as error:
+                print('fixture WSS ended: '+type(error).__name__,flush=True)
             finally:
                 with lock:
                     if nodes.get(name) is self:nodes.pop(name,None)
