@@ -58,16 +58,17 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     command('mount', '--bind', str(etc), '/etc')
     original_local=root/'original-local'; original_local.mkdir()
     command('mount', '--bind', '/usr/local', str(original_local))
-    command('mount', '-o', 'remount,bind,ro', str(original_local))
     # Always detach borrowed mounts BEFORE TemporaryDirectory traverses its tree.
     # A read-only source is a second guard against deletion of host files.
     mounts.callback(command, 'umount', '-l', str(original_local))
+    command('mount', '-o', 'remount,bind,ro', str(original_local))
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/local')
     # Official Python containers keep their stdlib here. Preserve it while
     # isolating product paths and /usr/local/bin from the host installation.
     if (original_local/'lib').is_dir():
         Path('/usr/local/lib').mkdir()
         command('mount', '--bind', str(original_local/'lib'), '/usr/local/lib')
+        command('mount', '-o', 'remount,bind,ro', '/usr/local/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/run')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/sbin')
     tools = root / 'tools'; tools.mkdir()
