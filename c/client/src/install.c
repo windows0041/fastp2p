@@ -86,6 +86,24 @@ static unsigned char *read_file(const char *path, size_t maximum, size_t *length
     data[size] = 0; *length = size;
     return data;
 }
+int fastp2p_profile_writable(const char *path) {
+    char parent[4096];
+    if(!path||snprintf(parent,sizeof(parent),"%s",path)>=(int)sizeof(parent))return 0;
+#ifdef _WIN32
+    char probe[4096];WCHAR wide_probe[4096],wide_path[4096];
+    if(wide(path,wide_path))return 0;
+    DWORD attributes=GetFileAttributesW(wide_path);
+    if(attributes==INVALID_FILE_ATTRIBUTES||(attributes&(FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_REPARSE_POINT)))return 0;
+    if(snprintf(probe,sizeof(probe),"%s.probe.%lu",path,(unsigned long)getpid())>=(int)sizeof(probe)||wide(probe,wide_probe))return 0;
+    HANDLE file=CreateFileW(wide_probe,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,NULL);
+    if(file==INVALID_HANDLE_VALUE)return 0;
+    CloseHandle(file);return 1;
+#else
+    char *slash=strrchr(parent,'/');
+    if(slash) {*slash=0;if(!*parent)strcpy(parent,"/");}else strcpy(parent,".");
+    return access(parent,W_OK|X_OK)==0;
+#endif
+}
 json_object *fastp2p_profile_read(const char *path) {
     size_t length;
     unsigned char *data = read_file(path, 1048576, &length);

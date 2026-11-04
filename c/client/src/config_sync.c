@@ -111,7 +111,9 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
         snprintf(sync_state.digest,sizeof(sync_state.digest),"%s",string(meta,"digest"));
         sync_state.deadline=op_monotonic_ns()+UINT64_C(25000000000);
     }
-    return client?fastp2p_client_set_config_handler(client,receive,NULL):0;
+    /* Old Linux units keep /etc read-only. Preserve their legacy rule protocol
+     * until the installer migrates them to the writable config directory. */
+    return client&&fastp2p_profile_writable(path)?fastp2p_client_set_config_handler(client,receive,NULL):0;
 }
 void fp_config_sync_online(void) {
     sync_state.online=1;

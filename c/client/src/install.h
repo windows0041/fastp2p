@@ -10,6 +10,7 @@ int fastp2p_service_profile(char out[4096]);
 json_object *fastp2p_profile_read(const char *path);
 int fastp2p_profile_write(const char *path, const char *text);
 int fastp2p_profile_write_machine(const char *path, const char *text);
+int fastp2p_profile_writable(const char *path);
 /* The double-clicked installer: takes the key from the file name. */
 int fastp2p_service_install_token(const char *token);
 void fastp2p_install_note(const char *text);
