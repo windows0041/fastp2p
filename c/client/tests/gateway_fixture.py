@@ -88,7 +88,10 @@ class HTTP(http.server.BaseHTTPRequestHandler):
         if self.headers.get('Upgrade','').lower()=='websocket':
             name=query.get('node',[''])[0]
             if path.path!='/api/v1/login' or query.get('protocol')!=['fastp2p2'] or query.get('token')!=[str(key)] or not 8<=len(name)<=31:
+                print('fixture WSS rejected: path=%s protocol=%s key=%s node_length=%s' %
+                      (path.path=='/api/v1/login',query.get('protocol')==['fastp2p2'],query.get('token')==[str(key)],len(name)),flush=True)
                 self.reply({},401);return
+            print('fixture WSS accepted',flush=True)
             self.send_response(101);self.send_header('Upgrade','websocket');self.send_header('Connection','Upgrade')
             self.send_header('Sec-WebSocket-Accept',base64.b64encode(hashlib.sha1((self.headers['Sec-WebSocket-Key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode());self.end_headers()
             self.node=name;self.send_lock=threading.Lock();self.metadata={};self.close_connection=True
@@ -145,6 +148,7 @@ class HTTP(http.server.BaseHTTPRequestHandler):
             self.send(packet(3,0,{'error':0 if peer else 1}));return
         body=json.loads(data)
         if main==6 and sub==0:
+            print('fixture node report accepted',flush=True)
             self.metadata=body;self.send(packet(6,7,{}))
             with lock:config=configs.get(self.node)
             if config:self.send(packet(3,19,config))

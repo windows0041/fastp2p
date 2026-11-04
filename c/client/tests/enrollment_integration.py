@@ -51,7 +51,11 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
         def install(expected=0):
             completed=subprocess.run([str(Path(args.client).resolve()),'install','--token-file',str(token_file),
                 '--config',str(profile),'--no-service'],env=client_environment,cwd=root,capture_output=True,timeout=40)
-            assert completed.returncode==expected,(completed.returncode,completed.stderr.decode(errors='replace'))
+            if completed.returncode != expected:
+                diagnostic = completed.stdout.decode(errors='replace') + completed.stderr.decode(errors='replace')
+                if Path(args.gateway).suffix == '.py':
+                    diagnostic += (root/'gateway.log').read_text(errors='replace')[-4000:]
+                raise AssertionError((completed.returncode, diagnostic.replace(token,'[fixture-key]').replace(payload['key'],'[fixture-key]')))
             assert token.encode() not in completed.stdout+completed.stderr and payload['key'].encode() not in completed.stdout+completed.stderr
             assert b'Sanitizer' not in completed.stderr and b'runtime error:' not in completed.stderr
             return completed
