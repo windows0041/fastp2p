@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
 
@@ -11,6 +12,7 @@
 #include <windows.h>
 #include <winsvc.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -280,7 +282,7 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
     SC_HANDLE handle = manager ? OpenServiceW(manager, wide_service, SERVICE_STOP | SERVICE_START |
                                               SERVICE_QUERY_STATUS) : NULL;
     int ok = 0;
-    wchar_t previous[4200], replacement[4200];
+    wchar_t previous[4200], replacement[4200], retired[4200];
     if (handle && swprintf(previous, 4200, L"%ls.old", wide_target) > 0 &&
         swprintf(replacement, 4200, L"%ls.new", wide_staged) > 0 && !stop_service(handle)) {
         /* The helper is running the staged image. Use a separate copy for the
@@ -290,6 +292,12 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
                        !fp_update_replace_file(replacement, wide_target);
         if (replaced && !start_service(handle)) {
             ok = 1;
+            /* Retire only AFTER committing the new service. Its runtime can
+             * retry removal once this helper and any scanner release files. */
+            if(swprintf(retired,4200,L"%ls.old",wide_staged)>0 &&
+               !fp_update_replace_file(previous,retired))DeleteFileW(retired);
+            else if(!DeleteFileW(previous))
+                fputs("fastp2p: previous executable cleanup deferred\n",stderr);
         } else if (!replaced || (!stop_service(handle) &&
                    !fp_update_replace_file(previous, wide_target))) {
             (void)start_service(handle);
@@ -357,6 +365,29 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
     return 0;
 }
 int fp_update_run_pending(char *const argv[]) { (void)argv; return 0; }
+void fp_update_cleanup(void) {
+    char own[4096];wchar_t directory[4096],pattern[4200];
+    if(fp_update_own_path(own,sizeof(own)) || wide(own,directory,4096))return;
+    wchar_t *slash=wcsrchr(directory,L'\\');if(!slash)slash=wcsrchr(directory,L'/');
+    if(!slash)return;
+    slash[1]=0;
+    if(swprintf(pattern,4200,L"%ls.fastp2p-update-*.exe*",directory)<0)return;
+    WIN32_FIND_DATAW entry;HANDLE search=FindFirstFileW(pattern,&entry);
+    if(search==INVALID_HANDLE_VALUE)return;
+    do {
+        if(entry.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))continue;
+        const wchar_t *name=entry.cFileName,*digits=name+16;wchar_t *end;
+        if(wcsncmp(name,L".fastp2p-update-",16) || *digits<L'0' || *digits>L'9')continue;
+        errno=0;unsigned long pid=wcstoul(digits,&end,10);
+        if(errno || !pid || (wcscmp(end,L".exe") && wcscmp(end,L".exe.old")))continue;
+        HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,(DWORD)pid);
+        if(process){DWORD state=WaitForSingleObject(process,0);CloseHandle(process);if(state!=WAIT_OBJECT_0)continue;}
+        else if(GetLastError()!=ERROR_INVALID_PARAMETER)continue; /* access denied means possibly active */
+        wchar_t path[4200];
+        if(swprintf(path,4200,L"%ls%ls",directory,name)>0)DeleteFileW(path);
+    }while(FindNextFileW(search,&entry));
+    FindClose(search);
+}
 #else
 int fp_update_own_path(char *out, size_t length) {
 #ifdef __APPLE__
@@ -532,5 +563,31 @@ int fp_update_run_pending(char *const argv[]) {
     execv(own, argv);
     perror("fastp2p previous executable could not restart");
     return -1;
+}
+void fp_update_cleanup(void) {
+#ifndef __ANDROID__
+    char own[4096],previous[4200],directory[4096];
+    if(fp_update_own_path(own,sizeof(own)))return;
+    snprintf(previous,sizeof(previous),"%s.old",own);
+    struct stat metadata;
+    if(!lstat(previous,&metadata) && S_ISREG(metadata.st_mode))unlink(previous);
+    snprintf(directory,sizeof(directory),"%s",own);
+    char *slash=strrchr(directory,'/');if(!slash)return;
+    slash[1]=0;
+    DIR *scan=opendir(directory);if(!scan)return;
+    struct dirent *entry;
+    while((entry=readdir(scan))){
+        if(strncmp(entry->d_name,".fastp2p-update-",16))continue;
+        const char *digits=entry->d_name+16;char *end;
+        if(*digits<'0' || *digits>'9')continue;
+        errno=0;unsigned long pid=strtoul(digits,&end,10);
+        if(errno || !pid || pid>INT_MAX || (*end && strcmp(end,".backup")))continue;
+        if(!kill((pid_t)pid,0) || errno!=ESRCH)continue;
+        char path[4400];
+        if(snprintf(path,sizeof(path),"%s%s",directory,entry->d_name)>=(int)sizeof(path))continue;
+        if(!lstat(path,&metadata) && S_ISREG(metadata.st_mode))unlink(path);
+    }
+    closedir(scan);
+#endif
 }
 #endif

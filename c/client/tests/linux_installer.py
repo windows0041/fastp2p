@@ -28,6 +28,7 @@ p.add_argument('--gateway', required=True)
 p.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
 args = p.parse_args()
 client, gateway = Path(args.client).resolve(), Path(args.gateway).resolve()
+version=subprocess.check_output([str(client),'--version'],text=True).split()[1]
 if not args.inside:
     assert os.geteuid() == 0, 'This isolated test requires root and mount/network namespaces'
     subprocess.run(['unshare', '--mount', '--net', '--pid', '--fork', '--mount-proc', sys.executable,
@@ -147,19 +148,19 @@ esac
         preset = root/'gateway.json'; preset.write_text(json.dumps(login['gateway']))
         environment['FASTP2P_BOOTSTRAP_FILE'] = str(preset)
         payload = client.read_bytes()
-        assert api('/api/v1/update?platform=linux&version=2.0.4', payload, 'PUT')[0] == 200
+        assert api(f'/api/v1/update?platform=linux&version={version}', payload, 'PUT')[0] == 200
         status, headers, installer = api('/api/v1/update/install?platform=linux')
         assert status == 200 and headers['content-disposition'] == f'attachment; filename="fastp2p-{key}"'
         assert key.encode() not in installer, 'shared installer must not contain token'
         assert len(installer)<128*1024 and b'__FASTP2P_PAYLOAD__' not in installer
         assert hashlib.sha256(payload).hexdigest().encode() in installer
-        assert api('/api/v1/update/install?platform=linux-x86_64&version=2.0.4')[2]==installer
+        assert api(f'/api/v1/update/install?platform=linux-x86_64&version={version}')[2]==installer
         cached=next((root/'updates').glob('installer-*.sh'))
         cached.write_bytes(installer[:-1]+bytes([installer[-1]^1]))
-        assert api('/api/v1/update/install?platform=linux&version=2.0.4')[2] == installer
-        raw = api('/api/v1/update/download?platform=linux&version=2.0.4&token='+key)[2]
+        assert api(f'/api/v1/update/install?platform=linux&version={version}')[2] == installer
+        raw = api(f'/api/v1/update/download?platform=linux&version={version}&token='+key)[2]
         assert raw == payload, 'remote upgrades must continue to receive raw ELF'
-        endpoint='/api/v1/update/download?platform=linux&version=2.0.4'
+        endpoint=f'/api/v1/update/download?platform=linux&version={version}'
         assert api(endpoint,extra_headers={'Authorization':'FastP2P '+key},port=37183)[2]==payload
         assert api(endpoint,extra_headers={'Authorization':'FastP2P 9999999999999998'},port=37183)[0]==401
         assert api('/api/v1/updates',extra_headers={'Authorization':'FastP2P '+key})[0]==401
@@ -213,6 +214,17 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert binary.read_bytes() == payload and Path('/usr/local/bin/fastp2p').read_bytes() == payload
             assert controller.stat().st_uid == 0 and not controller.stat().st_mode & 0o022
             assert Path('/usr/local/fastp2p').stat().st_uid == 0
+            backups=Path('/usr/local/fastp2p/.backups')
+            assert not any(backups.glob('*/incoming'))
+            historical=backups/'20200101T000000.42';historical.mkdir(mode=0o700)
+            for name in ('incoming','runtime','cli','controller','legacy-runtime','legacy-runtime.old'):
+                (historical/name).write_bytes(payload)
+            (historical/'desired-config').write_text('retain-private-config')
+            (historical/'startup-check.log').write_text('retain-diagnostics')
+            binary.with_name('fastp2p.old').write_bytes(payload)
+            outside=root/('outside-'+manager);outside.mkdir();(outside/'runtime').write_text('do-not-follow')
+            (backups/'20200102T000000.43').symlink_to(outside,target_is_directory=True)
+            unknown=backups/'user-data';unknown.mkdir();(unknown/'runtime').write_text('not-an-installer-backup')
             assert binary.parent.stat().st_uid != 0 and profile.stat().st_mode & 0o007 == 0
             if manager.startswith('systemd'):
                 unit = Path('/etc/systemd/system/fastp2p-client.service').read_text()
@@ -247,9 +259,17 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert old_profile.read_bytes() == before and not profile.exists()
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
             assert (legacy/'fastp2p').read_bytes() == payload
+            assert (historical/'runtime').read_bytes()==payload and binary.with_name('fastp2p.old').exists()
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             if manager.startswith('systemd'): assert (dropin/'20-remote-upgrade.conf').exists()
             run()
+            assert not binary.with_name('fastp2p.old').exists()
+            assert not any(historical.glob('runtime*')) and not (historical/'incoming').exists()
+            assert not any(p for p in backups.glob('*/incoming') if not p.parent.is_symlink())
+            assert (historical/'desired-config').read_text()=='retain-private-config'
+            assert (historical/'startup-check.log').read_text()=='retain-diagnostics'
+            assert (outside/'runtime').read_text()=='do-not-follow'
+            assert (unknown/'runtime').read_text()=='not-an-installer-backup'
             assert not legacy.exists() and not old_profile.exists()
             assert Path('/var/lib/fastp2p/config').stat().st_uid != 0
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
@@ -317,13 +337,13 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
         with sqlite3.connect(root/'nodes.sqlite3') as db:
             for arch in arches:
                 db.execute("INSERT INTO release_packages SELECT ?,version,sha256,size,filename,uploaded_at FROM updates WHERE platform='linux'",('linux-'+arch,))
-            db.execute("INSERT INTO release_packages SELECT platform,'2.0.5',sha256,size,filename,uploaded_at FROM release_packages WHERE platform='linux-x86_64'")
+            db.execute("INSERT INTO release_packages SELECT platform,'99.99.99',sha256,size,filename,uploaded_at FROM release_packages WHERE platform='linux-x86_64'")
         latest=api('/api/v1/update/install?platform=linux')[2]
-        assert b"x86_64) package_platform='linux-x86_64'; expected_version='2.0.5'" in latest
-        assert b"aarch64) package_platform='linux-aarch64'; expected_version='2.0.4'" in latest
-        assert b"expected_version='2.0.5'" not in api('/api/v1/update/install?platform=linux&version=2.0.4')[2]
+        assert b"x86_64) package_platform='linux-x86_64'; expected_version='99.99.99'" in latest
+        assert f"aarch64) package_platform='linux-aarch64'; expected_version='{version}'".encode() in latest
+        assert b"expected_version='99.99.99'" not in api(f'/api/v1/update/install?platform=linux&version={version}')[2]
         with sqlite3.connect(root/'nodes.sqlite3') as db:
-            db.execute("DELETE FROM release_packages WHERE version='2.0.5'")
+            db.execute("DELETE FROM release_packages WHERE version='99.99.99'")
         universal=api('/api/v1/update/install?platform=linux')[2]
         assert len(universal)<128*1024 and key.encode() not in universal
         assert all(('package_platform=\'linux-'+arch+'\'').encode() in universal for arch in arches)
@@ -349,7 +369,7 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
         for cpu,arch in [(a,a) for a in arches]+[('arm64','aarch64'),('armv7l','armv7'),('powerpc64le','ppc64le'),('mips64','mips64el'),('mips','mips64el')]:
             environment['FIXTURE_CPU']=cpu
             events.write_text('');run(alternate,1)
-            assert (root/'download-url').read_text().endswith('platform=linux-'+arch+'&version=2.0.4')
+            assert (root/'download-url').read_text().endswith('platform=linux-'+arch+'&version='+version)
             assert key not in (root/'download-url').read_text()
             assert events.read_text()=='' and profile.read_bytes()==before
         for cpu,elf_class,endian in [('mips64','2','2'),('mips','1','1'),('i586','2','1'),('unknown-cpu','2','1')]:

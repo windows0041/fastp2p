@@ -39,6 +39,8 @@ int fastp2p_service_installed(void);
 int fastp2p_service_prepare(const char *profile);
 int fastp2p_service_install(const char *profile, const char *ca);
 int fastp2p_service_remove(void);
+/* After the replacement service is healthy, remove only known old images. */
+int fastp2p_service_cleanup_previous(void);
 /* Removes the stored profile, its certificates and the installed copy. */
 int fastp2p_service_purge(void);
 int fastp2p_service_elevated(void);

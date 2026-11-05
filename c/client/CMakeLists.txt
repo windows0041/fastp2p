@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(fastp2p_c VERSION 2.0.4 LANGUAGES C)
+project(fastp2p_c VERSION 2.0.5 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)

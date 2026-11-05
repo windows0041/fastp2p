@@ -487,6 +487,8 @@ static int install_token(const char *token, const char *token_file, const char *
             fputs("Gateway verified and profile saved; automatic startup could not be installed.\n", stderr);
             return 1;
         }
+        if(machine && fastp2p_service_cleanup_previous())
+            fastp2p_install_note("installed; previous executable cleanup deferred because a file is in use");
     }
 #ifdef _WIN32
     if(*legacy_profile) {

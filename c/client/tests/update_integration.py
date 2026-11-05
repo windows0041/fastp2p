@@ -125,6 +125,15 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
                                          for n in body['nodes'])
         wait(online, what='client online')
         results['client_registered'] = True
+        # Cleanup may remove only files owned by an exited updater. Active
+        # downloads, directories, symlinks and unrelated files must survive.
+        stale=installed.parent/'.fastp2p-update-2147483647'
+        active=installed.parent/('.fastp2p-update-'+str(os.getpid()))
+        unrelated=installed.parent/'.fastp2p-update-user-data'
+        linked=installed.parent/'.fastp2p-update-2147483646'
+        subdir=installed.parent/'.fastp2p-update-2147483645'
+        for path in (stale,active,unrelated):path.write_bytes(b'cleanup-fixture')
+        linked.symlink_to(config);subdir.mkdir();(subdir/'keep').write_bytes(b'keep')
 
         def listening(port):
             try:
@@ -233,6 +242,12 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-update-') as temporary:
         # The rule is restored from the gateway and its port binds again.
         wait(lambda: listening(rule_port), timeout=60, what='rule listening after the upgrade')
         results['rule_listening_after_upgrade'] = True
+        wait(lambda:not installed.with_name('fastp2p.old').exists(),timeout=20,
+             what='retired executable removed after authenticated startup')
+        assert not stale.exists() and active.read_bytes()==b'cleanup-fixture'
+        assert unrelated.read_bytes()==b'cleanup-fixture' and linked.is_symlink()
+        assert (subdir/'keep').read_bytes()==b'keep'
+        results['old_executable_and_upgrade_staging_removed_after_success']=True
 
         # --- An unknown version is rejected rather than silently ignored.
         assert api('/api/v1/device/update-node-1/upgrade', {'version': '8.8.8'}, token)[0] == 404

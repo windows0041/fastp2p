@@ -65,6 +65,8 @@ Linux 控制台只提供一个通用 shell 安装脚本：`GET /api/v1/update/in
 
 专用客户端包通过 c/common/bootstrap.json 预置本网关地址和公开 CA，用户只需输入 16 位数字 Token。更换服务器 CA 或地址后需要重新构建专用客户端。
 
+网关 2.0.7 内置的 Linux 安装脚本在新程序验证启动成功后清理历史程序副本，保留配置、证书和诊断日志。客户端 2.0.5 同时处理远程升级后的旧可执行文件及已退出升级进程留下的临时程序；安装失败仍保留回滚所需文件。
+
 ## 客户端配置下发
 
 新版 Linux/Windows/macOS CLI 的「配置」按钮可编辑网关管理的 JSON 字段，按键值递归合并到客户端 config/fastp2p.conf，未下发字段保留，数组整体替换。客户端自动重载，确认新连接成功才显示 applied；失败会恢复原配置并反馈 failed。Windows 保持 DPAPI 加密。SDK/Android 需由宿主注册配置处理回调后才支持此功能。

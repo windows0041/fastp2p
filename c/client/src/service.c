@@ -262,9 +262,68 @@ int fastp2p_service_install(const char *profile, const char *ca) {
     failure.lpsaActions = actions;
     ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
     int started = StartServiceW(service, 0, NULL) != 0 || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
+    /* SCM accepts StartService before the client has actually initialized. */
+    int stable=0;
+    for(int attempt=0;started && stable<30 && attempt<100;attempt++){
+        SERVICE_STATUS status;
+        if(!QueryServiceStatus(service,&status) || status.dwCurrentState==SERVICE_STOPPED){started=0;break;}
+        stable=status.dwCurrentState==SERVICE_RUNNING?stable+1:0;
+        Sleep(100);
+    }
+    if(stable<30)started=0;
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
     return started ? 0 : -1;
+}
+
+static int delete_previous_image(const WCHAR *path) {
+    for(int attempt=0;attempt<50;attempt++){
+        if(DeleteFileW(path))return 0;
+        DWORD error=GetLastError();
+        if(error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND)return 0;
+        if(error!=ERROR_SHARING_VIOLATION && error!=ERROR_ACCESS_DENIED)return -1;
+        Sleep(100);
+    }
+    return -1;
+}
+static int same_image(const WCHAR *a,const WCHAR *b) {
+    HANDLE first=CreateFileW(a,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
+    if(first==INVALID_HANDLE_VALUE)return -1;
+    HANDLE second=CreateFileW(b,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
+    if(second==INVALID_HANDLE_VALUE){
+        DWORD error=GetLastError();CloseHandle(first);
+        return error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND?0:-1;
+    }
+    BY_HANDLE_FILE_INFORMATION x,y;
+    int result=GetFileInformationByHandle(first,&x) && GetFileInformationByHandle(second,&y)?
+        x.dwVolumeSerialNumber==y.dwVolumeSerialNumber && x.nFileIndexHigh==y.nFileIndexHigh && x.nFileIndexLow==y.nFileIndexLow:-1;
+    CloseHandle(first);CloseHandle(second);return result;
+}
+int fastp2p_service_cleanup_previous(void) {
+    const char *program_files=getenv("ProgramFiles"),*local=getenv("LOCALAPPDATA");
+    char text[4096];WCHAR target[4096],self[4096],legacy[4096],previous[4200];
+    if(!program_files || snprintf(text,sizeof(text),"%s/fastp2p/fastp2p.exe",program_files)>=(int)sizeof(text) || wide(text,target))return -1;
+    for(WCHAR *p=target;*p;p++)if(*p==L'/')*p=L'\\';
+    DWORD length=GetModuleFileNameW(NULL,self,4096);
+    if(!length || length>=4096)return -1;
+    int pending=0;
+    if(swprintf(previous,4200,L"%ls.old",target)<0 || delete_previous_image(previous))pending=1;
+    if(local && snprintf(text,sizeof(text),"%s/fastp2p/fastp2p.exe",local)<(int)sizeof(text) && !wide(text,legacy)){
+        for(WCHAR *p=legacy;*p;p++)if(*p==L'/')*p=L'\\';
+        WCHAR resolved[4096],installed[4096],running[4096];
+        DWORD a=GetFullPathNameW(legacy,4096,resolved,NULL),b=GetFullPathNameW(target,4096,installed,NULL),
+              c=GetFullPathNameW(self,4096,running,NULL);
+        if(!a || a>=4096 || !b || b>=4096 || !c || c>=4096)return -1;
+        /* Never erase the replacement or an installer executing in-place. */
+        if(_wcsicmp(resolved,installed) && _wcsicmp(resolved,running)){
+            int installed_alias=same_image(target,legacy),installer_alias=same_image(self,legacy);
+            if(installed_alias<0 || installer_alias<0)return -1;
+            if(installed_alias || installer_alias)return pending?-1:0;
+            if(delete_previous_image(legacy))pending=1;
+            if(swprintf(previous,4200,L"%ls.old",legacy)<0 || delete_previous_image(previous))pending=1;
+        }
+    }
+    return pending?-1:0;
 }
 
 int fastp2p_service_remove(void) {
@@ -421,6 +480,7 @@ int fastp2p_service_install(const char *profile, const char *ca) {
     return -1;
 }
 int fastp2p_service_remove(void) { return -1; }
+int fastp2p_service_cleanup_previous(void) { return 0; }
 int fastp2p_service_purge(void) {
     char profile[4096];
     if (!fastp2p_service_profile(profile))

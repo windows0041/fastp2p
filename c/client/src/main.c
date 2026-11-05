@@ -4,6 +4,7 @@
 #include "config_sync.h"
 #include "notices.h"
 #include "update.h"
+#include "platform.h"
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -16,6 +17,7 @@
 
 static volatile sig_atomic_t interrupted;
 static int was_online;
+static uint64_t cleanup_online_since, cleanup_next;
 static void signal_stop(int sig) {
     (void)sig;
     interrupted = 1;
@@ -27,6 +29,9 @@ static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     if (e->state == FASTP2P_ONLINE && e->type == FASTP2P_EVENT_STATE) {
         was_online = 1;
         fp_config_sync_online();
+        cleanup_online_since=op_monotonic_ns();cleanup_next=0;
+    } else if(e->type==FASTP2P_EVENT_STATE) {
+        cleanup_online_since=cleanup_next=0;
     }
     json_object *j = json_object_new_object();
     json_object_object_add(j, "event", json_object_new_string(types[e->type]));
@@ -270,6 +275,10 @@ static int client_main(int argc, char **argv) {
             break;
         if (verify_start && was_online)
             break;
+        uint64_t now=op_monotonic_ns();
+        if(!verify_start && cleanup_online_since && now-cleanup_online_since>=UINT64_C(5000000000) && now>=cleanup_next){
+            fp_update_cleanup();cleanup_next=now+UINT64_C(5000000000);
+        }
         if (fp_config_sync_tick()) {rv=FP_CONFIG_RELOAD;break;}
     }
     if (!was_online && !interrupted && !fastp2p_runtime_stopping() && rv != FP_CONFIG_RELOAD)

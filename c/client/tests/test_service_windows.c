@@ -34,6 +34,13 @@ static int loop(int argc, char **argv) {
 static DWORD WINAPI close_service_later(void *service) {
     Sleep(400); CloseServiceHandle((SC_HANDLE)service); return 0;
 }
+static void remove_released_image(const char *path) {
+    for(int attempt=0;attempt<50;attempt++){
+        if(DeleteFileA(path))return;
+        Sleep(100);
+    }
+    assert(!"Stopped image is still locked");
+}
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "service"))
         return fastp2p_service_dispatch(argv[3], argc, argv, loop) ? 1 : 0;
@@ -46,6 +53,12 @@ int main(int argc, char **argv) {
     /* getenv() reads the CRT environment, not just the Win32 environment block.
      * Verify isolation before any installation can touch the machine paths. */
     assert(!_putenv_s("ProgramFiles", root));
+    char local[4096],legacy[4096],adjacent[4096],retired[4096];
+    snprintf(local,sizeof(local),"%s/user-data",root);assert(!_putenv_s("LOCALAPPDATA",local));
+    snprintf(legacy,sizeof(legacy),"%s/fastp2p/fastp2p.exe",local);
+    snprintf(adjacent,sizeof(adjacent),"%s/fastp2p/fastp2p.conf",local);
+    assert(!fastp2p_private_parents(legacy));
+    FILE *kept=fopen(adjacent,"wb");assert(kept);fputs("preserve-user-config",kept);fclose(kept);
     assert(!strcmp(getenv("ProgramFiles"),root));
     snprintf(profile, sizeof(profile), "%s/config/client.dat", root);
     assert(!fastp2p_service_prepare(profile));
@@ -60,9 +73,18 @@ int main(int argc, char **argv) {
             Sleep(50);
         }
         assert(ready && fastp2p_service_installed());
+        file=fopen(legacy,"wb");assert(file);fputs("old executable",file);fclose(file);
+        snprintf(retired,sizeof(retired),"%s.old",installed);assert(CopyFileA(installed,retired,FALSE));
+        assert(!fastp2p_service_cleanup_previous());
+        assert(GetFileAttributesA(legacy)==INVALID_FILE_ATTRIBUTES && GetFileAttributesA(retired)==INVALID_FILE_ATTRIBUTES);
+        assert(GetFileAttributesA(installed)!=INVALID_FILE_ATTRIBUTES && GetFileAttributesA(adjacent)!=INVALID_FILE_ATTRIBUTES);
+        /* A junction or hard link may make the old name refer to the new image. */
+        assert(CreateHardLinkA(legacy,installed,NULL));
+        assert(!fastp2p_service_cleanup_previous() && GetFileAttributesA(legacy)!=INVALID_FILE_ATTRIBUTES);
         SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT); assert(scm);
         SC_HANDLE held = OpenServiceW(scm, L"fastp2p-installer-ci", SERVICE_QUERY_STATUS); assert(held);
         assert(!fastp2p_service_remove());
+        remove_released_image(legacy);
         HANDLE thread = CreateThread(NULL, 0, close_service_later, held, 0, NULL); assert(thread);
         /* An open service handle delays deletion. New registration must retry. */
         assert(!fastp2p_service_install(profile, NULL));
@@ -87,6 +109,8 @@ int main(int argc, char **argv) {
     DeleteFileA(profile);
     char directory[4096]; snprintf(directory, sizeof(directory), "%s/config", root); RemoveDirectoryA(directory);
     snprintf(directory, sizeof(directory), "%s/fastp2p", root); RemoveDirectoryA(directory);
+    assert(DeleteFileA(adjacent));snprintf(directory,sizeof(directory),"%s/fastp2p",local);assert(RemoveDirectoryA(directory));
+    assert(RemoveDirectoryA(local));
     assert(RemoveDirectoryA(root));
     puts("Windows service uninstall/reinstall waits for process exit and delayed SCM deletion; identity retained");
     return 0;

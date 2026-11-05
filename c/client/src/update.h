@@ -35,6 +35,10 @@ int fp_update_apply(const char *staged, char *error, size_t error_length);
  * nothing is pending or on Windows. */
 int fp_update_run_pending(char *const argv[]);
 
+/* CLI maintenance after a verified, stable startup. Removes only retired
+ * images and staging files belonging to exited updater processes. */
+void fp_update_cleanup(void);
+
 /* Detached-helper entry point: waits for the old image to be released, installs
  * staged over target, then restarts the service. */
 int fp_update_swap(const char *staged, const char *target, const char *service);

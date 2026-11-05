@@ -190,6 +190,25 @@ EOF
             rc-update add fastp2p default ;;
     esac
 }
+prune_program_backups() {
+    # Only installer-owned directories and exact program filenames. Keep the
+    # saved profiles, certificates and diagnostic logs; never traverse links.
+    cleanup_pending=false
+    for cleanup_dir in "$prefix/.backups/"*; do
+        [ -d "$cleanup_dir" ] && [ ! -L "$cleanup_dir" ] || continue
+        printf '%s\n' "${cleanup_dir##*/}" | grep -Eq '^[0-9]{8}T[0-9]{6}\.[0-9]+$' || continue
+        [ "$(stat -c '%u:%g:%a' "$cleanup_dir")" = 0:0:700 ] || continue
+        for cleanup_name in incoming runtime cli controller legacy-runtime legacy-runtime.old runtime.restore cli.restore controller.restore runtime.new cli.new controller.new; do
+            cleanup_file=$cleanup_dir/$cleanup_name
+            if [ -f "$cleanup_file" ] || [ -L "$cleanup_file" ]; then
+                rm -f -- "$cleanup_file" || cleanup_pending=true
+            fi
+        done
+    done
+    rm -f -- "$binary.old" || cleanup_pending=true
+    if $cleanup_pending; then printf '%s\n' '服务已安装，但部分旧程序未能删除，请检查文件权限。' >&2; fi
+    return 0
+}
 install_service() {
     source_binary=
     source_profile=$profile
@@ -354,10 +373,11 @@ install_service() {
     done
     printf '%s\n' "$manager" > "$prefix/init"
     transaction=false
+    prune_program_backups
     rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old
     rmdir /var/lib/fastp2p-client 2>/dev/null || true
     rm -f /etc/fastp2p/client.json /etc/fastp2p/client.json.identity /etc/fastp2p/client.json.ca.*.pem
-    printf '%s\n' "服务安装完成，回滚备份：$backup"
+    printf '%s\n' "服务安装完成，旧程序已清理；配置和诊断备份：$backup"
 }
 case "${1:-}" in
     check)
