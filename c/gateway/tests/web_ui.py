@@ -307,6 +307,29 @@ def main():
                     return statuses;
                 }''')
                 assert uploaded==[200,200],uploaded
+                # Raw packages stay per architecture, while operators download
+                # exactly one small universal Linux script without choosing CPU.
+                with closing(sqlite3.connect(root/'nodes.sqlite3',timeout=5)) as db, db:
+                    for arch in ('x86_64','aarch64'):
+                        db.execute("INSERT INTO release_packages SELECT ?,version,sha256,size,filename,uploaded_at FROM updates WHERE platform='windows'",('linux-'+arch,))
+                page.locator('#refresh-updates').click()
+                linux_button=page.get_by_role('button',name='下载 Linux 通用安装脚本',exact=True)
+                expect(linux_button).to_have_count(1)
+                expect(page.locator('#updates')).to_contain_text('Linux（自动识别架构）')
+                expect(page.locator('#updates')).not_to_contain_text('linux-x86_64')
+                with page.expect_download() as downloading, page.expect_response(lambda r:'/api/v1/update/install?' in r.url) as installing:
+                    linux_button.click()
+                assert installing.value.status==200 and installing.value.url.endswith('platform=linux')
+                download=downloading.value
+                assert download.suggested_filename=='fastp2p-'+token
+                body=Path(download.path()).read_bytes()
+                assert body.startswith(b'#!/bin/sh\n') and len(body)<128*1024 and token.encode() not in body
+                assert all(('package_platform=\'linux-'+arch+'\'').encode() in body for arch in ('x86_64','aarch64'))
+                expect(page.locator('#update-message')).to_contain_text('自动识别 CPU')
+                with closing(sqlite3.connect(root/'nodes.sqlite3',timeout=5)) as db, db:
+                    db.execute("DELETE FROM release_packages WHERE platform LIKE 'linux-%'")
+                page.locator('#refresh-updates').click();expect(linux_button).to_have_count(0)
+                results['one_linux_download_auto_architecture_token_filename_and_small_script']=True
                 with closing(sqlite3.connect(root/'nodes.sqlite3',timeout=5)) as db, db:
                     db.execute("INSERT INTO release_packages SELECT 'macos-arm64',version,sha256,size,filename,uploaded_at FROM updates WHERE platform='macos'")
                     db.execute("DELETE FROM updates WHERE platform='macos'")

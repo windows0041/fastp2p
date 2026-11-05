@@ -702,6 +702,44 @@ static int version_compare(const char *left, const char *right) {
     }
 }
 
+/* A single downloader selects the newest available package for each CPU.
+ * Old generic manual packages are classified from their ELF header, never run. */
+static int linux_installer_packages(const char *wanted,struct gw_linux_package out[GW_LINUX_ARCH_COUNT],size_t *count) {
+    struct gw_linux_package selected[GW_LINUX_ARCH_COUNT]={0};
+    json_object *list=gw_store_updates(g.db);
+    if(!list)return -1;
+    for(size_t i=0;i<json_object_array_length(list);i++){
+        json_object *row=json_object_array_get_idx(list,i);
+        const char *platform=gw_string(row,"platform"),*version=gw_string(row,"version");
+        if(strcmp(platform,"linux") && strncmp(platform,"linux-",6))continue;
+        if((*wanted && strcmp(wanted,version)) || !gw_store_package_key_valid(platform,version))continue;
+        const char *arch=platform+6;char sha[65],filename[260];uint64_t size=0;
+        if(gw_store_update_find(g.db,platform,version,sha,filename,&size))continue;
+        if(!strcmp(platform,"linux")){
+            char path[700];update_path(path,sizeof(path),filename);
+            arch=gw_linux_payload_arch(path);
+            if(!arch)continue;
+        }
+        for(size_t k=0;k<GW_LINUX_ARCH_COUNT;k++){
+            if(strcmp(arch,gw_linux_arches[k]))continue;
+            struct gw_linux_package *p=selected+k;
+            int comparison=version_compare(version,p->version);
+            if(p->arch && (comparison<0 || (!comparison && strcmp(p->platform,"linux"))))break;
+            p->arch=gw_linux_arches[k];p->size=size;
+            snprintf(p->platform,sizeof(p->platform),"%s",platform);
+            snprintf(p->version,sizeof(p->version),"%s",version);
+            snprintf(p->sha,sizeof(p->sha),"%s",sha);
+            break;
+        }
+    }
+    json_object_put(list);*count=0;
+    for(size_t k=0;k<GW_LINUX_ARCH_COUNT;k++)if(selected[k].arch){
+        if(gw_store_package_lease(g.db,selected[k].platform,selected[k].version,(uint64_t)time(NULL)+600))return -1;
+        out[(*count)++]=selected[k];
+    }
+    return 0;
+}
+
 /* Maps the OS string a client reports onto an update platform name. */
 static const char *platform_for_os(const char *os) {
     size_t length = os ? strlen(os) : 0;
@@ -967,19 +1005,42 @@ static void handle_http(struct connection *c) {
     if (download || installer) {
         /* The client presents the shared install token, the same secret it uses
          * to authenticate the WebSocket, so no extra credential is introduced. */
-        char platform[16], version[32], token[32];
-        if (query(c->wsi, "platform=", platform, sizeof(platform)) ||
-            query(c->wsi, "version=", version, sizeof(version))) {
-            http_error(c, 400, 1, "platform and version are required");
+        char platform[16], version[32]="", token[32], auth[128];
+        if (query(c->wsi, "platform=", platform, sizeof(platform))) {
+            http_error(c, 400, 1, "platform is required");
             return;
         }
+        int has_version=!query(c->wsi,"version=",version,sizeof(version));
+        int is_linux=!strcmp(platform,"linux") || !strncmp(platform,"linux-",6);
         uint64_t supplied = 0;
+        int header=lws_hdr_copy(c->wsi,auth,sizeof(auth),WSI_TOKEN_HTTP_AUTHORIZATION);
+        int install_auth=header>8 && !strncmp(auth,"FastP2P ",8) && fastp2p_install_key_valid(auth+8) &&
+                         !gw_decimal(auth+8,&supplied) && supplied==g.token;
         if (installer ? (!c->authorized || c->auth_generation != g.auth_generation) :
-            (query(c->wsi, "token=", token, sizeof(token)) || gw_decimal(token, &supplied) ||
-             supplied != g.token)) {
+            (!install_auth && (query(c->wsi, "token=", token, sizeof(token)) || gw_decimal(token, &supplied) ||
+             supplied != g.token))) {
             http_error(c, 401, 1, "unauthorized");
             return;
         }
+        if(installer && is_linux){
+            if(!gw_store_package_key_valid(platform,has_version?version:"1")){
+                http_error(c,400,1,"invalid platform or version");return;
+            }
+            struct gw_linux_package packages[GW_LINUX_ARCH_COUNT];size_t count=0;
+            if(linux_installer_packages(has_version?version:"",packages,&count)){
+                http_error(c,503,1,"cannot prepare package manifest; retry after synchronization");return;
+            }
+            if(!count){http_error(c,404,1,"no supported Linux packages found");return;}
+            char generated[700],headers[256];
+            if(gw_linux_installer(g.update_dir,g.public_host,g.ws_port,g.enrollment_ca,packages,count,generated)){
+                http_error(c,503,1,"cannot prepare Linux installer; retry after synchronization");return;
+            }
+            snprintf(headers,sizeof(headers),"Content-Disposition: attachment; filename=\"fastp2p-%" PRIu64 "\"\r\nCache-Control: no-store\r\n",g.token);
+            if(lws_serve_http_file(c->wsi,generated,"application/octet-stream",headers,(int)strlen(headers))<0)
+                http_error(c,503,1,"cannot serve Linux installer");
+            return;
+        }
+        if(!has_version){http_error(c,400,1,"version is required");return;}
         char sha[65], filename[260], path[700];
         uint64_t size = 0;
         if (gw_store_update_find(g.db, platform, version, sha, filename, &size)) {
@@ -993,18 +1054,6 @@ static void handle_http(struct connection *c) {
         update_path(path, sizeof(path), filename);
         char headers[256] = "";
         if (installer) {
-            int is_linux = !strcmp(platform,"linux") || !strncmp(platform,"linux-",6);
-            if (is_linux) {
-                char generated[700];
-                if (gw_linux_installer(g.update_dir,path,sha,size,generated)) {
-                    http_error(c,503,1,"cannot prepare Linux installer; retry after synchronization");
-                    return;
-                }
-                snprintf(headers,sizeof(headers),"Content-Disposition: attachment; filename=\"fastp2p-%" PRIu64 "\"\r\nCache-Control: no-store\r\n",g.token);
-                if (lws_serve_http_file(c->wsi,generated,"application/octet-stream",headers,(int)strlen(headers))<0)
-                    http_error(c,503,1,"cannot serve Linux installer");
-                return;
-            }
             const char *extension = !strcmp(platform, "windows") ? ".exe" :
                                     !strcmp(platform, "android") ? ".apk" : "";
             snprintf(headers, sizeof(headers),

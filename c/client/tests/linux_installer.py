@@ -133,10 +133,11 @@ esac
             except OSError:
                 assert time.monotonic() < deadline; time.sleep(.05)
         jwt = None
-        def api(path, body=None, method=None):
-            connection = http.client.HTTPSConnection('127.0.0.1', 31008, context=ctx, timeout=20)
+        def api(path, body=None, method=None, extra_headers=None, port=31008):
+            connection = http.client.HTTPSConnection('127.0.0.1', port, context=ctx, timeout=20)
             headers = {'Content-Type': 'application/octet-stream'}
             if jwt: headers['Authorization'] = 'Bearer '+jwt
+            if extra_headers: headers.update(extra_headers)
             connection.request(method or ('POST' if body else 'GET'), path, body, headers)
             response = connection.getresponse(); data = response.read(); headers = {k.lower(): v for k,v in response.getheaders()}
             connection.close(); return response.status, headers, data
@@ -147,16 +148,21 @@ esac
         environment['FASTP2P_BOOTSTRAP_FILE'] = str(preset)
         payload = client.read_bytes()
         assert api('/api/v1/update?platform=linux&version=2.0.4', payload, 'PUT')[0] == 200
-        status, headers, installer = api('/api/v1/update/install?platform=linux&version=2.0.4')
+        status, headers, installer = api('/api/v1/update/install?platform=linux')
         assert status == 200 and headers['content-disposition'] == f'attachment; filename="fastp2p-{key}"'
         assert key.encode() not in installer, 'shared installer must not contain token'
-        prefix, extracted = installer.split(b'__FASTP2P_PAYLOAD__\n', 1)
-        assert extracted == payload and hashlib.sha256(extracted).hexdigest().encode() in prefix
+        assert len(installer)<128*1024 and b'__FASTP2P_PAYLOAD__' not in installer
+        assert hashlib.sha256(payload).hexdigest().encode() in installer
+        assert api('/api/v1/update/install?platform=linux-x86_64&version=2.0.4')[2]==installer
         cached=next((root/'updates').glob('installer-*.sh'))
         cached.write_bytes(installer[:-1]+bytes([installer[-1]^1]))
         assert api('/api/v1/update/install?platform=linux&version=2.0.4')[2] == installer
         raw = api('/api/v1/update/download?platform=linux&version=2.0.4&token='+key)[2]
         assert raw == payload, 'remote upgrades must continue to receive raw ELF'
+        endpoint='/api/v1/update/download?platform=linux&version=2.0.4'
+        assert api(endpoint,extra_headers={'Authorization':'FastP2P '+key},port=37183)[2]==payload
+        assert api(endpoint,extra_headers={'Authorization':'FastP2P 9999999999999998'},port=37183)[0]==401
+        assert api('/api/v1/updates',extra_headers={'Authorization':'FastP2P '+key})[0]==401
         with sqlite3.connect(root/'nodes.sqlite3') as db:
             assert db.execute('SELECT expires_at FROM package_leases WHERE platform="linux"').fetchone()[0] > time.time()
         named = root/('fastp2p-'+key); named.write_bytes(installer)
@@ -176,6 +182,7 @@ esac
                 raise AssertionError(diagnostic.replace(key,'[redacted]'))
             assert key.encode() not in result.stdout+result.stderr
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
+            return result
         profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
@@ -293,7 +300,7 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             profile.write_bytes(before)
             # Corrupt payload, missing/ambiguous filename token, bad key and an
             # unreadable profile must not reach the service teardown.
-            for content, filename in ((installer[:-1]+bytes([installer[-1]^1]), named.name),
+            for content, filename in ((installer.replace(hashlib.sha256(payload).hexdigest().encode(),b'0'*64), named.name),
                                       (installer, 'fastp2p-missing'), (installer, named.name+'-'+key),
                                       (installer, 'fastp2p-9999999999999998')):
                 bad = root/filename; bad.write_bytes(content); events.write_text('')
@@ -303,6 +310,76 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert profile.read_text() == '{broken' and events.read_text() == ''
             profile.write_bytes(before)
             results[manager+'_install_reinstall_preserve_config_and_rollback'] = True
+        # Exercise the real downloader against all manifest platforms, without
+        # executing wrong-architecture images. Corrupt the fetched byte count
+        # deliberately and verify every failure precedes any service change.
+        arches=('x86_64','aarch64','armv7','i686','riscv64','s390x','ppc64le','mips64el')
+        with sqlite3.connect(root/'nodes.sqlite3') as db:
+            for arch in arches:
+                db.execute("INSERT INTO release_packages SELECT ?,version,sha256,size,filename,uploaded_at FROM updates WHERE platform='linux'",('linux-'+arch,))
+            db.execute("INSERT INTO release_packages SELECT platform,'2.0.5',sha256,size,filename,uploaded_at FROM release_packages WHERE platform='linux-x86_64'")
+        latest=api('/api/v1/update/install?platform=linux')[2]
+        assert b"x86_64) package_platform='linux-x86_64'; expected_version='2.0.5'" in latest
+        assert b"aarch64) package_platform='linux-aarch64'; expected_version='2.0.4'" in latest
+        assert b"expected_version='2.0.5'" not in api('/api/v1/update/install?platform=linux&version=2.0.4')[2]
+        with sqlite3.connect(root/'nodes.sqlite3') as db:
+            db.execute("DELETE FROM release_packages WHERE version='2.0.5'")
+        universal=api('/api/v1/update/install?platform=linux')[2]
+        assert len(universal)<128*1024 and key.encode() not in universal
+        assert all(('package_platform=\'linux-'+arch+'\'').encode() in universal for arch in arches)
+        alternate=root/('alternate-fastp2p-'+key);alternate.write_bytes(universal)
+        executable(tools/'uname','printf "%s\\n" "${FIXTURE_CPU:-x86_64}"\n')
+        executable(tools/'od','''
+if [ "${FIXTURE_CPU:-}" = mips64 ] || [ "${FIXTURE_CPU:-}" = mips ]; then
+    case "$*" in *-j4*) echo "${FIXTURE_CLASS:-2}" ;; *) echo "${FIXTURE_ENDIAN:-1}" ;; esac
+else exec /usr/bin/od "$@"; fi
+''')
+        (tools/'curl').write_text('''#!/usr/bin/python3
+import os,pathlib,stat,subprocess,sys
+args=sys.argv[1:]
+assert not any('Authorization:' in arg or 'token=' in arg for arg in args)
+config=pathlib.Path(args[args.index('--config')+1])
+assert stat.S_IMODE(config.stat().st_mode)==0o600
+assert b'Authorization: FastP2P ' in config.read_bytes()
+pathlib.Path(os.environ['FIXTURE'],'download-url').write_text(args[-1])
+code=subprocess.call(['/usr/bin/curl',*args])
+if code:sys.exit(code)
+with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt')
+''');(tools/'curl').chmod(0o755)
+        for cpu,arch in [(a,a) for a in arches]+[('arm64','aarch64'),('armv7l','armv7'),('powerpc64le','ppc64le'),('mips64','mips64el'),('mips','mips64el')]:
+            environment['FIXTURE_CPU']=cpu
+            events.write_text('');run(alternate,1)
+            assert (root/'download-url').read_text().endswith('platform=linux-'+arch+'&version=2.0.4')
+            assert key not in (root/'download-url').read_text()
+            assert events.read_text()=='' and profile.read_bytes()==before
+        for cpu,elf_class,endian in [('mips64','2','2'),('mips','1','1'),('i586','2','1'),('unknown-cpu','2','1')]:
+            environment.update(FIXTURE_CPU=cpu,FIXTURE_CLASS=elf_class,FIXTURE_ENDIAN=endian)
+            (root/'download-url').unlink(missing_ok=True);events.write_text('');run(alternate,1)
+            assert not (root/'download-url').exists() and events.read_text()=='' and profile.read_bytes()==before
+        environment['FIXTURE_CPU']='aarch64';events.write_text('')
+        run(named,1) # Old manifest has only the real native manual package.
+        assert events.read_text()=='' and profile.read_bytes()==before
+        for name in ('curl','uname','od'): (tools/name).unlink()
+        for name in ('FIXTURE_CPU','FIXTURE_CLASS','FIXTURE_ENDIAN'): environment.pop(name,None)
+        # A wrong public CA must fail before enrollment or service teardown.
+        create_certificates(root/'wrong-tls','127.0.0.1')
+        wrong_ca=installer.replace((root/'tls/ca.crt').read_bytes(),(root/'wrong-tls/ca.crt').read_bytes())
+        alternate.write_bytes(wrong_ca);events.write_text('');run(alternate,1)
+        assert events.read_text()=='' and profile.read_bytes()==before
+        # GNU wget fallback: a deliberately minimal PATH makes curl unavailable.
+        if shutil.which('wget'):
+            fallback=root/'wget-tools';fallback.mkdir()
+            for name in ('sh','id','awk','uname','od','sha256sum','mktemp','chmod','cp','stat','wc','rm','rmdir','mkdir','mv','grep','wget','cat'):
+                (fallback/name).symlink_to(shutil.which(name))
+            for name in ('rc-service','rc-update'):(fallback/name).symlink_to(tools/name)
+            environment['PATH']=str(fallback)
+            # Fail on an intentionally wrong digest, proving TLS/auth download
+            # completed but never reaching the native installer or old service.
+            alternate.write_bytes(installer.replace(hashlib.sha256(payload).hexdigest().encode(),b'0'*64))
+            events.write_text('');response=run(alternate,1)
+            assert b'SHA-256' in response.stderr and events.read_text()=='' and profile.read_bytes()==before
+            environment['PATH']=str(tools)+':/usr/bin:/bin'
+        results['universal_arch_selection_tls_header_auth_and_download_failures_preserve_service']=True
         Path('/var/run/fastp2p-install.lock').mkdir(); events.write_text('')
         run(expected=1); assert events.read_text() == '' and profile.read_bytes() == before
         Path('/var/run/fastp2p-install.lock').rmdir()

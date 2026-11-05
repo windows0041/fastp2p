@@ -239,7 +239,7 @@ jobs:
       - name: Native Debian 12 build dependencies
         run: |
           apt-get update -qq
-          apt-get install -y git curl ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
+          apt-get install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/cache@v4
         with:

@@ -292,15 +292,20 @@
   }
   function renderUpdates() {
     $('updates').replaceChildren();
-    for (const update of state.updates) {
+    const linux = state.updates.filter(update => /^linux(?:-|$)/.test(update.platform));
+    const downloads = state.updates.filter(update => !/^linux(?:-|$)/.test(update.platform));
+    if (linux.length) downloads.unshift({platform: 'linux', automatic: true,
+      uploadedAt: Math.max(...linux.map(update => update.uploadedAt || 0))});
+    for (const update of downloads) {
       const row = element('tr');
-      row.append(element('td', '', update.platform), element('td', 'mono', update.version),
-        element('td', 'mono', bytes(update.size)),
-        element('td', 'mono', String(update.sha256 || '').slice(0, 16) + '…'),
+      row.append(element('td', '', update.automatic ? 'Linux（自动识别架构）' : update.platform),
+        element('td', 'mono', update.automatic ? '按架构选择最新版' : update.version),
+        element('td', 'mono', update.automatic ? '按需下载' : bytes(update.size)),
+        element('td', 'mono', update.automatic ? '安装时校验 SHA-256' : String(update.sha256 || '').slice(0, 16) + '…'),
         element('td', 'mono', update.uploadedAt
           ? new Date(update.uploadedAt * 1000).toLocaleString('zh-CN', {hour12: false}) : '—'));
       const cell = element('td', '');
-      const button = element('button', 'button', update.platform.startsWith('linux') ? '下载安装脚本' : '下载安装包');
+      const button = element('button', 'button', update.automatic ? '下载 Linux 通用安装脚本' : '下载安装包');
       button.type = 'button';
       button.addEventListener('click', () => downloadInstaller(update, button));
       cell.append(button);
@@ -314,7 +319,8 @@
     const token = state.token;
     button.disabled = true;
     try {
-      const params = new URLSearchParams({platform: update.platform, version: update.version});
+      const params = new URLSearchParams({platform: update.platform});
+      if (!update.automatic) params.set('version', update.version);
       const response = await fetch('/api/v1/update/install?' + params, {
         headers: {Authorization: 'Bearer ' + token}, cache: 'no-store',
         credentials: 'omit', referrerPolicy: 'no-referrer'});
@@ -333,7 +339,7 @@
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       if (update.platform === 'android') text('update-message', '安装 APK 后，在客户端安装 Token 对话框中点「安卓接入」。');
-      else if (update.platform.startsWith('linux')) text('update-message', '执行 sh ' + filename[1] + '（也可用 bash）。脚本会保留节点身份与配置，替换旧服务，安装到 /usr/local/fastp2p 并设置开机启动。请勿修改文件名中的 Token。');
+      else if (update.platform.startsWith('linux')) text('update-message', '执行 sh ' + filename[1] + '（也可用 bash）。脚本自动识别 CPU，从本网关下载对应程序，保留节点身份与配置，安装到 /usr/local/fastp2p 并设置开机启动。需要 curl 或 GNU wget，请勿修改文件名中的 Token。');
     } catch (error) {
       $('update-message').classList.add('error');
       text('update-message', error.message);
