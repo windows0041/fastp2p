@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 project(fastp2p_c VERSION 2.0.5 LANGUAGES C)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/fastp2p.h" FASTP2P_HEADER_VERSION
+     REGEX "^#define FASTP2P_VERSION ")
+if(NOT FASTP2P_HEADER_VERSION STREQUAL "#define FASTP2P_VERSION \"${PROJECT_VERSION}\"")
+  message(FATAL_ERROR "CMake and include/fastp2p.h must declare the same client version")
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)

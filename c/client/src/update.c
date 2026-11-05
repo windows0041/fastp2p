@@ -379,7 +379,7 @@ void fp_update_cleanup(void) {
         const wchar_t *name=entry.cFileName,*digits=name+16;wchar_t *end;
         if(wcsncmp(name,L".fastp2p-update-",16) || *digits<L'0' || *digits>L'9')continue;
         errno=0;unsigned long pid=wcstoul(digits,&end,10);
-        if(errno || !pid || (wcscmp(end,L".exe") && wcscmp(end,L".exe.old")))continue;
+        if(errno || !pid || (wcscmp(end,L".exe") && wcscmp(end,L".exe.old") && wcscmp(end,L".exe.new")))continue;
         HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,(DWORD)pid);
         if(process){DWORD state=WaitForSingleObject(process,0);CloseHandle(process);if(state!=WAIT_OBJECT_0)continue;}
         else if(GetLastError()!=ERROR_INVALID_PARAMETER)continue; /* access denied means possibly active */

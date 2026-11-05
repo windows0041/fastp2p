@@ -57,11 +57,12 @@ int main(int argc,char **argv) {
     assert(DeleteFileW(target));
     /* The cleanup runs from a copied test binary in its own temporary folder,
      * never the build directory or the user's actual client installation. */
-    wchar_t root[MAX_PATH],image[4096],self[4096],old[MAX_PATH],active[MAX_PATH],locked[MAX_PATH],keep[MAX_PATH],folder[MAX_PATH];
+    wchar_t root[MAX_PATH],image[4096],self[4096],old[MAX_PATH],active[MAX_PATH],locked[MAX_PATH],keep[MAX_PATH],folder[MAX_PATH],partial[MAX_PATH];
     assert(GetTempFileNameW(directory,L"fpC",0,root) && DeleteFileW(root) && CreateDirectoryW(root,NULL));
     assert(GetModuleFileNameW(NULL,self,4096));
     swprintf(image,4096,L"%ls\\cleanup-test.exe",root);assert(CopyFileW(self,image,TRUE));
     swprintf(old,MAX_PATH,L"%ls\\.fastp2p-update-2147483647.exe.old",root);fixture(old);
+    swprintf(partial,MAX_PATH,L"%ls\\.fastp2p-update-2147483647.exe.new",root);fixture(partial);
     swprintf(active,MAX_PATH,L"%ls\\.fastp2p-update-%lu.exe",root,(unsigned long)GetCurrentProcessId());fixture(active);
     swprintf(locked,MAX_PATH,L"%ls\\.fastp2p-update-2147483643.exe",root);fixture(locked);
     swprintf(keep,MAX_PATH,L"%ls\\.fastp2p-update-2147483647.exe.keep",root);fixture(keep);
@@ -70,6 +71,7 @@ int main(int argc,char **argv) {
     HANDLE held=CreateFileW(locked,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);assert(held!=INVALID_HANDLE_VALUE);
     cleanup_child(image);
     assert(GetFileAttributesW(old)==INVALID_FILE_ATTRIBUTES);
+    assert(GetFileAttributesW(partial)==INVALID_FILE_ATTRIBUTES);
     assert(GetFileAttributesW(active)!=INVALID_FILE_ATTRIBUTES && GetFileAttributesW(locked)!=INVALID_FILE_ATTRIBUTES);
     assert(GetFileAttributesW(keep)!=INVALID_FILE_ATTRIBUTES && GetFileAttributesW(folder)!=INVALID_FILE_ATTRIBUTES &&
            (GetFileAttributesW(folder)&FILE_ATTRIBUTE_DIRECTORY));

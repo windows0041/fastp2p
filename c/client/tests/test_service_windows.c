@@ -10,6 +10,7 @@ int fastp2p_service_profile(char path[4096]) { (void)path; return -1; } /* purge
 int fastp2p_private_parents(const char *path) {
     WCHAR wide[4096];
     if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, 4096)) return -1;
+    for(WCHAR *p=wide;*p;p++)if(*p==L'/')*p=L'\\';
     WCHAR *slash = wcsrchr(wide, L'/'), *backslash = wcsrchr(wide, L'\\');
     if (backslash && (!slash || backslash > slash)) slash = backslash;
     if (!slash) return -1;
