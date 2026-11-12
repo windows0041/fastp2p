@@ -83,7 +83,10 @@ int main(int argc, char **argv) {
         assert(CreateHardLinkA(legacy,installed,NULL));
         assert(!fastp2p_service_cleanup_previous() && GetFileAttributesA(legacy)!=INVALID_FILE_ATTRIBUTES);
         SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT); assert(scm);
-        SC_HANDLE held = OpenServiceW(scm, L"fastp2p-installer-ci", SERVICE_QUERY_STATUS); assert(held);
+        SC_HANDLE held = OpenServiceW(scm, L"fastp2p-installer-ci", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG); assert(held);
+        SERVICE_FAILURE_ACTIONS_FLAG recovery = {0}; DWORD used = 0;
+        assert(QueryServiceConfig2W(held, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, (BYTE *)&recovery, sizeof(recovery), &used));
+        assert(recovery.fFailureActionsOnNonCrashFailures);
         assert(!fastp2p_service_remove());
         remove_released_image(legacy);
         HANDLE thread = CreateThread(NULL, 0, close_service_later, held, 0, NULL); assert(thread);

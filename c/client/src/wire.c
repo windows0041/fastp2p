@@ -43,9 +43,7 @@ uint64_t op_node_id(const char *s) {
 size_t op_buffer_size(const op_buffer *b) {
     return b->len - b->offset;
 }
-int op_buffer_add(op_buffer *b, const void *data, size_t len, size_t limit) {
-    if (len && !data)
-        return -1;
+static int buffer_reserve(op_buffer *b, size_t len, size_t limit) {
     size_t old = op_buffer_size(b);
     if (old > limit || len > limit - old)
         return -1;
@@ -60,12 +58,19 @@ int op_buffer_add(op_buffer *b, const void *data, size_t len, size_t limit) {
             cap = 4096;
         if (cap < limit / 2)
             cap *= 2;
+        if (cap > limit)
+            cap = limit;
         uint8_t *p = realloc(b->data, cap);
         if (!p)
             return -1;
         b->data = p;
         b->capacity = cap;
     }
+    return 0;
+}
+int op_buffer_add(op_buffer *b, const void *data, size_t len, size_t limit) {
+    if ((len && !data) || buffer_reserve(b, len, limit))
+        return -1;
     if (len)
         memcpy(b->data + b->len, data, len);
     b->len += len;
@@ -86,17 +91,31 @@ int op_frame_add(op_buffer *b, uint16_t main, uint16_t sub, const void *data, si
         return -1;
     if (len && !data)
         return -1;
-    uint8_t *frame = malloc(8 + len);
-    if (!frame)
+    /* Normal callers encode straight into the queue. Preserve the old ability
+     * to frame bytes from this same allocation, even if reserve compacts or
+     * reallocates it. Only that uncommon aliasing case needs a temporary copy. */
+    uint8_t *alias = NULL;
+    if (len && b->data && (uintptr_t)data >= (uintptr_t)b->data &&
+        (uintptr_t)data - (uintptr_t)b->data < b->capacity) {
+        size_t offset = (size_t)((uintptr_t)data - (uintptr_t)b->data);
+        if (len > b->capacity - offset || !(alias = malloc(len)))
+            return -1;
+        memcpy(alias, data, len);
+        data = alias;
+    }
+    if (buffer_reserve(b, 8 + len, OP_QUEUE_LIMIT)) {
+        free(alias);
         return -1;
+    }
+    uint8_t *frame = b->data + b->len;
     op_put32(frame, (uint32_t)len);
     op_put16(frame + 4, main);
     op_put16(frame + 6, sub);
     if (len)
         memcpy(frame + 8, data, len);
-    int rv = op_buffer_add(b, frame, 8 + len, OP_QUEUE_LIMIT);
-    free(frame);
-    return rv;
+    b->len += 8 + len;
+    free(alias);
+    return 0;
 }
 int op_frame_take(op_buffer *b, uint16_t *main, uint16_t *sub, uint8_t **body, size_t *len) {
     size_t n = op_buffer_size(b);

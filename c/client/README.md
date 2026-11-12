@@ -2,6 +2,8 @@
 
 C11 核心提供 WSS 协调、QUIC、TCP 打洞、中继回退、TCP/UDP 转发和 SOCKS5。隧道帧用 AES-256-GCM 保护：发起端生成 256 位会话密钥并经网关的 TLS 通道送达对端，两个方向各自派生密钥，接收端维护重放窗口。公开接口位于 `include/fastp2p.h`，符号前缀 `fastp2p_`，ABI 1。调用者独占客户端对象并驱动 `fastp2p_client_step`；回调属于驱动线程，销毁前停止调用。
 
+QUIC 接收采用有界环形缓冲，帧编码复用发送队列。[缓冲优化基准与验证](docs/performance-20261112.md) 包含可选基准的构建方法和适用范围。
+
 ## 安装与运行
 
 ```sh
@@ -38,6 +40,8 @@ sudo journalctl -u fastp2p-client -n 50 --no-pager
 Alpine/OpenRC 用 `rc-service fastp2p status`，OpenWrt 用 `/etc/init.d/fastp2p status`。安装完成后程序在后台运行，不需要保持安装终端在线。
 
 Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p/config/fastp2p.conf`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%/fastp2p/config/fastp2p.conf`，使用当前用户 DPAPI。旧 `client.dat` 会迁移，备份保存在新配置目录。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
+
+Windows 开机服务和 `run --background` 不创建终端窗口；后台日志写入配置文件同目录的 `fastp2p.conf.log`。手动从终端运行前台命令时连接现有终端，管道和文件重定向继续可用。只有双击安装并完成 UAC 授权后，才创建安装进度终端和结果提示。服务崩溃或启动时 DNS/网络暂不可用导致退出时，Windows 服务管理器会按恢复策略重启客户端。
 
 高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则保存在网关数据库，节点重连后恢复。
 

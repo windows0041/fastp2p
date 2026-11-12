@@ -261,6 +261,10 @@ int fastp2p_service_install(const char *profile, const char *ca) {
     failure.cActions = 3;
     failure.lpsaActions = actions;
     ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+    /* Boot-time DNS/network failures return a service-specific error through
+     * report(STOPPED). They need the same recovery as a crashed process. */
+    SERVICE_FAILURE_ACTIONS_FLAG failure_flag = {TRUE};
+    ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag);
     int started = StartServiceW(service, 0, NULL) != 0 || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
     /* SCM accepts StartService before the client has actually initialized. */
     int stable=0;

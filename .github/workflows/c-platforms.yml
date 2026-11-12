@@ -175,6 +175,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & build/windows/fastp2p.exe --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python c/client/tests/windows_startup.py --client build/windows/fastp2p.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-api.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python c/client/tests/identity_cli.py --client build/windows/fastp2p.exe
@@ -182,6 +184,8 @@ jobs:
           & build/windows/test-platform.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-update-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-quic-buffer.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-service-windows.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -308,6 +308,7 @@ static int client_loop(int argc,char **argv) {
 }
 
 int main(int argc, char **argv) {
+    fastp2p_console_prepare(argc, argv);
 #if !defined(_WIN32)
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "--no-service"))) {
         char token[17];

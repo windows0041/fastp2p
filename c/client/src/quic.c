@@ -35,7 +35,7 @@ struct opq {
     op_socklen local_len, peer_len;
     struct qchunk *head, *tail;
     uint64_t next_offset;
-    size_t pending, rxlen, rxcap;
+    size_t pending, rxlen, rxcap, rxoff;
     uint8_t *rx;
     uint8_t blocked_packet[1500];
     size_t blocked_len;
@@ -83,16 +83,39 @@ static int receive_stream(ngtcp2_conn *conn, uint32_t flags, int64_t sid, uint64
     if (sid != 0 || (flags & NGTCP2_STREAM_DATA_FLAG_0RTT) || len > QLIMIT - q->rxlen)
         return NGTCP2_ERR_CALLBACK_FAILURE;
     q->stream = sid;
+    if (!len)
+        return 0;
     if (q->rxlen + len > q->rxcap) {
-        size_t cap = q->rxlen + len;
-        uint8_t *p = realloc(q->rx, cap);
+        size_t cap = q->rxcap ? q->rxcap : 4096;
+        while (cap < q->rxlen + len)
+            cap = cap > QLIMIT / 2 ? QLIMIT : cap * 2;
+        uint8_t *p;
+        if (!q->rxoff) {
+            p = realloc(q->rx, cap);
+        } else {
+            /* A wrapped ring must be linearized only when it grows. Ordinary
+             * reads/appends never move already queued bytes. */
+            p = malloc(cap);
+            if (p) {
+                size_t first = q->rxcap - q->rxoff;
+                if (first > q->rxlen) first = q->rxlen;
+                memcpy(p, q->rx + q->rxoff, first);
+                if (q->rxlen > first) memcpy(p + first, q->rx, q->rxlen - first);
+                free(q->rx);
+            }
+        }
         if (!p)
             return NGTCP2_ERR_CALLBACK_FAILURE;
         q->rx = p;
         q->rxcap = cap;
+        q->rxoff = 0;
     }
-    if (len)
-        memcpy(q->rx + q->rxlen, data, len);
+    size_t tail = q->rxoff + q->rxlen;
+    if (tail >= q->rxcap) tail -= q->rxcap;
+    size_t first = q->rxcap - tail;
+    if (first > len) first = len;
+    memcpy(q->rx + tail, data, first);
+    if (len > first) memcpy(q->rx, data + first, len - first);
     q->rxlen += len;
     /* Flow-control credit is returned from opq_read once the tunnel has taken
      * the bytes, so a slow consumer backpressures the peer instead of tripping
@@ -430,9 +453,15 @@ int opq_write(opq *q, const void *data, size_t len) {
 size_t opq_read(opq *q, void *data, size_t cap) {
     size_t n = q->rxlen < cap ? q->rxlen : cap;
     if (n) {
-        memcpy(data, q->rx, n);
-        memmove(q->rx, q->rx + n, q->rxlen - n);
+        size_t first = q->rxcap - q->rxoff;
+        if (first > n) first = n;
+        memcpy(data, q->rx + q->rxoff, first);
+        if (n > first) memcpy((uint8_t *)data + first, q->rx, n - first);
         q->rxlen -= n;
+        if (q->rxlen) {
+            q->rxoff += n;
+            if (q->rxoff >= q->rxcap) q->rxoff -= q->rxcap;
+        } else q->rxoff = 0;
         if (q->conn && q->stream >= 0) {
             ngtcp2_conn_extend_max_stream_offset(q->conn, q->stream, n);
             ngtcp2_conn_extend_max_offset(q->conn, n);

@@ -34,8 +34,6 @@ int fastp2p_runtime_begin(const char *profile, int background) {
     /* A service STOP may arrive before this event exists. Keep the in-process
      * request; configuration reloads must not clear a real SCM shutdown either. */
     if (background) {
-        DWORD owners[2];
-        if (GetConsoleProcessList(owners, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE);
         char log[4096];
         if (snprintf(log, sizeof(log), "%s.log", profile) >= (int)sizeof(log)) return -1;
         WCHAR path[4096]; if (wide(log, path)) return -1;

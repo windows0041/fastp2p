@@ -15,6 +15,9 @@ int fastp2p_profile_relocate(const char *source,const char *destination);
 /* The double-clicked installer: takes the key from the file name. */
 int fastp2p_service_install_token(const char *token);
 void fastp2p_install_note(const char *text);
+/* Attach foreground CLI commands to their shell without creating a console.
+ * Service/background/update-helper invocations stay detached. */
+void fastp2p_console_prepare(int argc, char **argv);
 /* Double-clicked installer UI: a progress terminal plus a result dialog. */
 void fastp2p_installer_ui_begin(void);
 void fastp2p_install_step(const char *text);

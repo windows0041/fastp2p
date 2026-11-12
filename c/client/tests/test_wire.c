@@ -30,6 +30,34 @@ int main(void) {
     size_t len;
     assert(op_frame_take(&rx, &main, &sub, &body, &len) == -1);
     op_buffer_clear(&rx);
+    /* Direct encoding preserves aliasing across both growth and compaction. */
+    uint8_t seed_bytes[8192];
+    for(size_t i=0;i<sizeof(seed_bytes);i++)seed_bytes[i]=(uint8_t)(i^(i>>8));
+    assert(!op_buffer_add(&rx,seed_bytes,4096,OP_QUEUE_LIMIT));
+    assert(!op_frame_add(&rx,4,9,rx.data,4096));
+    op_buffer_consume(&rx,4096);
+    assert(op_frame_take(&rx,&main,&sub,&body,&len)==1 && len==4096 && !memcmp(body,seed_bytes,len));
+    free(body);op_buffer_clear(&rx);
+    assert(!op_buffer_add(&rx,seed_bytes,sizeof(seed_bytes),sizeof(seed_bytes)));
+    op_buffer_consume(&rx,4096);
+    assert(!op_frame_add(&rx,4,9,rx.data,4096));
+    assert(!memcmp(rx.data+rx.offset,seed_bytes+4096,4096));
+    op_buffer_consume(&rx,4096);
+    assert(op_frame_take(&rx,&main,&sub,&body,&len)==1 && len==4096 && !memcmp(body,seed_bytes,len));
+    free(body);op_buffer_clear(&rx);
+    assert(!op_frame_add(&rx,4,9,NULL,0));
+    size_t queued=op_buffer_size(&rx);
+    assert(op_frame_add(&rx,4,9,NULL,1)==-1 && op_buffer_size(&rx)==queued);
+    assert(op_frame_add(&rx,4,9,seed_bytes,SIZE_MAX)==-1 && op_buffer_size(&rx)==queued);
+    assert(op_frame_take(&rx,&main,&sub,&body,&len)==1 && !len);free(body);
+    /* Refuse a whole frame atomically when the queue has room for only its header. */
+    uint8_t *full=calloc(1,OP_QUEUE_LIMIT);assert(full);
+    assert(!op_buffer_add(&rx,full,OP_QUEUE_LIMIT-8,OP_QUEUE_LIMIT));
+    assert(op_frame_add(&rx,4,9,seed_bytes,1)==-1 && op_buffer_size(&rx)==OP_QUEUE_LIMIT-8);
+    assert(!op_frame_add(&rx,4,9,NULL,0) && op_buffer_size(&rx)==OP_QUEUE_LIMIT);
+    free(full);op_buffer_clear(&rx);
+    assert(!op_buffer_add(&rx,seed_bytes,8,8) && rx.capacity<=8);
+    op_buffer_clear(&rx);
     /* More than one frame per read, and a partial following header. */
     assert(!op_buffer_add(&rx, expected, sizeof(expected), OP_FRAME_LIMIT + 8));
     assert(!op_buffer_add(&rx, expected, sizeof(expected), OP_FRAME_LIMIT + 8));
