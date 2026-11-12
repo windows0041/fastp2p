@@ -12,7 +12,9 @@ static void tcp_retry(void) {
     int ti=new_tunnel(c,"retry-target",100,FASTP2P_TRANSPORT_TCP,0);assert(ti>=0);
     tunnel *t=&c->tunnels[ti];strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");
     t->local_port=local;t->remote_port=remote;t->tcp_v2=1;t->server=1;
-    start_underlay(c,ti);uint64_t until=mono()+3*NS;int listening=0;
+    /* BSD may leave the first connect pending until the production 3-second
+     * attempt deadline instead of reporting an immediate loopback refusal. */
+    start_underlay(c,ti);uint64_t until=mono()+12*NS;int listening=0;
     while(t->state==T_TCP_CONNECT && mono()<until){
         if(t->tcp_attempts>=2 && !listening){assert(!op_listen(endpoint,4));listening=1;}
         tick_tunnel(c,ti,mono());op_sleep_ms(2);
@@ -26,7 +28,7 @@ static void tcp_retry(void) {
     endpoint=bound_port(&remote);reserve=bound_port(&local);op_close(reserve);
     ti=new_tunnel(c,"fallback-peer",101,FASTP2P_TRANSPORT_TCP,1);assert(ti>=0);t=&c->tunnels[ti];
     strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");t->local_port=local;t->remote_port=remote;t->tcp_v2=1;
-    start_underlay(c,ti);until=mono()+3*NS;
+    start_underlay(c,ti);until=mono()+6*NS;
     while(t->state==T_TCP_CONNECT && t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
     assert(t->state==T_TCP_CONNECT && t->listen_fd>=0 && t->fd<0 && t->tcp_attempts==1 && t->session_owner);
     assert(!t->tcp_retry_at && !tunnel_ready(t));close_tunnel(c,ti,NULL);op_close(endpoint);free(c);
