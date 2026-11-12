@@ -5,7 +5,30 @@
 #include <string.h>
 #include <unistd.h>
 
+static void migrate_nat(void) {
+    char path[]="/tmp/fastp2p-store-v4-XXXXXX";int fd=mkstemp(path);assert(fd>=0);close(fd);
+    sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+    assert(!sqlite3_exec(db,"CREATE TABLE nodes(name TEXT PRIMARY KEY,node_id TEXT UNIQUE,device_id TEXT,"
+        "hostname TEXT DEFAULT '',ip TEXT DEFAULT '',ipv6 TEXT DEFAULT '',lanip TEXT DEFAULT '',mac TEXT DEFAULT '',"
+        "os TEXT DEFAULT '',version TEXT DEFAULT '',nat INTEGER DEFAULT 314,bandwidth INTEGER DEFAULT 0,"
+        "first_seen INTEGER,last_seen INTEGER,last_offline INTEGER DEFAULT 0,online INTEGER DEFAULT 0);"
+        "INSERT INTO nodes(name,node_id,nat,first_seen,last_seen,online) VALUES('existing-node','123',2,1,2,1);"
+        "PRAGMA application_id=1179660880; PRAGMA user_version=4;",NULL,NULL,NULL));
+    sqlite3_close(db);assert(!gw_store_open(&db,path));
+    json_object *list=gw_store_list(db,"existing-node",10,0);assert(list);
+    json_object *node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);
+    assert(gw_integer(node,"udpNatType")==2 && gw_integer(node,"tcpNatType")==314 && !gw_integer(node,"isActive"));
+    json_object_put(list);
+    struct connection connection={.nat=2,.tcp_nat=1,.tcp_nat_samples=4,.tcp_nat_ips=3};
+    strcpy(connection.node,"existing-node");assert(!gw_store_save(db,&connection,1));sqlite3_close(db);
+    assert(!gw_store_open(&db,path));list=gw_store_list(db,"existing-node",10,0);assert(list);
+    node=json_object_array_get_idx(gw_get(list,"nodes"),0);assert(node);
+    assert(gw_integer(node,"udpNatType")==2 && gw_integer(node,"tcpNatType")==1 &&
+           gw_integer(node,"tcpNatSamples")==4 && gw_integer(node,"tcpNatDestinationIPs")==3);
+    json_object_put(list);sqlite3_close(db);unlink(path);
+}
 int main(void) {
+    migrate_nat();
     char path[] = "/tmp/fastp2p-store-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0); close(fd);

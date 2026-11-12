@@ -251,6 +251,13 @@ int op_getsockopt(op_socket fd, int level, int option, void *value, op_socklen *
     return getsockopt((int)fd, level, option, value, length);
 #endif
 }
+int op_shutdown_write(op_socket fd) {
+#ifdef _WIN32
+    return shutdown((SOCKET)fd, SD_SEND) ? socket_error() : 0;
+#else
+    return shutdown((int)fd, SHUT_WR);
+#endif
+}
 int op_reuse_socket(op_socket fd) {
     int one = 1;
     if (op_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)))

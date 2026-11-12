@@ -3,7 +3,47 @@
 #include "../src/client.c"
 #include <assert.h>
 
+static op_socket bound_port(uint16_t *port) {
+    op_socket fd=socket_bound(0,"127.0.0.1",0,1);assert(fd>=0);*port=socket_port(fd);assert(*port);return fd;
+}
+static void tcp_retry(void) {
+    fastp2p_client *c=calloc(1,sizeof(*c));assert(c);strcpy(c->local_ip,"127.0.0.1");
+    uint16_t remote,local;op_socket endpoint=bound_port(&remote),reserve=bound_port(&local);op_close(reserve);
+    int ti=new_tunnel(c,"retry-target",100,FASTP2P_TRANSPORT_TCP,0);assert(ti>=0);
+    tunnel *t=&c->tunnels[ti];strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");
+    t->local_port=local;t->remote_port=remote;t->tcp_v2=1;t->server=1;
+    start_underlay(c,ti);uint64_t until=mono()+3*NS;int listening=0;
+    while(t->state==T_TCP_CONNECT && mono()<until){
+        if(t->tcp_attempts>=2 && !listening){assert(!op_listen(endpoint,4));listening=1;}
+        tick_tunnel(c,ti,mono());op_sleep_ms(2);
+    }
+    assert(listening && t->state==T_HANDSHAKE && t->tcp_attempts>=2 && t->tcp_attempts<=5 && t->server==1);
+    struct sockaddr_in peer;op_socklen length=sizeof(peer);op_socket accepted=op_accept(endpoint,(struct sockaddr *)&peer,&length);
+    assert(accepted>=0 && ntohs(peer.sin_port)==local);
+    /* Transport establishment does not bypass session authentication. */
+    assert(!tunnel_ready(t));op_close(accepted);close_tunnel(c,ti,NULL);op_close(endpoint);
+
+    endpoint=bound_port(&remote);reserve=bound_port(&local);op_close(reserve);
+    ti=new_tunnel(c,"fallback-peer",101,FASTP2P_TRANSPORT_TCP,1);assert(ti>=0);t=&c->tunnels[ti];
+    strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");t->local_port=local;t->remote_port=remote;t->tcp_v2=1;
+    start_underlay(c,ti);until=mono()+3*NS;
+    while(t->state==T_TCP_CONNECT && t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
+    assert(t->state==T_TCP_CONNECT && t->listen_fd>=0 && t->fd<0 && t->tcp_attempts==1 && t->session_owner);
+    assert(!t->tcp_retry_at && !tunnel_ready(t));close_tunnel(c,ti,NULL);op_close(endpoint);free(c);
+}
 int main(void) {
+    assert(!op_platform_init());tcp_retry();
+    /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
+    fastp2p_client client={0};client.nat_type=NAT_HARD_SYM;client.tcp_nat.type=FP_NAT_STABLE;
+    app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
+    assert(local_transport_nat(&client,rule.transport)==FP_NAT_STABLE);
+    assert(peer_transport_nat(&rule)==FP_NAT_STABLE);
+    assert(direct_rounds_allowed(nat_is_hard_sym(local_transport_nat(&client,rule.transport)),
+                                nat_is_hard_sym(peer_transport_nat(&rule)))==2);
+    client.tcp_nat.type=FP_NAT_UNKNOWN;rule.peer_tcp_nat=FP_NAT_UNKNOWN;
+    assert(!nat_is_hard_sym(local_transport_nat(&client,rule.transport)) && !nat_is_hard_sym(peer_transport_nat(&rule)));
+    rule.transport=FASTP2P_TRANSPORT_QUIC;
+    assert(local_transport_nat(&client,rule.transport)==NAT_HARD_SYM && peer_transport_nat(&rule)==NAT_HARD_SYM);
     /* Dense start: the first half second decides a cone-to-cone punch. */
     assert(punch_interval(0) == 50 * MS);
     assert(punch_interval(499 * MS) == 50 * MS);

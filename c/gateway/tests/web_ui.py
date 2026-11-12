@@ -42,7 +42,8 @@ class Peer:
         head,self.buffer=self.buffer.split(b'\r\n\r\n',1);assert b' 101 ' in head
         self.buffer=bytearray(self.buffer)
         self.sock.settimeout(None)
-        self.send(frame(6,0,{'os':system,'version':'2.0.0','lanIP':'192.0.2.8','hasIPv4':1}))
+        self.send(frame(6,0,{'os':system,'version':'2.0.0','lanIP':'192.0.2.8','hasIPv4':1,
+            'udpNatType':2,'tcpNatType':1,'tcpNatSamples':4,'tcpNatDestinationIPs':3}))
         self.reader=threading.Thread(target=self.read_loop,daemon=True);self.reader.start()
         self.heartbeat=threading.Thread(target=self.heartbeat_loop,daemon=True);self.heartbeat.start()
     def exact(self,n):
@@ -163,6 +164,11 @@ def main():
                 expect(page.locator('#online-count')).to_have_text('2',timeout=15000)
                 expect(page.locator('#login-screen')).to_be_hidden()
                 results['reload_keeps_the_console_session']=True
+                nat_row=page.locator('#nodes tr').filter(has_text='web-rich-node')
+                expect(nat_row.get_by_text('UDP：目标相关',exact=True)).to_be_visible()
+                expect(nat_row.get_by_text('TCP：映射稳定',exact=True)).to_be_visible()
+                assert '未检测入站过滤' in nat_row.locator('td').nth(3).get_attribute('title')
+                results['separate_udp_tcp_mapping_labels_and_filtering_caveat']=True
                 page.locator('#token-button').click();expect(page.locator('#install-token')).to_have_value(__import__('re').compile(r'^[1-9][0-9]{15}$'))
                 assert page.locator('#install-token').get_attribute('type')=='password'
                 page.locator('#reveal-token').click();assert page.locator('#install-token').get_attribute('type')=='text'

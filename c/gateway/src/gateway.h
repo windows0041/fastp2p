@@ -39,6 +39,7 @@ struct connection {
     uint64_t last_seen_wall, next_store;
     char hostname[256];
     unsigned nat, bandwidth, has_ipv4, has_upnp, public_port, major;
+    unsigned tcp_nat, tcp_nat_samples, tcp_nat_ips;
     struct packet *head, *tail;
     size_t queued, count;
     unsigned char *rx;

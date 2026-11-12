@@ -146,6 +146,20 @@ static unsigned major_version(const char *text) {
 static void copy_field(char *out, size_t size, json_object *j, const char *name) {
     snprintf(out, size, "%s", gw_string(j, name));
 }
+static int nat_fields(struct connection *c, json_object *j) {
+    const char *keys[] = {"udpNatType", "tcpNatType", "tcpNatSamples", "tcpNatDestinationIPs"};
+    unsigned *values[] = {&c->nat, &c->tcp_nat, &c->tcp_nat_samples, &c->tcp_nat_ips};
+    for (unsigned i = 0; i < 4; ++i) {
+        json_object *v = gw_get(j, keys[i]);
+        if (!v) continue;
+        if (!json_object_is_type(v, json_type_int) || json_object_get_int64(v) < 0) return -1;
+        uint64_t n = json_object_get_uint64(v);
+        if ((i == 0 && n != 1 && n != 2 && n != 3 && n != 4 && n != 314) ||
+            (i == 1 && n != 1 && n != 2 && n != 314) || (i >= 2 && n > 6)) return -1;
+        *values[i] = (unsigned)n;
+    }
+    return c->tcp_nat_ips > c->tcp_nat_samples ? -1 : 0;
+}
 static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const unsigned char *data,
                     size_t len) {
     if (main == 1) {
@@ -204,7 +218,12 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             json_object_put(j);
             return -1;
         }
+    } else if (main == 6 && sub == 9) {
+        if (nat_fields(c, j) || gw_store_save(g.db, c, 1)) {
+            json_object_put(j); return -1;
+        }
     } else if (main == 6 && sub == 0) {
+        if (nat_fields(c, j)) { json_object_put(j); return -1; }
         copy_field(c->os, sizeof(c->os), j, "os");
         copy_field(c->mac, sizeof(c->mac), j, "mac");
         copy_field(c->lan, sizeof(c->lan), j, "lanIP");
@@ -282,6 +301,8 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             gw_js(response, "IPv4", target->ip);
             gw_js(response, "lanIP", target->lan);
             gw_ju(response, "natType", target->nat);
+            gw_ju(response, "udpNatType", target->nat);
+            gw_ju(response, "tcpNatType", target->tcp_nat);
             gw_ju(response, "hasIPv4", target->has_ipv4);
             gw_ju(response, "hasUPNPorNATPMP", target->has_upnp);
             gw_js(response, "IPv6", target->ipv6);
@@ -295,6 +316,7 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
          * recently, so no single node carries every relayed session. */
         const char *name = gw_string(j, "peerNode");
         struct connection *peer = gw_node_valid(name) ? find_node(gw_node_id(name)) : NULL;
+        int tcp_relay = !strcmp(gw_string(j, "underlayProtocol"), "tcp");
         json_object *exclude = gw_get(j, "exclude");
         struct connection *relay = NULL;
         /* Rank candidates by how likely they are to be reachable: a node on a
@@ -322,7 +344,8 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
             /* nat 1 is endpoint-independent; 2, 3 and 4 are symmetric in
              * different flavours and cannot accept an unsolicited peer.
              * Unknown (314) stays eligible: it usually means probing failed. */
-            if (n->nat == 2 || n->nat == 3 || n->nat == 4) {
+            unsigned candidate_nat = tcp_relay ? n->tcp_nat : n->nat;
+            if (candidate_nat == 2 || candidate_nat == 3 || candidate_nat == 4) {
                 ++skip_nat;
                 continue;
             }
@@ -348,8 +371,8 @@ static int dispatch(struct connection *c, uint16_t main, uint16_t sub, const uns
                 relay = n;
             else {
                 unsigned rank = RELAY_RANK(n), best = RELAY_RANK(relay);
-                unsigned quality = n->nat == 1 ? 1u : 0u;
-                unsigned best_quality = relay->nat == 1 ? 1u : 0u;
+                unsigned quality = (tcp_relay ? n->tcp_nat : n->nat) == 1 ? 1u : 0u;
+                unsigned best_quality = (tcp_relay ? relay->tcp_nat : relay->nat) == 1 ? 1u : 0u;
                 if (rank != best)
                     relay = rank > best ? n : relay;
                 else if (quality != best_quality)
@@ -537,6 +560,10 @@ static json_object *devices(void) {
         gw_js(j, "ipv6", n->ipv6);
         snprintf(number, sizeof(number), "%u", n->nat);
         gw_js(j, "natType", number);
+        gw_ju(j, "udpNatType", n->nat);
+        gw_ju(j, "tcpNatType", n->tcp_nat);
+        gw_ju(j, "tcpNatSamples", n->tcp_nat_samples);
+        gw_ju(j, "tcpNatDestinationIPs", n->tcp_nat_ips);
         snprintf(number, sizeof(number), "%u", n->bandwidth);
         gw_js(j, "bandwidth", number);
         gw_js(j, "lanip", n->lan);
@@ -1730,6 +1757,8 @@ static int establish(struct lws *wsi, struct connection *c) {
     query(wsi, "ipv6=", c->ipv6, sizeof(c->ipv6));
     c->major = major_version(c->version);
     c->nat = query_integer(wsi, "nattype=", 314, 314);
+    c->tcp_nat = query_integer(wsi, "tcpnattype=", 314, 314);
+    if (c->tcp_nat != 1 && c->tcp_nat != 2) c->tcp_nat = 314;
     c->bandwidth = query_integer(wsi, "sharebandwidth=", 1000000, 0);
     c->slot = (int)slot;
     c->registered = 1;
@@ -1743,6 +1772,7 @@ static int establish(struct lws *wsi, struct connection *c) {
         return -1;
     }
     json_object *login = json_object_new_object();
+    gw_ju(login, "tcpProbeV2", 1);
     gw_js(login, "user", g.user);
     gw_js(login, "node", c->node);
     gw_js(login, "protocol", "fastp2p2");

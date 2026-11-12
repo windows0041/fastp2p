@@ -180,8 +180,8 @@ void gw_nat_step(struct nat_state *s) {
                 inet_ntop(AF_INET, &p->peer.sin_addr, ip, sizeof(ip));
                 p->offset = 0;
                 /* snprintf reports what it would have written; the buffer is the limit. */
-                int written = snprintf(p->output, sizeof(p->output), "%s:%u", ip,
-                                       ntohs(p->peer.sin_port));
+                int written = snprintf(p->output, sizeof(p->output), "%s:%u%s", ip,
+                                       ntohs(p->peer.sin_port), data[0] == '2' ? "\n" : "");
                 p->length = written > 0 && (size_t)written < sizeof(p->output) ? (size_t)written
                                                                              : sizeof(p->output) - 1;
                 p->deadline = now + 5000;

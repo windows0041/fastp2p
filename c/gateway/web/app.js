@@ -7,6 +7,7 @@
   /* The console keeps its session in sessionStorage: it survives a reload, but
    * it dies with the tab and is never shared with another tab. */
   const STORE = 'fastp2p.console';
+  const mapping = value => ({1: '映射稳定', 2: '目标相关', 3: '递增映射', 4: '递减映射'}[Number(value)] || '未知');
   function persist() {
     try {
       if (state.token)
@@ -90,7 +91,11 @@
       if (n.hostname) label.append(element('span', 'node-subtitle', '主机：' + n.hostname));
       info.append(label); cell.append(info); row.append(cell);
       for (const value of [n.ip || '—', n.lanip || '—']) row.append(element('td', 'mono', value));
-      row.append(element('td', '', 'NAT ' + (n.natType || '—')), element('td', 'mono', n.version || '—'));
+      const nat = element('td');
+      nat.append(element('span', '', 'UDP：' + mapping(n.udpNatType ?? n.natType)),
+        element('small', 'node-subtitle', 'TCP：' + mapping(n.tcpNatType)));
+      nat.title = `TCP：${Number(n.tcpNatSamples) || 0} 个样本，${Number(n.tcpNatDestinationIPs) || 0} 个目标 IP。仅检测映射，未检测入站过滤；映射稳定不等于任意来源可访问。`;
+      row.append(nat, element('td', 'mono', n.version || '—'));
       const active = Number(n.isActive) === 1;
       const status = element('td'); status.append(element('span', 'badge ' + (active ? 'online' : 'offline'), active ? '● 在线' : '○ 离线')); row.append(status);
       const action = element('td'), button = element('button', 'link-button', active ? '查看规则 →' : '查看记录 →');
@@ -469,7 +474,7 @@
     relay.firstChild.value = '';
     for (const n of state.nodes) {
       if (n.name === state.selected.name) continue;
-      const option = element('option', null, n.natType === 1 ? `${n.name}（NAT 1）` : `${n.name}（NAT ${n.natType ?? '?'}）`);
+      const option = element('option', null, `${n.name}（UDP：${mapping(n.udpNatType ?? n.natType)} / TCP：${mapping(n.tcpNatType)}）`);
       option.value = n.name; relay.append(option);
     }
     relay.value = app?.relayNode || '';

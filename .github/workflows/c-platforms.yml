@@ -187,6 +187,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-quic-buffer.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-tcp-nat.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-service-windows.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
@@ -243,7 +245,7 @@ jobs:
       - name: Native Debian 12 build dependencies
         run: |
           apt-get update -qq
-          apt-get install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
+          apt-get install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/cache@v4
         with:
@@ -257,6 +259,9 @@ jobs:
           ctest --test-dir build/c --output-on-failure
           cmake -S c/gateway -B build/c-gateway -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFASTP2P_SANITIZE=ON
           cmake --build build/c-gateway --parallel 3
+          ctest --test-dir build/c-gateway --output-on-failure
+      - name: TCP punching through two filtered NAT routers with UDP blocked
+        run: unshare --net python3 c/client/tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/c-gateway/fastp2p-gateway --logs build/c/tcp-nat3
       - name: C SOCKS5, QUIC and token enrollment
         run: |
           bash c/client/scripts/check-socks.sh
@@ -316,7 +321,14 @@ jobs:
         if: always()
         with:
           name: socks5-results-linux
-          path: build/socks-reports/
+          path: |
+            build/socks-reports/
+            build/c/tcp-nat3/result.json
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-tcp-nat3-linux
+          path: build/c/tcp-nat3/*.log
   musl:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

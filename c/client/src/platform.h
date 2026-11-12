@@ -77,6 +77,7 @@ void op_sleep_ms(unsigned milliseconds);
 op_socket op_socket_open(int family, int type, int protocol);
 op_socket op_accept(op_socket fd, struct sockaddr *address, op_socklen *length);
 int op_close(op_socket fd);
+int op_shutdown_write(op_socket fd);
 int op_bind(op_socket fd, const struct sockaddr *address, op_socklen length);
 int op_connect(op_socket fd, const struct sockaddr *address, op_socklen length);
 int op_listen(op_socket fd, int backlog);
