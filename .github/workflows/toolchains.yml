@@ -6,45 +6,78 @@ permissions:
 jobs:
   mirror:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
       - name: Copy the pinned archives into this repository
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           api=https://api.github.com/repos/${{ github.repository }}
           source=windows0041/oldfastp2p
           tag=musl-toolchains
-          release=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" "$api/releases/tags/$tag" || true)
+          auth="Authorization: Bearer $GITHUB_TOKEN"
+
+          release=$(curl -fsS -H "$auth" "$api/releases/tags/$tag" || true)
           if printf '%s' "$release" | grep -q '"id"'; then
             id=$(printf '%s' "$release" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+            echo "release $tag exists: $id"
           else
-            release=$(curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H 'Content-Type: application/json' \
+            release=$(curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
               -d "{\"tag_name\":\"$tag\",\"name\":\"musl toolchains\",\"body\":\"Pinned musl-cross toolchains for the static client builds.\",\"draft\":false,\"prerelease\":false}" \
               "$api/releases")
             id=$(printf '%s' "$release" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+            echo "release $tag created: $id"
           fi
-          # The releases/download/ URL of that release answers 404, so the assets are
-          # fetched through the API endpoint, which redirects to a signed URL.
-          curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$source/releases/tags/$tag" > source.json
-          python3 - <<'PY' > assets.tsv
+
+          # The asset list of the source release gives the ids to download by.
+          curl -fsS -H "$auth" "https://api.github.com/repos/$source/releases/tags/$tag" \
+            -o source.json
+          python3 - <<'PY' > wanted.txt
           import json
-          data = json.load(open('source.json'))
-          for asset in data.get('assets', []):
-              if asset['name'].endswith('cross.tar.gz'):
-                  print('%s\t%s' % (asset['url'], asset['name']))
+          wanted = ("x86_64-linux-musl-cross.tar.gz", "aarch64-linux-musl-cross.tar.gz",
+                    "arm-linux-musleabihf-cross.tar.gz", "mips64el-linux-musl-cross.tar.gz",
+                    "riscv64-linux-musl-cross.tar.gz")
+          data = json.load(open("source.json"))
+          for asset in data.get("assets", []):
+              if asset["name"] in wanted:
+                  print(asset["id"], asset["name"], asset["size"])
           PY
-          while IFS="$(printf '\t')" read -r url name; do
-            echo "--- $name"
-            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H 'Accept: application/octet-stream' -o "$name" "$url"
-            curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+
+          curl -fsS -H "$auth" "$api/releases/$id" -o current.json
+          python3 -c '
+          import json
+          data = json.load(open("current.json"))
+          for asset in data.get("assets", []):
+              print(asset["name"])
+          ' > have.txt
+
+          while read -r asset_id name size; do
+            if grep -qx "$name" have.txt; then
+              echo "skip $name (already here)"
+              continue
+            fi
+            echo "--- $name ($size bytes)"
+            curl -fsSL --retry 3 --retry-all-errors -H "$auth" \
+              -H 'Accept: application/octet-stream' -o "$name" \
+              "https://api.github.com/repos/$source/releases/assets/$asset_id"
+            got=$(stat -c%s "$name")
+            if [ "$got" != "$size" ]; then
+              echo "    truncated ($got != $size)"
+              continue
+            fi
+            curl -fsS --retry 3 --retry-all-errors -X POST -H "$auth" \
               -H 'Content-Type: application/octet-stream' --data-binary "@$name" \
               "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$name" \
-              > /dev/null && echo "    uploaded"
+              > /dev/null
+            echo "    uploaded"
             rm -f "$name"
-          done < assets.tsv
+          done < wanted.txt
+
+          curl -fsS -H "$auth" "$api/releases/$id" -o final.json
+          python3 -c '
+          import json
+          data = json.load(open("final.json"))
+          for asset in data.get("assets", []):
+              print("  ", asset["name"], asset["size"])
+          '
