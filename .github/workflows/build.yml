@@ -1,55 +1,349 @@
-name: client build
+name: fastp2p C clients
 on:
   push:
+    tags: ['fastp2p-client-v*']
     branches: ['**']
+    paths: ['**', 'c/common/**', 'scripts/tls/**', '.github/workflows/c-platforms.yml', 'scripts/publish-release.py', 'scripts/test-publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: c-clients-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-arm64
+          - runner: macos-15-intel
+            target: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
-      - name: Native dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
-            libcurl4-openssl-dev libssl-dev libjson-c-dev libwebsockets-dev \
-            libnghttp2-dev zlib1g-dev libev-dev python3
       - uses: actions/checkout@v5
-      - name: Configure and build
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        with:
+          path: ~/fastp2p-dev/cross
+          key: c-deps-${{ matrix.target }}-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+          restore-keys: c-deps-${{ matrix.target }}-
+      - name: Build pinned dependencies
+        run: python3 scripts/build-deps.py ${{ matrix.target }}
+      - uses: actions/cache/save@v4
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: ~/fastp2p-dev/cross
+          key: c-deps-${{ matrix.target }}-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+      - name: Build CLI and C SDK
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --parallel 4
-      - name: Version
-        run: ./build/fastp2p --version
-  static:
-    needs: toolchains
+          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake --build build/c --parallel 3
+          cmake --build build/c --target example-embed
+          cmake --install build/c
+          cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
+          cmake --build build/consumer
+          build/consumer/sdk-consumer
+      - name: ABI, lifecycle and TLS validation
+        run: |
+          export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
+          ctest --test-dir build/c --output-on-failure
+          dist/${{ matrix.target }}/bin/fastp2p --version
+      - name: Package SDK
+        run: |
+          python3 scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
+          tar -C dist -czf dist/fastp2p-${{ matrix.target }}.tar.gz ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-${{ matrix.target }}
+          path: dist/fastp2p-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            build/c/Testing/Temporary/LastTest.log
+            build/c/desktop-result.json
+            build/c/socks/result.json
+            build/c/compile_commands.json
+  cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - name: Build tools
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install cross toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ninja-build python3 qemu-user-static file perl
-      - uses: actions/checkout@v5
-      - name: Fetch the pinned toolchain and build
+          sudo apt-get install -y gcc-mingw-w64-x86-64 ninja-build
+          python3 -m pip install cmake==3.31.6
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1 || { tail -60 sdk-install.log; exit 1; }
+      - uses: actions/cache@v4
+        with:
+          path: ~/fastp2p-dev/cross
+          key: c-deps-cross-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+          restore-keys: c-deps-cross-
+      - name: Windows CLI and SDK
         run: |
-          bash scripts/build-musl.sh x86_64 --out "$PWD/dist"
-          ls -l dist
+          python3 scripts/build-deps.py windows-x86_64
+          cmake -S c/client -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/windows-x86_64.cmake" -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/windows-x86_64"
+          cmake --build build/windows --parallel 4
+          cmake --install build/windows --prefix "$PWD/dist/windows-x86_64"
+          python3 scripts/sdk-metadata.py --sdk dist/windows-x86_64
+          cp build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: fastp2p-linux-static-x86_64
-          path: dist/*.tar.gz
-  toolchains:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+          name: windows-validation
+          path: |
+            build/windows/*.exe
+            build/windows/fastp2p.dll
+            dist/windows-x86_64/
+      - name: Android signed headless APK
+        env:
+          FASTP2P_ANDROID_KEYSTORE_BASE64: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_BASE64 }}
+          FASTP2P_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
+          export FASTP2P_CMAKE_DIR="$(python3 -c 'import cmake,pathlib; print(pathlib.Path(cmake.CMAKE_BIN_DIR).parent)')"
+          test -n "$FASTP2P_ANDROID_KEYSTORE_BASE64" && test -n "$FASTP2P_ANDROID_KEYSTORE_PASSWORD"
+          export FASTP2P_ANDROID_KEYSTORE="$RUNNER_TEMP/fastp2p-android.p12"
+          printf '%s' "$FASTP2P_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$FASTP2P_ANDROID_KEYSTORE"
+          chmod 600 "$FASTP2P_ANDROID_KEYSTORE"
+          bash scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
+          python3 tests/android_artifact.py --apk android/app/build/outputs/apk/release/app-release.apk --ndk "$ANDROID_NDK_HOME"
+          mkdir -p dist/android
+          cp android/app/build/outputs/apk/release/app-release.apk dist/android/fastp2p-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-android
+          path: dist/android/fastp2p-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-device-validation
+          path: android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+      # Debuggable build signed with the release key: installs over the production
+      # app and writes the client event stream to logcat. It is only produced from
+      # main, because it carries the production certificate. Never published.
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: android-debug-logging
+          path: android/app/build/outputs/apk/staging/app-staging.apk
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-cross
+          path: |
+            android-build.log
+            sdk-install.log
+            android/app/build/reports/lint-results-release.*
+  windows:
+    needs: cross
+    runs-on: windows-2022
+    timeout-minutes: 15
     steps:
-      - name: Ensure the toolchain release exists
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-validation
+      - name: Package Windows installer exe
+        shell: pwsh
+        run: |
+          Copy-Item build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-windows-x86_64
+          path: dist/fastp2p-windows-x86_64.exe
+      - name: Native Windows protocol, lifecycle, TLS and QUIC tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & build/windows/fastp2p.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/windows_startup.py --client build/windows/fastp2p.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-api.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/identity_cli.py --client build/windows/fastp2p.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-platform.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-update-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-quic-buffer.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-tcp-nat.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-service-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-wire.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-secure.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-session-binding.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-socks.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
+          python tests/tls_negative.py --client build/windows/fastp2p.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/quic_native.py --binary build/windows/quic-interop.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/enrollment_integration.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/config_sync.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py --profile-probe build/windows/test-profile-probe.exe --fixture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/socks_integration.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py --logs build/windows/socks
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: MSVC consumer of the C DLL
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          lib /nologo /machine:x64 /def:c\client\platform\windows\fastp2p.def /out:dist\windows-x86_64\lib\fastp2p.lib
+          if errorlevel 1 exit /b 1
+          cmake -S tests/sdk-consumer -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CD%/dist/windows-x86_64"
+          if errorlevel 1 exit /b 1
+          cmake --build build/msvc
+          if errorlevel 1 exit /b 1
+          copy /y dist\windows-x86_64\bin\fastp2p.dll build\msvc\fastp2p.dll
+          build\msvc\sdk-consumer.exe
+          if errorlevel 1 exit /b 1
+      # Windows is shipped as one exe. It carries no token: users rename it with
+      # their 16-digit key after downloading, then double-click to install. The
+      # Windows SDK (dll/headers) is no longer a Release asset; developers can
+      # still get it from the cross job's windows-validation CI artifact.
+  linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.13-slim-bookworm
+      options: --privileged
+    timeout-minutes: 35
+    steps:
+      - name: Native Debian 12 build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: ~/fastp2p-dev/cross
+          key: gateway-client-deps-debian12-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+      - name: Package native C client SDK
+        run: |
+          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
+          cmake --build build/client-release --parallel 3
+          cmake --install build/client-release
+          python3 scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
+          tar -C dist -czf dist/fastp2p-sdk-linux-x86_64.tar.gz sdk-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-sdk-linux-x86_64
+          path: dist/fastp2p-sdk-linux-x86_64.tar.gz
+      - name: C relay escalation when a punch cannot succeed
+        run: |
+          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
+          bash scripts/check-escalation.sh
+      - name: TCP punching through two filtered NAT routers with UDP blocked
+        run: unshare --net python3 tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/gateway/fastp2p-gateway --logs build/c/tcp-nat3
+      - name: Dual-stack registration, per-family NAT levels and an IPv6 tunnel
+        run: |
+          bash scripts/tls/generate-cert.sh build/dualstack-certs localhost 127.0.0.1 ::1 10.203.0.1 >/dev/null
+          unshare --net sh -c 'ip link set lo up && python3 tests/dualstack_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/dualstack'
+      - name: NAT level detection with a foreign-source probe between two sites
+        run: |
+          unshare --net sh -c 'ip link set lo up && python3 tests/natlevel_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/natlevel'
+      - name: STUN responder wire behaviour
+        run: python3 scripts/stun/test-responder.py
+      - name: TCP NAT level detection against a local probe server
+        run: |
+          unshare --net sh -c 'ip link set lo up && python3 tests/tcplevel_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/tcplevel'
+      - name: Linux installer, filename enrollment, init branches and rollback in namespaces
+        run: python3 tests/linux_installer.py --client build/c/fastp2p --gateway build/gateway/fastp2p-gateway
+      - name: C relay fallback over TCP and QUIC
+        run: |
+          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
+          bash scripts/check-relay.sh
+      - name: C punch with a peer advertising a mapping window
+        run: |
+          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
+          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
+          bash scripts/check-nat-window.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: socks5-results-linux
+          path: |
+            build/socks-reports/
+            build/c/tcp-nat3/result.json
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-tcp-nat3-linux
+          path: build/c/tcp-nat3/*.log
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, armv7, i686, riscv64, s390x, ppc64le, mips64el]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Static musl toolchain and emulator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build qemu-user-static
+      - uses: actions/cache@v4
+        with:
+          path: ~/musl-cross
+          key: musl-cross-${{ matrix.arch }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/fastp2p-dev/musl
+          key: musl-deps-${{ matrix.arch }}-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+      - name: Build static client
+        run: FASTP2P_MUSL_OUT="$PWD/dist" bash scripts/build-musl.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-linux-static-${{ matrix.arch }}
+          path: dist/fastp2p-linux-static-${{ matrix.arch }}.tar.gz
+  release:
+    # Every job that produces a client artifact has to finish first: the SDK comes
+    # from the linux job and the Windows exe from the windows job, so publishing
+    # without them would silently ship an incomplete release.
+    needs: [macos, cross, linux, windows, musl]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/fastp2p-client-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fastp2p-*
+          path: release-input
+      - name: Publish verified clients and C SDKs
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/musl-toolchains" > /dev/null \
-            && echo 'toolchain release present' \
-            || echo 'toolchain release missing: run the musl toolchains workflow first'
+        run: python3 scripts/publish-release.py --kind client --input release-input --output release-output
