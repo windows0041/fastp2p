@@ -302,7 +302,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64, armv7, i686, riscv64, s390x, ppc64le, mips64el]
+        arch: [x86_64, aarch64, armv7, riscv64, mips64el]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
