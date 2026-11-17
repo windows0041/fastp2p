@@ -58,7 +58,9 @@ jobs:
               continue
             fi
             echo "--- $name ($size bytes)"
-            curl -fsSL --retry 3 --retry-all-errors -H "$auth" \
+            # The source repository is public: its assets must be fetched without this
+            # job's token, because the storage redirect rejects a foreign Bearer.
+            curl -fsSL --retry 3 --retry-all-errors \
               -H 'Accept: application/octet-stream' -o "$name" \
               "https://api.github.com/repos/$source/releases/assets/$asset_id"
             got=$(stat -c%s "$name")
