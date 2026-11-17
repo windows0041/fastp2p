@@ -1,0 +1,121 @@
+/* Real SCM lifecycle, isolated from the user's fastp2p service and directories. */
+#include "install.h"
+#include <windows.h>
+#include <shlobj.h>
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int fastp2p_service_profile(char path[4096]) { (void)path; return -1; } /* purge is never used */
+int fastp2p_private_parents(const char *path) {
+    WCHAR wide[4096];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, 4096)) return -1;
+    for(WCHAR *p=wide;*p;p++)if(*p==L'/')*p=L'\\';
+    WCHAR *slash = wcsrchr(wide, L'/'), *backslash = wcsrchr(wide, L'\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+    if (!slash) return -1;
+    *slash = 0;
+    int status = SHCreateDirectoryExW(NULL, wide, NULL);
+    return status == ERROR_SUCCESS || status == ERROR_ALREADY_EXISTS ? 0 : -1;
+}
+static int loop(int argc, char **argv) {
+    (void)argc;
+    Sleep(200); /* A STOP delivered during startup must survive runtime_begin. */
+    if(fastp2p_runtime_begin(argv[3],0))return 1;
+    char marker[4096]; snprintf(marker, sizeof(marker), "%s.ready", argv[3]);
+    FILE *file = fopen(marker, "wb"); if (!file) return 1;
+    fputs("ready", file); fclose(file);
+    while (!fastp2p_runtime_stopping()) Sleep(10);
+    /* Reporting STOPPED happens before process teardown; removal must also wait
+     * for the image handle to close, tested by replacing it immediately below. */
+    Sleep(400);
+    fastp2p_runtime_end();
+    return 0;
+}
+static DWORD WINAPI close_service_later(void *service) {
+    Sleep(400); CloseServiceHandle((SC_HANDLE)service); return 0;
+}
+static void remove_released_image(const char *path) {
+    for(int attempt=0;attempt<50;attempt++){
+        if(DeleteFileA(path))return;
+        Sleep(100);
+    }
+    assert(!"Stopped image is still locked");
+}
+int main(int argc, char **argv) {
+    if (argc >= 4 && !strcmp(argv[1], "service"))
+        return fastp2p_service_dispatch(argv[3], argc, argv, loop) ? 1 : 0;
+    assert(fastp2p_service_elevated());
+    assert(!fastp2p_service_installed()); /* test-only name; never delete an existing service */
+    char temp[4096], root[4096], profile[4096], marker[4096], installed[4096];
+    assert(GetTempPathA(sizeof(temp), temp));
+    snprintf(root, sizeof(root), "%sfastp2p-service-ci-%lu", temp, (unsigned long)GetCurrentProcessId());
+    assert(CreateDirectoryA(root, NULL));
+    /* getenv() reads the CRT environment, not just the Win32 environment block.
+     * Verify isolation before any installation can touch the machine paths. */
+    assert(!_putenv_s("ProgramFiles", root));
+    char local[4096],legacy[4096],adjacent[4096],retired[4096];
+    snprintf(local,sizeof(local),"%s/user-data",root);assert(!_putenv_s("LOCALAPPDATA",local));
+    snprintf(legacy,sizeof(legacy),"%s/fastp2p/fastp2p.exe",local);
+    snprintf(adjacent,sizeof(adjacent),"%s/fastp2p/fastp2p.conf",local);
+    assert(!fastp2p_private_parents(legacy));
+    FILE *kept=fopen(adjacent,"wb");assert(kept);fputs("preserve-user-config",kept);fclose(kept);
+    assert(!strcmp(getenv("ProgramFiles"),root));
+    snprintf(profile, sizeof(profile), "%s/config/client.dat", root);
+    assert(!fastp2p_service_prepare(profile));
+    FILE *file = fopen(profile, "wb"); assert(file); fputs("identity-fixture", file); fclose(file);
+    snprintf(marker, sizeof(marker), "%s.ready", profile);
+    snprintf(installed, sizeof(installed), "%s/fastp2p/fastp2p.exe", root);
+    for (int pass = 0; pass < 2; ++pass) {
+        assert(!fastp2p_service_install(profile, NULL));
+        int ready = 0;
+        for (int i = 0; i < 100; ++i) {
+            if (GetFileAttributesA(marker) != INVALID_FILE_ATTRIBUTES) { ready = 1; break; }
+            Sleep(50);
+        }
+        assert(ready && fastp2p_service_installed());
+        file=fopen(legacy,"wb");assert(file);fputs("old executable",file);fclose(file);
+        snprintf(retired,sizeof(retired),"%s.old",installed);assert(CopyFileA(installed,retired,FALSE));
+        assert(!fastp2p_service_cleanup_previous());
+        assert(GetFileAttributesA(legacy)==INVALID_FILE_ATTRIBUTES && GetFileAttributesA(retired)==INVALID_FILE_ATTRIBUTES);
+        assert(GetFileAttributesA(installed)!=INVALID_FILE_ATTRIBUTES && GetFileAttributesA(adjacent)!=INVALID_FILE_ATTRIBUTES);
+        /* A junction or hard link may make the old name refer to the new image. */
+        assert(CreateHardLinkA(legacy,installed,NULL));
+        assert(!fastp2p_service_cleanup_previous() && GetFileAttributesA(legacy)!=INVALID_FILE_ATTRIBUTES);
+        SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT); assert(scm);
+        SC_HANDLE held = OpenServiceW(scm, L"fastp2p-installer-ci", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG); assert(held);
+        SERVICE_FAILURE_ACTIONS_FLAG recovery = {0}; DWORD used = 0;
+        assert(QueryServiceConfig2W(held, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, (BYTE *)&recovery, sizeof(recovery), &used));
+        assert(recovery.fFailureActionsOnNonCrashFailures);
+        assert(!fastp2p_service_remove());
+        remove_released_image(legacy);
+        HANDLE thread = CreateThread(NULL, 0, close_service_later, held, 0, NULL); assert(thread);
+        /* An open service handle delays deletion. New registration must retry. */
+        assert(!fastp2p_service_install(profile, NULL));
+        assert(WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0);
+        CloseHandle(thread); CloseServiceHandle(scm);
+        assert(!fastp2p_service_remove());
+        file = fopen(profile, "rb"); assert(file);
+        char saved[32] = {0}; assert(fread(saved, 1, sizeof(saved)-1, file) == 16); fclose(file);
+        assert(!strcmp(saved, "identity-fixture"));
+        /* A virus scanner may briefly hold the stopped image too. Production
+         * replacement retries for this; verify release with the same tolerance. */
+        int removed=0;
+        for(int attempt=0;attempt<50;++attempt) {
+            if(DeleteFileA(installed)) {removed=1;break;}
+            Sleep(100);
+        }
+        if(!removed)fprintf(stderr,"Stopped image could not be removed, Win32 error %lu\n",(unsigned long)GetLastError());
+        assert(removed);
+        DeleteFileA(marker);
+    }
+    assert(!fastp2p_service_remove());
+    DeleteFileA(profile);
+    char directory[4096]; snprintf(directory, sizeof(directory), "%s/config", root); RemoveDirectoryA(directory);
+    snprintf(directory, sizeof(directory), "%s/fastp2p", root); RemoveDirectoryA(directory);
+    assert(DeleteFileA(adjacent));snprintf(directory,sizeof(directory),"%s/fastp2p",local);assert(RemoveDirectoryA(directory));
+    assert(RemoveDirectoryA(local));
+    assert(RemoveDirectoryA(root));
+    puts("Windows service uninstall/reinstall waits for process exit and delayed SCM deletion; identity retained");
+    return 0;
+}

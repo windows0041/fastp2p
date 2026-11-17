@@ -1,0 +1,82 @@
+plugins { id 'com.android.application' }
+
+def depsBase = providers.gradleProperty('fastp2pDepsBase').orElse(
+        System.getenv('FASTP2P_DEPS_BASE') ?: "${System.getProperty('user.home')}/fastp2p-dev/cross/prefix").get()
+def signingFile = System.getenv('FASTP2P_ANDROID_KEYSTORE')
+
+android {
+    namespace 'top.fastp2p.cclient'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    ndkVersion '30.0.16248370'
+    defaultConfig {
+        applicationId 'top.fastp2p.cclient'
+        minSdk 26
+        targetSdk 36
+        versionCode 20007
+        versionName '2.0.7'
+        testInstrumentationRunner 'top.fastp2p.cclient.LiveInstrumentation'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=none', '-DFASTP2P_BUILD_SHARED=ON',
+                        '-DFASTP2P_BUILD_CLI=OFF', '-DBUILD_TESTING=OFF', "-DFASTP2P_DEPS_BASE=${depsBase}"
+                targets 'fastp2p_jni'
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake { path '../../CMakeLists.txt'; version '3.31.6' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    signingConfigs {
+        release {
+            if (signingFile) {
+                storeFile file(signingFile)
+                storePassword System.getenv('FASTP2P_ANDROID_KEYSTORE_PASSWORD')
+                keyAlias 'fastp2p'
+                keyPassword System.getenv('FASTP2P_ANDROID_KEYSTORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.release }
+        // Same signing key and application id as release, but debuggable: it can
+        // be installed over the production app to collect client logs.
+        staging {
+            initWith release
+            debuggable true
+            matchingFallbacks = ['release']
+        }
+    }
+    testBuildType signingFile ? 'release' : 'debug'
+    packaging { jniLibs { useLegacyPackaging false } }
+}
+
+// The APK is also a binary distribution of the statically bundled TLS/QUIC
+// dependencies; keep their complete notices inside the installable artifact.
+def noticeOutput = layout.buildDirectory.dir('generated/native-notices')
+def nativeNotices = tasks.register('copyNativeNotices', Sync) {
+    outputs.upToDateWhen { false }
+    into noticeOutput
+    from('../../LICENSE') { into 'licenses'; rename { 'fastp2p-LICENSE' } }
+    from('../../THIRD_PARTY.md') { into 'licenses' }
+    def versions = new groovy.json.JsonSlurper().parse(file('../../deps.lock.json'))
+    versions.each { name, entry ->
+        def license = name == 'openssl' ? 'LICENSE.txt' : 'COPYING'
+        from(new File(new File(depsBase).parentFile, "sources/${name}-${entry.version}/${license}")) {
+            into 'licenses'; rename { "${name}-${license}" }
+        }
+    }
+}
+android.sourceSets.main.assets.srcDir(noticeOutput)
+tasks.named('preBuild').configure { dependsOn nativeNotices }
+
+gradle.taskGraph.whenReady { graph ->
+    if (graph.allTasks.any { it.name.toLowerCase().contains('release') } &&
+            (!signingFile || !System.getenv('FASTP2P_ANDROID_KEYSTORE_PASSWORD')))
+        throw new GradleException('Release APK requires FASTP2P_ANDROID_KEYSTORE and FASTP2P_ANDROID_KEYSTORE_PASSWORD')
+}
