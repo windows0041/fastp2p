@@ -1,0 +1,55 @@
+name: client build
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Native dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libcurl4-openssl-dev libssl-dev libjson-c-dev libwebsockets-dev \
+            libnghttp2-dev zlib1g-dev libev-dev python3
+      - uses: actions/checkout@v5
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --parallel 4
+      - name: Version
+        run: ./build/fastp2p --version
+  static:
+    needs: toolchains
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build python3 qemu-user-static file perl
+      - uses: actions/checkout@v5
+      - name: Fetch the pinned toolchain and build
+        run: |
+          bash scripts/build-musl.sh x86_64 --out "$PWD/dist"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastp2p-linux-static-x86_64
+          path: dist/*.tar.gz
+  toolchains:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Ensure the toolchain release exists
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/musl-toolchains" > /dev/null \
+            && echo 'toolchain release present' \
+            || echo 'toolchain release missing: run the musl toolchains workflow first'

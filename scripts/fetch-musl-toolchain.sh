@@ -5,7 +5,7 @@
 # project are verified against the committed digest list; external mirrors are
 # only a fallback for networks that cannot reach GitHub.
 set -euo pipefail
-repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 arch=${1:?usage: fetch-musl-toolchain.sh <arch>}
 root=${MUSL_CROSS_ROOT:-$HOME/musl-cross}
 
@@ -31,7 +31,7 @@ mkdir -p "$root"
 base=${FASTP2P_TOOLCHAIN_BASE:-https://github.com/windows0041/fastp2p/releases/download/musl-toolchains}
 name=$triple-cross.tar.gz
 expected=$(awk -v n="$name" '$2 == n { print $1 }' \
-  "$repository/c/client/scripts/musl-toolchains.txt" 2>/dev/null || true)
+  "$repository/scripts/musl-toolchains.txt" 2>/dev/null || true)
 if [[ -n $expected ]]; then
   echo "fetching pinned toolchain $name" >&2
   if curl -fsSL --retry 2 --connect-timeout 30 --max-time 1200 -o "$root/$name" "$base/$name"; then

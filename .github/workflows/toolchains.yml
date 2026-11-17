@@ -1,0 +1,39 @@
+name: musl toolchains
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Copy the pinned archives into this repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          api=https://api.github.com/repos/${{ github.repository }}
+          source=windows0041/oldfastp2p
+          tag=musl-toolchains
+          release=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" "$api/releases/tags/$tag" || true)
+          if printf '%s' "$release" | grep -q '"id"'; then
+            id=$(printf '%s' "$release" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          else
+            release=$(curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"$tag\",\"name\":\"musl toolchains\",\"body\":\"Pinned musl-cross toolchains for the static client builds.\",\"draft\":false,\"prerelease\":false}" \
+              "$api/releases")
+            id=$(printf '%s' "$release" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          fi
+          for name in x86_64-linux-musl-cross.tar.gz aarch64-linux-musl-cross.tar.gz; do
+            echo "--- $name"
+            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$name" \
+              "https://github.com/$source/releases/download/$tag/$name"
+            curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Content-Type: application/octet-stream' --data-binary "@$name" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$name" \
+              > /dev/null && echo "    uploaded"
+            rm -f "$name"
+          done

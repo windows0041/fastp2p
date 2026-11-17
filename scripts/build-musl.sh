@@ -8,7 +8,7 @@
 # built for the target first; the result is a static-pie binary that runs on any
 # Linux with the right CPU, including musl-based routers.
 set -euo pipefail
-repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 arch=${1:?usage: build-musl.sh <arch> [--out DIR]}
 shift || true
 out=${FASTP2P_MUSL_OUT:-$repository/dist}
@@ -30,7 +30,7 @@ esac
 
 # The pinned archive, musl.cc and Bootlin are tried in that order by the
 # shared helper, so the gateway build uses exactly the same toolchain.
-toolchain=$(bash "$repository/c/client/scripts/fetch-musl-toolchain.sh" "$arch")
+toolchain=$(bash "$repository/scripts/fetch-musl-toolchain.sh" "$arch")
 # A glob that matches nothing makes `ls` fail, which aborts the script before the
 # message on the next line under `set -e`; glob it directly instead.
 compiler=""
@@ -42,14 +42,14 @@ done
 [[ -x $compiler ]] || { echo "no compiler in $toolchain" >&2; exit 1; }
 binutils=${compiler%-gcc}
 
-python3 "$repository/c/client/scripts/build-deps.py" "linux-$arch-musl" \
+python3 "$repository/scripts/build-deps.py" "linux-$arch-musl" \
   --work "$work" --musl-toolchain "$toolchain" --jobs "$jobs"
 
 build=$work/build/$arch
 prefix=$work/prefix/linux-$arch-musl
-cmake -S "$repository/c/client" -B "$build" -G Ninja \
+cmake -S "$repository" -B "$build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-  -DCMAKE_TOOLCHAIN_FILE="$repository/c/client/cmake/linux-musl.cmake" \
+  -DCMAKE_TOOLCHAIN_FILE="$repository/cmake/linux-musl.cmake" \
   -DFASTP2P_TARGET_ARCH="$arch" \
   -DCMAKE_C_COMPILER="$compiler" \
   -DCMAKE_AR="${binutils}-ar" \
@@ -65,7 +65,7 @@ rm -rf "$stage"
 mkdir -p "$stage/bin"
 cp "$build/fastp2p" "$stage/bin/fastp2p"
 for doc in README.md PLATFORMS-ZH.md LICENSE; do
-  [[ -f $repository/c/client/$doc ]] && cp "$repository/c/client/$doc" "$stage/"
+  [[ -f $repository/$doc ]] && cp "$repository/$doc" "$stage/"
 done
 archive=$out/fastp2p-linux-static-$arch.tar.gz
 tar -C "$work/pkg" -czf "$archive" "fastp2p-linux-static-$arch"
