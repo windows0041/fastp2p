@@ -27,13 +27,24 @@ jobs:
               "$api/releases")
             id=$(printf '%s' "$release" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
           fi
-          for name in x86_64-linux-musl-cross.tar.gz aarch64-linux-musl-cross.tar.gz; do
+          # The releases/download/ URL of that release answers 404, so the assets are
+          # fetched through the API endpoint, which redirects to a signed URL.
+          curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$source/releases/tags/$tag" > source.json
+          python3 - <<'PY' > assets.tsv
+          import json
+          data = json.load(open('source.json'))
+          for asset in data.get('assets', []):
+              if asset['name'].endswith('cross.tar.gz'):
+                  print('%s\t%s' % (asset['url'], asset['name']))
+          PY
+          while IFS="$(printf '\t')" read -r url name; do
             echo "--- $name"
-            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$name" \
-              "https://github.com/$source/releases/download/$tag/$name"
+            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Accept: application/octet-stream' -o "$name" "$url"
             curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H 'Content-Type: application/octet-stream' --data-binary "@$name" \
               "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$name" \
               > /dev/null && echo "    uploaded"
             rm -f "$name"
-          done
+          done < assets.tsv
