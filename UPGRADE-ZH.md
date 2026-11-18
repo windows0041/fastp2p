@@ -65,9 +65,9 @@ Windows 客户端 2.0.3 修复了服务报告停止后 EXE 仍短暂被占用、
 
 | 文件 | 需要改的常量 |
 |---|---|
-| `c/client/include/fastp2p.h` | `FASTP2P_VERSION` |
-| `c/client/CMakeLists.txt` | `project(fastp2p_c VERSION ...)` |
-| `c/client/android/app/build.gradle` | `versionCode`（必须递增）与 `versionName` |
+| `include/fastp2p.h` | `FASTP2P_VERSION` |
+| `CMakeLists.txt` | `project(fastp2p_c VERSION ...)` |
+| `android/app/build.gradle` | `versionCode`（必须递增）与 `versionName` |
 
 客户端登录时把 `FASTP2P_VERSION` 上报给网关，控制台正是用它和上传包的版本号比较。
 如果上传的包版本写成 `2.0.2`、但构建里仍是 `2.0.1`，客户端升级后依然上报 `2.0.1`，

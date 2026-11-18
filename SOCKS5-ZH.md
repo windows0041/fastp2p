@@ -104,7 +104,7 @@ int result = fastp2p_client_add_socks5(client, &proxy, NULL);
 构建 C 客户端、C 网关和 Go 参考客户端后，在 Linux / WSL 运行：
 
 ```bash
-sudo bash c/client/scripts/check-socks.sh
+sudo bash scripts/check-socks.sh
 ```
 
 该脚本在独立 network namespace 中验证 TCP/QUIC、域名和 IPv4、可选认证、并发目标和错误关联、分片/合并握手、提前发送的数据、UDP 多目标与来源限制、连接回收、拒绝旧出口、网关重启及恢复后 35 秒心跳。测试证书、随机凭据和原始日志保存在私有 `/tmp/fastp2p-socks-tests.*` 目录，不修改公网部署。

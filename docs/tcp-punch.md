@@ -65,7 +65,7 @@ TCP 默认从同一本地源端口访问网关 TCP 27180、27181。新版网关�
 隔离 NAT 测试使用两个独立 Linux SNAT 路由器，保持端口并按连接跟踪过滤入站。没有出站状态的入站 SYN 被静默丢弃，所有转发 UDP 均被阻断。通过多个公网地址的 TCP STUN 样本确认映射行为，并用真实 C 客户端进行认证和业务传输。测试还覆盖 UDP 困难映射诊断值与 TCP 稳定映射并存，以及可选旧客户端协商回退。
 
 ```sh
-sudo unshare --net python3 c/client/tests/tcp_nat3_integration.py \
+sudo unshare --net python3 tests/tcp_nat3_integration.py \
   --client /absolute/build/client/fastp2p \
   --gateway /absolute/build/gateway/fastp2p-gateway \
   --logs /absolute/private/test-output

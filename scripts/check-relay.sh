@@ -13,6 +13,6 @@ chmod 700 "$runtime"
 bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 \
   > "$runtime/certificate-generation.log" 2>&1
 echo "Private relay logs: $runtime"
-exec python3 "$repository/c/client/tests/relay_integration.py" \
+exec python3 "$repository/tests/relay_integration.py" \
   --client "$client" --gateway "$gateway" \
   --cert-dir "$runtime/certs" --logs "$runtime/logs"

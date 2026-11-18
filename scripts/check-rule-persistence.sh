@@ -15,5 +15,5 @@ exec unshare --net bash -c '
   set -euo pipefail
   ip link set lo up
   exec python3 "$@"
-' _ "$repository/c/client/tests/rule_persistence.py" \
+' _ "$repository/tests/rule_persistence.py" \
   --client "$client" --gateway "$gateway" --logs "$runtime/logs"

@@ -16,6 +16,6 @@ chmod 700 "$runtime"
 bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 10.90.0.1 \
   > "$runtime/certificate-generation.log" 2>&1
 echo "Private escalation logs: $runtime"
-exec python3 "$repository/c/client/tests/escalation_integration.py" \
+exec python3 "$repository/tests/escalation_integration.py" \
   --client "$client" --gateway "$gateway" \
   --cert-dir "$runtime/certs" --logs "$runtime/logs"

@@ -54,8 +54,8 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 ## 构建与 SDK
 
 ```sh
-python3 c/client/scripts/build-deps.py linux-x86_64
-cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release \
+python3 scripts/build-deps.py linux-x86_64
+cmake -S . -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64"
 cmake --build build/c --parallel
 ctest --test-dir build/c --output-on-failure
@@ -65,7 +65,7 @@ ctest --test-dir build/c --output-on-failure
 
 Windows 使用 MinGW，macOS 原生构建；Android 使用 NDK 和轻量 Java/JNI 系统封装，网络核心仍为 C。[平台说明](PLATFORMS-ZH.md) · [验证](VALIDATION-ZH.md)。完整依赖许可证已嵌入单文件客户端，运行 `--licenses` 查看。
 
-专用构建的公开配置位于 c/common/bootstrap.json，只包含 host、port、ca，不含 Token 或私钥。自行部署其他网关时替换该文件，或用 CMake 参数 FASTP2P_BOOTSTRAP_FILE 选择另一份公开配置。安装器高级调试可用同名环境变量读取受信任的本地配置文件；不会从未验证的网络端点获取 CA。
+专用构建的公开配置位于 common/bootstrap.json，只包含 host、port、ca，不含 Token 或私钥。自行部署其他网关时替换该文件，或用 CMake 参数 FASTP2P_BOOTSTRAP_FILE 选择另一份公开配置。安装器高级调试可用同名环境变量读取受信任的本地配置文件；不会从未验证的网络端点获取 CA。
 
 Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.conf 为 0600，支持网关下发时原子替换。父目录与服务控制脚本仍由 root 持有；安装器执行特权文件操作时临时锁定配置目录。直接以 root 运行默认配置的 CLI 也会降为服务账号。重复接入不会重写相同的 CA 文件。
 

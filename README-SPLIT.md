@@ -6,7 +6,7 @@ macOS and Android, with the SOCKS5 and port-forwarding rules.
 ## What this repository contains
 
 - `src/ include/ tests/ android/ cmake/ docs/ examples/ platform/ scripts/` — the
-  client as it lived under `c/client` in the monorepo.
+  client as it lived under the repository root in the monorepo.
 - `common/` — the code shared with the gateway (enrollment, config merge, UTF-8
   helpers, the public bootstrap identity). The gateway keeps its own copy in the
   `fastp2p-gateway` repository.

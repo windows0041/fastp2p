@@ -32,7 +32,7 @@
 可选基准默认不参与发行程序构建：
 
 ```sh
-cmake -S c/client -B build/buffer-bench -G Ninja \
+cmake -S . -B build/buffer-bench -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DFASTP2P_BUILD_BENCHMARKS=ON \
   -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64"
 cmake --build build/buffer-bench --target bench-buffers --parallel 4

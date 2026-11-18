@@ -22,11 +22,11 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 KINDS = {
-    'gateway': ('fastp2p-gateway', 'c/gateway/CMakeLists.txt', [
+    'gateway': ('fastp2p-gateway', 'CMakeLists.txt', [
         'fastp2p-gateway-linux-static-x86_64.tar.gz',
         'fastp2p-gateway-linux-static-aarch64.tar.gz',
         'fastp2p-gateway-docker-amd64.tar.gz']),
-    'client': ('fastp2p-client', 'c/client/CMakeLists.txt', [
+    'client': ('fastp2p-client', 'CMakeLists.txt', [
         'fastp2p-sdk-linux-x86_64.tar.gz', 'fastp2p-windows-x86_64.exe',
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
         'fastp2p-android.apk',
@@ -98,8 +98,8 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
     api = GitHub(repository, token)
     if stable:
         tag_sha = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
-        paths = (['c/common','c/gateway/src','c/gateway/web','c/gateway/deploy','c/gateway/CMakeLists.txt','c/gateway/scripts/embed-web.py','c/gateway/Dockerfile'] if kind=='gateway' else
-                 ['c/common','c/client/src','c/client/include','c/client/cmake','c/client/platform','c/client/deps.lock.json','c/client/CMakeLists.txt','c/client/android/app/src/main','c/client/android/app/src/androidTest','c/client/android/jni','c/client/android/app/build.gradle','c/client/android/build.gradle','c/client/android/settings.gradle','c/client/android/gradle.properties','c/client/android/gradle'])
+        paths = (['common','src','web','deploy','CMakeLists.txt','scripts/embed-web.py','Dockerfile'] if kind=='gateway' else
+                 ['common','src','include','cmake','platform','deps.lock.json','CMakeLists.txt','android/app/src/main','android/app/src/androidTest','android/jni','android/app/build.gradle','android/build.gradle','android/settings.gradle','android/gradle.properties','android/gradle'])
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
     notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 x86_64 与 aarch64 静态可执行包（不依赖发行版运行库）和 amd64 Docker 镜像。' if kind == 'gateway' else

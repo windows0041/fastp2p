@@ -3,7 +3,6 @@ on:
   push:
     tags: ['fastp2p-client-v*']
     branches: ['**']
-    paths: ['**', 'c/common/**', 'scripts/tls/**', '.github/workflows/c-platforms.yml', 'scripts/publish-release.py', 'scripts/test-publish-release.py']
   workflow_dispatch:
 permissions:
   contents: read

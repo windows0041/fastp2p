@@ -7,7 +7,7 @@ for argument in "$@"; do
   case "$argument" in
     --sanitize) sanitize=ON ;;
     --interop) interop=1 ;;
-    *) printf 'Usage: bash c/client/scripts/check.sh [--sanitize] [--interop]\n' >&2; exit 2 ;;
+    *) printf 'Usage: bash scripts/check.sh [--sanitize] [--interop]\n' >&2; exit 2 ;;
   esac
 done
 suffix=c
