@@ -157,6 +157,8 @@ try:
                 ('both', 'same-port=1 other-ip=1', True, 1),
                 ('address', 'same-port=1 other-ip=0', True, 2),
                 ('port', 'same-port=0 other-ip=0', True, 3),
+                ('incomplete', 'same-port=1', True, 0),
+                ('contradictory', 'same-port=0 other-ip=1', True, 0),
                 ('silent', 'unused', False, 0)):
             server = ProbeServer(verdict, answered)
             server.start()
@@ -165,7 +167,7 @@ try:
             directory.mkdir()
             config = {'network': {
                 'Node': name, 'Token': token, 'ServerHost': '127.0.0.1', 'ServerPort': 27183,
-                'TCPNatProbe': '127.0.0.1:%d' % server.port},
+                'TCPNatProbe': '127.0.0.1:%d' % server.port, 'UDPSTUNServers': []},
                 'CACertFile': str(certs / 'ca.crt'), 'apps': []}
             path = directory / 'config.json'
             path.write_text(json.dumps(config))
@@ -178,13 +180,19 @@ try:
             print('%s -> level %d (expected %d)' % (label, level, expected), flush=True)
             assert level == expected, '%s: expected %d, got %d' % (label, expected, level)
             if expected:
-                wait(lambda n=name, e=expected: (node(n) or {}).get('tcpNatLevel') == e,
+                wait(lambda n=name, e=expected: e if (node(n) or {}).get('tcpNatLevel') == e else None,
                      timeout=40, what=label + ' to store level %d' % expected)
             else:
                 # No verdict must never reach the gateway as a level.
                 assert (node(name) or {}).get('tcpNatLevel') in (0, None), \
                     'a missing verdict must not be reported as a level'
             results['tcp ' + label] = level
+            if label == 'silent':
+                server.verdict = 'same-port=0 other-ip=0'
+                server.answered = True
+                wait(lambda: 3 if (node(name) or {}).get('tcpNatLevel') == 3 else None,
+                     timeout=55, what='TCP filtering to recover without reconnecting')
+                results['tcp retry published a new verdict'] = True
             server.stop()
 
         results['success'] = True

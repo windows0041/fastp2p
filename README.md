@@ -8,7 +8,9 @@ QUIC 接收采用有界环形缓冲，帧编码复用发送队列。[缓冲优�
 
 TCP/UDP 分开检测映射并选择重试策略。新版 TCP 打洞支持双方同时连接、同源端口重试和监听回退；网关控制台分别显示两种协议的结果。[TCP 打洞与检测说明](docs/tcp-punch.md) 包含配置、兼容方式和隔离 NAT 测试方法。
 
-NAT 等级按 EasyTier 的判定原理给出 NAT1–NAT4：映射探测判断锥形或对称，随后向**公共 STUN 服务器**发送带 CHANGE-REQUEST 的绑定请求，让服务器分别从**另一个端口**和**另一个地址**回包——收到陌生地址的回包即全锥，只收到陌生端口的回包是地址受限，两者都收不到是端口受限，映射随目标变化就是对称。STUN 列表用 `network.UDPSTUNServers` 配置（最多 4 个，`host` 或 `host:port`，默认端口 3478）；未配置或全部不可达时，锥形只报 `NAT1/2`，不做猜测。**服务器必须支持 RFC 3489 的 CHANGE-REQUEST**（收到该属性后换端口或换地址回包）；只按 RFC 5389 忽略该属性的公共 STUN 会一律回同一五元组，从而被误判为 NAT3，因此自建或选用明确支持该属性的服务器最可靠。实测可用的一组：`stun.miwifi.com:3478` 换端口从 `:3479` 回包、换地址从**另一台主机**回包（例如解析到 `.2` 而由 `.3` 应答），因此能证明全锥；`stun.nextcloud.com:3478` 换端口从 `:443` 回包但不换地址。两者合用足以区分 NAT1–NAT4。示例：`"UDPSTUNServers": ["stun.nextcloud.com:3478", "stun.miwifi.com:3478"]`。只支持换端口的服务器组合会把全锥与地址受限合并显示为 NAT2。[NAT 穿越说明](NAT-TRAVERSAL-ZH.md) 记录了算法与实测。
+UDP 和 TCP 的 NAT 等级分别使用映射和入站过滤的观测。默认通过 `stun.fastp2p.top:3478` 做 UDP STUN 过滤探测，通过 `stun.fastp2p.top:3479` 做 TCP 回连探测。UDP 探测把实际回包的源地址和端口与请求目标比较。TCP 探测需要同地址换端口和换地址两项结果。
+
+过滤证据不足时，客户端会在 30 秒后重测。测出等级后每 10 分钟更新，短暂超时会保留最近确认的等级，满 20 分钟未重新确认会回到过滤待判定。可通过 `network.UDPSTUNServers` 和 `network.TCPNatProbe` 指定探测服务。自建 UDP 服务需支持 CHANGE-REQUEST。 [NAT 穿越说明](NAT-TRAVERSAL-ZH.md) · [自建探测服务](scripts/stun/README.md)
 
 ## 安装与运行
 

@@ -29,6 +29,9 @@
 #define SYM_WINDOW_MAX 50
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
+#define NAT_FILTER_RETRY (30 * NS)
+#define NAT_FILTER_REFRESH (600 * NS)
+#define NAT_FILTER_MAX_AGE (1200 * NS)
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
 /* Tunnel frames.  Frames carrying application data or application control are
@@ -113,7 +116,7 @@ typedef struct {
     int retries;
 } nat_discovery;
 typedef struct {
-    int phase; /* 0 idle, 1 plain, 2 change-port, 3 change-ip, 4 done */
+    int phase; /* 0 idle, 1 plain, 2 change-port, 3 change-ip */
     int server, count;
     op_addr addr[FP_STUN_MAX_SERVERS];
     op_socket fd;
@@ -127,8 +130,6 @@ typedef struct {
      * a server advertising OTHER-ADDRESS also declares it implements change-ip.
      * Without either, a missing reply is not evidence of filtering. */
     int port_supported, ip_supported;
-    int has_alternate; /* some server advertised its alternate address */
-    int level; /* 0 = STUN produced no verdict */
     /* 1 when the server reported exactly the address we sent from, i.e. the path
      * has no NAT translation and the level describes the host firewall. */
     int no_nat;
@@ -137,6 +138,10 @@ typedef struct {
      * turn a measurable NAT into "unknown". */
     int retried;
 } nat_stun;
+typedef struct {
+    int level;
+    uint64_t measured_at, next_at;
+} nat_filter;
 typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
@@ -278,7 +283,7 @@ struct fastp2p_client {
     int stun_count;
     nat_stun stun;
     fp_tcp_level tcp_level;
-    int tcp_level_reported; /* the TCP verdict was already announced */
+    nat_filter udp_filter, tcp_filter;
     /* 1 once every family we decided to probe has finished (or timed out), so
      * the login goes out with a complete picture rather than half-way. */
     int nat_settled;
@@ -4233,7 +4238,17 @@ static void nat_stun_send(fastp2p_client *c) {
                         s->addr[s->server].len);
     s->deadline = mono() + 1200 * MS;
 }
-static void nat_stun_finish(fastp2p_client *c) {
+static void nat_filter_record(nat_filter *filter, int level, uint64_t now) {
+    if (level) {
+        filter->level = level;
+        filter->measured_at = now;
+    }
+    filter->next_at = now + (level ? NAT_FILTER_REFRESH : NAT_FILTER_RETRY);
+}
+static int nat_filter_level(const nat_filter *filter, uint64_t now) {
+    return now - filter->measured_at < NAT_FILTER_MAX_AGE ? filter->level : 0;
+}
+static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
     /* Read the local endpoint before closing: when the server reports exactly the
      * address we sent from, there is no NAT in the path at all, and calling that
@@ -4249,7 +4264,7 @@ static void nat_stun_finish(fastp2p_client *c) {
     if (s->fd >= 0)
         op_close(s->fd);
     s->fd = -1;
-    s->phase = 4;
+    s->phase = 0;
     /* Same mapping from every destination -> cone; anything else is a
      * per-destination mapping, which is symmetric by definition.
      *
@@ -4258,72 +4273,73 @@ static void nat_stun_finish(fastp2p_client *c) {
      * or an advertised OTHER-ADDRESS. Otherwise a missing reply is just as
      * likely to mean "server ignored the attribute", and reporting NAT3 there
      * would turn a full-cone network into a false "port restricted". */
-    int port_evidence = s->port_supported || s->has_alternate;
-    int ip_evidence = s->ip_supported || s->has_alternate;
+    int port_evidence = s->port_supported;
+    int ip_evidence = s->ip_supported;
+    int level;
     if (!s->mapped_seen)
-        s->level = 0;
+        level = 0;
     else if (s->no_nat)
         /* No translation, so the "levels" describe the host firewall instead:
          * reachable from elsewhere is an open internet host, and a path that
          * answers nothing is a symmetric UDP firewall (RFC 3489 §5). */
-        s->level = (s->port_changed || s->ip_changed) ? 6 : (port_evidence ? 7 : 0);
+        level = (s->port_changed || s->ip_changed) ? 6 : (port_evidence ? 7 : 0);
     else if (!s->mapped_same)
-        s->level = 4;
+        level = 4;
     else if (s->ip_changed)
-        s->level = 1;
+        level = 1;
     else if (s->port_changed)
         /* Another port got through, so not port-restricted. Whether a stranger
          * address would also be accepted is only known if one was probed. */
-        s->level = ip_evidence ? 2 : 5;
+        level = ip_evidence ? 2 : 5;
     else
-        s->level = port_evidence ? 3 : 5;
+        level = port_evidence ? 3 : 5;
+    nat_filter_record(&c->udp_filter, level == 5 ? 0 : level, now);
     {
         char message[176];
         snprintf(message, sizeof(message),
                  "STUN NAT level: %d (mapping %s, other port %s, other address %s; "
                  "server honours change-request: port %s, address %s)",
-                 s->level, s->mapped_same ? "stable" : "per-destination",
-                 s->port_changed ? "answered" : "filtered",
-                 s->ip_changed ? "answered" : "filtered", port_evidence ? "yes" : "unknown",
+                 level, !s->mapped_seen ? "unmeasured" : s->mapped_same ? "stable" : "per-destination",
+                 s->port_changed ? "answered" : "no reply",
+                 s->ip_changed ? "answered" : "no reply", port_evidence ? "yes" : "unknown",
                  ip_evidence ? "yes" : "unknown");
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     if (c->ws && c->login_ok)
         report_nat(c);
 }
-static void nat_stun_start(fastp2p_client *c) {
+static void nat_stun_start(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
-    if (s->phase || !c->stun_count || !c->ws || !c->login_ok)
+    if (s->phase || !c->stun_count || !c->ws || !c->login_ok ||
+        !family_wanted(c, OP_FAM_V4) || now < c->udp_filter.next_at)
         return;
     if (c->nat[OP_FAM_V4].type != NAT_CONE && c->nat[OP_FAM_V4].type != NAT_UNKNOWN)
         return; /* symmetric is already NAT4, no stranger test needed */
+    *s = (nat_stun){.fd = -1, .mapped_same = 1};
     int resolved = 0;
     for (int i = 0; i < c->stun_count; ++i) {
         op_addr address;
-        if (resolve_any(c->stun_host[i], c->stun_port[i], &address))
+        if (!(resolve_any_families(c->stun_host[i], c->stun_port[i], FAM_V4, &address, NULL) & FAM_V4))
             continue;
         s->addr[resolved++] = address;
     }
     if (!resolved) {
-        s->phase = 4;
+        nat_stun_finish(c, mono());
         return;
     }
     s->count = resolved;
     s->server = 0;
     s->phase = 1;
-    /* Assume cone until a server reports a different mapping. */
-    s->mapped_same = 1;
-    s->retried = 0;
     s->fd = socket_bound(1, NULL, 0, 0);
     if (s->fd < 0) {
-        s->phase = 4;
+        nat_stun_finish(c, mono());
         return;
     }
     nat_stun_send(c);
 }
 static void nat_stun_step(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
-    if (s->phase == 0 || s->phase >= 4)
+    if (!s->phase)
         return;
     if (s->fd >= 0) {
         uint8_t data[1024];
@@ -4335,14 +4351,13 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
         if (received > 0) {
             fp_stun_mapped mapped;
             if (fp_stun_response(data, (size_t)received, s->tid, &mapped) && mapped.valid) {
-                if (mapped.has_alternate) {
-                    /* The server told us where it would answer from, which is a
-                     * declaration that change-ip is implemented - so a missing
-                     * reply later is our NAT dropping it, not a missing feature. */
-                    s->has_alternate = 1;
-                    s->ip_supported = 1;
-                }
                 if (s->phase == 1) {
+                    if (mapped.has_alternate && op_addr_family(&mapped.alternate) == AF_INET) {
+                        /* Only the address or port actually offered by the server
+                         * can be used to interpret a missing filtering reply. */
+                        s->ip_supported |= !same_ip(&mapped.alternate, &s->addr[s->server]);
+                        s->port_supported |= op_addr_port(&mapped.alternate) != op_addr_port(&s->addr[s->server]);
+                    }
                     if (!s->mapped_seen) {
                         op_addr_copy(&s->mapped, &mapped.address);
                         s->mapped_seen = 1;
@@ -4357,7 +4372,7 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
                 /* The reply's source is the evidence, not the payload. Address and
                  * port are judged separately: a CHANGE-REQUEST answer may come
                  * from another address, another port, or both. */
-                if (op_addr_family(&from) == op_addr_family(&s->addr[s->server])) {
+                if (s->phase != 1 && op_addr_family(&from) == op_addr_family(&s->addr[s->server])) {
                     if (op_addr_port(&from) != op_addr_port(&s->addr[s->server])) {
                         s->port_changed = 1;
                         s->port_supported = 1;
@@ -4376,7 +4391,7 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
                     s->phase = 1;
                 }
                 if (s->server >= s->count) {
-                    nat_stun_finish(c);
+                    nat_stun_finish(c, now);
                     return;
                 }
                 s->retried = 0;
@@ -4401,29 +4416,26 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
     }
     /* Move on: a missing reply is itself information (that variant was filtered
      * out), and the next server or phase may still answer. */
-    ++s->phase;
     s->retried = 0;
-    if (s->phase > 3) {
+    /* A server that missed the initial binding cannot measure filtering. */
+    if (s->phase == 1 || s->phase == 3) {
         ++s->server;
         s->phase = 1;
-    }
+    } else
+        ++s->phase;
     if (s->server >= s->count) {
-        nat_stun_finish(c);
+        nat_stun_finish(c, now);
         return;
     }
     nat_stun_send(c);
 }
-/* NAT level in the four-step convention, derived from the mapping result plus the
- * inbound-filtering refinement. 5 means "cone, but the filtering test could not be
- * completed" (no second node to answer from a foreign address): claiming NAT1 or
- * NAT2 there would be a guess, so it is reported as its own value. */
+/* NAT level combines the mapping and filtering observations. 5 denotes a
+ * cone-shaped mapping whose filtering has yet to be measured. */
 /* TCP level: the mapping settles symmetric, the callback probe settles the cones. */
 static int tcp_nat_level(const fastp2p_client *c) {
     if (c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT)
         return 4;
-    if (c->tcp_level.level >= 1 && c->tcp_level.level <= 3)
-        return c->tcp_level.level;
-    return 0; /* mapping measured, filtering not */
+    return nat_filter_level(&c->tcp_filter, mono());
 }
 static int nat_level(const fastp2p_client *c) {
     const nat_discovery *n = &c->nat[OP_FAM_V4];
@@ -4434,8 +4446,9 @@ static int nat_level(const fastp2p_client *c) {
     /* An external STUN observer settles it without needing a second node. Levels
      * 6 and 7 mean "no NAT in the path": 6 is an open host, 7 a symmetric UDP
      * firewall, and both are decided from the local-versus-mapped comparison. */
-    if (c->stun.level >= 1 && c->stun.level <= 7)
-        return c->stun.level;
+    int level = nat_filter_level(&c->udp_filter, mono());
+    if (level)
+        return level;
     /* Without a STUN verdict the mapping still proves "cone", but which
      * cone variant it is stays unmeasured rather than guessed. */
     return 5;
@@ -4571,6 +4584,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
         c->nat[family].phase = 0;
     }
     fp_tcp_nat_init(&c->tcp_nat);
+    c->stun.fd = -1;
     c->tcp_level.listener = c->tcp_level.dialer = -1;
     c->force_relay = getenv("FASTP2P_FORCE_RELAY") != NULL;
     /* Diagnostic only: pretend the probe classified us differently, so the punch
@@ -4843,27 +4857,27 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     if (c->ws && c->login_ok && now - c->last_rx > 45 * NS)
         close_gateway(c);
     service_gateway(c);
-    /* The STUN refinement starts once the control connection is authenticated: its
-     * result is reported over 6/9, so it never delays the login itself. */
-    nat_stun_start(c);
+    /* Start and refresh the filter measurements after login. */
+    nat_stun_start(c, now);
     nat_stun_step(c, now);
     /* TCP filtering probe: same window, verdict arrives asynchronously. */
     /* server.len is only known after the probe resolves its server, so the ports
      * configured text is what says a probe is wanted. */
-    if (c->tcp_level.phase == 0 && c->tcp_level.server_port && c->ws && c->login_ok)
+    if (!c->tcp_level.phase && c->tcp_level.server_port && c->ws && c->login_ok &&
+        now >= c->tcp_filter.next_at) {
+        c->tcp_level.attempt = 0;
         fp_tcp_level_start(&c->tcp_level);
+    }
     fp_tcp_level_step(&c->tcp_level, now);
-    /* Announce the outcome once, including "no verdict": the console has to be
-     * able to tell a measured level from a probe that simply got no answer, and
-     * a silent probe looks identical to one that has not run yet. */
-    if (c->tcp_level.phase >= 4 && !c->tcp_level_reported) {
+    if (c->tcp_level.phase == 4) {
         char message[128];
         snprintf(message, sizeof(message),
                  "TCP NAT level: %d (callbacks accepted=%d same-port=%d other-ip=%d)",
                  c->tcp_level.level, c->tcp_level.accepted, c->tcp_level.same_port,
                  c->tcp_level.other_ip);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
-        c->tcp_level_reported = 1;
+        nat_filter_record(&c->tcp_filter, c->tcp_level.level, mono());
+        c->tcp_level.phase = 0;
         if (c->ws && c->login_ok)
             report_nat(c);
     }
@@ -4905,6 +4919,12 @@ int fastp2p_client_stop(fastp2p_client *c) {
     c->stopping = 1;
     c->running = 0;
     fp_tcp_nat_close(&c->tcp_nat);
+    if (c->stun.fd >= 0)
+        op_close(c->stun.fd);
+    c->stun = (nat_stun){.fd = -1};
+    fp_tcp_level_close(&c->tcp_level);
+    c->tcp_level.phase = 0;
+    c->udp_filter = c->tcp_filter = (nat_filter){0};
     for (int i = 0; i < NT; ++i)
         close_tunnel(c, i, NULL);
     for (int i = 0; i < NO; ++i)

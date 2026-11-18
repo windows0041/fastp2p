@@ -100,27 +100,35 @@ int main(void) {
     assert(nat_level(&levels) == 0);
     levels.nat[OP_FAM_V4].type = NAT_CONE;
     assert(nat_level(&levels) == 5); /* cone, but nothing measured the filter */
-    levels.stun.level = 1;
+    nat_filter_record(&levels.udp_filter, 1, mono());
     assert(nat_level(&levels) == 1); /* another address answered */
-    levels.stun.level = 2;
+    nat_filter_record(&levels.udp_filter, 2, mono());
     assert(nat_level(&levels) == 2); /* only another port answered */
-    levels.stun.level = 3;
+    nat_filter_record(&levels.udp_filter, 3, mono());
     assert(nat_level(&levels) == 3); /* nothing outside the tuple answered */
     for (int symmetric = NAT_HARD_SYM; symmetric <= NAT_EASY_SYM_DEC; ++symmetric) {
         levels.nat[OP_FAM_V4].type = symmetric;
-        levels.stun.level = 1;
+        nat_filter_record(&levels.udp_filter, 1, mono());
         assert(nat_level(&levels) == 4); /* mapping decides; STUN is moot */
     }
     /* 6 and 7 mean there is no NAT: the mapping is our own address, so the
      * level describes the host firewall rather than a translation. */
     levels.nat[OP_FAM_V4].type = NAT_CONE;
-    levels.stun.level = 6;
+    nat_filter_record(&levels.udp_filter, 6, mono());
     assert(nat_level(&levels) == 6);
-    levels.stun.level = 7;
+    nat_filter_record(&levels.udp_filter, 7, mono());
     assert(nat_level(&levels) == 7);
-    levels.stun.level = 0;
+    levels.udp_filter = (nat_filter){0};
     levels.nat[OP_FAM_V4].type = NAT_CONE;
     assert(nat_level(&levels) == 5); /* STUN unreachable: stay undetermined */
+    nat_filter filters = {0};
+    nat_filter_record(&filters, 0, NS);
+    assert(nat_filter_level(&filters, NS) == 0 && filters.next_at == NS + NAT_FILTER_RETRY);
+    nat_filter_record(&filters, 3, 2 * NS);
+    assert(filters.next_at == 2 * NS + NAT_FILTER_REFRESH);
+    nat_filter_record(&filters, 0, filters.next_at);
+    assert(nat_filter_level(&filters, filters.next_at) == 3);
+    assert(nat_filter_level(&filters, 2 * NS + NAT_FILTER_MAX_AGE) == 0);
 
     assert(nat_classify(40000, 40000, 0) == NAT_CONE);    assert(nat_classify(40000, 40001, 0) == NAT_HARD_SYM);
     assert(nat_classify(40000, 40001, 40000) == NAT_CONE);

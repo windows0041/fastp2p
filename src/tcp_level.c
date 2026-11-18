@@ -185,7 +185,9 @@ static int read_line(fp_tcp_level *state) {
 }
 
 static void verdict(fp_tcp_level *state) {
-    if (!state->answered)
+    /* An alternate IP succeeding while the same-IP callback fails does not
+     * match any of the three expected filter behaviours. Measure it again. */
+    if (!state->answered || (state->other_ip && !state->same_port))
         state->level = 0;
     else if (state->same_port && state->other_ip)
         state->level = 1;
@@ -296,10 +298,13 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
         state->phase = 4;
         return;
     }
-    if (line > 0 && strstr(state->line, "same-port=")) {
-        state->same_port = strstr(state->line, "same-port=1") != NULL;
-        state->other_ip = strstr(state->line, "other-ip=1") != NULL;
-        state->answered = 1;
+    if (line > 0) {
+        int used = 0;
+        state->answered = sscanf(state->line, "same-port=%1d other-ip=%1d%n",
+                                 &state->same_port, &state->other_ip, &used) == 2 &&
+                          state->same_port <= 1 && state->other_ip <= 1 &&
+                          (state->line[used] == '\n' ||
+                           (state->line[used] == '\r' && state->line[used + 1] == '\n'));
         finish(state);
         return;
     }

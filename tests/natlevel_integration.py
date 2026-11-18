@@ -197,7 +197,7 @@ try:
             directory = runtime / name
             directory.mkdir()
             cfg = {'network': {'Node': name, 'Token': token, 'ServerHost': '127.0.0.1',
-                               'ServerPort': 27183, 'UDPSTUNServers': endpoints},
+                               'ServerPort': 27183, 'UDPSTUNServers': endpoints, 'TCPNatProbe': ''},
                    'CACertFile': str(certs / 'ca.crt'), 'apps': []}
             path = directory / 'config.json'
             path.write_text(json.dumps(cfg))
@@ -222,6 +222,11 @@ try:
             wait(lambda n=name, e=expected: (node(n) or {}).get('natLevel') == e,
                  timeout=30, what=label + ' to publish NAT%d' % expected)
             results['stun ' + label] = level
+            if label == 'silent':
+                responders[0].advertise_alternate = True
+                wait(lambda: (node(name) or {}).get('natLevel') == 3, timeout=55,
+                     what='UDP filtering to recover without reconnecting')
+                results['stun retry published a new verdict'] = True
 
             for responder in responders:
                 responder.stop()
