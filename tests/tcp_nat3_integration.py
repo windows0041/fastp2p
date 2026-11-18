@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real clients behind two port-preserving, endpoint-filtered Linux NAT routers.
+"""Real clients behind two endpoint-filtered Linux NAT routers.
 
 Requires root inside an already isolated network namespace. Nested namespaces
 are owned by child processes, with no named-netns or host mount mutations.
@@ -26,7 +26,11 @@ p.add_argument('--client',required=True)
 p.add_argument('--gateway',required=True)
 p.add_argument('--logs',required=True)
 p.add_argument('--legacy-client',help='Optional previous client binary, for capability negotiation coverage')
+mode = p.add_mutually_exclusive_group()
+mode.add_argument('--mixed', action='store_true', help='Exercise TCP NAT3 to NAT4 prediction and relay fallback')
+mode.add_argument('--both-dependent', action='store_true', help='Exercise TCP NAT4 to NAT4 prediction and relay fallback')
 args=p.parse_args()
+prediction_cases = args.mixed or args.both_dependent
 if os.geteuid() or Path('/proc/self/ns/net').readlink()==Path('/proc/1/ns/net').readlink():
     raise SystemExit('Run as root with unshare --net; never run in the host network namespace')
 root=Path(args.logs).resolve();root.mkdir(parents=True,exist_ok=True);root.chmod(0o700)
@@ -56,7 +60,7 @@ def wait(check,timeout=60):
             if check():return
         except (OSError,ValueError,KeyError,AssertionError):pass
         time.sleep(.05)
-    raise TimeoutError('NAT3 condition timed out; inspect private test logs')
+    raise TimeoutError('TCP NAT condition timed out; inspect private test logs')
 def namespace(name):
     child=start(['unshare','--net','--','sleep','600'],name);anchors.append(child)
     wait(lambda:Path(f'/proc/{child.pid}/ns/net').readlink()!=Path('/proc/self/ns/net').readlink(),3)
@@ -176,14 +180,15 @@ with socket.create_connection(('127.0.0.1',30999),timeout=8) as client:
   client.sendall(payload)
   assert reply.read(len(payload))==payload
 """
-    cases=[('udp-blocked',None),('udp-hard-mapping','2')]
-    if args.legacy_client:cases.append(('legacy-peer',None))
+    cases=[] if prediction_cases else [('udp-blocked',None),('udp-hard-mapping','2')]
+    if not prediction_cases and args.legacy_client:cases.append(('legacy-peer',None))
     for label,override in cases:
         names={'a':'nat3-source-'+label,'b':'nat3-target-'+label}
         processes=[]
         for side,pid in (('b',cb),('a',ca)):
             config={'product':'fastp2p','network':{'Node':names[side],'Token':token,'ServerHost':'192.0.2.1','ServerPort':27183,
-                'TCPSTUNServers':['192.0.2.21:3478','192.0.2.22:3478']},'CACertFile':str(root/'tls/ca.crt'),'apps':[]}
+                'TCPSTUNServers':['192.0.2.21:3478','192.0.2.22:3478'], 'UDPSTUNServers':[], 'TCPNatProbe':''},
+                'CACertFile':str(root/'tls/ca.crt'),'apps':[]}
             if side=='a':config['apps']=[{'AppName':'tcp-through-nat3','Protocol':'tcp','SrcPort':28100,'PeerNode':names['b'],
                 'DstHost':'127.0.0.1','DstPort':38180,'UnderlayProtocol':'tcp','Enabled':1}]
             path=root/(label+'-'+side+'.json');path.write_text(json.dumps(config));path.chmod(0o600)
@@ -194,7 +199,7 @@ with socket.create_connection(('127.0.0.1',30999),timeout=8) as client:
         observed=api('/api/v1/nodes')['nodes'];observed={n['name']:n for n in observed}
         for side,name in names.items():
             node=observed[name]
-            if label=='legacy-peer' and side=='b':assert int(node['tcpNatType'])==314
+            if label=='legacy-peer' and side=='b':assert int(node['tcpNatType']) in (1,314)
             else:assert int(node['tcpNatType'])==1 and int(node['tcpNatSamples'])==4 and int(node['tcpNatDestinationIPs'])==3
             assert int(node['udpNatType'])==(2 if override else 314)
         command=transfer
@@ -224,12 +229,121 @@ with socket.create_connection(('127.0.0.1',30999),timeout=8) as client:
         for process in processes:stop(process)
         wait(lambda:all(not int(n['isActive']) for n in api('/api/v1/nodes')['nodes'] if n['name'] in names.values()),10)
         persisted={n['name']:n for n in api('/api/v1/nodes')['nodes']}
-        assert all(int(persisted[name]['tcpNatType'])==(314 if label=='legacy-peer' and side=='b' else 1) for side,name in names.items())
+        assert all(int(persisted[name]['tcpNatType'])==int(observed[name]['tcpNatType']) for name in names.values())
+    if prediction_cases:
+        relay = namespace('relay-ns')
+        interface('wan-relay', 'eth0', relay, '192.0.2.31/24')
+        start([sys.executable, '-u', '-c', echo_code], 'echo-a', ca)
+        local_ports = range(39000, 39200)
+        run(['sysctl', '-qw', f'net.ipv4.ip_local_port_range={local_ports.start} {local_ports.stop - 1}'], cb)
+        if args.both_dependent:
+            run(['sysctl', '-qw', f'net.ipv4.ip_local_port_range={local_ports.start} {local_ports.stop - 1}'], ca)
+
+        def mixed_node(name, pid):
+            config = {
+                'product': 'fastp2p',
+                'network': {'Node': name, 'Token': token, 'ServerHost': '192.0.2.1', 'ServerPort': 27183,
+                            'TCPSTUNServers': ['192.0.2.21:3478', '192.0.2.22:3478'],
+                            'UDPSTUNServers': [], 'TCPNatProbe': ''},
+                'CACertFile': str(root / 'tls/ca.crt'), 'apps': [],
+            }
+            path = root / (name + '.json')
+            path.write_text(json.dumps(config))
+            path.chmod(0o600)
+            return start([client, 'run', '--config', str(path)], name, pid)
+
+        def sampled(*names):
+            nodes = api('/api/v1/nodes')['nodes']
+            return all(any(node['name'] == name and int(node['isActive']) and
+                           int(node['tcpNatSamples']) == 4 for node in nodes) for name in names)
+
+        def dependent_nat(router, public_ip, peer_ip, public_base, offsets):
+            targets = [('192.0.2.1', 27180), ('192.0.2.21', 3478),
+                       ('192.0.2.22', 3478), (peer_ip, None), ('192.0.2.31', None)]
+            # Reserve distinct translated ports for each local source, including
+            # retries and relay connections while earlier conntrack entries exist.
+            rules = ['add table ip mixed_nat',
+                     'add chain ip mixed_nat outgoing { type nat hook postrouting priority 99; }']
+            for (ip, dst_port), offset in zip(targets, (*offsets, offsets[0])):
+                ports = ', '.join(f'{source} : {public_base + slot * 30 + offset}'
+                                  for slot, source in enumerate(local_ports))
+                destination = f'tcp dport {dst_port}' if dst_port else 'ip protocol tcp'
+                rules.append(f'add rule ip mixed_nat outgoing oifname "wan" ip daddr {ip} '
+                             f'{destination} snat to {public_ip} : tcp sport map {{ {ports} }}')
+            run(['nft', '-f', '-'], router, input='\n'.join(rules) + '\n')
+
+        def assert_direct_tuple(pid, peer_ip, public_base, offset):
+            connections = run(['ss', '-tnH', 'state', 'established'], pid).stdout
+            direct_ports = {public_base + slot * 30 + offset for slot in range(len(local_ports))}
+            assert any(int(endpoint.rsplit(':', 1)[1]) in direct_ports
+                       for endpoint in connections.split() if endpoint.startswith(peer_ip + ':')), connections
+
+        mixed_node('mixed-relay', relay)
+        wait(lambda: sampled('mixed-relay'), 20)
+        if args.both_dependent:
+            up, down = (0, 1, 2, 3), (4, 3, 2, 1)
+            nat_cases = [
+                ('both-increment', up, up, False, True, True),
+                ('opposite-directions', up, down, True, True, True),
+                ('both-decrement', down, down, False, True, True),
+                ('pair-miss', up, (4, 3, 2, 0), False, False, True),
+                ('pair-irregular', up, (0, 7, 3, 20), False, False, False),
+            ]
+        else:
+            nat_cases = [
+                ('increment', None, (0, 1, 2, 5), False, True, True),
+                ('decrement', None, (4, 3, 2, 1), True, True, True),
+                ('observed-port', None, (0, 1, 2, 0), False, True, True),
+                ('window-miss', None, (0, 1, 2, 20), False, False, True),
+                ('irregular', None, (0, 7, 3, 20), False, False, False),
+            ]
+        for index, (label, a_offsets, b_offsets, reverse, direct, predicted) in enumerate(nat_cases):
+            public_base = 33000 + index * 6000
+            if a_offsets:
+                dependent_nat(ra, '192.0.2.11', '192.0.2.12', public_base, a_offsets)
+            dependent_nat(rb, '192.0.2.12', '192.0.2.11', public_base, b_offsets)
+            name_a, name_b = 'a-' + label, 'b-' + label
+            first = mixed_node(name_a, ca)
+            second = mixed_node(name_b, cb)
+            wait(lambda: sampled(name_a, name_b), 20)
+            reported = {node['name']: int(node['tcpNatType']) for node in api('/api/v1/nodes')['nodes']}
+            assert reported[name_a] == (2 if a_offsets else 1) and reported[name_b] == 2
+            source, target, source_ns = (name_b, name_a, cb) if reverse else (name_a, name_b, ca)
+            path = '/api/v1/device/' + source
+            api(path + '/app', {'appName': label, 'protocol': 'socks5', 'srcPort': 30999,
+                                'peerNode': target, 'punchPriority': 3})
+            expected_link = 'tcppunch' if direct else 'relay'
+            wait(lambda: any(app.get('srcPort') == 30999 and app.get('linkStatus') == 'connected' and
+                             app.get('linkMode') == expected_link for app in api(path + '/apps')['Apps']), 90)
+            run([sys.executable, '-c', socks_transfer], source_ns, timeout=15)
+            if args.both_dependent:
+                marker = 'TCP NAT prediction dialing a single endpoint for simultaneous open'
+                for name in (name_a, name_b):
+                    assert (marker in text(name)) == predicted
+            else:
+                assert ('TCP NAT prediction opened a bounded port window' in text(name_a)) == predicted
+                assert ('TCP NAT prediction peer ready' in text(name_b)) == predicted
+            if direct:
+                assert_direct_tuple(ca, '192.0.2.12', public_base, b_offsets[-1])
+                if a_offsets:
+                    assert_direct_tuple(cb, '192.0.2.11', public_base, a_offsets[-1])
+                assert 'forward attached to relay' not in text(source)
+            else:
+                assert 'forward attached to relay' in text(source)
+            results[label] = {'link_mode': expected_link, 'prediction_attempted': predicted, 'socks5_echo': True}
+            stop(first)
+            stop(second)
+            run(['nft', 'delete', 'table', 'ip', 'mixed_nat'], rb)
+            if a_offsets:
+                run(['nft', 'delete', 'table', 'ip', 'mixed_nat'], ra)
     for router in (ra,rb):
         counters=run(['iptables','-L','FORWARD','-vnx'],router).stdout
         rows=[line.split() for line in counters.splitlines() if 'FP-UDP-DROP' in line]
         assert rows and int(rows[0][0])>0
-    results['udp_packets_really_blocked']=True;results['offline_mapping_results_persisted']=True;results['success']=True
+    results['udp_packets_really_blocked']=True
+    if not prediction_cases:
+        results['offline_mapping_results_persisted']=True
+    results['success']=True
 finally:
     finished.set()
     for listener in stun_listeners:listener.close()

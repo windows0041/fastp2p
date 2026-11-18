@@ -5,6 +5,7 @@
 
 /* These are mapping observations, never a claim about inbound filtering. */
 enum { FP_NAT_STABLE = 1, FP_NAT_DEPENDENT = 2, FP_NAT_UNKNOWN = 314 };
+enum { FP_TCP_MAP_NONE, FP_TCP_MAP_STABLE, FP_TCP_MAP_INCREMENT, FP_TCP_MAP_DECREMENT };
 #define FP_TCP_STUN_MAX 4
 #define FP_TCP_PROBE_MAX (2 + FP_TCP_STUN_MAX)
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
     /* Destination endpoints sampled in this cycle, for the distinct-IP count. */
     op_addr target_used[FP_TCP_PROBE_MAX];
     op_socket fd, held[FP_TCP_PROBE_MAX];
+    op_addr source;
     uint16_t source_port;
     int phase, prepared;
     uint64_t deadline, next_cycle;
@@ -50,6 +52,12 @@ void fp_tcp_nat_prepare(fp_tcp_nat *state, const op_addr gateway[OP_FAM_COUNT], 
 /* Returns a FAM_* bitmap of the families that completed a fresh observation. */
 int fp_tcp_nat_step(fp_tcp_nat *state, uint64_t now);
 void fp_tcp_nat_close(fp_tcp_nat *state);
+/* Optional tunnel samples reuse the exact source of the first gateway echo. */
+fp_tcp_family *fp_tcp_punch_sample_start(const fp_tcp_family *catalog, const op_addr *source,
+                                       const op_addr *first_mapping);
+/* 0 while running, 1 on completion. Ports come from the last successful sample. */
+int fp_tcp_punch_sample_step(fp_tcp_family *sample, uint64_t now, unsigned *mapping, uint16_t *port);
+void fp_tcp_punch_sample_free(fp_tcp_family *sample);
 /* -1 malformed, 0 incomplete, 1 complete. Exposed only to internal tests. */
 int fp_tcp_stun_response(const uint8_t *data, size_t length, const uint8_t transaction[12],
                          struct sockaddr_in *mapped);

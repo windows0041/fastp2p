@@ -27,6 +27,7 @@
 /* Sessions this node is willing to relay for at once. */
 #define RELAY_SESSION_LIMIT 4
 #define SYM_WINDOW_MAX 50
+#define TCP_PREDICT_PORTS 4
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define NAT_FILTER_RETRY (30 * NS)
@@ -71,6 +72,7 @@ enum tunnel_state {
      * this one state; the per-family probe machines carry the old
      * T_NAT_CONNECT/READ/UDP detail. */
     T_PROBE,
+    T_TCP_SAMPLE,
     T_NAT_CONNECT,
     T_NAT_READ,
     T_NAT_UDP,
@@ -84,6 +86,7 @@ enum tunnel_state {
     T_QUIC,
     T_DIRECT
 };
+enum { TCP_PREDICT_NONE, TCP_PREDICT_OPEN, TCP_PREDICT_DIAL, TCP_PREDICT_PAIR };
 /* One address-family mapping probe. A dual-stack client runs the identical
  * sequence once per family, against the gateway's address of that family
  * (SPEC §2); a v4-only client keeps exactly one, which is the old behaviour.
@@ -147,6 +150,15 @@ typedef struct {
     int tcp_v2, tcp_punch_immediate;
     unsigned tcp_attempts;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
+    fp_tcp_family *tcp_sample;
+    unsigned tcp_mapping, peer_tcp_mapping;
+    uint16_t tcp_last_port, peer_tcp_last_port;
+    int peer_tcp_pair, tcp_predict_role, tcp_predict_ready, tcp_predict_ready_sent;
+    int tcp_peer_ip_verified;
+    uint64_t tcp_predict_wait, tcp_predict_until;
+    unsigned tcp_candidate_count;
+    uint16_t tcp_candidate_ports[1 + TCP_PREDICT_PORTS];
+    op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     /* Peer's predicted mapping window: base port, direction and width. A
@@ -888,6 +900,12 @@ static void tick_relays(fastp2p_client *c, uint64_t now) {
         }
     }
 }
+static void close_tcp_candidates(tunnel *t) {
+    for (unsigned i = 0; i < t->tcp_candidate_count; ++i)
+        if (t->tcp_candidates[i] >= 0)
+            op_close(t->tcp_candidates[i]);
+    t->tcp_candidate_count = 0;
+}
 static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
     if (!t->state)
@@ -940,6 +958,8 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
         op_close(t->listen_fd);
     if (t->alternate_fd >= 0)
         op_close(t->alternate_fd);
+    close_tcp_candidates(t);
+    fp_tcp_punch_sample_free(t->tcp_sample);
     op_buffer_clear(&t->rx);
     op_buffer_clear(&t->tx);
     op_buffer_clear(&t->alternate_rx);
@@ -1433,8 +1453,39 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     t->local_port = t->probes[adopt].local_port;
     t->mapped_port = t->probes[adopt].mapped_port;
     address_copy(t->mapped_ip, t->probes[adopt].mapped_ip);
+    if (adopt == OP_FAM_V4 && !t->lan && !t->relay_wait && t->tcp_punch_immediate &&
+        (t->initiator || t->peer_tcp_mapping) && (c->gateway_tcp_probe_v2 || c->gateway_tcp_probe_v3)) {
+        op_addr source, mapped, bind_address;
+        if (!op_addr_socketname(t->probes[adopt].fd, &source) &&
+            !op_addr_from_text(&bind_address, source_text(c, adopt), 0) &&
+            op_addr_equal(&source, &bind_address) &&
+            !op_addr_from_text(&mapped, t->mapped_ip, t->mapped_port))
+            t->tcp_sample = fp_tcp_punch_sample_start(&c->tcp_nat.family[adopt], &source, &mapped);
+        if (t->tcp_sample) {
+            t->state = T_TCP_SAMPLE;
+            t->deadline = now + 2 * NS;
+            return 0;
+        }
+    }
     probe_complete(c, index);
     return 1;
+}
+static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port) {
+    if (mapping == FP_TCP_MAP_INCREMENT && last_port && last_port < UINT16_MAX)
+        return (uint16_t)(last_port + 1);
+    if (mapping == FP_TCP_MAP_DECREMENT && last_port > 1)
+        return (uint16_t)(last_port - 1);
+    return 0;
+}
+static void learn_tcp_mapping(tunnel *t, json_object *j) {
+    uint64_t mapping = op_integer(j, "tcpPunchMap");
+    uint64_t port = op_integer(j, "tcpPunchLastPort");
+    if (t->tcp_punch_immediate && mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_DECREMENT &&
+        port > 0 && port <= 65535) {
+        t->peer_tcp_mapping = (unsigned)mapping;
+        t->peer_tcp_last_port = (uint16_t)port;
+        t->peer_tcp_pair = op_integer(j, "tcpPunchPair") == 1;
+    }
 }
 static void probe_complete(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -1461,6 +1512,12 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);
     if (t->tcp_v2) op_ju(j, "tcpPunchV2", 1);
     if (t->tcp_punch_immediate) op_ju(j, "tcpPunchImmediate", 1);
+    if (t->tcp_mapping) {
+        op_ju(j, "tcpPunchMap", t->tcp_mapping);
+        op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
+        if (tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port))
+            op_ju(j, "tcpPunchPair", 1);
+    }
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
      * old peer reads (SPEC §5). */
@@ -1595,6 +1652,125 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         tcp_punch_failed(c, index, now);
     }
 }
+static int tcp_mapping_moves(unsigned mapping) {
+    return mapping == FP_TCP_MAP_INCREMENT || mapping == FP_TCP_MAP_DECREMENT;
+}
+static void tcp_candidate_connected(tunnel *t, op_socket fd, uint64_t now) {
+    close_tcp_candidates(t);
+    op_close(t->listen_fd);
+    t->listen_fd = -1;
+    t->fd = fd;
+    t->state = T_HANDSHAKE;
+    t->deadline = now + 10 * NS;
+    if (!t->server) {
+        uint8_t id[8];
+        op_put64(id, t->id);
+        tframe(t, 2, id, 8);
+    }
+}
+static int tcp_predict_add_candidate(fastp2p_client *c, tunnel *t, uint16_t port) {
+    op_socket fd = socket_bound(0, source_text(c, OP_FAM_V4), t->local_port, 1);
+    if (fd < 0)
+        return -1;
+    op_addr candidate = t->peer_addr;
+    op_addr_set_port(&candidate, port);
+    if (op_connect(fd, &candidate.u.sa, candidate.len) && errno != EINPROGRESS) {
+        op_close(fd);
+        return 0;
+    }
+    unsigned slot = t->tcp_candidate_count++;
+    t->tcp_candidates[slot] = fd;
+    t->tcp_candidate_ports[slot] = port;
+    return 1;
+}
+static int tcp_send_prediction_ready(fastp2p_client *c, const tunnel *t) {
+    json_object *j = json_object_new_object();
+    op_ju(j, "id", t->id);
+    op_ju(j, "tcpPredictReady", 1);
+    int rv = push(c, t->peer, PUSH_READY, j);
+    json_object_put(j);
+    return rv;
+}
+static void tcp_predict_open(fastp2p_client *c, tunnel *t, uint64_t now) {
+    int direction = t->peer_tcp_mapping == FP_TCP_MAP_INCREMENT ? 1 : -1;
+    /* Some destination-dependent NATs still reuse the observed port for a
+     * particular peer. Open that tuple alongside the predicted ones. */
+    for (int i = 0; i <= TCP_PREDICT_PORTS; ++i) {
+        int port = i ? t->peer_tcp_last_port + direction * i : t->remote_port;
+        if (port <= 0 || port > 65535)
+            break;
+        if (i && port == t->remote_port)
+            continue;
+        if (tcp_predict_add_candidate(c, t, (uint16_t)port) < 0)
+            break;
+    }
+    if (!t->tcp_candidate_count) {
+        t->tcp_predict_wait = now;
+        return;
+    }
+    /* Keep the SYN-SENT sockets for simultaneous open. The existing listener
+     * also covers candidates whose connection attempt has already ended. */
+    tcp_send_prediction_ready(c, t);
+    t->tcp_predict_until = now + 4 * NS;
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP NAT prediction opened a bounded port window");
+}
+static void tcp_predict_pair(fastp2p_client *c, tunnel *t, uint64_t now) {
+    if (!t->tcp_predict_ready_sent) {
+        if (tcp_send_prediction_ready(c, t)) {
+            t->tcp_predict_wait = now;
+            return;
+        }
+        t->tcp_predict_ready_sent = 1;
+    }
+    if (!t->tcp_predict_ready)
+        return;
+    /* A second destination could consume our next translated port. Each
+     * side therefore sends a SYN to exactly one peer endpoint per round. */
+    uint16_t port = tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port);
+    if (tcp_predict_add_candidate(c, t, port) <= 0) {
+        t->tcp_predict_wait = now;
+        return;
+    }
+    t->tcp_predict_until = now + 4 * NS;
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP NAT prediction dialing a single endpoint for simultaneous open");
+}
+static void tcp_predict_tick(fastp2p_client *c, int index, uint64_t now) {
+    tunnel *t = &c->tunnels[index];
+    if (!t->tcp_candidate_count && t->tcp_peer_ip_verified && now < t->tcp_predict_wait) {
+        if (t->tcp_predict_role == TCP_PREDICT_OPEN)
+            tcp_predict_open(c, t, now);
+        else if (t->tcp_predict_role == TCP_PREDICT_PAIR)
+            tcp_predict_pair(c, t, now);
+    }
+    if (t->tcp_candidate_count) {
+        for (unsigned i = 0; i < t->tcp_candidate_count; ++i) {
+            op_socket fd = t->tcp_candidates[i];
+            if (fd < 0)
+                continue;
+            int ready = connect_ready(fd);
+            if (ready)
+                t->tcp_candidates[i] = -1;
+            if (ready > 0) {
+                tcp_candidate_connected(t, fd, now);
+                return;
+            }
+            if (ready < 0)
+                op_close(fd);
+        }
+        return;
+    }
+    if (t->tcp_predict_role == TCP_PREDICT_DIAL && t->tcp_predict_ready) {
+        t->tcp_predict_role = TCP_PREDICT_NONE;
+        t->tcp_predict_until = now + 4 * NS;
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP NAT prediction peer ready; dialing from sampled port");
+        tcp_punch_dial(c, index, now);
+        return;
+    }
+    if (now >= t->tcp_predict_wait) {
+        t->tcp_predict_role = TCP_PREDICT_NONE;
+        tcp_punch_dial(c, index, now);
+    }
+}
 static void start_underlay(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     if (!t->peer_addr.len) {
@@ -1609,6 +1785,26 @@ static void start_underlay(fastp2p_client *c, int index) {
         uint64_t now = mono();
         t->deadline = now + 15 * NS;
         t->state = T_TCP_CONNECT;
+        if (t->family == OP_FAM_V4) {
+            if (t->tcp_mapping == FP_TCP_MAP_STABLE && tcp_mapping_moves(t->peer_tcp_mapping))
+                t->tcp_predict_role = TCP_PREDICT_OPEN;
+            else if (tcp_mapping_moves(t->tcp_mapping) && t->peer_tcp_mapping == FP_TCP_MAP_STABLE)
+                t->tcp_predict_role = TCP_PREDICT_DIAL;
+            else if (t->peer_tcp_pair && tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port) &&
+                     tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port))
+                t->tcp_predict_role = TCP_PREDICT_PAIR;
+        }
+        if (t->tcp_predict_role) {
+            t->tcp_predict_wait = now + (t->tcp_predict_role == TCP_PREDICT_OPEN ? 1 : 2) * NS;
+            if (t->tcp_predict_role != TCP_PREDICT_DIAL) {
+                /* Verify the destination IPv4 independently of peer input. */
+                json_object *j = json_object_new_object();
+                op_js(j, "peerNode", t->peer);
+                ws_json(c, 7, 0, j);
+                json_object_put(j);
+            }
+            return;
+        }
         tcp_punch_dial(c, index, now);
         return;
     }
@@ -2365,7 +2561,21 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         data += 16;
         len -= 16;
     }
-    if (main == 3 && sub == 8) {
+    if (main == 3 && sub == PUSH_READY) {
+        json_object *ready = op_json(data, len);
+        int prediction = op_integer(ready, "tcpPredictReady") == 1;
+        if (prediction) {
+            int ti = tunnel_by_id(c, op_integer(ready, "id"));
+            if (ti >= 0) {
+                tunnel *t = &c->tunnels[ti];
+                if (t->peer_id == sender && (t->state == T_TIME || t->state == T_TCP_CONNECT))
+                    t->tcp_predict_ready = 1;
+            }
+        }
+        if (ready)
+            json_object_put(ready);
+        if (prediction)
+            return;
         for (int i = 0; i < NT; ++i)
             if (c->tunnels[i].state && c->tunnels[i].peer_id == sender)
                 c->tunnels[i].notified = 1;
@@ -2460,6 +2670,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 strcpy(t->mode, mode);
                 t->tcp_v2 = !strcmp(mode, "tcppunch") && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
+                learn_tcp_mapping(t, j);
                 if (v4_ok)
                     tunnel_learn_peer(t, peer_text, port);
                 if (v6_ok)
@@ -2515,6 +2726,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     tunnel_learn_peer(t, peer_text6, port6);
                 t->tcp_v2 = t->tcp_v2 && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
+                learn_tcp_mapping(t, j);
                 int64_t delay = 0;
                 if (!t->tcp_punch_immediate) {
                     uint64_t ts = op_integer(j, "punchts"), local = wall();
@@ -2599,6 +2811,16 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         }
     } else if (main == 7 && sub == 1) {
         const char *peer = op_string(j, "peerNode"), *lan = op_string(j, "lanIP");
+        op_addr gateway_ip;
+        if (valid_node(peer) && !op_addr_from_text(&gateway_ip, op_string(j, "IPv4"), 0) &&
+            op_addr_family(&gateway_ip) == AF_INET)
+            for (int i = 0; i < NT; ++i) {
+                tunnel *t = &c->tunnels[i];
+                if (t->state == T_TCP_CONNECT &&
+                    (t->tcp_predict_role == TCP_PREDICT_OPEN || t->tcp_predict_role == TCP_PREDICT_PAIR) &&
+                    !strcmp(t->peer, peer) && op_addr_equal(&gateway_ip, &t->peer_addr))
+                    t->tcp_peer_ip_verified = 1;
+            }
         struct in_addr lan_address;
         /* SPEC §4: the gateway's 7/1 answer carries the family bitmap and the
          * parallel v6 levels. It has no separate v6 LAN column; `IPv6` is the
@@ -3059,6 +3281,16 @@ static void accept_punch(fastp2p_client *c, int ti) {
     if (fd < 0)
         return;
     op_addr_normalize(&peer);
+    if (t->tcp_predict_role == TCP_PREDICT_OPEN || t->tcp_predict_role == TCP_PREDICT_PAIR) {
+        if (op_addr_equal(&peer, &t->peer_addr))
+            for (unsigned i = 0; i < t->tcp_candidate_count; ++i)
+                if (op_addr_port(&peer) == t->tcp_candidate_ports[i]) {
+                    tcp_candidate_connected(t, fd, mono());
+                    return;
+                }
+        op_close(fd);
+        return;
+    }
     op_addr expected;
     if (op_addr_from_text(&expected, t->ip, 0) || !op_addr_equal(&peer, &expected) ||
         op_addr_port(&peer) != t->remote_port) {
@@ -3110,6 +3342,14 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     if (!t->state)
         return;
+    if (t->state == T_TCP_SAMPLE &&
+        (now >= t->deadline || fp_tcp_punch_sample_step(t->tcp_sample, now, &t->tcp_mapping, &t->tcp_last_port))) {
+        fp_tcp_punch_sample_free(t->tcp_sample);
+        t->tcp_sample = NULL;
+        probe_complete(c, ti);
+        if (!t->state)
+            return;
+    }
     if (t->state != T_ACTIVE && now > t->deadline) {
         close_tunnel(c, ti, "tunnel establishment timed out");
         return;
@@ -3200,9 +3440,10 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                 json_object_put(r);
             if (id != t->id)
                 continue;
+            /* QUIC must use the endpoint confirmed by the punch. */
             t->remote_port = op_addr_port(&from);
-            op_addr_copy(&peer, &from);
-            udp_packet(t->fd, &peer, 4, 1, j);
+            op_addr_copy(&t->peer_addr, &from);
+            udp_packet(t->fd, &t->peer_addr, 4, 1, j);
             if (op_u16(data + 6) == 1)
                 start_underlay(c, ti);
         }
@@ -3210,6 +3451,21 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     }
     if (t->state == T_UNDERLAY && t->notified)
         start_underlay(c, ti);
+    if (t->state == T_TCP_CONNECT && t->tcp_predict_until && now >= t->tcp_predict_until) {
+        /* The predicted port can miss even when the original mapped endpoint
+         * works. Use the rest of the original budget for the standard punch. */
+        close_tcp_candidates(t);
+        if (t->fd >= 0)
+            op_close(t->fd);
+        t->fd = -1;
+        t->tcp_predict_until = 0;
+        t->tcp_predict_role = TCP_PREDICT_NONE;
+        t->tcp_attempts = 0;
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP NAT prediction timed out; trying the observed endpoint");
+        tcp_punch_dial(c, ti, now);
+    }
+    if (t->state == T_TCP_CONNECT && t->tcp_predict_role)
+        tcp_predict_tick(c, ti, now);
     if (t->state == T_TCP_CONNECT) {
         if (t->state && t->tcp_v2 && t->fd < 0 && t->tcp_retry_at && now >= t->tcp_retry_at)
             tcp_punch_dial(c, ti, now);
@@ -3550,18 +3806,14 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                          (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
                         in_progress = 1;
                 if (!in_progress) {
-                    /* Two failed punches, symmetric NAT on both sides, or an
-                     * explicit diagnostic request means a direct path is not
-                     * reachable: ask the gateway for a relay.  A reachable LAN
-                     * address is tried first, because it needs no NAT support
-                     * at all and stays direct. */
-                    /* One side maps a different port per destination with no
-                     * pattern, so no amount of sending or spraying finds it.
-                     * Skip the punch ladder entirely: the first round is worth
-                     * trying for the LAN case, then go straight to the relay. */
-                    int rounds = direct_rounds_allowed(
-                        nat_is_hard_sym(local_transport_nat(c, a->transport)),
-                        nat_is_hard_sym(peer_transport_nat(a)));
+                    int hard_self = nat_is_hard_sym(local_transport_nat(c, a->transport));
+                    int hard_peer = nat_is_hard_sym(peer_transport_nat(a));
+                    int rounds = direct_rounds_allowed(hard_self, hard_peer);
+                    /* A TCP dependent mapping report does not say whether its
+                     * ports are predictable. Let peers with enough destinations
+                     * take fresh samples before assuming they require a relay. */
+                    int can_sample_tcp = a->transport == FASTP2P_TRANSPORT_TCP &&
+                                         c->tcp_nat.family[OP_FAM_V4].destinations >= 3;
                     if (lan_punch_possible(c, a) && !a->lan_tried && a->attempts < rounds && !c->force_relay) {
                         if (a->transport != FASTP2P_TRANSPORT_TCP)
                             ++a->attempts;
@@ -3572,8 +3824,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             start_punch(c, ti);
                         }
                     } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
-                        (nat_is_hard_sym(local_transport_nat(c, a->transport)) &&
-                         nat_is_hard_sym(peer_transport_nat(a)))) {
+                        (hard_self && hard_peer && !can_sample_tcp)) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();

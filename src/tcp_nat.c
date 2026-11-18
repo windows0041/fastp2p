@@ -5,6 +5,7 @@
 #include <string.h>
 
 #define SECOND UINT64_C(1000000000)
+#define PUNCH_SAMPLE_TIMEOUT UINT64_C(450000000)
 static uint16_t be16(const uint8_t *p) { return (uint16_t)((unsigned)p[0] << 8 | p[1]); }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 
@@ -258,7 +259,9 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
     if (k->phase == 1) {
         op_addr bind_to;
         memset(&bind_to, 0, sizeof(bind_to));
-        if (op_addr_from_text(&bind_to, family == OP_FAM_V6 ? "::" : "0.0.0.0", k->source_port)) {
+        if (k->source.len) {
+            bind_to = k->source;
+        } else if (op_addr_from_text(&bind_to, family == OP_FAM_V6 ? "::" : "0.0.0.0", k->source_port)) {
             next_target(k, NULL);
             return 0;
         }
@@ -278,7 +281,9 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
             if (RAND_bytes(k->request + 8, 12) != 1) { next_target(k, NULL); return 0; }
             k->request_length = 20;
         } else { k->request[0] = '2'; k->request_length = 1; }
-        k->sent = k->received = 0; k->deadline = now + 2 * SECOND; k->phase = 2;
+        k->sent = k->received = 0;
+        k->deadline = now + (k->source.len ? PUNCH_SAMPLE_TIMEOUT : 2 * SECOND);
+        k->phase = 2;
         if (op_connect(k->fd, &k->targets[k->index].address.u.sa,
                        k->targets[k->index].address.len) && errno != EINPROGRESS)
             next_target(k, NULL);
@@ -329,4 +334,63 @@ int fp_tcp_nat_step(fp_tcp_nat *s, uint64_t now) {
     for (int f = 0; f < OP_FAM_COUNT; ++f)
         if (family_step(&s->family[f], f, now)) done |= 1 << f;
     return done;
+}
+
+fp_tcp_family *fp_tcp_punch_sample_start(const fp_tcp_family *catalog, const op_addr *source,
+                                       const op_addr *first_mapping) {
+    if (catalog->target_count < 3)
+        return NULL;
+    /* Sample distinct destination IPs. The first result came from 27180. */
+    fp_tcp_probe_target targets[FP_TCP_PROBE_MAX];
+    unsigned count = 0;
+    for (unsigned i = 1; i < catalog->target_count; ++i) {
+        const fp_tcp_probe_target *target = &catalog->targets[i];
+        int duplicate = op_addr_equal(&target->address, &catalog->targets[0].address);
+        for (unsigned j = 0; j < count; ++j)
+            duplicate |= op_addr_equal(&target->address, &targets[j].address);
+        if (!duplicate)
+            targets[count++] = *target;
+    }
+    if (count < 2)
+        return NULL;
+    fp_tcp_family *sample = calloc(1, sizeof(*sample));
+    if (!sample)
+        return NULL;
+    sample->source = *source;
+    sample->source_port = op_addr_port(source);
+    sample->fd = -1;
+    for (unsigned i = 0; i < FP_TCP_PROBE_MAX; ++i)
+        sample->held[i] = -1;
+    memcpy(sample->targets, targets, count * sizeof(targets[0]));
+    sample->target_count = count;
+    sample->target_used[0] = catalog->targets[0].address;
+    sample->mapped[0] = *first_mapping;
+    sample->collected = sample->collected_ips = 1;
+    sample->prepared = sample->phase = 1;
+    return sample;
+}
+
+int fp_tcp_punch_sample_step(fp_tcp_family *sample, uint64_t now, unsigned *mapping, uint16_t *port) {
+    if (!family_step(sample, OP_FAM_V4, now))
+        return 0;
+    if (sample->destinations < 3)
+        return 1;
+    int step = (int)op_addr_port(&sample->mapped[1]) - op_addr_port(&sample->mapped[0]);
+    if (step < -1 || step > 1)
+        return 1;
+    for (unsigned i = 1; i < sample->samples; ++i) {
+        if (!op_addr_equal(&sample->mapped[i], &sample->mapped[0]) ||
+            (int)op_addr_port(&sample->mapped[i]) - op_addr_port(&sample->mapped[i - 1]) != step)
+            return 1;
+    }
+    *mapping = step == 0 ? FP_TCP_MAP_STABLE : step > 0 ? FP_TCP_MAP_INCREMENT : FP_TCP_MAP_DECREMENT;
+    *port = op_addr_port(&sample->mapped[sample->samples - 1]);
+    return 1;
+}
+
+void fp_tcp_punch_sample_free(fp_tcp_family *sample) {
+    if (sample) {
+        family_close(sample);
+        free(sample);
+    }
 }

@@ -1,5 +1,4 @@
-/* The punch cadence, mapping classification and symmetric window are pure
- * decisions, so they can be checked without a socket. */
+/* Check NAT decisions and exercise punch handoff on loopback sockets. */
 #include "../src/client.c"
 #include <assert.h>
 
@@ -72,8 +71,58 @@ static void tcp_punch_scheduling(void) {
     }
     free(c);
 }
+static void quic_uses_punch_endpoint(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "quic-peer", 124, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    op_socket advertised = socket_bound(1, "127.0.0.1", 0, 0);
+    op_socket confirmed = socket_bound(1, "127.0.0.1", 0, 0);
+    t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(advertised >= 0 && confirmed >= 0 && t->fd >= 0);
+    op_addr local;
+    assert(!op_addr_socketname(t->fd, &local));
+    assert(!op_addr_socketname(advertised, &t->peer_addr));
+    t->remote_port = op_addr_port(&t->peer_addr);
+    t->state = T_PUNCH;
+    t->punch_next = t->deadline = mono() + 5 * NS;
+
+    /* The peer replies from a different port than the gateway observed. */
+    json_object *ack = json_object_new_object();
+    op_ju(ack, "id", t->id);
+    assert(!udp_packet(confirmed, &local, 4, 1, ack));
+    json_object_put(ack);
+    uint64_t until = mono() + NS;
+    while (t->state == T_PUNCH && mono() < until) {
+        tick_tunnel(c, ti, mono());
+        op_sleep_ms(2);
+    }
+    assert(t->state == T_UNDERLAY && t->remote_port == socket_port(confirmed));
+
+    /* The QUIC client starts when the peer is ready. Inspect its first UDP
+     * datagrams on the confirmed socket, skipping the punch reply. */
+    t->notified = 1;
+    int received_initial = 0;
+    until = mono() + NS;
+    while (!received_initial && mono() < until) {
+        tick_tunnel(c, ti, mono());
+        uint8_t packet[1500];
+        op_ssize size = op_recv(confirmed, packet, sizeof(packet), MSG_DONTWAIT);
+        received_initial = size >= 1200 && (packet[0] & 0x80);
+        op_sleep_ms(2);
+    }
+    assert(received_initial);
+    close_tunnel(c, ti, NULL);
+    op_close(advertised);
+    op_close(confirmed);
+    free(c);
+}
 int main(void) {
-    assert(!op_platform_init());tcp_retry();tcp_punch_scheduling();
+    assert(!op_platform_init());
+    tcp_retry();
+    tcp_punch_scheduling();
+    quic_uses_punch_endpoint();
     /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
     fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;
     app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
