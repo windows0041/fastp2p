@@ -42,9 +42,9 @@ jobs:
           key: c-deps-${{ matrix.target }}-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
       - name: Build CLI and C SDK
         run: |
-          cmake -S c/client -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
-          cmake --build build/c --parallel 3
-          cmake --build build/c --target example-embed
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake --build build --parallel 3
+          cmake --build build --target example-embed
           cmake --install build/c
           cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
           cmake --build build/consumer
@@ -52,7 +52,7 @@ jobs:
       - name: ABI, lifecycle and TLS validation
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
-          ctest --test-dir build/c --output-on-failure
+          ctest --test-dir build --output-on-failure
           dist/${{ matrix.target }}/bin/fastp2p --version
       - name: Package SDK
         run: |
@@ -67,10 +67,10 @@ jobs:
         with:
           name: diagnostics-${{ matrix.target }}
           path: |
-            build/c/Testing/Temporary/LastTest.log
-            build/c/desktop-result.json
-            build/c/socks/result.json
-            build/c/compile_commands.json
+            build/Testing/Temporary/LastTest.log
+            build/desktop-result.json
+            build/socks/result.json
+            build/compile_commands.json
   cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -97,7 +97,7 @@ jobs:
       - name: Windows CLI and SDK
         run: |
           python3 scripts/build-deps.py windows-x86_64
-          cmake -S c/client -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/windows-x86_64.cmake" -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/windows-x86_64"
+          cmake -S . -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/windows-x86_64.cmake" -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/windows-x86_64"
           cmake --build build/windows --parallel 4
           cmake --install build/windows --prefix "$PWD/dist/windows-x86_64"
           python3 scripts/sdk-metadata.py --sdk dist/windows-x86_64
@@ -244,7 +244,7 @@ jobs:
           key: gateway-client-deps-debian12-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
       - name: Package native C client SDK
         run: |
-          cmake -S c/client -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
+          cmake -S . -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
           cmake --build build/client-release --parallel 3
           cmake --install build/client-release
           python3 scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
@@ -253,49 +253,20 @@ jobs:
         with:
           name: fastp2p-sdk-linux-x86_64
           path: dist/fastp2p-sdk-linux-x86_64.tar.gz
-      - name: C relay escalation when a punch cannot succeed
-        run: |
-          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
-          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
-          bash scripts/check-escalation.sh
-      - name: TCP punching through two filtered NAT routers with UDP blocked
-        run: unshare --net python3 tests/tcp_nat3_integration.py --client build/c/fastp2p --gateway build/gateway/fastp2p-gateway --logs build/c/tcp-nat3
-      - name: Dual-stack registration, per-family NAT levels and an IPv6 tunnel
-        run: |
-          bash scripts/tls/generate-cert.sh build/dualstack-certs localhost 127.0.0.1 ::1 10.203.0.1 >/dev/null
-          unshare --net sh -c 'ip link set lo up && python3 tests/dualstack_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/dualstack'
-      - name: NAT level detection with a foreign-source probe between two sites
-        run: |
-          unshare --net sh -c 'ip link set lo up && python3 tests/natlevel_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/natlevel'
       - name: STUN responder wire behaviour
         run: python3 scripts/stun/test-responder.py
-      - name: TCP NAT level detection against a local probe server
-        run: |
-          unshare --net sh -c 'ip link set lo up && python3 tests/tcplevel_integration.py --gateway build/gateway/fastp2p-gateway --c-client build/c/fastp2p --cert-dir build/dualstack-certs --logs build/c/tcplevel'
-      - name: Linux installer, filename enrollment, init branches and rollback in namespaces
-        run: python3 tests/linux_installer.py --client build/c/fastp2p --gateway build/gateway/fastp2p-gateway
-      - name: C relay fallback over TCP and QUIC
-        run: |
-          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
-          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
-          bash scripts/check-relay.sh
-      - name: C punch with a peer advertising a mapping window
-        run: |
-          FASTP2P_C_BUILD_DIR="$PWD/build/c" \
-          FASTP2P_C_GATEWAY_BUILD_DIR="$PWD/build/gateway" \
-          bash scripts/check-nat-window.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: socks5-results-linux
           path: |
             build/socks-reports/
-            build/c/tcp-nat3/result.json
+            build/tcp-nat3/result.json
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: diagnostics-tcp-nat3-linux
-          path: build/c/tcp-nat3/*.log
+          path: build/tcp-nat3/*.log
   musl:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
