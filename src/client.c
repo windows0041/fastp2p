@@ -139,7 +139,7 @@ typedef struct {
 } nat_stun;
 typedef struct {
     int state, server, initiator, transport, notified;
-    int tcp_v2;
+    int tcp_v2, tcp_punch_immediate;
     unsigned tcp_attempts;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     op_socket fd, listen_fd, alternate_fd;
@@ -1455,6 +1455,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);
     if (t->tcp_v2) op_ju(j, "tcpPunchV2", 1);
+    if (t->tcp_punch_immediate) op_ju(j, "tcpPunchImmediate", 1);
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
      * old peer reads (SPEC §5). */
@@ -1500,7 +1501,9 @@ static void probe_complete(fastp2p_client *c, int index) {
             op_ju(j, "symUp", c->nat[family].type == NAT_EASY_SYM_INC ? 1 : 0);
         }
         push(c, t->peer, 2, j);
-        t->at = mono() + 3 * NS;
+        /* Peers that understand immediate TCP punching start as soon as they
+         * have the other's mapping. Keep the timestamp for older peers. */
+        t->at = mono() + (t->tcp_punch_immediate ? 0 : 3 * NS);
         t->state = T_TIME;
         t->deadline = t->at + 10 * NS;
         if (!strcmp(t->mode, "tcp4") || !strcmp(t->mode, "intranet") || !strcmp(t->mode, "udp4"))
@@ -1751,6 +1754,7 @@ static void start_punch(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     strcpy(t->mode, t->transport == FASTP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
     t->tcp_v2 = t->transport == FASTP2P_TRANSPORT_TCP;
+    t->tcp_punch_immediate = t->tcp_v2;
     json_object *j = json_object_new_object();
     op_js(j, "peerNode", t->peer);
     ws_json(c, 7, 0, j);
@@ -2222,8 +2226,12 @@ static void report_apps(fastp2p_client *c) {
         op_ju(j, "enabled", 1);
         if (a->relay_node[0])
             op_js(j, "relayNode", a->relay_node);
-        op_ju(j, "isActive", a->tunnel_index >= 0 && c->tunnels[a->tunnel_index].state == T_ACTIVE);
-        op_js(j, "linkMode", a->transport == FASTP2P_TRANSPORT_QUIC ? "udppunch" : "ipv4");
+        const tunnel *link = a->tunnel_index >= 0 ? &c->tunnels[a->tunnel_index] : NULL;
+        int ready = a->synced && link && tunnel_ready(link);
+        op_ju(j, "isActive", ready);
+        op_ju(j, "linkReady", ready);
+        if (ready)
+            op_js(j, "linkMode", link->relay_wait ? "relay" : link->mode);
         json_object_array_add(list, j);
     }
     json_object_object_add(root, "Apps", list);
@@ -2446,6 +2454,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 tunnel *t = &c->tunnels[ti];
                 strcpy(t->mode, mode);
                 t->tcp_v2 = !strcmp(mode, "tcppunch") && op_integer(j, "tcpPunchV2") == 1;
+                t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
                 if (v4_ok)
                     tunnel_learn_peer(t, peer_text, port);
                 if (v6_ok)
@@ -2500,18 +2509,22 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 if (v6_ok)
                     tunnel_learn_peer(t, peer_text6, port6);
                 t->tcp_v2 = t->tcp_v2 && op_integer(j, "tcpPunchV2") == 1;
-                uint64_t ts = op_integer(j, "punchts"), local = wall();
-                uint64_t difference = ts >= local ? ts - local : local - ts;
-                if (ts > INT64_MAX || local > INT64_MAX || difference > 2 * 86400 * NS) {
-                    close_tunnel(c, ti, "peer sent an invalid punch timestamp");
-                    json_object_put(j);
-                    return;
+                t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
+                int64_t delay = 0;
+                if (!t->tcp_punch_immediate) {
+                    uint64_t ts = op_integer(j, "punchts"), local = wall();
+                    uint64_t difference = ts >= local ? ts - local : local - ts;
+                    if (ts > INT64_MAX || local > INT64_MAX || difference > 2 * 86400 * NS) {
+                        close_tunnel(c, ti, "peer sent an invalid punch timestamp");
+                        json_object_put(j);
+                        return;
+                    }
+                    delay = ((int64_t)ts - (int64_t)local) + c->clock_delta;
+                    if (delay < 0)
+                        delay = 0;
+                    if (delay > (int64_t)(3 * NS))
+                        delay = (int64_t)(3 * NS);
                 }
-                int64_t delay = ((int64_t)ts - (int64_t)local) + c->clock_delta;
-                if (delay < 0)
-                    delay = 0;
-                if (delay > (int64_t)(3 * NS))
-                    delay = (int64_t)(3 * NS);
                 t->at = mono() + (uint64_t)delay;
                 t->deadline = t->at + 10 * NS;
                 t->state = T_TIME;
@@ -2626,7 +2639,10 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     /* Only after a direct attempt has actually failed: switching
                      * earlier preempts the punch that would have succeeded, and in a
                      * two-node topology there is no relay to fall back to. */
-                    if (c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
+                    /* Two private addresses alone do not prove a shared LAN.
+                     * Let an in-flight TCP punch complete before trying LAN. */
+                    if (c->apps[i].transport != FASTP2P_TRANSPORT_TCP && !c->apps[i].synced &&
+                        c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
                         c->apps[i].attempts >= 1 && lan_punch_possible(c, &c->apps[i])) {
                         int index = c->apps[i].tunnel_index;
                         if (index >= 0 && c->tunnels[index].state &&
@@ -3542,7 +3558,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                         nat_is_hard_sym(local_transport_nat(c, a->transport)),
                         nat_is_hard_sym(peer_transport_nat(a)));
                     if (lan_punch_possible(c, a) && !a->lan_tried && a->attempts < rounds && !c->force_relay) {
-                        ++a->attempts;
+                        if (a->transport != FASTP2P_TRANSPORT_TCP)
+                            ++a->attempts;
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
                             c->tunnels[ti].lan = 1;

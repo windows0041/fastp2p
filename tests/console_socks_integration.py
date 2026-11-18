@@ -186,7 +186,9 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-console-socks-') as temporary:
         apps = body.get('Apps') or body.get('apps') or []
         socks = [a for a in apps if a.get('protocol') == 'socks5']
         assert {int(a['srcPort']) for a in socks} >= {open_port_auth, open_port_open}, apps
-        results['pushed_rules_reported_as_socks5'] = True
+        assert all(rule['linkStatus'] == 'connected' and rule['isActive'] == 1 and
+                   rule.get('linkMode') for rule in socks), socks
+        results['pushed_rules_reported_as_connected_socks5'] = True
         results['success'] = True
     finally:
         for child in children:

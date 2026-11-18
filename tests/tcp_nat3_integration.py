@@ -77,7 +77,7 @@ def api(path,body=None,auth=True):
     if jwt and auth:headers['Authorization']='Bearer '+jwt
     connection.request('POST' if body is not None else 'GET',path,json.dumps(body) if body is not None else None,headers)
     response=connection.getresponse();data=response.read();connection.close()
-    assert response.status==200;return json.loads(data)
+    assert response.status==200;return json.loads(data) if data else {}
 def text(name):return (root/(name+'.log')).read_text(errors='replace')
 def stop(process):
     if process.poll() is None:
@@ -164,6 +164,18 @@ with socket.create_connection(('127.0.0.1',28100),timeout=10) as s:
   r.extend(d)
 assert len(r)==len(p),(len(r),len(p));print(hashlib.sha256(r).hexdigest())
 """
+    socks_transfer="""import socket,struct
+with socket.create_connection(('127.0.0.1',30999),timeout=8) as client:
+ with client.makefile('rb') as reply:
+  client.sendall(bytes((5,1,0)))
+  assert reply.read(2)==bytes((5,0))
+  client.sendall(bytes((5,1,0,1))+socket.inet_aton('127.0.0.1')+struct.pack('!H',38180))
+  response=reply.read(10)
+  assert response[:4]==bytes((5,0,0,1)),response
+  payload=b'SOCKS5 across two port-restricted TCP NATs'
+  client.sendall(payload)
+  assert reply.read(len(payload))==payload
+"""
     cases=[('udp-blocked',None),('udp-hard-mapping','2')]
     if args.legacy_client:cases.append(('legacy-peer',None))
     for label,override in cases:
@@ -197,6 +209,18 @@ assert len(r)==len(p),(len(r),len(p));print(hashlib.sha256(r).hexdigest())
             assert 'forward attached to relay' not in diagnostic and 'tunnel authentication failed' not in diagnostic
         results[label]={'direct_tcp':True,'three_256k_roundtrips':True,'half_close':label!='legacy-peer','tcp_mapping_samples':4,'tcp_destination_ips':3,
                         'udp_nat_type':2 if override else 314}
+        if label=='udp-blocked':
+            path='/api/v1/device/'+names['a']
+            api(path+'/app',{'appName':'nat3-socks','protocol':'socks5','srcPort':30999,
+                            'peerNode':names['b'],'punchPriority':3})
+
+            def socks_tunnel_ready():
+                return any(app.get('srcPort')==30999 and app.get('linkStatus')=='connected' and
+                           app.get('linkMode')=='tcppunch' for app in api(path+'/apps')['Apps'])
+
+            wait(socks_tunnel_ready,60)
+            run([sys.executable,'-c',socks_transfer],ca,timeout=15)
+            results[label]['socks5_over_direct_tcp']=True
         for process in processes:stop(process)
         wait(lambda:all(not int(n['isActive']) for n in api('/api/v1/nodes')['nodes'] if n['name'] in names.values()),10)
         persisted={n['name']:n for n in api('/api/v1/nodes')['nodes']}

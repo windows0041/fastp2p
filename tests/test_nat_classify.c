@@ -35,8 +35,45 @@ static void tcp_retry(void) {
     assert(t->state==T_TCP_CONNECT && t->listen_fd>=0 && t->fd<0 && t->tcp_attempts==1 && t->session_owner);
     assert(!t->tcp_retry_at && !tunnel_ready(t));close_tunnel(c,ti,NULL);op_close(endpoint);free(c);
 }
+static void tcp_punch_scheduling(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    for (int immediate = 0; immediate <= 1; ++immediate) {
+        int ti = new_tunnel(c, "remote-node", 123, FASTP2P_TRANSPORT_TCP, 1);
+        assert(ti >= 0);
+        tunnel *t = &c->tunnels[ti];
+        t->state = T_REPLY;
+        t->tcp_v2 = t->tcp_punch_immediate = 1;
+
+        json_object *reply = json_object_new_object();
+        op_js(reply, "from", "remote-node");
+        op_js(reply, "fromIP", "127.0.0.1");
+        op_ju(reply, "coneNatPort", 12345);
+        op_ju(reply, "id", 123);
+        op_ju(reply, "tcpPunchV2", 1);
+        if (immediate)
+            op_ju(reply, "tcpPunchImmediate", 1); /* no shared clock needed */
+        else
+            op_ju(reply, "punchts", wall() + 3 * NS);
+        const char *body = json_object_to_json_string_ext(reply, JSON_C_TO_STRING_PLAIN);
+        uint8_t packet[256];
+        size_t length = strlen(body);
+        assert(length <= sizeof(packet) - 16);
+        op_put64(packet, op_node_id("remote-node"));
+        op_put64(packet + 8, c->node_id);
+        memcpy(packet + 16, body, length);
+        uint64_t before = mono();
+        control_message(c, 3, 2, packet, length + 16);
+        assert(t->state == T_TIME && t->tcp_v2 && t->tcp_punch_immediate == immediate);
+        assert(immediate ? t->at <= mono() : t->at >= before + 2 * NS);
+        json_object_put(reply);
+        close_tunnel(c, ti, NULL);
+    }
+    free(c);
+}
 int main(void) {
-    assert(!op_platform_init());tcp_retry();
+    assert(!op_platform_init());tcp_retry();tcp_punch_scheduling();
     /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
     fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;
     app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
