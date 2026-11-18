@@ -213,7 +213,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          lib /nologo /machine:x64 /def:c\client\platform\windows\fastp2p.def /out:dist\windows-x86_64\lib\fastp2p.lib
+          lib /nologo /machine:x64 /def:platform\windows\fastp2p.def /out:dist\windows-x86_64\lib\fastp2p.lib
           if errorlevel 1 exit /b 1
           cmake -S tests/sdk-consumer -B build/msvc -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CD%/dist/windows-x86_64"
           if errorlevel 1 exit /b 1
