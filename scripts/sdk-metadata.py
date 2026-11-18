@@ -5,29 +5,49 @@ import json
 from pathlib import Path
 import shutil
 
-p=argparse.ArgumentParser()
-p.add_argument('--sdk',required=True)
-p.add_argument('--work',default=str(Path.home()/'fastp2p-dev/cross'))
-args=p.parse_args()
-project=Path(__file__).resolve().parents[1]
-sdk=Path(args.sdk).resolve();sdk.mkdir(parents=True,exist_ok=True)
-for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY.md','config.example.json','config.socks5.example.json','deps.lock.json']:
-    shutil.copyfile(project/file,sdk/file)
-(sdk/'examples').mkdir(exist_ok=True)
-(sdk/'include').mkdir(exist_ok=True)
-storage = next((p for p in (project/'NODE-STORAGE-ZH.md', project/'docs'/'NODE-STORAGE-ZH.md')
-                  if p.exists()), None)
-if storage:
-    shutil.copyfile(storage, sdk/'NODE-STORAGE-ZH.md')
-else:
-    print('note: NODE-STORAGE-ZH.md is not part of this repository; skipped')
-shutil.copyfile(project/'include/fastp2p.h',sdk/'include/fastp2p.h')
-shutil.copyfile(project/'examples/embed.c',sdk/'examples/embed.c')
-shutil.copyfile(project/'common/bootstrap.json',sdk/'gateway-public.json')
-notices=sdk/'licenses';notices.mkdir(exist_ok=True)
-manifest=json.loads((project/'deps.lock.json').read_text())
-for name,item in manifest.items():
-    source=Path(args.work)/'sources'/(name+'-'+item['version'])
-    filename='LICENSE.txt' if name=='openssl' else 'COPYING'
-    shutil.copyfile(source/filename,notices/(name+'-'+filename))
-print('SDK metadata and third-party licenses:',sdk)
+PROJECT = Path(__file__).resolve().parents[1]
+SDK_FILES = {
+    name: name for name in (
+        'LICENSE', 'README.md', 'PLATFORMS-ZH.md', 'SOCKS5-ZH.md', 'THIRD_PARTY.md',
+        'NODE-STORAGE-ZH.md', 'NAT-TRAVERSAL-ZH.md', 'VALIDATION-ZH.md', 'UPGRADE-ZH.md',
+        'WINDOWS-INSTALL-ZH.md', 'docs/tcp-punch.md', 'docs/performance-20261112.md',
+        'config.example.json', 'config.socks5.example.json', 'deps.lock.json',
+        'include/fastp2p.h', 'examples/embed.c',
+    )
+}
+SDK_FILES['common/bootstrap.json'] = 'gateway-public.json'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument('--sdk', type=Path)
+    operation.add_argument('--check-inputs', action='store_true')
+    parser.add_argument('--work', type=Path, default=Path.home() / 'fastp2p-dev/cross')
+    args = parser.parse_args()
+
+    missing = [name for name in SDK_FILES if not (PROJECT / name).is_file()]
+    if missing:
+        parser.error('missing SDK packaging inputs: ' + ', '.join(missing))
+    if args.check_inputs:
+        print('SDK packaging inputs verified')
+        return
+
+    sdk = args.sdk.resolve()
+    for name, destination in SDK_FILES.items():
+        target = sdk / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(PROJECT / name, target)
+
+    notices = sdk / 'licenses'
+    notices.mkdir(exist_ok=True)
+    manifest = json.loads((PROJECT / 'deps.lock.json').read_text(encoding='utf-8'))
+    for name, item in manifest.items():
+        source = args.work / 'sources' / f"{name}-{item['version']}"
+        filename = 'LICENSE.txt' if name == 'openssl' else 'COPYING'
+        shutil.copyfile(source / filename, notices / f'{name}-{filename}')
+    print('SDK metadata and third-party licenses:', sdk)
+
+
+if __name__ == '__main__':
+    main()

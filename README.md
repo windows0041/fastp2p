@@ -1,5 +1,7 @@
 # fastp2p C 客户端
 
+本仓库包含客户端、C SDK 和 Android 应用。网关服务和 Web 控制台在独立的 [fastp2p-gateway 仓库](https://github.com/windows0041/fastp2p-gateway)。客户端安装包见 [GitHub Releases](https://github.com/windows0041/fastp2p/releases)。
+
 C11 核心提供 WSS 协调、QUIC、TCP 打洞、中继回退、TCP/UDP 转发和 SOCKS5。隧道帧用 AES-256-GCM 保护：发起端生成 256 位会话密钥并经网关的 TLS 通道送达对端，两个方向各自派生密钥，接收端维护重放窗口。公开接口位于 `include/fastp2p.h`，符号前缀 `fastp2p_`，ABI 1。调用者独占客户端对象并驱动 `fastp2p_client_step`；回调属于驱动线程，销毁前停止调用。
 
 QUIC 接收采用有界环形缓冲，帧编码复用发送队列。[缓冲优化基准与验证](docs/performance-20261112.md) 包含可选基准的构建方法和适用范围。
@@ -11,7 +13,6 @@ NAT 等级按 EasyTier 的判定原理给出 NAT1–NAT4：映射探测判断锥
 ## 安装与运行
 
 ```sh
-sh fastp2p-<16位Token>
 fastp2p run
 fastp2p stop
 fastp2p --version
@@ -53,19 +54,21 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 
 ## 构建与 SDK
 
+在 Linux 或 WSL 的客户端仓库根目录运行。构建需要 C 编译器、CMake、Ninja、Python 3 和 pkg-config。
+
 ```sh
 python3 scripts/build-deps.py linux-x86_64
-cmake -S . -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64"
-cmake --build build/c --parallel
-ctest --test-dir build/c --output-on-failure
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
 主程序静态链接项目核心与锁定的 TLS/QUIC/HTTP/JSON 依赖，系统 C 库仍由操作系统提供。SDK 包另外包含共享库、头文件、示例、CMake 配置；使用 `find_package(fastp2p CONFIG REQUIRED)` 和 `fastp2p::fastp2p`。
 
-Windows 使用 MinGW，macOS 原生构建；Android 使用 NDK 和轻量 Java/JNI 系统封装，网络核心仍为 C。[平台说明](PLATFORMS-ZH.md) · [验证](VALIDATION-ZH.md)。完整依赖许可证已嵌入单文件客户端，运行 `--licenses` 查看。
+Windows 使用 MinGW，macOS 原生构建，Android 使用 NDK 和 Java/JNI 系统封装。完整依赖许可证已嵌入单文件客户端，运行 `--licenses` 查看。 [平台和发行包](PLATFORMS-ZH.md) · [本地验证与 CI](VALIDATION-ZH.md)
 
-专用构建的公开配置位于 common/bootstrap.json，只包含 host、port、ca，不含 Token 或私钥。自行部署其他网关时替换该文件，或用 CMake 参数 FASTP2P_BOOTSTRAP_FILE 选择另一份公开配置。安装器高级调试可用同名环境变量读取受信任的本地配置文件；不会从未验证的网络端点获取 CA。
+专用构建从仓库根目录的 `common/bootstrap.json` 读取公开的 `host`、`port` 和 `ca`。自行部署网关时，可以修改该文件，或通过 CMake 参数 `FASTP2P_BOOTSTRAP_FILE` 选择另一份公开配置。SDK 中的副本名为 `gateway-public.json`。接入 Token 和私钥应存放在私有配置中。
 
 Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.conf 为 0600，支持网关下发时原子替换。父目录与服务控制脚本仍由 root 持有；安装器执行特权文件操作时临时锁定配置目录。直接以 root 运行默认配置的 CLI 也会降为服务账号。重复接入不会重写相同的 CA 文件。
 

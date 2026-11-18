@@ -4,7 +4,7 @@
 
 1. 从 GitHub Release 下载 `fastp2p-windows-x86_64.exe`（单个文件，不含 token）。
 2. 把它**重命名**，把网关控制台给的 16 位安装密钥放进文件名，例如
-   `fastp2p-9864596884675924.exe`（密钥可以在文件名任何位置连续出现，
+   `fastp2p-1234567890123456.exe`（请替换成自己的 Token，密钥可以在文件名任何位置连续出现，
    但不能以 0 开头、不能断开）。
 3. 双击。系统弹出 UAC 授权框，点"是"。
 
@@ -29,7 +29,7 @@
 1. 从文件名中取 16 位数字作为接入密钥；
 2. 申请管理员权限（创建服务必须）；
 3. 用该密钥连接网关，验证证书、主机名与密钥；
-4. 把配置写到 `%ProgramData%\fastp2p\client.dat`（机器级 DPAPI 加密）；
+4. 把配置写到 `%ProgramData%\fastp2p\config\fastp2p.conf`（机器级 DPAPI 加密）；
 5. 把这个 exe 复制到 `%ProgramFiles%\fastp2p\fastp2p.exe`；
 6. 注册 Windows 服务 `fastp2p`，设为自动启动，并配置失败后自动重启
    （5 秒 / 10 秒 / 30 秒，一天后重置计数）；
@@ -43,7 +43,7 @@
 | 停止 | `sc stop fastp2p` |
 | 启动 | `sc start fastp2p` |
 | 卸载 | `fastp2p.exe uninstall`（需要管理员） |
-| 运行日志 | `%ProgramData%\fastp2p\client.dat.log` |
+| 运行日志 | `%ProgramData%\fastp2p\config\fastp2p.conf.log` |
 
 ## 安全说明
 

@@ -2,9 +2,9 @@
 # NAT window check: a peer that advertises a predictable mapping window must
 # still complete a session, and the cone control case must be unaffected.
 set -euo pipefail
-repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
-client="${FASTP2P_C_BUILD_DIR:-$repository/build/c}/fastp2p"
-gateway="${FASTP2P_C_GATEWAY_BUILD_DIR:-$repository/build/c-gateway}/fastp2p-gateway"
+repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+client="${FASTP2P_C_BUILD_DIR:-$repository/build}/fastp2p"
+gateway="${FASTP2P_C_GATEWAY_BUILD_DIR:-$repository/../fastp2p-gateway/build}/fastp2p-gateway"
 for binary in "$client" "$gateway"; do
   [[ -x "$binary" ]] || { echo "Build $binary first." >&2; exit 1; }
 done

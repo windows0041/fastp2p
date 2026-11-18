@@ -5,8 +5,8 @@ macOS and Android, with the SOCKS5 and port-forwarding rules.
 
 ## What this repository contains
 
-- `src/ include/ tests/ android/ cmake/ docs/ examples/ platform/ scripts/` — the
-  client as it lived under the repository root in the monorepo.
+- Client source, tests, Android sources, and build scripts live directly under
+  `src/`, `include/`, `tests/`, `android/`, `cmake/`, and `scripts/`.
 - `common/` — the code shared with the gateway (enrollment, config merge, UTF-8
   helpers, the public bootstrap identity). The gateway keeps its own copy in the
   `fastp2p-gateway` repository.
@@ -15,6 +15,10 @@ macOS and Android, with the SOCKS5 and port-forwarding rules.
 
 ## Related repositories
 
-- `fastp2p-gateway` — the WSS control plane, rule store and web console.
-- `oldfastp2p` — the previous monorepo this tree was extracted from; it is kept for
-  reference and is no longer built.
+- [fastp2p-gateway](https://github.com/windows0041/fastp2p-gateway) hosts the WSS
+  control plane, rule store, and web console.
+- [oldfastp2p](https://github.com/windows0041/oldfastp2p) preserves the monorepo
+  history.
+
+Build commands run from the client repository root. See the [client README](README.md)
+and [validation guide](VALIDATION-ZH.md).

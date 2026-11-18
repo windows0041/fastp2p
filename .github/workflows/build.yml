@@ -11,15 +11,17 @@ concurrency:
   cancel-in-progress: false
 jobs:
   preflight:
-    # Seconds, not minutes: every packaging break since the split was a file this step
-    # can see is missing, and finding that out after a full build wastes a quarter hour.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      musl_arches: ${{ steps.packaging.outputs.musl_arches }}
     steps:
       - uses: actions/checkout@v5
       - name: Packaging inputs and paths
+        id: packaging
         run: |
           python3 -m py_compile scripts/*.py
+          python3 scripts/sdk-metadata.py --check-inputs
           python3 scripts/check-packaging-inputs.py
 
   macos:
@@ -73,7 +75,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-${{ matrix.target }}
-          path: dist/fastp2p-*.tar.gz
+          path: dist/fastp2p-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -100,8 +103,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
-          key: c-deps-cross-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
-          restore-keys: c-deps-cross-
+          key: c-deps-windows-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+          restore-keys: |
+            c-deps-windows-
+            c-deps-cross-
       - name: Windows CLI and SDK
         run: |
           python3 scripts/build-deps.py windows-x86_64
@@ -109,7 +114,6 @@ jobs:
           cmake --build build/windows --parallel 4
           cmake --install build/windows --prefix "$PWD/dist/windows-x86_64"
           python3 scripts/sdk-metadata.py --sdk dist/windows-x86_64
-          cp build/windows/fastp2p.exe dist/fastp2p-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-validation
@@ -117,11 +121,14 @@ jobs:
             build/windows/*.exe
             build/windows/fastp2p.dll
             dist/windows-x86_64/
+          if-no-files-found: error
 
   cross-android:
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    outputs:
+      variant: ${{ steps.android.outputs.variant }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -140,39 +147,64 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
-          key: c-deps-cross-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
-          restore-keys: c-deps-cross-
-      - name: Android signed headless APK
+          key: c-deps-android-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+          restore-keys: |
+            c-deps-android-
+            c-deps-cross-
+      - name: Build and validate Android APK
+        id: android
         env:
           FASTP2P_ANDROID_KEYSTORE_BASE64: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_BASE64 }}
           FASTP2P_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_PASSWORD }}
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.16248370"
           export FASTP2P_CMAKE_DIR="$(python3 -c 'import cmake,pathlib; print(pathlib.Path(cmake.CMAKE_BIN_DIR).parent)')"
-          test -n "$FASTP2P_ANDROID_KEYSTORE_BASE64" && test -n "$FASTP2P_ANDROID_KEYSTORE_PASSWORD"
-          export FASTP2P_ANDROID_KEYSTORE="$RUNNER_TEMP/fastp2p-android.p12"
-          printf '%s' "$FASTP2P_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$FASTP2P_ANDROID_KEYSTORE"
-          chmod 600 "$FASTP2P_ANDROID_KEYSTORE"
+          variant=debug
+          if [[ -n "$FASTP2P_ANDROID_KEYSTORE_BASE64" && -n "$FASTP2P_ANDROID_KEYSTORE_PASSWORD" ]]; then
+            variant=release
+            export FASTP2P_ANDROID_KEYSTORE="$RUNNER_TEMP/fastp2p-android.p12"
+            (umask 077; printf '%s' "$FASTP2P_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$FASTP2P_ANDROID_KEYSTORE")
+            trap 'rm -f -- "$FASTP2P_ANDROID_KEYSTORE"' EXIT
+          elif [[ "$GITHUB_REF_TYPE" == tag || -n "$FASTP2P_ANDROID_KEYSTORE_BASE64$FASTP2P_ANDROID_KEYSTORE_PASSWORD" ]]; then
+            echo "::error::Configure both Android signing secrets to build an APK for release."
+            exit 1
+          else
+            echo "::notice::Building a debug APK for CI validation. Configure the Android signing secrets to include a signed APK in Releases."
+          fi
           bash scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
-          python3 tests/android_artifact.py --apk android/app/build/outputs/apk/release/app-release.apk --ndk "$ANDROID_NDK_HOME"
-          mkdir -p dist/android
-          cp android/app/build/outputs/apk/release/app-release.apk dist/android/fastp2p-android.apk
+          apk="android/app/build/outputs/apk/$variant/app-$variant.apk"
+          python3 tests/android_artifact.py --apk "$apk" --ndk "$ANDROID_NDK_HOME"
+          if [[ "$variant" == release ]]; then
+            mkdir -p dist/android
+            cp "$apk" dist/android/fastp2p-android.apk
+          fi
+          echo "variant=$variant" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: steps.android.outputs.variant == 'release'
         with:
           name: fastp2p-android
           path: dist/android/fastp2p-android.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: steps.android.outputs.variant == 'debug'
+        with:
+          name: android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: android-device-validation
-          path: android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+          path: android/app/build/outputs/apk/androidTest/${{ steps.android.outputs.variant }}/app-${{ steps.android.outputs.variant }}-androidTest.apk
+          if-no-files-found: error
       # Debuggable build signed with the release key: installs over the production
       # app and writes the client event stream to logcat. It is only produced from
       # main, because it carries the production certificate. Never published.
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.android.outputs.variant == 'release'
         with:
           name: android-debug-logging
           path: android/app/build/outputs/apk/staging/app-staging.apk
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -202,6 +234,7 @@ jobs:
         with:
           name: fastp2p-windows-x86_64
           path: dist/fastp2p-windows-x86_64.exe
+          if-no-files-found: error
       - name: Native Windows protocol, lifecycle, TLS and QUIC tests
         shell: pwsh
         run: |
@@ -283,7 +316,7 @@ jobs:
         run: python3 scripts/build-deps.py linux-x86_64
       - name: Package native C client SDK
         run: |
-          cmake -S . -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
+          cmake -S . -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
           cmake --build build/client-release --parallel 3
           cmake --install build/client-release
           python3 scripts/sdk-metadata.py --sdk dist/sdk-linux-x86_64
@@ -292,20 +325,20 @@ jobs:
         with:
           name: fastp2p-sdk-linux-x86_64
           path: dist/fastp2p-sdk-linux-x86_64.tar.gz
+          if-no-files-found: error
+      - name: Native tests and installed SDK consumer
+        run: |
+          ctest --test-dir build/client-release --output-on-failure
+          cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/sdk-linux-x86_64"
+          cmake --build build/consumer
+          build/consumer/sdk-consumer
       - name: STUN responder wire behaviour
         run: python3 scripts/stun/test-responder.py
       - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: socks5-results-linux
-          path: |
-            build/socks-reports/
-            build/tcp-nat3/result.json
-      - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: diagnostics-tcp-nat3-linux
-          path: build/tcp-nat3/*.log
+          name: diagnostics-linux
+          path: build/client-release/Testing/Temporary/LastTest.log
   musl:
     needs: preflight
     runs-on: ubuntu-24.04
@@ -313,7 +346,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64, armv7, riscv64, mips64el]
+        arch: ${{ fromJSON(needs.preflight.outputs.musl_arches) }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -337,6 +370,7 @@ jobs:
         with:
           name: fastp2p-linux-static-${{ matrix.arch }}
           path: dist/fastp2p-linux-static-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
   release:
     # Every job that produces a client artifact has to finish first: the SDK comes
     # from the linux job and the Windows exe from the windows job, so publishing
@@ -357,4 +391,10 @@ jobs:
       - name: Publish verified clients and C SDKs
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/publish-release.py --kind client --input release-input --output release-output
+          ANDROID_VARIANT: ${{ needs.cross-android.outputs.variant }}
+        run: |
+          args=()
+          if [[ "$ANDROID_VARIANT" == debug && "$GITHUB_REF_TYPE" == branch ]]; then
+            args+=(--without-android)
+          fi
+          python3 scripts/publish-release.py --kind client --input release-input --output release-output "${args[@]}"

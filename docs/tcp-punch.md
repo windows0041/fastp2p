@@ -66,8 +66,8 @@ TCP 默认从同一本地源端口访问网关 TCP 27180、27181。新版网关�
 
 ```sh
 sudo unshare --net python3 tests/tcp_nat3_integration.py \
-  --client /absolute/build/client/fastp2p \
-  --gateway /absolute/build/gateway/fastp2p-gateway \
+  --client "$PWD/build/fastp2p" \
+  --gateway "$PWD/../fastp2p-gateway/build/fastp2p-gateway" \
   --logs /absolute/private/test-output
 ```
 

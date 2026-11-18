@@ -21,6 +21,13 @@ def digest(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
+CLIENT_MUSL_ARCHES = ('x86_64', 'aarch64', 'armv7', 'riscv64', 'mips64el')
+CLIENT_SOURCE_PATHS = (
+    'common', 'src', 'include', 'cmake', 'platform', 'deps.lock.json', 'CMakeLists.txt',
+    'android/app/src/main', 'android/app/src/androidTest', 'android/jni', 'android/app/build.gradle',
+    'android/build.gradle', 'android/settings.gradle', 'android/gradle.properties', 'android/gradle',
+)
+
 KINDS = {
     'gateway': ('fastp2p-gateway', 'CMakeLists.txt', [
         'fastp2p-gateway-linux-static-x86_64.tar.gz',
@@ -30,16 +37,15 @@ KINDS = {
         'fastp2p-sdk-linux-x86_64.tar.gz', 'fastp2p-windows-x86_64.exe',
         'fastp2p-macos-arm64.tar.gz', 'fastp2p-macos-x86_64.tar.gz',
         'fastp2p-android.apk',
-        'fastp2p-linux-static-x86_64.tar.gz', 'fastp2p-linux-static-aarch64.tar.gz',
-        'fastp2p-linux-static-armv7.tar.gz', 'fastp2p-linux-static-i686.tar.gz',
-        'fastp2p-linux-static-riscv64.tar.gz', 'fastp2p-linux-static-s390x.tar.gz',
-        'fastp2p-linux-static-ppc64le.tar.gz', 'fastp2p-linux-static-mips64el.tar.gz'])
+        *(f'fastp2p-linux-static-{arch}.tar.gz' for arch in CLIENT_MUSL_ARCHES)])
 }
 
-def prepare(kind, incoming, output):
+def prepare(kind, incoming, output, without_android=False):
     output.mkdir(parents=True, exist_ok=True)
     result = []
     for name in KINDS[kind][2]:
+        if without_android and name == 'fastp2p-android.apk':
+            continue
         matches = [p for p in incoming.rglob(name) if p.is_file()]
         if len(matches) != 1 or matches[0].is_symlink() or matches[0].stat().st_size == 0:
             raise RuntimeError('Expected exactly one nonempty CI artifact: ' + name)
@@ -99,11 +105,18 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
     if stable:
         tag_sha = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
         paths = (['common','src','web','deploy','CMakeLists.txt','scripts/embed-web.py','Dockerfile'] if kind=='gateway' else
-                 ['common','src','include','cmake','platform','deps.lock.json','CMakeLists.txt','android/app/src/main','android/app/src/androidTest','android/jni','android/app/build.gradle','android/build.gradle','android/settings.gradle','android/gradle.properties','android/gradle'])
+                 CLIENT_SOURCE_PATHS)
         if subprocess.run(['git','diff','--quiet',sha,tag_sha,'--',*paths]).returncode:
             raise RuntimeError('Tag runtime source differs from the tested build')
-    notes = ('C 网关：内嵌 Web 控制台、HTTPS/WSS、NAT 探测及连接协调。包含 x86_64 与 aarch64 静态可执行包（不依赖发行版运行库）和 amd64 Docker 镜像。' if kind == 'gateway' else
-             'C 客户端：桌面 CLI / ABI 1 C 库、Android 应用、SOCKS5 TCP/UDP、TCP 打洞与 QUIC。Linux 提供 x86_64、aarch64、armv7、i686、riscv64、s390x、ppc64le、mips64el 八种架构的静态可执行包，另有 Windows EXE、macOS 两种架构压缩包、签名 Android APK 和 Linux C SDK。Windows EXE 和 Android APK 可直接使用，tar.gz 包解压后使用。')
+    if kind == 'gateway':
+        notes = 'C 网关内嵌 Web 控制台，提供 HTTPS/WSS、NAT 探测及连接协调。提供 x86_64 和 aarch64 静态包以及 amd64 Docker 镜像。'
+    else:
+        arches = '、'.join(CLIENT_MUSL_ARCHES)
+        notes = f'提供 Linux {arches} 静态包、Linux C SDK、Windows EXE 和 macOS 双架构包。'
+        if any(file.name == 'fastp2p-android.apk' for file in files):
+            notes += '本次发布包含正式签名的 Android APK。'
+        else:
+            notes += 'Android 调试 APK 可从对应的 Actions 运行下载。'
 
     body = notes + '\n\n构建提交：`' + sha + '`\n\n[GitHub 构建与测试](https://github.com/' + repository + '/actions/runs/' + run_id + ')\n\n下载后使用 `SHA256SUMS.txt` 校验。专用客户端包含网关地址和公开 CA；账号、接入 Token 和私钥不在发行包中。'
     metadata = {'tag_name': tag, 'target_commitish': sha,
@@ -167,8 +180,14 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--prepare-only', action='store_true')
     p.add_argument('--tag')
+    p.add_argument('--without-android', action='store_true',
+                   help='Prepare an unsigned development run with desktop assets only')
     args = p.parse_args()
-    files = prepare(args.kind, args.input, args.output)
+    if args.without_android and (
+        args.kind != 'client' or args.tag or os.environ.get('GITHUB_REF_TYPE') == 'tag'
+    ):
+        p.error('--without-android is only available for client development builds')
+    files = prepare(args.kind, args.input, args.output, args.without_android)
     if not args.prepare_only:
         publish(args.kind, files, os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA'],
                 os.environ['GITHUB_REF_NAME'], os.environ['GITHUB_REF_TYPE'], os.environ['GITHUB_RUN_ID'],
