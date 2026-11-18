@@ -50,6 +50,7 @@ case "$cpu" in
         arch=mips64el ;;
     *) fail "暂不支持 CPU 架构 $cpu，请先提供对应编译包。" ;;
 esac
+@@FASTP2P_DOWNLOAD@@
 @@FASTP2P_CONTROLLER@@
 chmod 700 "$work/fastp2p-service"
 # Validate the init implementation and account tools before touching the old app.
@@ -58,7 +59,6 @@ mkdir -p /var/run
 mkdir /var/run/fastp2p-install.lock 2>/dev/null || fail '另一个安装尚未结束；若上次被强制终止，请检查 /var/run/fastp2p-install.lock。'
 locked=true
 printf '%s\n' "$$" > /var/run/fastp2p-install.lock/pid
-@@FASTP2P_DOWNLOAD@@
 url=$gateway_url/api/v1/update/download?platform=$package_platform\&version=$expected_version
 printf '%s\n' "检测到 $cpu，正在从网关下载 $package_platform $expected_version…"
 # Credentials go in a root-private file, not URLs or process command lines.

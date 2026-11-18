@@ -319,6 +319,8 @@ struct fastp2p_client {
     fastp2p_event_fn callback;
     fastp2p_config_handler config_handler;
     void *config_user;
+    fastp2p_restart_handler restart_handler;
+    void *restart_user;
     int validate_only;
     void *user;
     tunnel tunnels[NT];
@@ -2360,6 +2362,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         report_apps(c);
         return;
     }
+    if (main == 3 && sub == 11) {
+        if (c->login_ok && c->report_ok && !c->stopping && c->restart_handler) {
+            c->in_callback = 1;
+            c->restart_handler(c->restart_user);
+            c->in_callback = 0;
+        }
+        return;
+    }
     json_object *j = op_json(data, len);
     if (!j || !json_object_is_type(j, json_type_object)) {
         if (j)
@@ -3693,6 +3703,7 @@ static void report_client(fastp2p_client *c) {
     op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
     op_ju(j, "publicIPPort", c->public_port);
     op_ju(j, "configPush", c->config_handler != NULL);
+    op_ju(j, "restart", c->restart_handler != NULL);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);
     op_ju(j, "tcpNatSamples", c->tcp_nat.family[OP_FAM_V4].samples);
@@ -4577,6 +4588,13 @@ void fp_client_validation_mode(fastp2p_client *c) { if(c)c->validate_only=1; }
 int fastp2p_client_set_config_handler(fastp2p_client *c,fastp2p_config_handler handler,void *user) {
     if(!c || c->running || c->in_callback)return FASTP2P_ESTATE;
     c->config_handler=handler;c->config_user=user;return FASTP2P_OK;
+}
+int fastp2p_client_set_restart_handler(fastp2p_client *c, fastp2p_restart_handler handler, void *user) {
+    if (!c || c->running || c->in_callback)
+        return FASTP2P_ESTATE;
+    c->restart_handler = handler;
+    c->restart_user = user;
+    return FASTP2P_OK;
 }
 int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint64_t *id) {
     /* relay_node is appended to the struct, so callers built against the

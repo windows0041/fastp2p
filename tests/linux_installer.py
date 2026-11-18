@@ -376,6 +376,33 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
             environment.update(FIXTURE_CPU=cpu,FIXTURE_CLASS=elf_class,FIXTURE_ENDIAN=endian)
             (root/'download-url').unlink(missing_ok=True);events.write_text('');run(alternate,1)
             assert not (root/'download-url').exists() and events.read_text()=='' and profile.read_bytes()==before
+        # A lease can keep a previous release around after the new release has
+        # dropped some architectures. New installers should use only current packages.
+        current_arches=('x86_64','aarch64','armv7','riscv64','mips64el')
+        with sqlite3.connect(root/'nodes.sqlite3') as db:
+            for arch in current_arches:
+                db.execute("INSERT INTO release_packages SELECT platform,'99.99.99',sha256,size,filename,uploaded_at FROM release_packages WHERE platform=?",('linux-'+arch,))
+            db.execute("INSERT INTO release_sync VALUES(1,'99.99.99',99)")
+        current=api('/api/v1/update/install?platform=linux')[2]
+        assert all(f"package_platform='linux-{arch}'; expected_version='99.99.99'".encode() in current for arch in current_arches)
+        assert all(f"package_platform='linux-{arch}'".encode() not in current for arch in ('i686','s390x','ppc64le'))
+        assert b"package_platform='linux-i686'" in api(f'/api/v1/update/install?platform=linux-i686&version={version}')[2]
+        alternate.write_bytes(current)
+        lock=Path('/var/run/fastp2p-install.lock')
+        lock.mkdir()
+        try:
+            environment['FIXTURE_CPU']='i686'
+            events.write_text('')
+            response=run(alternate,1)
+            assert '此安装脚本没有 i686 的客户端包'.encode() in response.stderr
+            assert all(arch.encode() in response.stderr for arch in current_arches)
+            assert not (root/'download-url').exists() and events.read_text()=='' and profile.read_bytes()==before
+        finally:
+            lock.rmdir()
+            with sqlite3.connect(root/'nodes.sqlite3') as db:
+                db.execute("DELETE FROM release_packages WHERE version='99.99.99'")
+                db.execute("DELETE FROM release_sync WHERE id=1")
+        results['new_installers_follow_the_current_release_architectures']=True
         environment['FIXTURE_CPU']='aarch64';events.write_text('')
         run(named,1) # Old manifest has only the real native manual package.
         assert events.read_text()=='' and profile.read_bytes()==before

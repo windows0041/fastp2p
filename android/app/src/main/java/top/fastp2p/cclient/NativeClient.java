@@ -1,6 +1,7 @@
 package top.fastp2p.cclient;
 
 final class NativeClient {
+    static final int STEP_RESTART_REQUESTED = 1;
     static { System.loadLibrary("fastp2p_jni"); }
     private NativeClient() {}
     static native long create(byte[] jsonUtf8, String decimalToken, String caPath, Object listener);

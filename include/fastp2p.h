@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "2.0.15"
+#define FASTP2P_VERSION "2.0.16"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)
@@ -52,6 +52,11 @@ typedef void (*fastp2p_event_fn)(fastp2p_client *, const fastp2p_event *, void *
  * never writes configuration files; the embedding host owns persistence. */
 typedef int (*fastp2p_config_handler)(const char *fields_json, uint64_t revision, void *user);
 FASTP2P_API int fastp2p_client_set_config_handler(fastp2p_client *, fastp2p_config_handler, void *user);
+/* Install before start to accept restart requests from the authenticated gateway.
+ * The handler runs on the owning thread. Schedule the restart after step
+ * returns and leave the current instance untouched in the handler. */
+typedef void (*fastp2p_restart_handler)(void *user);
+FASTP2P_API int fastp2p_client_set_restart_handler(fastp2p_client *, fastp2p_restart_handler, void *user);
 typedef struct {
     size_t struct_size;
     uint32_t abi_version;

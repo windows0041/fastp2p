@@ -22,6 +22,9 @@ static void signal_stop(int sig) {
     (void)sig;
     interrupted = 1;
 }
+static void request_restart(void *user) {
+    *(int *)user = 1;
+}
 static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     (void)c;
     (void)user;
@@ -248,6 +251,9 @@ static int client_main(int argc, char **argv) {
         return 2;
     }
     fp_config_sync_bind(client,managed_config?config_file:NULL,root);
+    int restart_requested = 0;
+    if (!verify_start)
+        fastp2p_client_set_restart_handler(client, request_restart, &restart_requested);
     const char *configured_identity = string(network, "DeviceID");
     const char *effective_host = string(network, "ServerHost");
     if ((!configured_identity || !*configured_identity) &&
@@ -273,6 +279,10 @@ static int client_main(int argc, char **argv) {
         rv = fastp2p_client_step(client, 10);
         if (rv)
             break;
+        if (restart_requested) {
+            rv = FP_CONFIG_RELOAD;
+            break;
+        }
         if (verify_start && was_online)
             break;
         uint64_t now=op_monotonic_ns();
@@ -292,6 +302,8 @@ done:
     /* Install a verified upgrade package only after a clean shutdown: the run
      * loop then returns success, so a service manager sees a normal stop instead
      * of a failure it would answer with a restart of the old image. */
+    if (rv == FP_CONFIG_RELOAD && fastp2p_runtime_stopping())
+        rv = 0;
     fastp2p_runtime_end();
     if (!verify_start && fp_update_run_pending(original_argv))
         rv = FASTP2P_EIO;

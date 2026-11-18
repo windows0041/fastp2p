@@ -12,7 +12,15 @@ typedef struct {
     jmethodID callback;
     fastp2p_client *client;
     int callback_failed;
+    int restart_requested;
 } binding;
+
+enum { STEP_RESTART_REQUESTED = 1 };
+
+static void request_restart(void *user) {
+    binding *b = user;
+    b->restart_requested = 1;
+}
 
 static void notify(fastp2p_client *client, const fastp2p_event *event, void *user) {
     (void)client;
@@ -85,6 +93,7 @@ JNIEXPORT jlong JNICALL Java_top_fastp2p_cclient_NativeClient_create(JNIEnv *env
         free(b);
         return 0;
     }
+    fastp2p_client_set_restart_handler(b->client, request_restart, b);
     return (jlong)(intptr_t)b;
 }
 
@@ -103,7 +112,9 @@ JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_step(JNIEnv *env, j
     if (!b)
         return FASTP2P_EINVAL;
     int rv = fastp2p_client_step(b->client, 10);
-    return b->callback_failed ? FASTP2P_EIO : rv;
+    if (b->callback_failed)
+        return FASTP2P_EIO;
+    return !rv && b->restart_requested ? STEP_RESTART_REQUESTED : rv;
 }
 JNIEXPORT void JNICALL Java_top_fastp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
                                                                         jlong handle) {

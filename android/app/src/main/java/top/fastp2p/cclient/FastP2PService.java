@@ -80,25 +80,32 @@ public final class FastP2PService extends Service {
         long handle = 0; String failure = null;
         try {
             Bootstrap pending = enrollment == null ? null : Bootstrap.decode(this, enrollment, migrate);
-            String config = pending == null ? SecretStore.config(this) : pending.config;
-            String token = pending == null ? SecretStore.token(this) : pending.token;
-            String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
-            ca = TrustStore.resolve(this, ca);
-            // The library stages a downloaded upgrade in this directory; Android
-            // then asks the user to confirm the install. Kept out of the stored
-            // configuration because it is device state, not enrolment state.
-            String nativeConfig = withUpdateDir(config, getCacheDir().getAbsolutePath());
-            handle = NativeClient.create(nativeConfig.getBytes(StandardCharsets.UTF_8), token, ca, this);
-            if (handle == 0) throw new IllegalArgumentException("接入配置无效");
-            if (NativeClient.start(handle) != 0) throw new IllegalStateException();
-            long deadline = SystemClock.elapsedRealtime() + 30000;
-            while (!stopping.get()) {
-                if (NativeClient.step(handle) != 0) throw new IllegalStateException();
-                if (pending != null) {
-                    if (state == 2) { pending.commit(this); pending = null; }
-                    else if (SystemClock.elapsedRealtime() > deadline) throw new IllegalArgumentException("无法校验网关证书或安装 Token");
+            boolean restart;
+            do {
+                restart = false;
+                String config = pending == null ? SecretStore.config(this) : pending.config;
+                String token = pending == null ? SecretStore.token(this) : pending.token;
+                String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
+                ca = TrustStore.resolve(this, ca);
+                // Keep the APK staging directory out of the stored enrolment profile.
+                String nativeConfig = withUpdateDir(config, getCacheDir().getAbsolutePath());
+                handle = NativeClient.create(nativeConfig.getBytes(StandardCharsets.UTF_8), token, ca, this);
+                if (handle == 0) throw new IllegalArgumentException("接入配置无效");
+                if (NativeClient.start(handle) != 0) throw new IllegalStateException();
+                long deadline = SystemClock.elapsedRealtime() + 30000;
+                while (!stopping.get()) {
+                    int step = NativeClient.step(handle);
+                    restart = step == NativeClient.STEP_RESTART_REQUESTED;
+                    if (step != 0 && !restart) throw new IllegalStateException();
+                    if (pending != null) {
+                        if (state == 2) { pending.commit(this); pending = null; }
+                        else if (SystemClock.elapsedRealtime() > deadline) throw new IllegalArgumentException("无法校验网关证书或安装 Token");
+                    }
+                    if (restart) break;
                 }
-            }
+                NativeClient.destroy(handle);
+                handle = 0;
+            } while (restart && !stopping.get());
         } catch (Exception error) {
             failure = error instanceof IllegalArgumentException ? error.getMessage() : "连接或配置保存失败";
             android.util.Log.w("fastp2p", "client stopped: " + failure, error);
