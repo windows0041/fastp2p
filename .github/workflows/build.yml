@@ -44,7 +44,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
           cmake --build build --parallel 3
           cmake --build build --target example-embed
-          cmake --install build/c
+          cmake --install build
           cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
           cmake --build build/consumer
           build/consumer/sdk-consumer
@@ -241,6 +241,10 @@ jobs:
         with:
           path: ~/fastp2p-dev/cross
           key: gateway-client-deps-debian12-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
+      - name: Linux dependencies for the SDK
+        # The configure step resolves libcrypto and friends under FASTP2P_DEPS_ROOT, which
+        # an empty cache does not provide - the monorepo cache always had them.
+        run: python3 scripts/build-deps.py linux-x86_64
       - name: Package native C client SDK
         run: |
           cmake -S . -B build/client-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/linux-x86_64" -DCMAKE_INSTALL_PREFIX="$PWD/dist/sdk-linux-x86_64"
