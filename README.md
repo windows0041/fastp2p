@@ -44,6 +44,8 @@ sudo journalctl -u fastp2p-client -n 50 --no-pager
 
 Alpine/OpenRC 用 `rc-service fastp2p status`，OpenWrt 用 `/etc/init.d/fastp2p status`。安装完成后程序在后台运行，不需要保持安装终端在线。
 
+macOS 在网关控制台的「安装客户端 → Mac」下载通用安装脚本。保留文件名，在终端执行 `sh ./fastp2p-macos-<16位数字>.sh`，无需 sudo。脚本支持 macOS 13 及以上，自动下载 Apple Silicon 或 Intel 版本，保留原节点身份和配置。安装后 LaunchAgent 随当前用户登录启动。
+
 Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p/config/fastp2p.conf`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%/fastp2p/config/fastp2p.conf`，使用当前用户 DPAPI。旧 `client.dat` 会迁移，备份保存在新配置目录。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
 
 Windows 开机服务和 `run --background` 不创建终端窗口；后台日志写入配置文件同目录的 `fastp2p.conf.log`。手动从终端运行前台命令时连接现有终端，管道和文件重定向继续可用。只有双击安装并完成 UAC 授权后，才创建安装进度终端和结果提示。服务崩溃或启动时 DNS/网络暂不可用导致退出时，Windows 服务管理器会按恢复策略重启客户端。
