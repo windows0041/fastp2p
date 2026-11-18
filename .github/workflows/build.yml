@@ -10,7 +10,20 @@ concurrency:
   group: c-clients-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  preflight:
+    # Seconds, not minutes: every packaging break since the split was a file this step
+    # can see is missing, and finding that out after a full build wastes a quarter hour.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Packaging inputs and paths
+        run: |
+          python3 -m py_compile scripts/*.py
+          python3 scripts/check-packaging-inputs.py
+
   macos:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +84,7 @@ jobs:
             build/socks/result.json
             build/compile_commands.json
   cross:
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -148,7 +162,7 @@ jobs:
             sdk-install.log
             android/app/build/reports/lint-results-release.*
   windows:
-    needs: cross
+    needs: [preflight, cross]
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
@@ -226,6 +240,7 @@ jobs:
       # Windows SDK (dll/headers) is no longer a Release asset; developers can
       # still get it from the cross job's windows-validation CI artifact.
   linux:
+    needs: preflight
     runs-on: ubuntu-24.04
     container:
       image: python:3.13-slim-bookworm
@@ -271,6 +286,7 @@ jobs:
           name: diagnostics-tcp-nat3-linux
           path: build/tcp-nat3/*.log
   musl:
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
