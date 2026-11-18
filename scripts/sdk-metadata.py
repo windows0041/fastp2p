@@ -15,10 +15,15 @@ for file in ['LICENSE','README.md','PLATFORMS-ZH.md','SOCKS5-ZH.md','THIRD_PARTY
     shutil.copyfile(project/file,sdk/file)
 (sdk/'examples').mkdir(exist_ok=True)
 (sdk/'include').mkdir(exist_ok=True)
-shutil.copyfile(project.parent/'NODE-STORAGE-ZH.md',sdk/'NODE-STORAGE-ZH.md')
+storage = next((p for p in (project/'NODE-STORAGE-ZH.md', project/'docs'/'NODE-STORAGE-ZH.md')
+                  if p.exists()), None)
+if storage:
+    shutil.copyfile(storage, sdk/'NODE-STORAGE-ZH.md')
+else:
+    print('note: NODE-STORAGE-ZH.md is not part of this repository; skipped')
 shutil.copyfile(project/'include/fastp2p.h',sdk/'include/fastp2p.h')
 shutil.copyfile(project/'examples/embed.c',sdk/'examples/embed.c')
-shutil.copyfile(project.parent/'common/bootstrap.json',sdk/'gateway-public.json')
+shutil.copyfile(project/'common/bootstrap.json',sdk/'gateway-public.json')
 notices=sdk/'licenses';notices.mkdir(exist_ok=True)
 manifest=json.loads((project/'deps.lock.json').read_text())
 for name,item in manifest.items():
