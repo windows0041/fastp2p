@@ -23,10 +23,24 @@ detect_init() {
 manager=$(detect_init)
 transaction=false
 locked=false
+install_backup=
+discard_install_stage() {
+    if [ -n "$install_backup" ]; then
+        rm -f -- "$install_backup/incoming" "$install_backup/runtime.new" \
+            "$install_backup/cli.new" "$install_backup/controller.new"
+    fi
+}
 finish() {
     status=$?
     set +e
-    if $transaction && [ "$status" -ne 0 ]; then rollback; fi
+    if [ "$status" -ne 0 ]; then
+        if $transaction; then
+            rollback
+        elif [ -n "$install_backup" ]; then
+            rm -f -- "$install_backup/runtime" "$install_backup/cli" "$install_backup/controller"
+        fi
+    fi
+    discard_install_stage
     if $locked; then rm -f /var/run/fastp2p-service.lock/pid; rmdir /var/run/fastp2p-service.lock; fi
     exit "$status"
 }
@@ -227,16 +241,33 @@ prune_program_backups() {
         printf '%s\n' "${cleanup_dir##*/}" | grep -Eq '^[0-9]{8}T[0-9]{6}\.[0-9]+$' || continue
         details=$(file_metadata "$cleanup_dir") || continue
         [ "${details%:*}" = 0:0:700 ] || continue
-        for cleanup_name in incoming runtime cli controller legacy-runtime legacy-runtime.old runtime.restore cli.restore controller.restore runtime.new cli.new controller.new; do
+        for cleanup_name in "$@"; do
             cleanup_file=$cleanup_dir/$cleanup_name
             if [ -f "$cleanup_file" ] || [ -L "$cleanup_file" ]; then
                 rm -f -- "$cleanup_file" || cleanup_pending=true
             fi
         done
     done
-    rm -f -- "$binary.old" || cleanup_pending=true
-    if $cleanup_pending; then printf '%s\n' '服务已安装，但部分旧程序未能删除，请检查文件权限。' >&2; fi
+    if $cleanup_pending; then printf '%s\n' '部分安装临时文件未能清理，请检查文件权限。' >&2; fi
     return 0
+}
+save_program() {
+    if [ -L "$1" ]; then
+        cp -pP -- "$1" "$2"
+    elif [ -f "$1" ]; then
+        ln -- "$1" "$2" 2>/dev/null || cp -p -- "$1" "$2"
+    fi
+}
+restore_program() {
+    if [ -f "$1" ] || [ -L "$1" ]; then
+        if [ ! -L "$1" ] && [ ! -L "$2" ] && [ "$1" -ef "$2" ]; then
+            rm -f -- "$1"
+        else
+            mv -fT -- "$1" "$2"
+        fi
+    else
+        rm -f -- "$2"
+    fi
 }
 install_service() {
     source_binary=
@@ -289,18 +320,26 @@ install_service() {
     chown 0:0 "$prefix"; chmod 755 "$prefix"
     [ ! -L "$prefix/.backups" ] || fail '备份目录不能是符号链接。'
     mkdir -p "$prefix/.backups"; chown 0:0 "$prefix/.backups"; chmod 700 "$prefix/.backups"
+    # A previous failed install may have left its incoming image and partial
+    # replacements on disk. Older verified backups and profiles are separate.
+    prune_program_backups incoming runtime.new cli.new controller.new
     backup=$prefix/.backups/$(date +%Y%m%dT%H%M%S).$$
     mkdir "$backup"; chmod 700 "$backup"
-    # Stage before uninstalling; /proc/PARENT/exe can refer to an installed image.
-    cp "$source_binary" "$backup/incoming"; chmod 755 "$backup/incoming"
+    install_backup=$backup
+    # Both destinations use the same root-owned image on a single filesystem.
+    # A hard link keeps the CLI pinned even after the service swaps its path.
+    if ! cp "$source_binary" "$backup/incoming"; then
+        bytes=$(wc -c < "$source_binary")
+        fail "无法暂存客户端（需 $bytes 字节），请检查 /usr/local 的磁盘空间。原服务尚未停止。"
+    fi
+    chmod 755 "$backup/incoming"
+    save_program "$backup/incoming" "$backup/runtime.new"
+    save_program "$backup/incoming" "$backup/cli.new"
+    cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"
     cp "$source_profile" "$backup/desired-config"; chmod 600 "$backup/desired-config"
-    for pair in "bin/fastp2p:runtime" "fastp2p-service:controller"; do
-        path=${pair%:*}; label=${pair#*:}
-        if [ -f "$prefix/$path" ]; then cp -p "$prefix/$path" "$backup/$label"; fi
-    done
-    if [ -f /usr/local/bin/fastp2p ]; then cp -p /usr/local/bin/fastp2p "$backup/cli"; fi
-    if [ -f /var/lib/fastp2p-client/fastp2p ]; then cp -p /var/lib/fastp2p-client/fastp2p "$backup/legacy-runtime"; fi
-    if [ -f /var/lib/fastp2p-client/fastp2p.old ]; then cp -p /var/lib/fastp2p-client/fastp2p.old "$backup/legacy-runtime.old"; fi
+    save_program "$binary" "$backup/runtime"
+    save_program /usr/local/bin/fastp2p "$backup/cli"
+    save_program "$prefix/fastp2p-service" "$backup/controller"
     if [ -f /etc/fastp2p/client.json ]; then
         cp -p /etc/fastp2p/client.json "$backup/legacy-profile.json"
         for ca in /etc/fastp2p/client.json.ca.*.pem; do
@@ -331,6 +370,10 @@ install_service() {
         # Remove the replacement's boot links, including fresh-install failures.
         # Restoring an init file alone does not restore procd/OpenRC autostart.
         disable_service >/dev/null 2>&1 || true
+        restore_program "$backup/runtime" "$binary"
+        restore_program "$backup/cli" /usr/local/bin/fastp2p
+        restore_program "$backup/controller" "$prefix/fastp2p-service"
+        discard_install_stage
         if $config_changed; then
             chown -h 0:0 "$state"; chmod 700 "$state"
             rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
@@ -338,9 +381,6 @@ install_service() {
                 [ ! -f "$saved" ] || cp -p "$saved" "$state/${saved##*/}"
             done
         fi
-        if [ -f "$backup/runtime" ]; then cp -p "$backup/runtime" "$backup/runtime.restore"; mv -fT "$backup/runtime.restore" "$binary"; else rm -f "$binary"; fi
-        if [ -f "$backup/cli" ]; then cp -p "$backup/cli" "$backup/cli.restore"; mv -fT "$backup/cli.restore" /usr/local/bin/fastp2p; else rm -f /usr/local/bin/fastp2p; fi
-        if [ -f "$backup/controller" ]; then cp -p "$backup/controller" "$backup/controller.restore"; mv -fT "$backup/controller.restore" "$prefix/fastp2p-service"; else rm -f "$prefix/fastp2p-service"; fi
         case "$manager" in
             systemd)
                 if [ -f "$backup/unit" ]; then cp -p "$backup/unit" "/etc/systemd/system/$service.service"; else rm -f "/etc/systemd/system/$service.service"; fi
@@ -378,9 +418,9 @@ install_service() {
     done
     config_changed=true
     chown "fastp2p:$group" "$prefix/bin"; chmod 700 "$prefix/bin"
-    cp "$backup/incoming" "$backup/runtime.new"; chmod 755 "$backup/runtime.new"; mv -fT "$backup/runtime.new" "$binary"
-    cp "$backup/incoming" "$backup/cli.new"; chmod 755 "$backup/cli.new"; mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
-    cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"; mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
+    mv -fT "$backup/runtime.new" "$binary"
+    mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
+    mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
     "$backup/incoming" --relocate-profile "$backup/desired-config" "$profile"
     chown "fastp2p:$group" "$profile"; chmod 600 "$profile"
     for ca in "$state"/fastp2p.conf.ca.*.pem; do
@@ -404,7 +444,9 @@ install_service() {
     done
     printf '%s\n' "$manager" > "$prefix/init"
     transaction=false
-    prune_program_backups
+    prune_program_backups incoming runtime cli controller legacy-runtime legacy-runtime.old \
+        runtime.restore cli.restore controller.restore runtime.new cli.new controller.new
+    rm -f -- "$binary.old" || printf '%s\n' '服务已安装，但旧程序未能删除。' >&2
     rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old
     rmdir /var/lib/fastp2p-client 2>/dev/null || true
     rm -f /etc/fastp2p/client.json /etc/fastp2p/client.json.identity /etc/fastp2p/client.json.ca.*.pem

@@ -201,7 +201,7 @@ esac
         minimal = root/'procd-tools'
         minimal.mkdir()
         for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','wc','rm','rmdir',
-                     'mkdir','mv','grep','curl','cat','ls','date','chown','sleep','touch'):
+                     'mkdir','mv','grep','curl','cat','ls','date','chown','sleep','touch','ln'):
             (minimal/name).symlink_to(shutil.which(name))
         native_path = environment['PATH']
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
@@ -222,8 +222,37 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
 ''')
             else: executable(Path('/sbin/openrc-run'), 'exit 0\n')
             events.write_text('')
-            run(short_name if manager == 'procd' else named,
-                shell='bash' if manager.startswith('systemd') else 'sh')
+            if manager == 'procd':
+                # Limit the actual install filesystem to one binary plus metadata.
+                # Seed a failed transaction's staged image to exercise recovery.
+                Path('/usr/local/bin/fastp2p').unlink(missing_ok=True)
+                stats=os.statvfs('/usr/local')
+                original_size=stats.f_blocks*stats.f_frsize
+                command('mount','-o',f'remount,size={len(payload)+512*1024}','/usr/local')
+                try:
+                    stale=Path('/usr/local/fastp2p/.backups/20200103T000000.44')
+                    stale.mkdir(parents=True, mode=0o700)
+                    (stale/'incoming').write_bytes(payload)
+                    (stale/'startup-check.log').write_text('keep diagnostics')
+                    stats=os.statvfs('/usr/local')
+                    assert stats.f_bavail*stats.f_frsize < len(payload)
+                    run(short_name)
+                    binary=Path('/usr/local/fastp2p/bin/fastp2p')
+                    cli=Path('/usr/local/bin/fastp2p')
+                    assert binary.samefile(cli) and not cli.is_symlink() and cli.stat().st_uid==0
+                    assert not (stale/'incoming').exists()
+                    assert (stale/'startup-check.log').read_text()=='keep diagnostics'
+                    events.write_text('')
+                    response=run(short_name,1)
+                    assert '原服务尚未停止'.encode() in response.stderr
+                    assert events.read_text()=='' and binary.read_bytes()==payload and binary.samefile(cli)
+                    assert not any(stale.parent.glob('*/incoming'))
+                    assert (root/'client-running').exists()
+                finally:
+                    command('mount','-o',f'remount,size={original_size}','/usr/local')
+                results['one_image_install_reclaims_failed_stage_and_preserves_service_on_enospc']=True
+            else:
+                run(shell='bash' if manager.startswith('systemd') else 'sh')
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             first = json.loads(profile.read_text()); identity = first['network']['DeviceID']
             first['customSetting'] = {'preserve': True}; first['network']['UDPPort'] = 29887
