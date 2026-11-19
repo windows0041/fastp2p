@@ -198,7 +198,14 @@ esac
         profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
+        minimal = root/'procd-tools'
+        minimal.mkdir()
+        for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','wc','rm','rmdir',
+                     'mkdir','mv','grep','curl','cat','ls','date','chown','sleep','touch'):
+            (minimal/name).symlink_to(shutil.which(name))
+        native_path = environment['PATH']
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
+            environment['PATH'] = str(minimal) if manager == 'procd' else native_path
             for name in ('client-running', 'client-enabled', 'fail-start', 'fail-after-start'):
                 (root/name).unlink(missing_ok=True)
             for folder in ('/usr/local/fastp2p', '/etc/systemd/system', '/etc/init.d'):
@@ -295,11 +302,27 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             if manager.startswith('systemd'): assert not (dropin/'20-remote-upgrade.conf').exists()
             # Real startup failure must roll back old image, controller and profile.
             before = profile.read_bytes(); binary.write_bytes(payload+b'old-marker')
+            if manager == 'procd':
+                # The fallback must still reject multiply-linked config files.
+                alias = profile.with_name('test-config.hardlink')
+                os.link(profile, alias)
+                try:
+                    result = run(expected=1)
+                    assert '单链接普通文件'.encode() in result.stderr
+                    assert profile.stat().st_nlink == 2 and profile.read_bytes() == before
+                    assert (root/'client-running').exists() and (root/'client-enabled').exists()
+                finally:
+                    alias.unlink()
+                # The fallback must also preserve special mode bits on rollback.
+                profile.parent.chmod(0o2700)
             old_controller = controller.read_bytes(); events.write_text(''); (root/'fail-start').touch()
             run(expected=1)
             assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
             assert controller.read_bytes() == old_controller and 'start' in events.read_text()
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
+            if manager == 'procd':
+                assert profile.parent.stat().st_mode & 0o7777 == 0o2700
+                results['procd_without_stat_preserves_modes_and_rejects_hardlinks'] = True
             # A successful start command does not guarantee a live service.
             # Detect the failed native status and restore both runtime and boot links.
             events.write_text(''); (root/'fail-after-start').touch(); run(expected=1)
@@ -424,12 +447,12 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
         wrong_ca=installer.replace((root/'tls/ca.crt').read_bytes(),(root/'wrong-tls/ca.crt').read_bytes())
         alternate.write_bytes(wrong_ca);events.write_text('');run(alternate,1)
         assert events.read_text()=='' and profile.read_bytes()==before
-        # A minimal x86_64 PATH has neither od nor dd. Exercise both downloaders.
+        # A minimal x86_64 PATH has no od, dd or stat. Exercise both downloaders.
         for downloader in ('curl','wget'):
             if not shutil.which(downloader):
                 continue
             fallback=root/(downloader+'-tools');fallback.mkdir()
-            for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','stat','wc','rm','rmdir','mkdir','mv','grep',downloader,'cat'):
+            for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','wc','rm','rmdir','mkdir','mv','grep',downloader,'cat','ls'):
                 (fallback/name).symlink_to(shutil.which(name))
             for name in ('rc-service','rc-update'):(fallback/name).symlink_to(tools/name)
             environment['PATH']=str(fallback)
@@ -439,7 +462,7 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
             events.write_text('');response=run(alternate,1)
             assert b'SHA-256' in response.stderr and events.read_text()=='' and profile.read_bytes()==before
             environment['PATH']=str(tools)+':/usr/bin:/bin'
-        results['native_x86_64_download_with_no_od_or_dd']=True
+        results['native_x86_64_download_with_no_od_dd_or_stat']=True
         results['universal_arch_selection_tls_header_auth_and_download_failures_preserve_service']=True
         Path('/var/run/fastp2p-install.lock').mkdir(); events.write_text('')
         run(expected=1); assert events.read_text() == '' and profile.read_bytes() == before

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The gateway embeds an architecture manifest and its public download CA.
-# Compatible with bash, dash and BusyBox ash. The token lives only in the name.
+# Compatible with bash, dash and BusyBox ash.
 set -eu
 umask 077
 fail() { printf '%s\n' "fastp2p: $*" >&2; exit 1; }
@@ -17,7 +17,7 @@ if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || fail '需要 root 权限，请以 root 执行此脚本。'
     exec sudo -- sh "$self"
 fi
-for tool in awk uname sha256sum mktemp chmod cp stat wc; do
+for tool in awk uname sha256sum mktemp chmod cp wc; do
     command -v "$tool" >/dev/null 2>&1 || fail "缺少必要命令：$tool"
 done
 work=$(mktemp -d /tmp/fastp2p-install.XXXXXXXX)

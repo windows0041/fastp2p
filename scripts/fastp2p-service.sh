@@ -190,6 +190,34 @@ EOF
             rc-update add fastp2p default ;;
     esac
 }
+file_metadata() {
+    if info=$(stat -c '%u:%g:%a:%h' -- "$1" 2>/dev/null) ||
+       info=$(busybox stat -c '%u:%g:%a:%h' -- "$1" 2>/dev/null); then
+        printf '%s\n' "$info"
+        return
+    fi
+    # Minimal OpenWrt images may have no stat applet. Read numeric metadata
+    # from the first record only, since the filename may contain a newline.
+    info=$(LC_ALL=C ls -ldn -- "$1" 2>/dev/null) || return 1
+    printf '%s\n' "$info" | LC_ALL=C awk '
+        function permissions(at, x) {
+            x=substr($1,at+2,1)
+            return 4*(substr($1,at,1)=="r") + 2*(substr($1,at+1,1)=="w") + (x ~ /[xst]/)
+        }
+        NR==1 && $1 ~ /^[-d][r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-][+.@]?$/ &&
+                 $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+            special=4*(substr($1,4,1) ~ /[sS]/) + 2*(substr($1,7,1) ~ /[sS]/) + (substr($1,10,1) ~ /[tT]/)
+            mode=512*special + 64*permissions(2) + 8*permissions(5) + permissions(8)
+            printf "%s:%s:%o:%s\n", $3, $4, mode, $2
+            valid=1
+        }
+        END {exit !valid}'
+}
+is_single_link_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    details=$(file_metadata "$1") || return 1
+    [ "${details##*:}" = 1 ]
+}
 prune_program_backups() {
     # Only installer-owned directories and exact program filenames. Keep the
     # saved profiles, certificates and diagnostic logs; never traverse links.
@@ -197,7 +225,8 @@ prune_program_backups() {
     for cleanup_dir in "$prefix/.backups/"*; do
         [ -d "$cleanup_dir" ] && [ ! -L "$cleanup_dir" ] || continue
         printf '%s\n' "${cleanup_dir##*/}" | grep -Eq '^[0-9]{8}T[0-9]{6}\.[0-9]+$' || continue
-        [ "$(stat -c '%u:%g:%a' "$cleanup_dir")" = 0:0:700 ] || continue
+        details=$(file_metadata "$cleanup_dir") || continue
+        [ "${details%:*}" = 0:0:700 ] || continue
         for cleanup_name in incoming runtime cli controller legacy-runtime legacy-runtime.old runtime.restore cli.restore controller.restore runtime.new cli.new controller.new; do
             cleanup_file=$cleanup_dir/$cleanup_name
             if [ -f "$cleanup_file" ] || [ -L "$cleanup_file" ]; then
@@ -231,8 +260,9 @@ install_service() {
     config_metadata=
     if [ -e "$parent" ]; then
         [ -d "$parent" ] || fail '数据路径不是目录。'
-        parent_metadata=$(stat -c '%u:%g:%a' "$parent")
-        parent_uid=$(stat -c %u "$parent")
+        details=$(file_metadata "$parent") || fail '无法读取数据目录的权限。'
+        parent_metadata=${details%:*}
+        parent_uid=${parent_metadata%%:*}
         [ "$parent_uid" -eq 0 ] || [ "$parent_uid" -eq "$(id -u fastp2p)" ] || fail '数据目录属于其他用户，未卸载原服务。'
         if [ "$parent_uid" -ne 0 ]; then
             # An old co-located gateway may still need to write this directory.
@@ -251,7 +281,8 @@ install_service() {
     fi
     if [ -e "$state" ]; then
         [ -d "$state" ] || fail '配置路径不是目录。'
-        config_metadata=$(stat -c '%u:%g:%a' "$state")
+        details=$(file_metadata "$state") || fail '无法读取配置目录的权限。'
+        config_metadata=${details%:*}
     fi
     [ ! -L "$prefix" ] || fail '安装目录不能是符号链接。'
     mkdir -p "$prefix"
@@ -341,7 +372,7 @@ install_service() {
     mkdir "$backup/config"
     for file in "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem; do
         if [ -e "$file" ] || [ -L "$file" ]; then
-            [ -f "$file" ] && [ ! -L "$file" ] && [ "$(stat -c %h "$file")" -eq 1 ] || fail '配置文件不能是符号链接、硬链接或其他类型。'
+            is_single_link_file "$file" || fail '无法确认配置是单链接普通文件。'
             cp -p "$file" "$backup/config/${file##*/}"
         fi
     done
@@ -354,7 +385,7 @@ install_service() {
     chown "fastp2p:$group" "$profile"; chmod 600 "$profile"
     for ca in "$state"/fastp2p.conf.ca.*.pem; do
         [ -f "$ca" ] || continue
-        [ ! -L "$ca" ] && [ "$(stat -c %h "$ca")" -eq 1 ] || fail '证书文件不能是符号链接或硬链接。'
+        is_single_link_file "$ca" || fail '无法确认证书是单链接普通文件。'
         chown "0:$group" "$ca"; chmod 640 "$ca"
     done
     chown "fastp2p:$group" "$state"; chmod 700 "$state"
@@ -382,6 +413,7 @@ install_service() {
 case "${1:-}" in
     check)
         mv --help 2>&1 | grep -q -- '-T' || fail '需要支持 -T 的 mv（GNU coreutils 或 BusyBox）。'
+        file_metadata / >/dev/null || fail '无法读取文件权限，请检查 stat 或 ls -ldn。'
         printf '%s\n' "检测到服务管理器：$manager" ;;
     install) install_service "$@" ;;
     stop) stop_service ;;
