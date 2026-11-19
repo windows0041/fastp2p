@@ -16,6 +16,7 @@
 #include <openssl/x509.h>
 
 #define QLIMIT (4u * 1024u * 1024u)
+#define DIRECT_CID_LEN 16
 struct qchunk {
     struct qchunk *next;
     uint64_t offset;
@@ -29,7 +30,7 @@ struct opq {
     SSL *tls;
     ngtcp2_crypto_ossl_ctx *native_tls;
     op_socket fd;
-    int server, failed, ready;
+    int server, shared, failed, ready;
     int64_t stream;
     struct sockaddr_storage local, peer;
     op_socklen local_len, peer_len;
@@ -215,7 +216,7 @@ static int select_alpn(SSL *ssl, const unsigned char **out, unsigned char *outle
     *out = selected;
     return SSL_TLSEXT_ERR_OK;
 }
-static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
+static int init_conn(opq *q, const ngtcp2_pkt_hd *first, const uint8_t *direct_id) {
     ngtcp2_callbacks cb = {
         .client_initial = ngtcp2_crypto_client_initial_cb,
         .recv_client_initial = ngtcp2_crypto_recv_client_initial_cb,
@@ -261,9 +262,11 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
         rv = ngtcp2_conn_server_new(&q->conn, &dcid, &scid, &path, first->version, &cb, &settings,
                                     &params, NULL, q);
     } else {
-        dcid.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
+        dcid.datalen = direct_id ? DIRECT_CID_LEN : NGTCP2_MIN_INITIAL_DCIDLEN;
         if (qrandom(dcid.data, dcid.datalen))
             return -1;
+        if (direct_id)
+            memcpy(dcid.data, direct_id, OPQ_DIRECT_ID_LEN);
         rv = ngtcp2_conn_client_new(&q->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &cb,
                                     &settings, &params, NULL, q);
     }
@@ -272,7 +275,8 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first) {
     ngtcp2_conn_set_tls_native_handle(q->conn, q->native_tls);
     return 0;
 }
-opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server) {
+static opq *create(op_socket fd, const struct sockaddr *peer, op_socklen peer_len,
+                   int server, int shared, const uint8_t *direct_id) {
     if ((size_t)peer_len > sizeof(struct sockaddr_storage))
         return NULL;
     opq *q = calloc(1, sizeof(*q));
@@ -280,6 +284,7 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
         return NULL;
     q->fd = fd;
     q->server = server;
+    q->shared = shared;
     q->stream = -1;
     q->peer_len = peer_len;
     memcpy(&q->peer, peer, peer_len);
@@ -318,12 +323,31 @@ opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int
             ngtcp2_crypto_ossl_configure_client_session(q->tls))
             goto error;
     }
-    if (!server && init_conn(q, NULL))
+    if (!server && init_conn(q, NULL, direct_id))
         goto error;
     return q;
 error:
     opq_free(q);
     return NULL;
+}
+opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server) {
+    return create(fd, peer, peer_len, server, 0, NULL);
+}
+opq *opq_dial_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len,
+                       const uint8_t id[OPQ_DIRECT_ID_LEN]) {
+    return create(fd, peer, peer_len, 0, 0, id);
+}
+opq *opq_accept_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len) {
+    return create(fd, peer, peer_len, 1, 1, NULL);
+}
+int opq_initial_tunnel_id(const uint8_t *packet, size_t length, uint8_t id[OPQ_DIRECT_ID_LEN]) {
+    ngtcp2_pkt_hd first;
+    if (length < 1200 || ngtcp2_pkt_decode_hd_long(&first, packet, length) < 0 ||
+        first.version != NGTCP2_PROTO_VER_V1 || first.type != NGTCP2_PKT_INITIAL ||
+        first.dcid.datalen != DIRECT_CID_LEN)
+        return 0;
+    memcpy(id, first.dcid.data, OPQ_DIRECT_ID_LEN);
+    return 1;
 }
 static int send_packet(opq *q, const uint8_t *data, size_t len) {
     op_ssize n;
@@ -336,9 +360,26 @@ static int send_packet(opq *q, const uint8_t *data, size_t len) {
         return fail(q, "QUIC send", 0);
     return 0;
 }
-int opq_step(opq *q) {
-    if (!q || q->failed)
-        return -1;
+int opq_receive(opq *q, const uint8_t *packet, size_t length) {
+    /* Other UDP traffic can still arrive after the punch-to-QUIC handoff. */
+    if (!length || !(packet[0] & 0x40))
+        return 0;
+    if (!q->conn) {
+        ngtcp2_pkt_hd first;
+        if (ngtcp2_pkt_decode_hd_long(&first, packet, length) < 0 ||
+            first.type != NGTCP2_PKT_INITIAL)
+            return 0;
+        if (init_conn(q, &first, NULL))
+            return -1;
+    }
+    ngtcp2_path path = {{(struct sockaddr *)&q->local, q->local_len},
+                       {(struct sockaddr *)&q->peer, q->peer_len},
+                       NULL};
+    ngtcp2_pkt_info pi = {0};
+    int rv = ngtcp2_conn_read_pkt(q->conn, &path, &pi, packet, length, now_ns());
+    return rv ? fail(q, "QUIC packet", rv) : 0;
+}
+static int receive_packets(opq *q) {
     uint8_t packet[65536];
     for (int i = 0; i < 64; ++i) {
         struct sockaddr_storage peer;
@@ -358,25 +399,14 @@ int opq_step(opq *q) {
         if (!op_address_equal((struct sockaddr *)&peer, plen, (struct sockaddr *)&q->peer,
                               q->peer_len))
             continue;
-        /* Stray FastP2P UDP punch markers may still arrive after handoff. */
-        if (!n || !(packet[0] & 0x40))
-            continue;
-        if (!q->conn) {
-            ngtcp2_pkt_hd first;
-            if (ngtcp2_pkt_decode_hd_long(&first, packet, (size_t)n) < 0 ||
-                first.type != NGTCP2_PKT_INITIAL)
-                continue;
-            if (init_conn(q, &first))
-                return -1;
-        }
-        ngtcp2_path path = {{(struct sockaddr *)&q->local, q->local_len},
-                            {(struct sockaddr *)&q->peer, q->peer_len},
-                            NULL};
-        ngtcp2_pkt_info pi = {0};
-        int rv = ngtcp2_conn_read_pkt(q->conn, &path, &pi, packet, (size_t)n, now_ns());
-        if (rv)
-            return fail(q, "QUIC packet", rv);
+        if (opq_receive(q, packet, (size_t)n))
+            return -1;
     }
+    return 0;
+}
+int opq_step(opq *q) {
+    if (!q || q->failed || (!q->shared && receive_packets(q)))
+        return -1;
     if (!q->conn)
         return 0;
     uint64_t now = now_ns();

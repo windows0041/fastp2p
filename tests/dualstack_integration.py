@@ -157,7 +157,8 @@ try:
             directory = runtime / name
             directory.mkdir(mode=0o700)
             cfg = {'product': 'fastp2p', 'network': {'Node': name, 'Token': install_token, 'ServerHost': host,
-                               'ServerPort': 27183, 'ShareBandwidth': 0},
+                               'ServerPort': 27183, 'ShareBandwidth': 0,
+                               'UDPSTUNServers': [], 'TCPNatProbe': ''},
                    'CACertFile': str(certs / 'ca.crt'), 'LogLevel': 0, 'apps': list(apps)}
             if public_port:
                 cfg['network']['PublicIPPort'] = public_port
@@ -211,6 +212,19 @@ try:
         assert json.loads(profile.read_text())['network']['PublicIPPort'] == peer_port
         results['tunnel_and_forwarding_over_ipv6'] = True
 
+        assert node_record('dual-target-v6')['publicUDP'] == 1
+        for suffix, app_port in [('a', 26503), ('b', 26504)]:
+            name = f'quic-source-{suffix}'
+            client(name, '::1')
+            wait(lambda: (node_record(name) or {}).get('isActive'), what=f'{name} to register')
+            rule(name, f'quic-direct-{suffix}', app_port, 'dual-target-v6', punch_priority=4)
+        wait(lambda: tcp_roundtrip(26503) and tcp_roundtrip(26504),
+             what='two QUIC sessions on the same UDP peer listener')
+        for suffix in ('a', 'b'):
+            assert 'UDP peer listener connected' in (logs / f'quic-source-{suffix}.log').read_text()
+        assert (logs / 'dual-target-v6.log').read_text().count('UDP peer listener accepted connection') >= 2
+        results['two_quic_peers_share_one_udp_listener'] = True
+
         # --- the same gateway still serves IPv4 -----------------------------
         client('dual-target-v4', '127.0.0.1', public_port=8234)
         client('dual-source-v4', '127.0.0.1')
@@ -229,6 +243,29 @@ try:
         finally:
             subprocess.run(['iptables', '-D', *blocked_port], check=True)
         results['blocked_tcp_peer_listener_falls_back_to_punch'] = True
+
+        blocked_udp = ['INPUT', '-p', 'udp', '--dport', '8234', '-j', 'DROP']
+        subprocess.run(['iptables', '-A', *blocked_udp], check=True)
+        try:
+            rule('dual-source-v4', 'blocked-quic', 26505, 'dual-target-v4', punch_priority=4)
+            wait(lambda: tcp_roundtrip(26505), timeout=60,
+                 what='QUIC punch after the UDP peer listener times out')
+            text = (logs / 'dual-source-v4.log').read_text(errors='replace')
+            assert 'tunnel establishment timed out' in text
+            assert 'QUIC tunnel connected' in text and 'UDP peer listener connected' not in text
+        finally:
+            subprocess.run(['iptables', '-D', *blocked_udp], check=True)
+        results['blocked_udp_peer_listener_falls_back_to_punch'] = True
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
+            occupied.bind(('127.0.0.1', 9234))
+            client('occupied-udp-port', '127.0.0.1', public_port=9234)
+            wait(lambda: (node_record('occupied-udp-port') or {}).get('publicIPPort') == 9234,
+                 what='the pinned TCP listener to register with its UDP port occupied')
+            assert node_record('occupied-udp-port')['publicUDP'] == 0
+            with socket.create_connection(('127.0.0.1', 9234), timeout=2):
+                pass
+        results['occupied_pinned_udp_port_retains_tcp_listener'] = True
 
         # A v4-only client must still report exactly the historical fields, with
         # no IPv6 capability invented for it.

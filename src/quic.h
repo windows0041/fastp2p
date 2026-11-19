@@ -10,7 +10,15 @@
  * the key it presented, and the tunnel confirms the exact certificate through
  * an end-to-end check after the handshake. */
 typedef struct opq opq;
+#define OPQ_DIRECT_ID_LEN 8
 opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server);
+/* The first Initial names a tunnel previously negotiated with the gateway. */
+opq *opq_dial_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len,
+                       const uint8_t id[OPQ_DIRECT_ID_LEN]);
+opq *opq_accept_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len);
+int opq_initial_tunnel_id(const uint8_t *packet, size_t length, uint8_t id[OPQ_DIRECT_ID_LEN]);
+/* The caller dispatches shared-socket datagrams to the matching connection. */
+int opq_receive(opq *q, const uint8_t *packet, size_t length);
 int opq_step(opq *q);
 int opq_write(opq *q, const void *data, size_t length);
 size_t opq_read(opq *q, void *data, size_t capacity);
