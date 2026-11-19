@@ -221,8 +221,6 @@ static int client_main(int argc, char **argv) {
         host = string(network, "ServerHost");
     if (!node)
         node = string(network, "Node");
-    if (!ca)
-        ca = string(root, "CACertFile");
     if (!port)
         port = number(network, "ServerPort");
     if (!public_port)

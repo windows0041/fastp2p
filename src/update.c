@@ -65,7 +65,15 @@ static size_t sink_write(char *data, size_t size, size_t count, void *user) {
     return length;
 }
 
-int fp_update_download(const char *url, const char *ca, const char *dest,
+CURLcode fp_tls_set_ca(CURL *curl, const char *file, const char *pem) {
+    if (pem) {
+        struct curl_blob certificate = {(void *)pem, strlen(pem), CURL_BLOB_COPY};
+        return curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &certificate);
+    }
+    return file && *file ? curl_easy_setopt(curl, CURLOPT_CAINFO, file) : CURLE_OK;
+}
+
+int fp_update_download(const char *url, const char *ca, const char *ca_pem, const char *dest,
                        const char *expect_sha, uint64_t expect_size,
                        char *error, size_t error_length) {
     if (!url || !*url || !dest || !expect_sha || strlen(expect_sha) != 64) {
@@ -107,10 +115,9 @@ int fp_update_download(const char *url, const char *ca, const char *dest,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-    if (ca && *ca)
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ca);
-
-    CURLcode result = curl_easy_perform(curl);
+    CURLcode result = fp_tls_set_ca(curl, ca, ca_pem);
+    if (result == CURLE_OK)
+        result = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_cleanup(curl);
@@ -119,7 +126,7 @@ int fp_update_download(const char *url, const char *ca, const char *dest,
     if (result != CURLE_OK) {
         EVP_MD_CTX_free(digest);
         remove(dest);
-        set_error(error, error_length, failure[0] ? failure : "download failed");
+        set_error(error, error_length, failure[0] ? failure : curl_easy_strerror(result));
         return -1;
     }
     if (status != 200) {

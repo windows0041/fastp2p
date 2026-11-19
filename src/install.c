@@ -348,13 +348,22 @@ static int install_token(const char *token, const char *token_file, const char *
     }
     if (machine && fastp2p_service_prepare(profile)) { json_object_put(enrollment); return 1; }
     const char *ca = field(enrollment, "ca");
-    int custom_ca = *ca != 0;
-    unsigned char digest[32]; unsigned digest_length;
-    char fingerprint[65];
-    if (!EVP_Digest(ca, strlen(ca), digest, &digest_length, EVP_sha256(), NULL)) { json_object_put(enrollment); return 1; }
-    for (unsigned i = 0; i < 32; ++i) snprintf(fingerprint + 2*i, 3, "%02x", digest[i]);
-    int size = snprintf(ca_path, sizeof(ca_path), "%s.ca.%s.pem", profile, fingerprint);
-    if (size < 0 || (size_t)size >= sizeof(ca_path)) { json_object_put(enrollment); return 2; }
+    const char *host = field(enrollment, "host");
+    json_object *port_value = NULL;
+    json_object_object_get_ex(enrollment, "port", &port_value);
+    int port = json_object_get_int(port_value);
+    const char *builtin = fastp2p_builtin_ca(host, (unsigned)port);
+    int use_builtin = builtin && !strcmp(builtin, ca);
+    int use_ca_file = *ca && !use_builtin;
+    if (use_ca_file) {
+        unsigned char digest[32];
+        unsigned digest_length;
+        char fingerprint[65];
+        if (!EVP_Digest(ca, strlen(ca), digest, &digest_length, EVP_sha256(), NULL)) { json_object_put(enrollment); return 1; }
+        for (unsigned i = 0; i < 32; ++i) snprintf(fingerprint + 2*i, 3, "%02x", digest[i]);
+        int size = snprintf(ca_path, sizeof(ca_path), "%s.ca.%s.pem", profile, fingerprint);
+        if (size < 0 || (size_t)size >= sizeof(ca_path)) { json_object_put(enrollment); return 2; }
+    }
     json_object *previous = fastp2p_profile_read(profile), *root = json_object_new_object();
 #ifdef _WIN32
     char legacy_profile[4096]="";
@@ -408,18 +417,20 @@ static int install_token(const char *token, const char *token_file, const char *
     if (RAND_bytes(bytes, sizeof(bytes)) != 1) { json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous); return 1; }
     for (unsigned i = 0; i < sizeof(bytes); ++i) snprintf(identity + 2*i, 3, "%02x", bytes[i]);
     if (old_network && strlen(field(old_network, "DeviceID")) == 32) strcpy(identity, field(old_network, "DeviceID"));
-    if (*ca && ensure_ca(ca_path, ca)) goto fail;
+    if (use_ca_file && ensure_ca(ca_path, ca)) goto fail;
     json_object *network = json_object_new_object();
     json_object_object_add(root, "network", network);
     json_object_object_add(root, "product", json_object_new_string("fastp2p"));
-    json_object_object_add(network, "ServerHost", json_object_new_string(field(enrollment, "host")));
-    json_object *port = NULL; json_object_object_get_ex(enrollment, "port", &port);
-    json_object_object_add(network, "ServerPort", json_object_new_int(json_object_get_int(port)));
+    json_object_object_add(network, "ServerHost", json_object_new_string(host));
+    json_object_object_add(network, "ServerPort", json_object_new_int(port));
     json_object_object_add(network, "Token", json_object_new_string(field(enrollment, "key")));
     json_object_object_add(network, "AutoNode", json_object_new_boolean(!node || !*node));
     if (node && *node) json_object_object_add(network, "Node", json_object_new_string(node));
     json_object_object_add(network, "DeviceID", json_object_new_string(identity));
-    if (*ca) json_object_object_add(root, "CACertFile", json_object_new_string(ca_path));
+    if (use_builtin)
+        json_object_object_add(root, "CACertBuiltin", json_object_new_string(fastp2p_builtin_ca_hash()));
+    else if (use_ca_file)
+        json_object_object_add(root, "CACertFile", json_object_new_string(ca_path));
     fastp2p_client *client = NULL;
     verification result = {0};
     if (machine) fastp2p_install_step("[2/5] 正在连接网关并校验证书与密钥（最多 25 秒）…");
@@ -452,10 +463,13 @@ static int install_token(const char *token, const char *token_file, const char *
                 json_object_object_add(saved_network, keys[i], json_object_get(value));
             else json_object_object_del(saved_network, keys[i]);
         }
-        json_object *value = NULL;
-        if (json_object_object_get_ex(root, "CACertFile", &value))
-            json_object_object_add(saved, "CACertFile", json_object_get(value));
-        else json_object_object_del(saved, "CACertFile");
+        const char *trust_keys[] = {"CACertBuiltin", "CACertFile"};
+        for (unsigned i = 0; i < sizeof(trust_keys) / sizeof(trust_keys[0]); ++i) {
+            json_object *value = NULL;
+            if (json_object_object_get_ex(root, trust_keys[i], &value))
+                json_object_object_add(saved, trust_keys[i], json_object_get(value));
+            else json_object_object_del(saved, trust_keys[i]);
+        }
         json_object_put(root); root = saved;
     }
     if(fp_config_validate_json(json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN))) {
@@ -493,8 +507,8 @@ static int install_token(const char *token, const char *token_file, const char *
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
     if (!no_service) {
         if (machine) fastp2p_install_step("[4/5] 正在注册 Windows 服务并设为开机自启…");
-        int installed = machine ? fastp2p_service_install(profile, custom_ca ? ca_path : NULL)
-                                : fastp2p_enable_autostart(profile, custom_ca ? ca_path : NULL);
+        int installed = machine ? fastp2p_service_install(profile, use_ca_file ? ca_path : NULL)
+                                : fastp2p_enable_autostart(profile, use_ca_file ? ca_path : NULL);
         if (installed) {
             fputs("Gateway verified and profile saved; automatic startup could not be installed.\n", stderr);
             return 1;

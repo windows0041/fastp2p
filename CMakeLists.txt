@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(fastp2p_c VERSION 2.0.21 LANGUAGES C)
+project(fastp2p_c VERSION 2.0.22 LANGUAGES C)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/fastp2p.h" FASTP2P_HEADER_VERSION
      REGEX "^#define FASTP2P_VERSION ")
 if(NOT FASTP2P_HEADER_VERSION STREQUAL "#define FASTP2P_VERSION \"${PROJECT_VERSION}\"")
@@ -19,7 +19,8 @@ option(FASTP2P_BUILD_BENCHMARKS "Build isolated internal buffer benchmarks" OFF)
 set(FASTP2P_BOOTSTRAP_FILE "${CMAKE_CURRENT_SOURCE_DIR}/common/bootstrap.json" CACHE FILEPATH "Public gateway identity for this distribution")
 if(FASTP2P_BUILD_CLI OR ANDROID)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FASTP2P_BOOTSTRAP_FILE}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FASTP2P_BOOTSTRAP_FILE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed-bootstrap.py")
   execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed-bootstrap.py
     --input "${FASTP2P_BOOTSTRAP_FILE}" --output "${CMAKE_CURRENT_BINARY_DIR}/bootstrap_profile.h"
     RESULT_VARIABLE bootstrap_status)
@@ -89,9 +90,10 @@ if(FASTP2P_BUILD_CLI)
     message(FATAL_ERROR "Cannot embed required distribution notices")
   endif()
   add_library(fastp2p_cli_core STATIC src/client.c src/tcp_nat.c src/stun.c src/tcp_level.c src/wire.c src/config.c src/socks.c src/secure.c src/update.c common/enrollment.c)
-  target_compile_definitions(fastp2p_cli_core PUBLIC FASTP2P_STATIC)
+  target_compile_definitions(fastp2p_cli_core PUBLIC FASTP2P_STATIC PRIVATE FASTP2P_BUILTIN_TRUST)
   target_include_directories(fastp2p_cli_core PUBLIC include src common)
-  target_link_libraries(fastp2p_cli_core PUBLIC fastp2p_quic ${FASTP2P_WEB_TARGET} ${FASTP2P_JSON_TARGET} ${FASTP2P_CRYPTO_TARGET})
+  target_link_libraries(fastp2p_cli_core PUBLIC fastp2p_quic ${FASTP2P_WEB_TARGET} ${FASTP2P_JSON_TARGET} ${FASTP2P_CRYPTO_TARGET}
+    PRIVATE fastp2p_bootstrap)
   add_executable(fastp2p-client src/main.c src/config_sync.c common/config_merge.c src/identity_file.c src/install.c src/autostart.c src/service.c src/installer_ui.c)
   target_include_directories(fastp2p-client PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
   set_target_properties(fastp2p-client PROPERTIES OUTPUT_NAME fastp2p)
@@ -132,6 +134,8 @@ endif()
 add_executable(example-embed EXCLUDE_FROM_ALL examples/embed.c)
 target_link_libraries(example-embed PRIVATE fastp2p)
 if(ANDROID)
+  target_compile_definitions(fastp2p PRIVATE FASTP2P_BUILTIN_TRUST)
+  target_link_libraries(fastp2p PRIVATE fastp2p_bootstrap)
   target_link_options(fastp2p PRIVATE "LINKER:-z,max-page-size=16384")
   add_library(fastp2p_jni SHARED android/jni/client_jni.c)
   target_link_libraries(fastp2p_jni PRIVATE fastp2p fastp2p_bootstrap)
@@ -202,7 +206,7 @@ target_link_libraries(test-wire PRIVATE ${FASTP2P_JSON_TARGET} ${FASTP2P_CRYPTO_
   add_test(NAME wire COMMAND test-wire)
   add_test(NAME api COMMAND test-api)
   add_test(NAME tls-validation COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_negative.py
-    --client $<TARGET_FILE:fastp2p-client> --cert-script ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tls/generate-cert.sh)
+    --client $<TARGET_FILE:fastp2p-client> --bootstrap "${FASTP2P_BOOTSTRAP_FILE}")
   set_tests_properties(tls-validation PROPERTIES TIMEOUT 45)
 endif()
 

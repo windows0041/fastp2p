@@ -2,6 +2,7 @@
 #define FASTP2P_UPDATE_H
 #include <stddef.h>
 #include <stdint.h>
+#include <curl/curl.h>
 
 /* Self-update support. The gateway hosts the packages and pushes an order over
  * the authenticated control channel; the client verifies the digest before it
@@ -9,7 +10,8 @@
 
 /* Downloads url into dest while hashing it, and fails unless the digest and the
  * byte count match what the gateway announced. Returns 0 on success. */
-int fp_update_download(const char *url, const char *ca, const char *dest,
+CURLcode fp_tls_set_ca(CURL *curl, const char *file, const char *pem);
+int fp_update_download(const char *url, const char *ca, const char *ca_pem, const char *dest,
                        const char *expect_sha, uint64_t expect_size,
                        char *error, size_t error_length);
 

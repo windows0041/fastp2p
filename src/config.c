@@ -2,6 +2,9 @@
 #include "update.h"
 #include "config_internal.h"
 #include "wire.h"
+#ifdef FASTP2P_BUILTIN_TRUST
+#include "bootstrap.h"
+#endif
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +68,20 @@ static int create_json(const char *text, const char *token_text, const char *ca,
     }
     const char *host = op_string(network, "ServerHost");
     const char *ca_file = ca ? ca : op_string(root, "CACertFile");
+    const char *ca_pem = NULL;
+    json_object *builtin = NULL;
+    if ((!ca || !*ca) && json_object_object_get_ex(root, "CACertBuiltin", &builtin)) {
+#ifdef FASTP2P_BUILTIN_TRUST
+        if (!*ca_file && json_object_is_type(builtin, json_type_string) &&
+            json_object_get_string_len(builtin) == 64 &&
+            !strcmp(json_object_get_string(builtin), fastp2p_builtin_ca_hash()))
+            ca_pem = fastp2p_builtin_ca(host, port ? (unsigned)port : 27183);
+#endif
+        if (!ca_pem) {
+            json_object_put(root);
+            return FASTP2P_EINVAL;
+        }
+    }
     json_object *automatic = op_get(network, "AutoNode");
     if (automatic && !json_object_is_type(automatic, json_type_boolean)) {
         json_object_put(root);
@@ -81,6 +98,7 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                        .on_event = callback,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
+    if (!rv && ca_pem) fp_client_set_ca_pem(*out, ca_pem);
     if (!rv) rv = fp_client_tcp_nat_config(*out, op_get(network, "TCPSTUNServers"));
     if (!rv) rv = fp_client_stun_config(*out, op_get(network, "UDPSTUNServers"));
     if (!rv) rv = fp_client_tcp_level_config(*out, op_get(network, "TCPNatProbe"));

@@ -7,6 +7,8 @@ int fp_client_tcp_nat_config(fastp2p_client *client, json_object *servers);
 int fp_client_stun_config(fastp2p_client *client, json_object *servers);
 /* TCP filtering probe server (network.TCPNatProbe), empty disables it. */
 int fp_client_tcp_level_config(fastp2p_client *client, json_object *probe);
+/* The PEM lives in static storage for the lifetime of the client. */
+void fp_client_set_ca_pem(fastp2p_client *client, const char *pem);
 void fp_client_validation_mode(fastp2p_client *client);
 int fp_config_validate_json(const char *json);
 #endif

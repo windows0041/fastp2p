@@ -72,7 +72,7 @@ ctest --test-dir build --output-on-failure
 
 Windows 使用 MinGW，macOS 原生构建，Android 使用 NDK 和 Java/JNI 系统封装。完整依赖许可证已嵌入单文件客户端，运行 `--licenses` 查看。 [平台和发行包](PLATFORMS-ZH.md) · [本地验证与 CI](VALIDATION-ZH.md)
 
-专用构建从仓库根目录的 `common/bootstrap.json` 读取公开的 `host`、`port` 和 `ca`。自行部署网关时，可以修改该文件，或通过 CMake 参数 `FASTP2P_BOOTSTRAP_FILE` 选择另一份公开配置。SDK 中的副本名为 `gateway-public.json`。接入 Token 和私钥应存放在私有配置中。
+专用构建从仓库根目录的 `common/bootstrap.json` 读取公开的 `host`、`port` 和 `ca`。新安装匹配内置网关和 CA 时，客户端直接从内存加载 CA，配置文件只保存证书指纹。现有的 `CACertFile` 配置和自定义网关证书文件仍可使用。自行部署网关时，可以修改该文件，或通过 CMake 参数 `FASTP2P_BOOTSTRAP_FILE` 选择另一份公开配置。SDK 中的副本名为 `gateway-public.json`。接入 Token 和私钥应存放在私有配置中。
 
 Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.conf 为 0600，支持网关下发时原子替换。父目录与服务控制脚本仍由 root 持有；安装器执行特权文件操作时临时锁定配置目录。直接以 root 运行默认配置的 CLI 也会降为服务账号。重复接入不会重写相同的 CA 文件。
 

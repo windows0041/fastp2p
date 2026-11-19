@@ -2,12 +2,10 @@ package top.fastp2p.cclient;
 
 import android.content.Context;
 import android.content.SharedPreferences;
-import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
-import java.security.cert.CertificateFactory;
 import java.util.UUID;
 import org.json.JSONObject;
 
@@ -59,21 +57,14 @@ final class Bootstrap {
             identity = UUID.randomUUID().toString().replace("-", "");
             if (!preferences.edit().putString("deviceID", identity).commit()) throw new IllegalStateException();
         }
-        String ca;
-        if (pem.isEmpty()) ca = TrustStore.resolve(context, "");
-        else {
-            if (CertificateFactory.getInstance("X.509").generateCertificates(
-                    new ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII))).isEmpty())
-                throw new IllegalArgumentException("安装 Token 的证书无效");
-            File file = new File(context.getFilesDir(), "trust-" + digest(pem) + ".pem");
-            Files.write(file.toPath(), pem.getBytes(StandardCharsets.US_ASCII));
-            ca = file.getAbsolutePath();
-        }
+        String ca = pem.isEmpty() ? TrustStore.resolve(context, "") : "";
         JSONObject network = new JSONObject().put("AutoNode", true).put("DeviceID", identity)
                 .put("ServerHost", host).put("ServerPort", port).put("Token", 0);
         JSONObject root = preferences.contains("enrollment") ? new JSONObject(SecretStore.config(context)) : new JSONObject();
         root.put("product", "fastp2p").put("network", network);
         root.remove("CACertFile");
+        if (pem.isEmpty()) root.remove("CACertBuiltin");
+        else root.put("CACertBuiltin", digest(pem));
         return new Bootstrap(root.toString(), key, ca, fingerprint);
     }
     void commit(Context context) throws Exception {

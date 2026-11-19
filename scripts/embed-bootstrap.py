@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Embed only public gateway identity, never credentials or private keys."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,4 +16,9 @@ assert isinstance(profile['ca'],str) and len(profile['ca'])<=16384 and 'PRIVATE 
 if profile['ca']:ssl.create_default_context(cadata=profile['ca'])
 data=json.dumps(profile,separators=(',',':')).encode()+b'\0'
 Path(args.output).write_text('static const unsigned char fastp2p_bootstrap_profile[] = {\n'+
-    '\n'.join(','.join(map(str,data[i:i+32]))+',' for i in range(0,len(data),32))+'\n};\n',encoding='utf-8')
+    '\n'.join(','.join(map(str,data[i:i+32]))+',' for i in range(0,len(data),32))+'\n};\n'+
+    f'static const char fastp2p_bootstrap_host[] = {json.dumps(profile["host"])};\n'+
+    f'static const unsigned fastp2p_bootstrap_port = {profile["port"]};\n'+
+    f'static const char fastp2p_bootstrap_ca[] = {json.dumps(profile["ca"])};\n'+
+    f'static const char fastp2p_bootstrap_ca_hash[] = "{hashlib.sha256(profile["ca"].encode()).hexdigest()}";\n',
+    encoding='utf-8')

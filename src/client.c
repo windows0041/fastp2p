@@ -276,6 +276,7 @@ typedef struct {
 } relay_link;
 struct fastp2p_client {
     char host[256], ca[4096], node[32];
+    const char *ca_pem;
     char error[192], path[2048], hostname[256], device_id[33];
     int automatic_node;
     uint16_t port, public_port;
@@ -2973,7 +2974,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             emit(c, FASTP2P_EVENT_STATE, 0, 0, message);
             if (fp_update_stage_path(staged, sizeof(staged))) {
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "cannot locate the install directory");
-            } else if (fp_update_download(url, c->ca, staged, sha, size, error, sizeof(error))) {
+            } else if (fp_update_download(url, c->ca, c->ca_pem, staged, sha, size, error, sizeof(error))) {
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
 #ifdef __ANDROID__
             } else {
@@ -3997,6 +3998,9 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
  * slots stay at their sentinel values, exactly as an old client read them. */
 static void report_families(const fastp2p_client *c, json_object *j) {
     op_ju(j, "families", (uint64_t)c->families_wanted);
+    if (family_wanted(c, OP_FAM_V4) &&
+        strcmp(c->ip[OP_FAM_V4], "0.0.0.0") && address_of_family(c->ip[OP_FAM_V4], OP_FAM_V4))
+        op_js(j, "IPv4", c->ip[OP_FAM_V4]);
     op_ju(j, "hasIPv6", family_wanted(c, OP_FAM_V6) ? 1 : 0);
     if (family_wanted(c, OP_FAM_V6) && address_of_family(c->ip[OP_FAM_V6], OP_FAM_V6))
         op_js(j, "IPv6", c->ip[OP_FAM_V6]);
@@ -4134,24 +4138,22 @@ static void connect_gateway(fastp2p_client *c) {
         snprintf(hostpart, sizeof(hostpart), "[%s]", c->host);
     else
         snprintf(hostpart, sizeof(hostpart), "%s", c->host);
+    char addresses[OP_FAM_COUNT][OP_ADDR_TEXT] = {{0}};
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         if (!c->gateway_addr[family].len || !family_wanted(c, family))
             continue;
-        char text[OP_ADDR_TEXT], resolve[400];
-        if (op_addr_text(&c->gateway_addr[family], text, sizeof(text)))
-            continue;
-        if (family == OP_FAM_V4)
-            snprintf(resolve, sizeof(resolve), "%s:%u:%s", hostpart, c->port, text);
-        else
-            snprintf(resolve, sizeof(resolve), "%s:%u:[%s]", hostpart, c->port, text);
-        struct curl_slist *next = curl_slist_append(c->resolve, resolve);
-        if (!next) {
-            curl_slist_free_all(c->resolve);
-            c->resolve = NULL;
-            gateway_failed(c);
-            return;
-        }
-        c->resolve = next;
+        if (op_addr_text(&c->gateway_addr[family], addresses[family], sizeof(addresses[family])))
+            addresses[family][0] = 0;
+    }
+    int ipv4 = addresses[OP_FAM_V4][0] != 0, ipv6 = addresses[OP_FAM_V6][0] != 0;
+    if (ipv4 || ipv6) {
+        char entry[512];
+        /* Multiple entries for the same host and port replace each other. */
+        int length = snprintf(entry, sizeof(entry), "%s:%u:%s%s%s%s%s", hostpart, c->port,
+                              addresses[OP_FAM_V4], ipv4 && ipv6 ? "," : "", ipv6 ? "[" : "",
+                              addresses[OP_FAM_V6], ipv6 ? "]" : "");
+        if (length > 0 && (size_t)length < sizeof(entry))
+            c->resolve = curl_slist_append(NULL, entry);
     }
     if (!c->resolve) {
         gateway_failed(c);
@@ -4176,10 +4178,12 @@ static void connect_gateway(fastp2p_client *c) {
     SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
     SETOPT(CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     SETOPT(CURLOPT_PROTOCOLS_STR, "wss");
-    if (c->ca[0])
-        SETOPT(CURLOPT_CAINFO, c->ca);
+    if (fp_tls_set_ca(c->ws, c->ca, c->ca_pem) != CURLE_OK) {
+        gateway_failed(c);
+        return;
+    }
 #ifdef _WIN32
-    if (c->ca[0])
+    if (c->ca[0] || c->ca_pem)
         SETOPT(CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_REVOKE_BEST_EFFORT);
 #endif
 #undef SETOPT
@@ -4748,7 +4752,8 @@ static int nat_level(const fastp2p_client *c) {
  * route but no global address still "succeeds", because the kernel picks a
  * link-local source that can never reach a global destination. Such a family is
  * reported unusable here, otherwise every v6 attempt would hang until timeout. */
-static int local_family_routable(const op_addr *gateway, int family) {
+static int local_family_routable(const op_addr *gateway, int family, char source[OP_ADDR_TEXT]) {
+    source[0] = 0;
     if (!gateway || !gateway->len || op_family_index(op_addr_family(gateway)) != family)
         return 0;
     op_socket fd = op_socket_open(op_index_family(family), SOCK_DGRAM, 0);
@@ -4757,18 +4762,16 @@ static int local_family_routable(const op_addr *gateway, int family) {
     int usable = op_connect(fd, &gateway->u.sa, gateway->len) == 0;
     if (usable) {
         op_addr local;
-        if (op_addr_socketname(fd, &local) == 0) {
-            char text[OP_ADDR_TEXT];
-            if (!op_addr_text(&local, text, sizeof(text))) {
-                /* :: and fe80::/10 cannot carry traffic to a global peer. */
-                if (!strncmp(text, "fe80", 4) || !strncmp(text, "::", 2))
-                    usable = 0;
-            }
-        }
-    } else if (errno == EINPROGRESS) {
-        usable = 0; /* no source was selected, so there is no usable path */
+        usable = !op_addr_socketname(fd, &local) && !op_addr_text(&local, source, OP_ADDR_TEXT);
+        if (usable && family == OP_FAM_V6)
+            usable = !IN6_IS_ADDR_LINKLOCAL(&local.u.in6.sin6_addr) &&
+                     !IN6_IS_ADDR_UNSPECIFIED(&local.u.in6.sin6_addr);
+        else if (usable)
+            usable = local.u.in.sin_addr.s_addr != 0;
     }
     op_close(fd);
+    if (!usable)
+        source[0] = 0;
     return usable;
 }
 /* Recompute which families this host can actually use toward the gateway. Called
@@ -4778,8 +4781,7 @@ static int local_family_routable(const op_addr *gateway, int family) {
 static int refresh_families(fastp2p_client *c) {
     int wanted = 0;
     for (int family = 0; family < OP_FAM_COUNT; ++family)
-        if ((c->gateway_families & family_bit(family)) &&
-            local_family_routable(&c->gateway_addr[family], family))
+        if (local_family_routable(&c->gateway_addr[family], family, c->local_ip[family]))
             wanted |= family_bit(family);
     if (!wanted)
         /* Nothing verified: keep the family the name resolved to so the client
@@ -4904,6 +4906,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     return FASTP2P_OK;
 }
 void fp_client_validation_mode(fastp2p_client *c) { if(c)c->validate_only=1; }
+void fp_client_set_ca_pem(fastp2p_client *c, const char *pem) { c->ca_pem = pem; }
 int fastp2p_client_set_config_handler(fastp2p_client *c,fastp2p_config_handler handler,void *user) {
     if(!c || c->running || c->in_callback)return FASTP2P_ESTATE;
     c->config_handler=handler;c->config_user=user;return FASTP2P_OK;
@@ -5070,6 +5073,7 @@ int fastp2p_client_start(fastp2p_client *c) {
     c->stopping = 0;
     c->reconnect_at = 0;
     c->nat_settled = 0;
+    snprintf(c->ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "0.0.0.0");
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         c->nat[family].type = NAT_UNKNOWN;
         c->nat[family].phase = 0;

@@ -4,6 +4,7 @@ import android.app.Instrumentation;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
+import org.json.JSONObject;
 
 /** Opt-in device test with a private numeric token provided by the operator. */
 public final class LiveInstrumentation extends Instrumentation {
@@ -28,7 +29,7 @@ public final class LiveInstrumentation extends Instrumentation {
                 require(SecretStore.preferences(context).getString("gatewayIdentity", "").equals(oldGateway));
                 result.putBoolean("migration_requires_explicit_flag", true);
             }
-            require(!bootstrap.ca.isEmpty());
+            require(bootstrap.ca.isEmpty() == new JSONObject(bootstrap.config).has("CACertBuiltin"));
             Intent start = new Intent(context, InstallActivity.class).putExtra("token", token)
                 .putExtra("migrate", migrate)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

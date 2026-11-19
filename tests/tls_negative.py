@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prove CA and hostname rejection happens before the token-bearing HTTP GET."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from certificates import create_certificates
 parser = argparse.ArgumentParser()
 parser.add_argument('--client', required=True)
 parser.add_argument('--cert-script', help='Deprecated: certificates are generated portably with OpenSSL')
+parser.add_argument('--bootstrap', type=Path, help='Public gateway preset compiled into the client')
 args = parser.parse_args()
 client = str(Path(args.client).resolve())
 results = {}
@@ -72,4 +74,20 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-tls-') as runtime:
         else:
             assert counters['http_requests'] == 0, case + ': credential-bearing request escaped TLS validation'
         results[case] = True
+
+    if args.bootstrap:
+        preset = json.loads(args.bootstrap.read_text(encoding='utf-8'))
+        fingerprint = hashlib.sha256(preset['ca'].encode()).hexdigest()
+        port = 1 if preset['port'] != 1 else 2
+        profile = runtime / 'invalid-builtin.json'
+        for case, digest in [('wrong_builtin_ca_fingerprint', '0' * 64),
+                             ('wrong_builtin_ca_endpoint', fingerprint)]:
+            profile.write_text(json.dumps({'CACertBuiltin': digest, 'network': {
+                'Node': 'c-tls-negative', 'ServerHost': '127.0.0.1', 'ServerPort': port,
+                'Token': '9007199254740993'}}))
+            profile.chmod(0o600)
+            result = subprocess.run([client, '--config', str(profile), '--run-seconds', '1'],
+                                    capture_output=True, timeout=12)
+            assert result.returncode == 2 and b'Invalid client configuration' in result.stderr, case
+            results[case] = True
 print(json.dumps(results, indent=2))

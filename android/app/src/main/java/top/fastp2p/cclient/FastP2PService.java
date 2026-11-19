@@ -16,6 +16,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONObject;
 
 public final class FastP2PService extends Service {
     static final String STOP = "top.fastp2p.cclient.STOP";
@@ -86,10 +87,10 @@ public final class FastP2PService extends Service {
                 String config = pending == null ? SecretStore.config(this) : pending.config;
                 String token = pending == null ? SecretStore.token(this) : pending.token;
                 String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
-                ca = TrustStore.resolve(this, ca);
                 // Keep the APK staging directory out of the stored enrolment profile.
-                String nativeConfig = withUpdateDir(config, getCacheDir().getAbsolutePath());
-                handle = NativeClient.create(nativeConfig.getBytes(StandardCharsets.UTF_8), token, ca, this);
+                JSONObject nativeConfig = new JSONObject(config).put("UpdateDir", getCacheDir().getAbsolutePath());
+                ca = nativeConfig.has("CACertBuiltin") ? null : TrustStore.resolve(this, ca);
+                handle = NativeClient.create(nativeConfig.toString().getBytes(StandardCharsets.UTF_8), token, ca, this);
                 if (handle == 0) throw new IllegalArgumentException("接入配置无效");
                 if (NativeClient.start(handle) != 0) throw new IllegalStateException();
                 long deadline = SystemClock.elapsedRealtime() + 30000;
@@ -119,18 +120,6 @@ public final class FastP2PService extends Service {
                 if (failed && canNotify()) getSystemService(NotificationManager.class).notify(2, notification(false));
                 stopSelf();
             });
-        }
-    }
-    /** Adds the upgrade staging directory to the configuration handed to native code. */
-    private static String withUpdateDir(String config, String directory) {
-        try {
-            org.json.JSONObject object = new org.json.JSONObject(config);
-            object.put("UpdateDir", directory);
-            return object.toString();
-        } catch (org.json.JSONException error) {
-            // Without a staging directory an upgrade order simply fails; the
-            // client still runs with its original configuration.
-            return config;
         }
     }
     public void onNativeEvent(int type, int newState, int code, String id, String message) {
