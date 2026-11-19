@@ -171,11 +171,24 @@ static void lan_punch_public_ipv4(void) {
  * window and nothing else. Consecutive loopback sockets stand in for a peer
  * whose mapping moves by one port per destination; each one that lies inside the
  * window must receive a punch datagram, and a port outside it must not. */
-static int drain(op_socket fd) {
+/* Generous against a loopback round trip, short enough to stay a unit test. */
+#define SPRAY_WAIT (200 * MS)
+/* Loopback delivery is not synchronous on every kernel: Linux queues the
+ * datagram during sendto, while macOS hands it to the interface and delivers it
+ * on the receive path some moments later. A single non-blocking pass therefore
+ * misses a packet that is already in flight, so wait for the first arrival and
+ * give the caller a bounded budget to prove that nothing arrives at all. */
+static int drain(op_socket fd, uint64_t budget) {
     int seen = 0;
-    uint8_t buffer[1024];
-    while (op_recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0)
-        ++seen;
+    uint64_t until = mono() + budget;
+    for (;;) {
+        uint8_t buffer[1024];
+        while (op_recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0)
+            ++seen;
+        if (seen || mono() >= until)
+            break;
+        op_sleep_ms(2);
+    }
     return seen;
 }
 static void sym_spray_ports(void) {
@@ -221,11 +234,11 @@ static void sym_spray_ports(void) {
         t->punch_started = t->punch_next = t->sym_spray_at = 0;
         t->deadline = mono() + 5 * NS;
         tick_tunnel(c, ti, mono());
-        assert(drain(peer[0]) >= 1);
-        assert(drain(peer[1]) >= 1);
-        assert(drain(peer[2]) >= 1);
+        assert(drain(peer[0], SPRAY_WAIT) >= 1);
+        assert(drain(peer[1], SPRAY_WAIT) >= 1);
+        assert(drain(peer[2], SPRAY_WAIT) >= 1);
         if (outside >= 0)
-            assert(drain(outside) == 0);
+            assert(drain(outside, SPRAY_WAIT) == 0);
         close_tunnel(c, ti, NULL);
 
         /* Directional window: unchanged behaviour, walks up from the mapping. */
@@ -244,10 +257,10 @@ static void sym_spray_ports(void) {
         t->punch_started = t->punch_next = t->sym_spray_at = 0;
         t->deadline = mono() + 5 * NS;
         tick_tunnel(c, ti, mono());
-        assert(drain(peer[0]) >= 1); /* the explicit punch target */
-        assert(drain(peer[1]) >= 1 && drain(peer[2]) >= 1);
+        assert(drain(peer[0], SPRAY_WAIT) >= 1); /* the explicit punch target */
+        assert(drain(peer[1], SPRAY_WAIT) >= 1 && drain(peer[2], SPRAY_WAIT) >= 1);
         if (outside >= 0)
-            assert(drain(outside) == 0);
+            assert(drain(outside, SPRAY_WAIT) == 0);
         close_tunnel(c, ti, NULL);
 
         for (int i = 0; i < 3; ++i)
