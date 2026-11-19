@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 from certificates import create_certificates
 
 p = argparse.ArgumentParser()
@@ -158,6 +159,16 @@ esac
         cached=next((root/'updates').glob('installer-*.sh'))
         cached.write_bytes(installer[:-1]+bytes([installer[-1]^1]))
         assert api(f'/api/v1/update/install?platform=linux&version={version}')[2] == installer
+        status, _, link = api('/api/v1/install/link', json.dumps({'platform': 'linux'}))
+        assert status == 200
+        url = urlsplit(json.loads(link)['url'])
+        path = url.path + '?' + url.query
+        status, headers, personal = api(path, extra_headers={'Authorization': 'unused'}, port=37183)
+        assert status == 200 and headers['cache-control'] == 'no-store'
+        assert f"token='{key}'".encode() in personal
+        assert api(path, port=37183)[0] == 403
+        assert all(key.encode() not in script.read_bytes() for script in (root/'updates').glob('installer-*.sh'))
+        short_name = root/'install.sh'; short_name.write_bytes(personal)
         raw = api(f'/api/v1/update/download?platform=linux&version={version}&token='+key)[2]
         assert raw == payload, 'remote upgrades must continue to receive raw ELF'
         endpoint=f'/api/v1/update/download?platform=linux&version={version}'
@@ -204,7 +215,8 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
 ''')
             else: executable(Path('/sbin/openrc-run'), 'exit 0\n')
             events.write_text('')
-            run(shell='bash' if manager.startswith('systemd') else 'sh')
+            run(short_name if manager == 'procd' else named,
+                shell='bash' if manager.startswith('systemd') else 'sh')
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             first = json.loads(profile.read_text()); identity = first['network']['DeviceID']
             first['customSetting'] = {'preserve': True}; first['network']['UDPPort'] = 29887
@@ -349,10 +361,9 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
         assert all(('package_platform=\'linux-'+arch+'\'').encode() in universal for arch in arches)
         alternate=root/('alternate-fastp2p-'+key);alternate.write_bytes(universal)
         executable(tools/'uname','printf "%s\\n" "${FIXTURE_CPU:-x86_64}"\n')
-        executable(tools/'od','''
-if [ "${FIXTURE_CPU:-}" = mips64 ] || [ "${FIXTURE_CPU:-}" = mips ]; then
-    case "$*" in *-j4*) echo "${FIXTURE_CLASS:-2}" ;; *) echo "${FIXTURE_ENDIAN:-1}" ;; esac
-else exec /usr/bin/od "$@"; fi
+        executable(tools/'dd',r'''
+case "$1 $2 $3" in 'if=/proc/'*'/exe bs=1 count=6') ;; *) exit 1 ;; esac
+printf '\177ELF%b%b' "\\0${FIXTURE_CLASS:-2}" "\\0${FIXTURE_ENDIAN:-1}"
 ''')
         (tools/'curl').write_text('''#!/usr/bin/python3
 import os,pathlib,stat,subprocess,sys
@@ -406,17 +417,19 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
         environment['FIXTURE_CPU']='aarch64';events.write_text('')
         run(named,1) # Old manifest has only the real native manual package.
         assert events.read_text()=='' and profile.read_bytes()==before
-        for name in ('curl','uname','od'): (tools/name).unlink()
+        for name in ('curl','uname','dd'): (tools/name).unlink()
         for name in ('FIXTURE_CPU','FIXTURE_CLASS','FIXTURE_ENDIAN'): environment.pop(name,None)
         # A wrong public CA must fail before enrollment or service teardown.
         create_certificates(root/'wrong-tls','127.0.0.1')
         wrong_ca=installer.replace((root/'tls/ca.crt').read_bytes(),(root/'wrong-tls/ca.crt').read_bytes())
         alternate.write_bytes(wrong_ca);events.write_text('');run(alternate,1)
         assert events.read_text()=='' and profile.read_bytes()==before
-        # GNU wget fallback: a deliberately minimal PATH makes curl unavailable.
-        if shutil.which('wget'):
-            fallback=root/'wget-tools';fallback.mkdir()
-            for name in ('sh','id','awk','uname','od','sha256sum','mktemp','chmod','cp','stat','wc','rm','rmdir','mkdir','mv','grep','wget','cat'):
+        # A minimal x86_64 PATH has neither od nor dd. Exercise both downloaders.
+        for downloader in ('curl','wget'):
+            if not shutil.which(downloader):
+                continue
+            fallback=root/(downloader+'-tools');fallback.mkdir()
+            for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','stat','wc','rm','rmdir','mkdir','mv','grep',downloader,'cat'):
                 (fallback/name).symlink_to(shutil.which(name))
             for name in ('rc-service','rc-update'):(fallback/name).symlink_to(tools/name)
             environment['PATH']=str(fallback)
@@ -426,6 +439,7 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
             events.write_text('');response=run(alternate,1)
             assert b'SHA-256' in response.stderr and events.read_text()=='' and profile.read_bytes()==before
             environment['PATH']=str(tools)+':/usr/bin:/bin'
+        results['native_x86_64_download_with_no_od_or_dd']=True
         results['universal_arch_selection_tls_header_auth_and_download_failures_preserve_service']=True
         Path('/var/run/fastp2p-install.lock').mkdir(); events.write_text('')
         run(expected=1); assert events.read_text() == '' and profile.read_bytes() == before

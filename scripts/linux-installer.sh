@@ -7,14 +7,17 @@ fail() { printf '%s\n' "fastp2p: $*" >&2; exit 1; }
 [ "$#" -eq 0 ] || fail '请直接运行 sh 或 bash 加下载文件名，无需传入 Token。'
 case "$0" in /*) self=$0 ;; *) self=$PWD/$0 ;; esac
 name=${0##*/}
-token=$(printf '%s\n' "$name" | awk -F '[^0-9]+' '
+token=''
+if [ -z "$token" ]; then
+    token=$(printf '%s\n' "$name" | awk -F '[^0-9]+' '
  { for (i=1;i<=NF;i++) if (length($i)==16 && $i ~ /^[1-9][0-9]*$/) { n++; key=$i } }
  END { if(n==1) print key; else exit 1 }') || fail '文件名必须包含且仅包含一个有效的 16 位 Token，请重新从控制台下载。'
+fi
 if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || fail '需要 root 权限，请以 root 执行此脚本。'
     exec sudo -- sh "$self"
 fi
-for tool in awk uname od sha256sum mktemp chmod cp stat wc; do
+for tool in awk uname sha256sum mktemp chmod cp stat wc; do
     command -v "$tool" >/dev/null 2>&1 || fail "缺少必要命令：$tool"
 done
 work=$(mktemp -d /tmp/fastp2p-install.XXXXXXXX)
@@ -32,9 +35,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cpu=$(uname -m)
-# Inspect the running userspace for ambiguous MIPS names; never guess byte order.
-elf=/proc/self/exe
-[ -r "$elf" ] || elf=/bin/sh
 case "$cpu" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
@@ -44,9 +44,12 @@ case "$cpu" in
     s390x) arch=s390x ;;
     ppc64le|powerpc64le) arch=ppc64le ;;
     mips64el|mips64le|mips64|mips)
-        class=$(od -An -tu1 -j4 -N1 "$elf" | awk '{print $1}')
-        endian=$(od -An -tu1 -j5 -N1 "$elf" | awk '{print $1}')
-        [ "$class:$endian" = 2:1 ] || fail '当前只提供 MIPS64 小端 64 位用户空间安装包。'
+        # The running shell's ELF header identifies the MIPS userspace ABI.
+        command -v dd >/dev/null 2>&1 || fail '检测 MIPS 用户空间需要 dd。'
+        elf=/proc/$$/exe
+        [ -r "$elf" ] || elf=/bin/sh
+        header=$(dd if="$elf" bs=1 count=6 2>/dev/null) || fail '无法读取 MIPS 用户空间的 ELF 头。'
+        [ "$header" = "$(printf '\177ELF\002\001')" ] || fail '当前只提供 MIPS64 小端 64 位用户空间安装包。'
         arch=mips64el ;;
     *) fail "暂不支持 CPU 架构 $cpu，请先提供对应编译包。" ;;
 esac
