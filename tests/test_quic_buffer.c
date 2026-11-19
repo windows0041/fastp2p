@@ -31,7 +31,39 @@ static void consume(opq *q,size_t *consumed,size_t n) {
     for(size_t i=0;i<got;i++)assert(output[i]==value(*consumed+i));
     *consumed+=got;
 }
+
+static void check_sni(void) {
+    assert(!op_platform_init());
+    op_socket sockets[2];
+    struct sockaddr_in addresses[2];
+    for (int i = 0; i < 2; ++i) {
+        sockets[i] = op_socket_open(AF_INET, SOCK_DGRAM, 0);
+        assert(sockets[i] != OP_INVALID_SOCKET);
+        addresses[i] = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        op_socklen length = sizeof(addresses[i]);
+        assert(!op_bind(sockets[i], (struct sockaddr *)&addresses[i], length));
+        assert(!op_getsockname(sockets[i], (struct sockaddr *)&addresses[i], &length));
+    }
+    const char *hostname = "speedtest.test";
+    opq *client = opq_new(sockets[0], (struct sockaddr *)&addresses[1], sizeof(addresses[1]), 0, hostname);
+    opq *server = opq_new(sockets[1], (struct sockaddr *)&addresses[0], sizeof(addresses[0]), 1, NULL);
+    assert(client && server);
+    uint64_t deadline = now_ns() + 5000000000ULL;
+    while ((!opq_ready(client) || !opq_ready(server)) && now_ns() < deadline) {
+        assert(!opq_step(client) && !opq_step(server));
+        op_sleep_ms(1);
+    }
+    assert(opq_ready(client) && opq_ready(server));
+    const char *received = SSL_get_servername(server->tls, TLSEXT_NAMETYPE_host_name);
+    assert(received && !strcmp(received, hostname));
+    opq_free(client);
+    opq_free(server);
+    op_close(sockets[0]);
+    op_close(sockets[1]);
+}
+
 int main(void) {
+    check_sni();
     opq q={0};size_t produced=0,consumed=0;
     uint8_t first[4096]={0};fail_allocation=1;
     assert(receive_stream(NULL,0,0,0,first,sizeof(first),&q,NULL)==NGTCP2_ERR_CALLBACK_FAILURE);

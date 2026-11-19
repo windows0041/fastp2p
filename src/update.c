@@ -77,7 +77,8 @@ CURLcode fp_tls_set_ca(CURL *curl, const char *file, const char *pem) {
     return file && *file ? curl_easy_setopt(curl, CURLOPT_CAINFO, file) : CURLE_OK;
 }
 
-int fp_update_download(const char *url, const char *ca, const char *ca_pem, const char *dest,
+int fp_update_download(const char *url, const char *ca, const char *ca_pem,
+                       const struct curl_slist *resolve, const char *dest,
                        const char *expect_sha, uint64_t expect_size,
                        char *error, size_t error_length) {
     if (!url || !*url || !dest || !expect_sha || strlen(expect_sha) != 64) {
@@ -107,6 +108,7 @@ int fp_update_download(const char *url, const char *ca, const char *ca_pem, cons
     failure[0] = 0;
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sink_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, failure);

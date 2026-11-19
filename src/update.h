@@ -11,7 +11,8 @@
 /* Downloads url into dest while hashing it, and fails unless the digest and the
  * byte count match what the gateway announced. Returns 0 on success. */
 CURLcode fp_tls_set_ca(CURL *curl, const char *file, const char *pem);
-int fp_update_download(const char *url, const char *ca, const char *ca_pem, const char *dest,
+int fp_update_download(const char *url, const char *ca, const char *ca_pem,
+                       const struct curl_slist *resolve, const char *dest,
                        const char *expect_sha, uint64_t expect_size,
                        char *error, size_t error_length);
 

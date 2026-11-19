@@ -80,6 +80,8 @@ Windows 使用 MinGW，macOS 原生构建，Android 使用 NDK 和 Java/JNI 系�
 
 专用构建从仓库根目录的 `common/bootstrap.json` 读取公开的 `host`、`port` 和 `ca`。新安装匹配内置网关和 CA 时，客户端直接从内存加载 CA，配置文件只保存证书指纹。现有的 `CACertFile` 配置和自定义网关证书文件仍可使用。自行部署网关时，可以修改该文件，或通过 CMake 参数 `FASTP2P_BOOTSTRAP_FILE` 选择另一份公开配置。SDK 中的副本名为 `gateway-public.json`。接入 Token 和私钥应存放在私有配置中。
 
+可选的 `tls_alias` 包含 `host` 和 `ca`。客户端匹配内置网关且使用默认信任时，通过这个名称建立并验证 HTTPS/WSS 连接，也会在节点间的 QUIC ClientHello 发送该名称。官方网关的客户端 TLS 名称为 `speedtest.fastp2p.top`，控制台入口为 `fastp2p.top`。
+
 Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.conf 为 0600，支持网关下发时原子替换。父目录与服务控制脚本仍由 root 持有；安装器执行特权文件操作时临时锁定配置目录。直接以 root 运行默认配置的 CLI 也会降为服务账号。重复接入不会重写相同的 CA 文件。
 
 启动先读取 fastp2p.conf（Linux 内容沿用 JSON；Windows 文件由 DPAPI 加密）。网关控制台不再接受手动字段下发：操作员只需维护转发与 SOCKS5 规则，网关把规则渲染成 `apps`/`socks5` 期望字段并在改动、停用、删除时同步给在线节点（离线节点上线后自动应用）。客户端收到期望字段后按键递归合并（对象逐层合并，数组/标量/null 按整字段替换，未下发的键保留），先验证候选配置，再私密保存、自动重载并重连；端口冲突、启动失败或 25 秒内无法通过网关认证时恢复旧配置。失败版本会被记住，规则改动后重新下发可重试。保留的 .previous 是上次配置备份，_fastp2pManaged 为内部状态，不能远程编辑。

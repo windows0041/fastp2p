@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
     op_getsockname(fd, (struct sockaddr *)&local, &length);
     printf("UDP_PORT=%u\n", ntohs(local.sin_port));
     fflush(stdout);
-    opq *q = opq_new(fd, (struct sockaddr *)&peer, sizeof(peer), server);
+    opq *q = opq_new(fd, (struct sockaddr *)&peer, sizeof(peer), server, NULL);
     if (!q) {
         fprintf(stderr, "QUIC initialization failed\n");
         op_close(fd);

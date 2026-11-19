@@ -276,7 +276,7 @@ static int init_conn(opq *q, const ngtcp2_pkt_hd *first, const uint8_t *direct_i
     return 0;
 }
 static opq *create(op_socket fd, const struct sockaddr *peer, op_socklen peer_len,
-                   int server, int shared, const uint8_t *direct_id) {
+                   int server, int shared, const uint8_t *direct_id, const char *tls_host) {
     if ((size_t)peer_len > sizeof(struct sockaddr_storage))
         return NULL;
     opq *q = calloc(1, sizeof(*q));
@@ -319,7 +319,8 @@ static opq *create(op_socket fd, const struct sockaddr *peer, op_socklen peer_le
     } else {
         SSL_set_connect_state(q->tls);
         static const unsigned char alpn[] = "\x09" "fastp2pv2";
-        if (SSL_set_alpn_protos(q->tls, alpn, sizeof(alpn) - 1) ||
+        if ((tls_host && SSL_set_tlsext_host_name(q->tls, tls_host) != 1) ||
+            SSL_set_alpn_protos(q->tls, alpn, sizeof(alpn) - 1) ||
             ngtcp2_crypto_ossl_configure_client_session(q->tls))
             goto error;
     }
@@ -330,15 +331,16 @@ error:
     opq_free(q);
     return NULL;
 }
-opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server) {
-    return create(fd, peer, peer_len, server, 0, NULL);
+opq *opq_new(op_socket fd, const struct sockaddr *peer, op_socklen peer_len, int server,
+             const char *tls_host) {
+    return create(fd, peer, peer_len, server, 0, NULL, tls_host);
 }
 opq *opq_dial_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len,
-                       const uint8_t id[OPQ_DIRECT_ID_LEN]) {
-    return create(fd, peer, peer_len, 0, 0, id);
+                      const uint8_t id[OPQ_DIRECT_ID_LEN], const char *tls_host) {
+    return create(fd, peer, peer_len, 0, 0, id, tls_host);
 }
 opq *opq_accept_listener(op_socket fd, const struct sockaddr *peer, op_socklen peer_len) {
-    return create(fd, peer, peer_len, 1, 1, NULL);
+    return create(fd, peer, peer_len, 1, 1, NULL, NULL);
 }
 int opq_initial_tunnel_id(const uint8_t *packet, size_t length, uint8_t id[OPQ_DIRECT_ID_LEN]) {
     ngtcp2_pkt_hd first;

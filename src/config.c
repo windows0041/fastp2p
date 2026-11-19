@@ -4,10 +4,31 @@
 #include "wire.h"
 #ifdef FASTP2P_BUILTIN_TRUST
 #include "bootstrap.h"
+#include <stdio.h>
 #endif
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef FASTP2P_BUILTIN_TRUST
+/* Older official installs may still store the bundled root as a PEM file. */
+static int matches_builtin_ca(const char *path, const char *pem) {
+    FILE *file = pem ? fopen(path, "rb") : NULL;
+    if (!file)
+        return 0;
+    while (*pem) {
+        int ch = fgetc(file);
+        if (ch == '\r' && *pem == '\n')
+            ch = fgetc(file);
+        if (ch != (unsigned char)*pem)
+            break;
+        ++pem;
+    }
+    int matches = !*pem && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    return matches;
+}
+#endif
 
 static int decimal_token(const char *s, uint64_t *value) {
     if (!s || !*s)
@@ -99,6 +120,14 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
     if (!rv && ca_pem) fp_client_set_ca_pem(*out, ca_pem);
+#ifdef FASTP2P_BUILTIN_TRUST
+    if (!rv) {
+        unsigned gateway_port = port ? (unsigned)port : 27183;
+        const char *tls_host = fastp2p_builtin_tls_host(host, gateway_port);
+        if (tls_host && (!*ca_file || matches_builtin_ca(ca_file, fastp2p_builtin_ca(host, gateway_port))))
+            fp_client_set_tls_alias(*out, tls_host, fastp2p_builtin_tls_ca());
+    }
+#endif
     if (!rv) rv = fp_client_tcp_nat_config(*out, op_get(network, "TCPSTUNServers"));
     if (!rv) rv = fp_client_stun_config(*out, op_get(network, "UDPSTUNServers"));
     if (!rv) rv = fp_client_tcp_level_config(*out, op_get(network, "TCPNatProbe"));

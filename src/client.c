@@ -304,7 +304,7 @@ typedef struct {
 } relay_link;
 struct fastp2p_client {
     char host[256], ca[4096], node[32];
-    const char *ca_pem;
+    const char *ca_pem, *tls_host;
     char error[192], path[2048], hostname[256], device_id[33];
     int automatic_node;
     uint16_t port, public_port;
@@ -2032,7 +2032,7 @@ static void start_underlay(fastp2p_client *c, int index) {
             t->state = T_UNDERLAY;
             return;
         }
-        t->quic = opq_new(t->fd, &t->peer_addr.u.sa, t->peer_addr.len, t->server);
+        t->quic = opq_new(t->fd, &t->peer_addr.u.sa, t->peer_addr.len, t->server, c->tls_host);
         if (!t->quic) {
             close_tunnel(c, index, "QUIC initialization failed");
             return;
@@ -3187,7 +3187,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             emit(c, FASTP2P_EVENT_STATE, 0, 0, message);
             if (fp_update_stage_path(staged, sizeof(staged))) {
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "cannot locate the install directory");
-            } else if (fp_update_download(url, c->ca, c->ca_pem, staged, sha, size, error, sizeof(error))) {
+            } else if (fp_update_download(url, c->ca, c->ca_pem, c->tls_host ? c->resolve : NULL,
+                                          staged, sha, size, error, sizeof(error))) {
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
 #ifdef __ANDROID__
             } else {
@@ -3687,7 +3688,7 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                 uint8_t id[OPQ_DIRECT_ID_LEN];
                 op_put64(id, t->id);
                 op_addr_set_port(&t->peer_addr, t->udp_direct_port);
-                t->quic = opq_dial_listener(t->fd, &t->peer_addr.u.sa, t->peer_addr.len, id);
+                t->quic = opq_dial_listener(t->fd, &t->peer_addr.u.sa, t->peer_addr.len, id, c->tls_host);
                 t->state = T_QUIC;
                 t->deadline = now + UDP_DIRECT_WAIT;
                 if (!t->quic || tframe(t, TUN_HELLO, id, sizeof(id))) {
@@ -4469,11 +4470,11 @@ static void connect_gateway(fastp2p_client *c) {
     /* SPEC §7: a v6 literal host must be bracketed in the URL authority, while
      * a plain name or v4 literal is unchanged. */
     char urlhost[300];
-    int literal6 = strchr(c->host, ':') != NULL;
-    if (literal6)
-        snprintf(urlhost, sizeof(urlhost), "[%s]", c->host);
+    const char *tls_host = c->tls_host ? c->tls_host : c->host;
+    if (strchr(tls_host, ':'))
+        snprintf(urlhost, sizeof(urlhost), "[%s]", tls_host);
     else
-        snprintf(urlhost, sizeof(urlhost), "%s", c->host);
+        snprintf(urlhost, sizeof(urlhost), "%s", tls_host);
     snprintf(c->path, sizeof(c->path),
              "wss://%s:%u/api/v1/login?node=%s&token=%" PRIu64
              "&protocol=" WIRE_PROTOCOL
@@ -4494,11 +4495,6 @@ static void connect_gateway(fastp2p_client *c) {
      * before it falls back, which is exactly what happens on a host that
      * resolves AAAA but has no working IPv6 uplink. */
     c->resolve = NULL;
-    char hostpart[300];
-    if (literal6)
-        snprintf(hostpart, sizeof(hostpart), "[%s]", c->host);
-    else
-        snprintf(hostpart, sizeof(hostpart), "%s", c->host);
     char addresses[OP_FAM_COUNT][OP_ADDR_TEXT] = {{0}};
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         if (!c->gateway_addr[family].len || !family_wanted(c, family))
@@ -4510,7 +4506,7 @@ static void connect_gateway(fastp2p_client *c) {
     if (ipv4 || ipv6) {
         char entry[512];
         /* Multiple entries for the same host and port replace each other. */
-        int length = snprintf(entry, sizeof(entry), "%s:%u:%s%s%s%s%s", hostpart, c->port,
+        int length = snprintf(entry, sizeof(entry), "%s:%u:%s%s%s%s%s", urlhost, c->port,
                               addresses[OP_FAM_V4], ipv4 && ipv6 ? "," : "", ipv6 ? "[" : "",
                               addresses[OP_FAM_V6], ipv6 ? "]" : "");
         if (length > 0 && (size_t)length < sizeof(entry))
@@ -5267,6 +5263,11 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
 }
 void fp_client_validation_mode(fastp2p_client *c) { if(c)c->validate_only=1; }
 void fp_client_set_ca_pem(fastp2p_client *c, const char *pem) { c->ca_pem = pem; }
+
+void fp_client_set_tls_alias(fastp2p_client *c, const char *hostname, const char *pem) {
+    c->tls_host = hostname;
+    c->ca_pem = pem;
+}
 int fastp2p_client_set_config_handler(fastp2p_client *c,fastp2p_config_handler handler,void *user) {
     if(!c || c->running || c->in_callback)return FASTP2P_ESTATE;
     c->config_handler=handler;c->config_user=user;return FASTP2P_OK;
