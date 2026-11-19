@@ -50,7 +50,7 @@ case "$cpu" in
         header=$(dd if="$elf" bs=1 count=6 2>/dev/null) || fail '无法读取 MIPS 用户空间的 ELF 头。'
         [ "$header" = "$(printf '\177ELF\002\001')" ] || fail '当前只提供 MIPS64 小端 64 位用户空间安装包。'
         arch=mips64el ;;
-    *) fail "暂不支持 CPU 架构 $cpu，请先提供对应编译包。" ;;
+    *) fail "暂不支持 CPU 架构 ${cpu}，请先提供对应编译包。" ;;
 esac
 @@FASTP2P_DOWNLOAD@@
 @@FASTP2P_CONTROLLER@@
@@ -65,7 +65,7 @@ mkdir /var/run/fastp2p-install.lock 2>/dev/null || fail '另一个安装尚未�
 locked=true
 printf '%s\n' "$$" > /var/run/fastp2p-install.lock/pid
 url=$gateway_url/api/v1/update/download?platform=$package_platform\&version=$expected_version
-printf '%s\n' "检测到 $cpu，正在从网关下载 $package_platform $expected_version…"
+printf '检测到 %s，正在从网关下载 %s %s…\n' "$cpu" "$package_platform" "$expected_version"
 # Credentials go in a root-private file, not URLs or process command lines.
 if command -v curl >/dev/null 2>&1; then
     printf 'header = "Authorization: FastP2P %s"\n' "$token" > "$work/download.conf"
