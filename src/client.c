@@ -2531,6 +2531,34 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
         }
 }
 
+static void rename_peer(fastp2p_client *c, const char *old_name, const char *name) {
+    if (!valid_node(old_name) || !valid_node(name) || !strcmp(old_name, name))
+        return;
+    for (int i = 0; i < NT; ++i) {
+        tunnel *t = &c->tunnels[i];
+        if (t->state && (!strcmp(t->peer, old_name) || !strcmp(t->relay_peer, old_name)))
+            close_tunnel(c, i, NULL);
+    }
+    for (int i = 0; i < NA; ++i) {
+        app *a = &c->apps[i];
+        if (!a->used || !a->local)
+            continue;
+        int peer = !strcmp(a->peer, old_name);
+        int relay = !strcmp(a->relay_node, old_name);
+        if (peer)
+            strcpy(a->peer, name);
+        if (relay)
+            strcpy(a->relay_node, name);
+        if (peer || relay) {
+            a->attempts = 0;
+            a->lan_tried = 0;
+            a->relay_requested = 0;
+            a->relay_failed_count = 0;
+            a->retry = 0;
+        }
+    }
+}
+
 static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, const uint8_t *data,
                             size_t len) {
     c->last_rx = mono();
@@ -2604,7 +2632,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway rejected login");
             c->stopping = 1;
         } else {
-            if (c->automatic_node) {
+            if (c->automatic_node || op_integer(j, "nodeRename") == 1) {
                 const char *assigned = op_string(j, "node");
                 if (!valid_node(assigned)) {
                     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "gateway returned an invalid node name");
@@ -2612,11 +2640,13 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     json_object_put(j);
                     return;
                 }
-                strcpy(c->node, assigned);
-                c->node_id = op_node_id(c->node);
-                char message[64];
-                snprintf(message, sizeof(message), "node name: %s", c->node);
-                emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
+                if (c->automatic_node || strcmp(c->node, assigned)) {
+                    strcpy(c->node, assigned);
+                    c->node_id = op_node_id(c->node);
+                    char message[64];
+                    snprintf(message, sizeof(message), "node name: %s", c->node);
+                    emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
+                }
             }
             c->login_ok = 1;
             c->gateway_tcp_probe_v2 = op_integer(j, "tcpProbeV2") == 1;
@@ -2811,6 +2841,11 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         }
     } else if (main == 7 && sub == 1) {
         const char *peer = op_string(j, "peerNode"), *lan = op_string(j, "lanIP");
+        const char *canonical = op_string(j, "canonicalNode");
+        if (valid_node(canonical)) {
+            rename_peer(c, peer, canonical);
+            peer = canonical;
+        }
         op_addr gateway_ip;
         if (valid_node(peer) && !op_addr_from_text(&gateway_ip, op_string(j, "IPv4"), 0) &&
             op_addr_family(&gateway_ip) == AF_INET)
@@ -2882,7 +2917,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                         c->apps[i].retry = mono();
                     }
                 }
-    } else if (main == 3 && sub == 7)
+    } else if (main == 3 && sub == 21 && c->login_ok)
+        rename_peer(c, op_string(j, "oldName"), op_string(j, "name"));
+    else if (main == 3 && sub == 7)
         report_apps(c);
     else if (main == 3 && sub == 16) {
         /* RULE_SYNC: the gateway is the source of truth. Drop every local rule
@@ -4075,7 +4112,7 @@ static void connect_gateway(fastp2p_client *c) {
     snprintf(c->path, sizeof(c->path),
              "wss://%s:%u/api/v1/login?node=%s&token=%" PRIu64
              "&protocol=" WIRE_PROTOCOL
-             "&version=%s&nattype=%d&tcpnattype=%u&families=%d&sharebandwidth=0",
+             "&version=%s&nattype=%d&tcpnattype=%u&families=%d&sharebandwidth=0&nodeRename=1",
              urlhost, c->port, c->node, c->token, WIRE_VERSION, c->nat[OP_FAM_V4].type,
              c->tcp_nat.family[OP_FAM_V4].type, c->families_wanted);
     if (c->automatic_node) {
