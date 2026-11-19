@@ -22,7 +22,6 @@ for tool in awk uname sha256sum mktemp chmod cp wc; do
 done
 work=$(mktemp -d /tmp/fastp2p-install.XXXXXXXX)
 locked=false
-profile=/var/lib/fastp2p/config/fastp2p.conf
 cleanup() {
     status=$?
     set +e
@@ -58,6 +57,9 @@ esac
 chmod 700 "$work/fastp2p-service"
 # Validate the init implementation and account tools before touching the old app.
 "$work/fastp2p-service" check
+profile=$("$work/fastp2p-service" profile)
+state=${profile%/*}
+parent=${state%/*}
 mkdir -p /var/run
 mkdir /var/run/fastp2p-install.lock 2>/dev/null || fail '另一个安装尚未结束；若上次被强制终止，请检查 /var/run/fastp2p-install.lock。'
 locked=true
@@ -91,12 +93,20 @@ chmod 700 "$work/fastp2p"
 version=$("$work/fastp2p" --version) || fail "程序无法在 $cpu 上运行，原服务尚未卸载。"
 case "$version" in "fastp2p $expected_version ABI "*) ;; *) fail '安装包版本不符。' ;; esac
 [ "$("$work/fastp2p" --installer-abi 2>/dev/null)" = 2 ] || fail '安装需要 fastp2p 客户端 2.0.4 或更新版本。'
-[ ! -L /var/lib/fastp2p ] && [ ! -L /var/lib/fastp2p/config ] || fail '配置目录不能是符号链接。'
+if [ "$profile" = /etc/fastp2p-client/config/fastp2p.conf ] &&
+   [ "$("$work/fastp2p" --service-profile 2>/dev/null || true)" != "$profile" ]; then
+    fail '当前安装包不支持 OpenWrt 持久配置，请从控制台重新生成安装命令。'
+fi
+[ ! -L "$parent" ] && [ ! -L "$state" ] || fail '配置目录不能是符号链接。'
 mkdir "$work/verified"
 prepared=$work/verified/fastp2p.conf
 if [ -f "$profile" ]; then
     [ ! -L "$profile" ] || fail '配置不能是符号链接。'
     cp -p "$profile" "$prepared"
+elif [ "$profile" = /etc/fastp2p-client/config/fastp2p.conf ] &&
+     [ -f /var/lib/fastp2p/config/fastp2p.conf ]; then
+    [ ! -L /var/lib/fastp2p/config/fastp2p.conf ] || fail '旧配置不能是符号链接。'
+    cp -p /var/lib/fastp2p/config/fastp2p.conf "$prepared"
 elif [ -f /etc/fastp2p/client.json ]; then
     [ ! -L /etc/fastp2p/client.json ] || fail '旧配置不能是符号链接。'
     cp -p /etc/fastp2p/client.json "$prepared"

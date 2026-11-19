@@ -195,7 +195,8 @@ esac
             assert key.encode() not in result.stdout+result.stderr
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
             return result
-        profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
+        linux_profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
+        openwrt_profile = Path('/etc/fastp2p-client/config/fastp2p.conf')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
         minimal = root/'procd-tools'
@@ -205,18 +206,19 @@ esac
             (minimal/name).symlink_to(shutil.which(name))
         native_path = environment['PATH']
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
+            profile = openwrt_profile if manager == 'procd' else linux_profile
             environment['PATH'] = str(minimal) if manager == 'procd' else native_path
             for name in ('client-running', 'client-enabled', 'fail-start', 'fail-after-start'):
                 (root/name).unlink(missing_ok=True)
             for folder in ('/usr/local/fastp2p', '/etc/systemd/system', '/etc/init.d'):
                 shutil.rmtree(folder, ignore_errors=True); Path(folder).mkdir(parents=True)
-            for file in (profile, Path('/etc/openwrt_release'), Path('/etc/rc.common'), Path('/sbin/openrc-run')):
+            for file in (linux_profile, openwrt_profile, Path('/etc/openwrt_release'), Path('/etc/rc.common'), Path('/sbin/openrc-run')):
                 file.unlink(missing_ok=True)
             shutil.rmtree('/run/systemd', ignore_errors=True)
             environment['FIXTURE_SYSTEMD'] = '219' if manager == 'systemd219' else '252'
             if manager.startswith('systemd'): Path('/run/systemd/system').mkdir(parents=True)
             elif manager == 'procd':
-                Path('/etc/openwrt_release').touch()
+                Path('/etc/openwrt_release').write_text("DISTRIB_ID='ImmortalWrt'\nDISTRIB_RELEASE='25.12.2'\n")
                 executable(Path('/etc/rc.common'), '''
 exec "$FIXTURE/tools/service-fixture" procd "$2"
 ''')
@@ -236,7 +238,10 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
                     (stale/'startup-check.log').write_text('keep diagnostics')
                     stats=os.statvfs('/usr/local')
                     assert stats.f_bavail*stats.f_frsize < len(payload)
-                    run(short_name)
+                    starting = run(short_name)
+                    assert 'ImmortalWrt 25.12.2'.encode() in starting.stdout
+                    assert openwrt_profile.is_file() and not linux_profile.exists()
+                    assert subprocess.check_output([str(client),'--service-profile'],text=True).strip() == str(openwrt_profile)
                     binary=Path('/usr/local/fastp2p/bin/fastp2p')
                     cli=Path('/usr/local/bin/fastp2p')
                     assert binary.samefile(cli) and not cli.is_symlink() and cli.stat().st_uid==0
@@ -283,11 +288,12 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             else:
                 unit = Path('/etc/init.d/fastp2p').read_text()
                 assert ('respawn 3600 3 0' if manager == 'procd' else 'supervisor="supervise-daemon"') in unit
+                assert str(profile) in unit
             legacy=Path('/var/lib/fastp2p-client'); legacy.mkdir(exist_ok=True)
             (legacy/'fastp2p').write_bytes(payload)
             old_profile=Path('/etc/fastp2p/client.json')
             old_profile.write_bytes(profile.read_bytes()); profile.unlink()
-            gateway_db=Path('/var/lib/fastp2p/nodes.sqlite3'); gateway_db.write_bytes(b'gateway-fixture')
+            gateway_db=profile.parent.parent/'nodes.sqlite3'; gateway_db.write_bytes(b'gateway-fixture')
             os.chown(gateway_db, 32123, 32123)
             os.chown(gateway_db.parent, 12345, 12345)
             events.write_text(''); run(expected=1)
@@ -319,7 +325,7 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert (outside/'runtime').read_text()=='do-not-follow'
             assert (unknown/'runtime').read_text()=='not-an-installer-backup'
             assert not legacy.exists() and not old_profile.exists()
-            assert Path('/var/lib/fastp2p/config').stat().st_uid != 0
+            assert profile.parent.stat().st_uid != 0
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
             assert gateway_db.parent.stat().st_uid == 0 and not gateway_db.parent.stat().st_mode & 0o022
             saved = json.loads(profile.read_text())

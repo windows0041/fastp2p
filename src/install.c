@@ -32,6 +32,13 @@ static int wide(const char *text, WCHAR out[4096]) {
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, out, 4096) ? 0 : -1;
 }
 #endif
+#define FASTP2P_LINUX_PROFILE "/var/lib/fastp2p/config/fastp2p.conf"
+#define FASTP2P_OPENWRT_PROFILE "/etc/fastp2p-client/config/fastp2p.conf"
+#if defined(__linux__)
+int fastp2p_linux_managed_profile(const char *path) {
+    return path && (!strcmp(path, FASTP2P_LINUX_PROFILE) || !strcmp(path, FASTP2P_OPENWRT_PROFILE));
+}
+#endif
 int fastp2p_default_profile(char out[4096]) {
     const char *base;
     int size;
@@ -43,7 +50,7 @@ int fastp2p_default_profile(char out[4096]) {
     size = base ? snprintf(out, 4096, "%s/Library/Application Support/fastp2p/client.json", base) : -1;
 #else
     base = getenv("XDG_CONFIG_HOME");
-    if (geteuid() == 0) size = snprintf(out, 4096, "/var/lib/fastp2p/config/fastp2p.conf");
+    if (geteuid() == 0) return fastp2p_service_profile(out);
     else if (base && *base) size = snprintf(out, 4096, "%s/fastp2p/client.json", base);
     else { base = getenv("HOME"); size = base ? snprintf(out, 4096, "%s/.config/fastp2p/client.json", base) : -1; }
 #endif
@@ -60,7 +67,12 @@ int fastp2p_service_profile(char out[4096]) {
 }
 #else
 int fastp2p_service_profile(char out[4096]) {
-    int size = snprintf(out, 4096, "/var/lib/fastp2p/config/fastp2p.conf");
+    const char *profile = FASTP2P_LINUX_PROFILE;
+#if defined(__linux__)
+    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK))
+        profile = FASTP2P_OPENWRT_PROFILE;
+#endif
+    int size = snprintf(out, 4096, "%s", profile);
     return size > 0 && size < 4096 ? 0 : -1;
 }
 #endif

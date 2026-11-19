@@ -132,7 +132,7 @@ int fastp2p_runtime_prepare(const char *profile) {
 #if defined(__linux__)
     /* Managed configuration is writable by the service for gateway updates.
      * An interactive root CLI must run it with the same unprivileged identity. */
-    if (!geteuid() && profile && !strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf")) {
+    if (!geteuid() && fastp2p_linux_managed_profile(profile)) {
         struct passwd *account=getpwnam("fastp2p");
         if (!account || !account->pw_uid || setgroups(0,NULL) ||
             setgid(account->pw_gid) || setuid(account->pw_uid)) return -1;
@@ -168,7 +168,7 @@ int fastp2p_remove_autostart(const char *profile) {
     (void)fastp2p_stop_installed(profile);
     return 0;
 #else
-    if (geteuid() || strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf")) return -1;
+    if (geteuid() || !fastp2p_linux_managed_profile(profile)) return -1;
     return fastp2p_linux_uninstall(1);
 #endif
 }
@@ -251,7 +251,8 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     return execute(load);
 #else
     (void)ca;
-    if (geteuid() || strcmp(profile, "/var/lib/fastp2p/config/fastp2p.conf") || !linux_controller_ready()) {
+    char expected[4096];
+    if (geteuid() || fastp2p_service_profile(expected) || strcmp(profile, expected) || !linux_controller_ready()) {
         fputs("Install the Linux service using the script downloaded from the gateway.\n", stderr);
         return -1;
     }

@@ -91,6 +91,12 @@ static int client_main(int argc, char **argv) {
     optind = 1;
     was_online = 0;
     if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("2");return 0;}
+    if (argc == 2 && !strcmp(argv[1], "--service-profile")) {
+        char profile[4096];
+        if (fastp2p_service_profile(profile)) return 1;
+        puts(profile);
+        return 0;
+    }
     if(argc==4&&!strcmp(argv[1],"--relocate-profile"))return fastp2p_profile_relocate(argv[2],argv[3])?1:0;
     char **original_argv = argv;
     if (argc == 2 && !strcmp(argv[1], "--licenses")) {

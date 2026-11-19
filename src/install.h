@@ -7,6 +7,9 @@ int fastp2p_default_profile(char out[4096]);
 /* Machine-wide profile, used when the client runs as a Windows service and the
  * per-user location is not readable by the account the service runs under. */
 int fastp2p_service_profile(char out[4096]);
+#if defined(__linux__)
+int fastp2p_linux_managed_profile(const char *path);
+#endif
 json_object *fastp2p_profile_read(const char *path);
 int fastp2p_profile_write(const char *path, const char *text);
 int fastp2p_profile_write_machine(const char *path, const char *text);

@@ -23,7 +23,7 @@ fastp2p --licenses
 
 安装 Token 为 16 位数字，网关地址、端口和公开 CA 已预置于专用客户端包。安装先完成 TLS 主机名校验及网关认证，成功后原子保存配置。错误凭据不会替换旧配置。支持 `--token`、`FASTP2P_INSTALL_TOKEN`、`--node`、`--config`、`--no-service`。
 
-Linux 从网关控制台下载唯一的通用安装脚本，用 `sh 文件名` 或 `bash 文件名` 安装。脚本自动识别 CPU，通过 HTTPS 从本网关下载相应程序并校验长度、SHA-256 与版本；支持网关自签 CA，不关闭证书校验。设备需要 curl 或启用 TLS 的 GNU wget，无需 Python 或 Bash。程序安装到 `/usr/local/fastp2p/bin/fastp2p`，配置为 `/var/lib/fastp2p/config/fastp2p.conf`。Token 只从文件名读取，下载鉴权使用私有临时配置文件，不放进下载 URL 或下载器命令行。不要改动文件名中的 Token。
+在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/bin/fastp2p`。OpenWrt 和 ImmortalWrt 将配置存放在 `/etc/fastp2p-client/config/fastp2p.conf`，其他 Linux 系统使用 `/var/lib/fastp2p/config/fastp2p.conf`。手动下载脚本时请保留文件名中的 Token。
 
 该脚本要求客户端 2.0.4 或更新版本：先在私有临时目录验证接入和合并配置，通过后才停止旧服务。替换后以服务账号加载完整配置、验证监听端口及网关认证，并检查系统服务持续运行，再提交安装；失败时恢复旧文件、目录权限及原有开机启动状态。旧客户端持有的数据父目录会安全迁移为 root 持有，配置子目录仍由客户端账号持有。同目录的其他文件（例如停用网关的数据库）保持内容与文件所有者不变。若旧网关仍在使用该目录，请先迁移网关，安装器会在卸载客户端前报错。
 
