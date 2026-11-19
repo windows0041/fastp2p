@@ -18,6 +18,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <linux/fs.h>
+#include <sys/syscall.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -554,16 +558,29 @@ int fp_update_run_pending(char *const argv[]) {
     char previous[4200], backup[4240];
     snprintf(previous, sizeof(previous), "%s.old", own);
     snprintf(backup, sizeof(backup), "%s.backup", staged);
-    if (backup_executable(own, backup) || rename(backup, previous) || rename(staged, own)) {
-        perror("fastp2p update swap failed");
-        remove(backup);
-        remove(staged);
-    } else {
+    const char *rollback = NULL;
+#if defined(SYS_renameat2) && defined(RENAME_EXCHANGE)
+    /* Exchange the directory entries without copying a root-owned executable.
+     * The running service can rename files in its directory even when it is
+     * not allowed to hard-link the original binary. */
+    if (!syscall(SYS_renameat2, AT_FDCWD, staged, AT_FDCWD, own, RENAME_EXCHANGE))
+        rollback = rename(staged, previous) ? staged : previous;
+#endif
+    if (!rollback) {
+        if (backup_executable(own, backup) || rename(backup, previous) || rename(staged, own)) {
+            perror("fastp2p update swap failed");
+            remove(backup);
+            remove(staged);
+        } else {
+            rollback = previous;
+        }
+    }
+    if (rollback) {
         execv(own, argv);
         perror("fastp2p update start failed");
-        if (rename(previous, own)) {
+        if (rename(rollback, own)) {
             perror("fastp2p update rollback failed");
-            execv(previous, argv);
+            execv(rollback, argv);
             return -1;
         }
     }

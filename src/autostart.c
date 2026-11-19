@@ -146,10 +146,19 @@ int fastp2p_runtime_begin(const char *profile, int background) { (void)profile; 
 int fastp2p_runtime_stopping(void) { return 0; }
 void fastp2p_runtime_request_stop(void) {}
 void fastp2p_runtime_end(void) {}
-static int execute(char *const arguments[]) {
+static int execute(char *const arguments[], int quiet) {
     pid_t child = fork();
     if (child < 0) return -1;
-    if (!child) { execv(arguments[0], arguments); _exit(127); }
+    if (!child) {
+        if (quiet) {
+            int output = open("/dev/null", O_WRONLY);
+            if (output < 0 || dup2(output, STDOUT_FILENO) < 0 || dup2(output, STDERR_FILENO) < 0)
+                _exit(127);
+            if (output != STDOUT_FILENO && output != STDERR_FILENO) close(output);
+        }
+        execv(arguments[0], arguments);
+        _exit(127);
+    }
     int status;
     while (waitpid(child, &status, 0) < 0) if (errno != EINTR) return -1;
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
@@ -157,16 +166,25 @@ static int execute(char *const arguments[]) {
 int fastp2p_stop_installed(const char *profile) {
     (void)profile;
 #ifdef __APPLE__
-    char service[80]; snprintf(service, sizeof(service), "gui/%lu/top.fastp2p", (unsigned long)getuid());
-    char *const stop[] = {"/bin/launchctl", "bootout", service, NULL}; return execute(stop);
+    char domain[64], service[80];
+    snprintf(domain, sizeof(domain), "gui/%lu", (unsigned long)getuid());
+    snprintf(service, sizeof(service), "%s/top.fastp2p", domain);
+    char *const check[] = {"/bin/launchctl", "print", service, NULL};
+    if (execute(check, 1)) {
+        char *const session[] = {"/bin/launchctl", "print", domain, NULL};
+        if (!execute(session, 1)) return 0;
+        fputs("Cannot access the macOS graphical login session for fastp2p.\n", stderr);
+        return -1;
+    }
+    char *const stop[] = {"/bin/launchctl", "bootout", service, NULL};
+    return execute(stop, 0);
 #else
-    char *const stop[] = {"/usr/local/fastp2p/fastp2p-service", "stop", NULL}; return execute(stop);
+    char *const stop[] = {"/usr/local/fastp2p/fastp2p-service", "stop", NULL}; return execute(stop, 0);
 #endif
 }
 int fastp2p_remove_autostart(const char *profile) {
 #ifdef __APPLE__
-    (void)fastp2p_stop_installed(profile);
-    return 0;
+    return fastp2p_stop_installed(profile);
 #else
     if (geteuid() || !fastp2p_linux_managed_profile(profile)) return -1;
     return fastp2p_linux_uninstall(1);
@@ -188,7 +206,7 @@ int fastp2p_linux_uninstall(int keep_config) {
     }
     char *const command[] = {"/usr/local/fastp2p/fastp2p-service", "uninstall",
                              keep_config ? "--keep-config" : NULL, NULL};
-    return execute(command);
+    return execute(command, 0);
 }
 #endif
 #ifdef __APPLE__
@@ -245,10 +263,8 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     if (fclose(file)) ok = 0;
     if (!ok) return -1;
     snprintf(domain, sizeof(domain), "gui/%lu", (unsigned long)getuid());
-    char *const unload[] = {"/bin/launchctl", "bootout", domain, plist, NULL};
-    (void)execute(unload);
     char *const load[] = {"/bin/launchctl", "bootstrap", domain, plist, NULL};
-    return execute(load);
+    return execute(load, 0);
 #else
     (void)ca;
     char expected[4096];
@@ -259,7 +275,7 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     char source[80]; snprintf(source, sizeof(source), "/proc/%lu/exe", (unsigned long)getpid());
     char *const install[] = {"/usr/local/fastp2p/fastp2p-service", "install", "--binary", source,
                              "--config", (char *)profile, NULL};
-    return execute(install);
+    return execute(install, 0);
 #endif
 }
 #endif
