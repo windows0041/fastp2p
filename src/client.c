@@ -241,6 +241,7 @@ typedef struct {
      * filled when the peer reports one, so an old peer looks LAN-less exactly
      * as it did before. */
     char peer_lan[OP_ADDR_TEXT], peer_lan6[OP_ADDR_TEXT];
+    uint32_t peer_public_ipv4;
     uint64_t peer_families, peer_nat6, peer_tcp_nat6;
     /* The current attempt's session; relay offers create a fresh session. */
     uint64_t session;
@@ -470,11 +471,24 @@ static int valid_gateway_host(const char *host) {
         return 0;
     return op_addr_from_text(&scratch, host, 0) == 0 && op_addr_family(&scratch) == AF_INET6;
 }
-/* A LAN punch is possible when both ends hold a private address for each other
- * **in the same family** (SPEC §5). Comparing a v4 self-report against a v6
- * peer report would claim a LAN path that does not exist. The IPv4 pair is
- * checked first so the historical decision is unchanged whenever v4 exists. */
+static uint32_t public_ipv4(const op_addr *address) {
+    if (op_addr_family(address) != AF_INET || !op_addr_routable(address))
+        return 0;
+    uint32_t ip = ntohl(address->u.in.sin_addr.s_addr);
+    /* Shared carrier space can also be observed by a privately hosted gateway. */
+    return (ip & 0xffc00000u) == 0x64400000u ? 0 : ip;
+}
+
+/* Different public IPv4 observations rule out a LAN attempt between sites.
+ * Private gateways and IPv6-only peers can lack a comparable observation.
+ * The LAN candidates still need private addresses in the same family. */
 static int lan_punch_possible(const fastp2p_client *c, const app *a) {
+    op_addr local_public;
+    if (a->peer_public_ipv4 && !op_addr_from_text(&local_public, c->ip[OP_FAM_V4], 0)) {
+        uint32_t local_ip = public_ipv4(&local_public);
+        if (local_ip && local_ip != a->peer_public_ipv4)
+            return 0;
+    }
     for (int index = 0; index < OP_FAM_COUNT; ++index) {
         const char *peer_text = index == OP_FAM_V4 ? a->peer_lan : a->peer_lan6;
         op_addr peer, local;
@@ -2969,8 +2983,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             peer = canonical;
         }
         op_addr gateway_ip;
-        if (valid_node(peer) && !op_addr_from_text(&gateway_ip, op_string(j, "IPv4"), 0) &&
-            op_addr_family(&gateway_ip) == AF_INET)
+        int has_gateway_ipv4 = !op_addr_from_text(&gateway_ip, op_string(j, "IPv4"), 0) &&
+                               op_addr_family(&gateway_ip) == AF_INET;
+        if (valid_node(peer) && has_gateway_ipv4)
             for (int i = 0; i < NT; ++i) {
                 tunnel *t = &c->tunnels[i];
                 if (t->state == T_TCP_CONNECT &&
@@ -2978,7 +2993,6 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     !strcmp(t->peer, peer) && op_addr_equal(&gateway_ip, &t->peer_addr))
                     t->tcp_peer_ip_verified = 1;
             }
-        struct in_addr lan_address;
         /* SPEC §4: the gateway's 7/1 answer carries the family bitmap and the
          * parallel v6 levels. It has no separate v6 LAN column; `IPv6` is the
          * address observed for the peer, so it is used as the v6 LAN endpoint
@@ -3005,26 +3019,12 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                                                   : FP_NAT_UNKNOWN;
                     c->apps[i].peer_nat6 = op_integer(j, "udpNatType6");
                     c->apps[i].peer_families = op_integer(j, "families");
-                    if (lan && inet_pton(AF_INET, lan, &lan_address) == 1)
-                        copy_string(c->apps[i].peer_lan, sizeof(c->apps[i].peer_lan), lan);
-                    if (lan6 && *lan6) {
-                        op_addr parsed;
-                        if (!op_addr_from_text(&parsed, lan6, 0) &&
-                            op_family_index(op_addr_family(&parsed)) == OP_FAM_V6)
-                            copy_string(c->apps[i].peer_lan6, sizeof(c->apps[i].peer_lan6),
-                                        lan6);
-                    }
-                    /* The peer's private address only arrives with this answer, long
-                     * after the rule was created and possibly after a WAN punch or a
-                     * relay link was already chosen. A LAN link is cheaper and does not
-                     * depend on the relay, so drop a link that is still not ready and
-                     * let the app loop re-decide with the LAN path available. A link
-                     * that already carries traffic is left alone. */
-                    /* Only after a direct attempt has actually failed: switching
-                     * earlier preempts the punch that would have succeeded, and in a
-                     * two-node topology there is no relay to fall back to. */
-                    /* Two private addresses alone do not prove a shared LAN.
-                     * Let an in-flight TCP punch complete before trying LAN. */
+                    c->apps[i].peer_public_ipv4 = has_gateway_ipv4 ? public_ipv4(&gateway_ip) : 0;
+                    address_text_out(c->apps[i].peer_lan, lan, OP_FAM_V4);
+                    address_text_out(c->apps[i].peer_lan6, lan6, OP_FAM_V6);
+                    /* A late lookup can make a LAN attempt eligible after the
+                     * first attempt started. Keep established links and TCP
+                     * attempts on their current path. */
                     if (c->apps[i].transport != FASTP2P_TRANSPORT_TCP && !c->apps[i].synced &&
                         c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
                         c->apps[i].attempts >= 1 && lan_punch_possible(c, &c->apps[i])) {

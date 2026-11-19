@@ -118,11 +118,54 @@ static void quic_uses_punch_endpoint(void) {
     op_close(confirmed);
     free(c);
 }
+static void lan_punch_public_ipv4(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    strcpy(c->local_ip[OP_FAM_V4], "172.16.12.192");
+    strcpy(c->local_ip[OP_FAM_V6], "fd00::10");
+    strcpy(c->ip[OP_FAM_V4], "198.51.100.10");
+
+    app *a = &c->apps[0];
+    strcpy(a->peer, "mobile-peer");
+    a->used = a->local = 1;
+    a->transport = FASTP2P_TRANSPORT_QUIC;
+    a->attempts = 1;
+    a->retry = NS;
+    int ti = new_tunnel(c, a->peer, 125, a->transport, 1);
+    assert(ti >= 0);
+    a->tunnel_index = ti;
+    c->tunnels[ti].state = T_TIME;
+
+    const char different[] = "{\"peerNode\":\"mobile-peer\",\"IPv4\":\"203.0.113.10\","
+                             "\"lanIP\":\"172.16.12.193\",\"lanIP6\":\"fd00::11\"}";
+    control_message(c, 7, 1, (const uint8_t *)different, sizeof(different) - 1);
+    assert(!lan_punch_possible(c, a));
+    assert(a->attempts == 1 && a->retry == NS);
+    assert(a->tunnel_index == ti && c->tunnels[ti].state == T_TIME);
+
+    /* No public observation is available through a private gateway. */
+    strcpy(c->ip[OP_FAM_V4], "100.64.0.10");
+    assert(lan_punch_possible(c, a));
+    strcpy(c->ip[OP_FAM_V4], "198.51.100.10");
+
+    const char shared[] = "{\"peerNode\":\"mobile-peer\",\"IPv4\":\"198.51.100.10\","
+                          "\"lanIP\":\"172.16.12.193\"}";
+    control_message(c, 7, 1, (const uint8_t *)shared, sizeof(shared) - 1);
+    assert(lan_punch_possible(c, a));
+    assert(a->attempts == 0 && a->tunnel_index == -1 && !c->tunnels[ti].state);
+
+    const char ipv6_only[] = "{\"peerNode\":\"mobile-peer\",\"lanIP6\":\"fd00::11\"}";
+    control_message(c, 7, 1, (const uint8_t *)ipv6_only, sizeof(ipv6_only) - 1);
+    assert(!a->peer_lan[0] && lan_punch_possible(c, a));
+    free(c);
+}
+
 int main(void) {
     assert(!op_platform_init());
     tcp_retry();
     tcp_punch_scheduling();
     quic_uses_punch_endpoint();
+    lan_punch_public_ipv4();
     /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
     fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;
     app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
