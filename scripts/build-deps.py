@@ -93,7 +93,8 @@ elif text.count(fixed)!=1:
 environment=os.environ.copy()
 environment['PKG_CONFIG_LIBDIR']=str(prefix/'lib/pkgconfig')
 environment['PKG_CONFIG_PATH']=str(prefix/'lib/pkgconfig')
-cmake_common=['-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DCMAKE_INSTALL_PREFIX='+str(prefix),
+build_type='Release'
+cmake_common=['-G','Ninja','-DCMAKE_INSTALL_PREFIX='+str(prefix),
     '-DCMAKE_INSTALL_LIBDIR=lib','-DCMAKE_POSITION_INDEPENDENT_CODE=ON','-DBUILD_SHARED_LIBS=OFF','-DBUILD_TESTING=OFF',
     '-DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON']
 environment['CFLAGS']='-O2 -fPIC'
@@ -147,13 +148,15 @@ elif args.target.endswith('-musl'):
     environment['CC']=str(compiler)
     environment['AR']=str(archiver)
     environment['RANLIB']=str(ranlib)
-    environment['CFLAGS']=('-O2 -fPIC '+arch_flags).strip()
+    build_type='MinSizeRel'
+    environment['CFLAGS']=('-Os -fPIC -ffunction-sections -fdata-sections '+arch_flags).strip()
     environment['LDFLAGS']='-static'
     cmake_common+=['-DCMAKE_TOOLCHAIN_FILE='+str(project/'cmake/linux-musl.cmake'),
                    '-DFASTP2P_TARGET_ARCH='+arch,
                    '-DCMAKE_C_COMPILER='+str(compiler),
                    '-DCMAKE_AR='+str(archiver),
                    '-DCMAKE_RANLIB='+str(ranlib),
+                   '-DCMAKE_C_FLAGS='+environment['CFLAGS'],
                    '-DCMAKE_EXE_LINKER_FLAGS=-static']
 elif args.target.startswith('macos-'):
     if sys.platform!='darwin': raise SystemExit('macOS dependencies require an Apple SDK on macOS')
@@ -162,6 +165,7 @@ elif args.target.startswith('macos-'):
     environment['CFLAGS']='-O2 -fPIC -arch '+arch+' -mmacosx-version-min=13.0'
     openssl_target='darwin64-arm64-cc' if arch=='arm64' else 'darwin64-x86_64-cc'
     cmake_common+=['-DCMAKE_OSX_ARCHITECTURES='+arch,'-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0']
+cmake_common.append('-DCMAKE_BUILD_TYPE='+build_type)
 
 def run(command,directory,label):
     print(args.target+': '+label,flush=True)
@@ -199,6 +203,11 @@ curl=['-DBUILD_CURL_EXE=OFF','-DBUILD_EXAMPLES=OFF','-DBUILD_LIBCURL_DOCS=OFF','
       '-DUSE_LIBIDN2=OFF','-DCURL_USE_LIBPSL=OFF','-DCURL_BROTLI=OFF','-DCURL_ZSTD=OFF','-DCURL_ZLIB=OFF',
       '-DCURL_USE_LIBSSH2=OFF','-DCURL_USE_LIBSSH=OFF','-DUSE_NGHTTP2=OFF','-DUSE_NGTCP2=OFF',
       '-DENABLE_THREADED_RESOLVER=OFF','-DENABLE_ARES=OFF','-DENABLE_WEBSOCKETS=ON']
+if args.target.endswith('-musl'):
+    # The static CLI only uses curl for HTTPS downloads and WSS gateway traffic.
+    curl += [f'-DCURL_DISABLE_{protocol}=ON' for protocol in
+             ('DICT', 'FILE', 'FTP', 'GOPHER', 'IMAP', 'IPFS', 'MQTT', 'POP3',
+              'RTSP', 'SMTP', 'TELNET', 'TFTP')]
 if args.target=='windows-x86_64':
     curl+=['-DCURL_USE_SCHANNEL=ON','-DCURL_USE_OPENSSL=OFF']
 else:

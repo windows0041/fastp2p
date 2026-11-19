@@ -48,15 +48,16 @@ python3 "$repository/scripts/build-deps.py" "linux-$arch-musl" \
 build=$work/build/$arch
 prefix=$work/prefix/linux-$arch-musl
 cmake -S "$repository" -B "$build" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DCMAKE_BUILD_TYPE=MinSizeRel -DBUILD_TESTING=OFF \
   -DCMAKE_TOOLCHAIN_FILE="$repository/cmake/linux-musl.cmake" \
   -DFASTP2P_TARGET_ARCH="$arch" \
   -DCMAKE_C_COMPILER="$compiler" \
   -DCMAKE_AR="${binutils}-ar" \
   -DCMAKE_RANLIB="${binutils}-ranlib" \
-  -DCMAKE_EXE_LINKER_FLAGS=-static \
+  -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG -ffunction-sections -fdata-sections" \
+  -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--gc-sections" \
   -DFASTP2P_DEPS_ROOT="$prefix" >/dev/null
-cmake --build "$build" --parallel "$jobs"
+cmake --build "$build" --target fastp2p-client --parallel "$jobs"
 
 # Ship an archive like every other platform: one download, no loose binaries.
 mkdir -p "$out"
@@ -64,6 +65,7 @@ stage=$work/pkg/fastp2p-linux-static-$arch
 rm -rf "$stage"
 mkdir -p "$stage/bin"
 cp "$build/fastp2p" "$stage/bin/fastp2p"
+"${binutils}-strip" --strip-all "$stage/bin/fastp2p"
 for doc in README.md PLATFORMS-ZH.md LICENSE; do
   [[ -f $repository/$doc ]] && cp "$repository/$doc" "$stage/"
 done
