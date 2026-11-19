@@ -10,29 +10,35 @@ import android.os.Build;
 import android.provider.Settings;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.io.OutputStream;
 
-/**
- * Installs a verified upgrade package through the system installer.
- *
- * Android never lets an app replace itself silently, so the most the console can
- * do is deliver the package and ask the user to confirm the install.
- */
+/** Installs a verified upgrade package through the interactive system installer. */
 final class UpdateInstaller {
     static final String ACTION_INSTALLED = "top.fastp2p.cclient.UPDATE_INSTALLED";
     private static final String TAG = "fastp2p";
     private UpdateInstaller() {}
 
-    static void install(Context context, String path) {
-        if (path == null || path.isEmpty()) return;
-        File packageFile = new File(path);
+    static File stagedPackage(Context context, String path) {
+        if (path == null || path.isEmpty()) return null;
         // The launcher activity is exported. Only accept the verified cache
         // file from the native updater, never a path supplied by another app.
-        if (!packageFile.equals(new File(context.getCacheDir(), "fastp2p-update.apk"))) return;
-        if (!packageFile.isFile()) {
-            android.util.Log.w(TAG, "update package missing: " + path);
-            return;
+        try {
+            File expected = new File(context.getCacheDir().getCanonicalFile(), "fastp2p-update.apk");
+            return expected.isFile() && expected.equals(new File(path).getCanonicalFile()) ? expected : null;
+        } catch (IOException error) {
+            return null;
         }
+    }
+
+    @SuppressWarnings("deprecation")
+    static long versionCode(PackageInfo info) {
+        return Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+    }
+
+    static void install(Context context, String path) {
+        File packageFile = stagedPackage(context, path);
+        if (packageFile == null) return;
         // Without this the installer rejects the session outright; the user must
         // grant it once in system settings.
         if (!context.getPackageManager().canRequestPackageInstalls()) {
@@ -43,7 +49,7 @@ final class UpdateInstaller {
         // Android refuses to replace an app with the same versionCode, and the
         // rejection is silent. Say so instead of failing without explanation.
         try {
-            PackageInfo staged = context.getPackageManager().getPackageArchiveInfo(path, 0);
+            PackageInfo staged = context.getPackageManager().getPackageArchiveInfo(packageFile.getAbsolutePath(), 0);
             PackageInfo current = context.getPackageManager()
                     .getPackageInfo(context.getPackageName(), 0);
             if (staged == null || !context.getPackageName().equals(staged.packageName)) {
@@ -51,9 +57,8 @@ final class UpdateInstaller {
                 packageFile.delete();
                 return;
             }
-            long next = Build.VERSION.SDK_INT >= 28 ? staged.getLongVersionCode() : staged.versionCode;
-            long installed = Build.VERSION.SDK_INT >= 28
-                    ? current.getLongVersionCode() : current.versionCode;
+            long next = versionCode(staged);
+            long installed = versionCode(current);
             if (next <= installed) {
                 android.util.Log.w(TAG, "update package versionCode " + next
                         + " is not newer than installed " + installed + "; ignoring");
@@ -96,6 +101,10 @@ final class UpdateInstaller {
                 }
             }
         }
+    }
+
+    static void discardStagedPackage(Context context) {
+        new File(context.getCacheDir(), "fastp2p-update.apk").delete();
     }
 
     /** Sends the operator to the per-app "install unknown apps" toggle. */

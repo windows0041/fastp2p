@@ -13,6 +13,7 @@
             <intent-filter><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" /><data android:scheme="fastp2p" android:host="install" /></intent-filter>
         </activity>
+        <activity android:name=".RootUpdateActivity" android:exported="false" android:excludeFromRecents="true" />
         <service android:name=".FastP2PService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-enrolled persistent private P2P TCP and UDP forwarding" />
         </service>

@@ -3099,8 +3099,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
 #ifdef __ANDROID__
             } else {
-                /* Android cannot replace its own package: hand the verified APK
-                 * to the app, which asks the user to confirm the install. */
+                /* Hand the verified APK to the Android install flow. */
                 char ready[4300];
                 snprintf(ready, sizeof(ready), "update-ready:%s", staged);
                 emit(c, FASTP2P_EVENT_STATE, 0, 0, ready);

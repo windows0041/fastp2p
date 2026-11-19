@@ -9,7 +9,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInstaller;
 import android.os.Build;
-import java.io.File;
 
 /** Receives the system installer's verdict and drops the staged package. */
 public final class UpdateReceiver extends BroadcastReceiver {
@@ -47,8 +46,6 @@ public final class UpdateReceiver extends BroadcastReceiver {
             // Keep the package so the operator can retry from the console.
             return;
         }
-        File staged = new File(context.getCacheDir(), "fastp2p-update.apk");
-        if (staged.isFile() && !staged.delete())
-            android.util.Log.w("fastp2p", "staged package could not be removed");
+        UpdateInstaller.discardStagedPackage(context);
     }
 }

@@ -6,6 +6,10 @@ import android.content.Intent;
 
 public final class BootReceiver extends BroadcastReceiver {
     @Override public void onReceive(Context context, Intent intent) {
+        if (Intent.ACTION_MY_PACKAGE_REPLACED.equals(intent.getAction())) {
+            UpdateInstaller.discardStagedPackage(context);
+            RootUpdateInstaller.discardSnapshots(context);
+        }
         if (SecretStore.preferences(context).getBoolean("enabled", false) &&
                 SecretStore.preferences(context).contains("enrollment")) {
             context.startForegroundService(new Intent(context, FastP2PService.class));

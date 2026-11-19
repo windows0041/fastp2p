@@ -14,6 +14,8 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
@@ -26,15 +28,20 @@ public final class FastP2PService extends Service {
     static volatile int state;
     static volatile String status = "未连接";
     private final AtomicBoolean stopping = new AtomicBoolean();
+    private static final AtomicBoolean UPDATE_IN_PROGRESS = new AtomicBoolean();
     private final Handler main = new Handler(Looper.getMainLooper());
     private Thread worker;
     private Notification notification(boolean ongoing) {
         Intent open = new Intent(this, InstallActivity.class);
         Intent stop = new Intent(this, FastP2PService.class).setAction(STOP);
+        Intent rootUpdates = new Intent(this, RootUpdateActivity.class);
         return new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_upload_done)
             .setContentTitle("fastp2p").setContentText(status).setOngoing(ongoing)
             .setContentIntent(PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE))
-            .addAction(new Notification.Action.Builder(null, "停止", PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE)).build()).build();
+            .addAction(new Notification.Action.Builder(null, "停止", PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE)).build())
+            .addAction(new Notification.Action.Builder(null, "Root 更新",
+                    PendingIntent.getActivity(this, 3, rootUpdates, PendingIntent.FLAG_IMMUTABLE)).build())
+            .build();
     }
     private boolean canNotify() {
         return Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
@@ -56,6 +63,28 @@ public final class FastP2PService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE))
             .setAutoCancel(true).build();
         manager.notify(2, notice);
+    }
+    private void updateReady(String path) {
+        if (!RootUpdateInstaller.enabled(this) || !UPDATE_IN_PROGRESS.compareAndSet(false, true)) {
+            notifyUpdate(path);
+            return;
+        }
+        final File snapshot;
+        try {
+            snapshot = RootUpdateInstaller.snapshot(this, path);
+        } catch (IOException error) {
+            UPDATE_IN_PROGRESS.set(false);
+            android.util.Log.w("fastp2p", "cannot prepare the silent update", error);
+            notifyUpdate(path);
+            return;
+        }
+        new Thread(() -> {
+            try {
+                if (!RootUpdateInstaller.install(this, snapshot)) notifyUpdate(path);
+            } finally {
+                UPDATE_IN_PROGRESS.set(false);
+            }
+        }, "fastp2p-root-update").start();
     }
     @Override public void onCreate() {
         super.onCreate();
@@ -135,11 +164,8 @@ public final class FastP2PService extends Service {
                 + " id=" + id + " " + message);
         state = newState;
         status = newState == 2 ? "已连接" : newState == 3 ? "正在重连" : newState == 1 ? "正在连接" : "已停止";
-        // A verified upgrade package is ready. Android refuses an install handed
-        // over by a background service, so offer it through a notification the
-        // user taps; the activity then runs in the foreground.
-        if (message != null && message.startsWith("update-ready:"))
-            notifyUpdate(message.substring("update-ready:".length()));
+        if (type == 0 && code == 0 && message != null && message.startsWith("update-ready:"))
+            updateReady(message.substring("update-ready:".length()));
         if (type == 0) main.post(() -> { if (running && canNotify()) getSystemService(NotificationManager.class).notify(1, notification(true)); });
     }
     @Override public void onDestroy() { stopping.set(true); super.onDestroy(); }

@@ -88,6 +88,8 @@ Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.
 
 安卓从旧网关迁移时，先安装新专用 APK，停止已有客户端进程，再执行 `adb shell am start -n top.fastp2p.cclient/.InstallActivity --es token YOUR_16_DIGIT_TOKEN --ez migrate true`。此标记只允许采用已签名 APK 中内置的目标地址和 CA，不接受 Intent 提供的服务器或证书；新网关验证成功后才替换已加密的配置，保留 DeviceID 和已有规则。普通安装入口仍拒绝跨网关覆盖。
 
+已 Root 的 Android 设备可以在 fastp2p 常驻通知中选择「Root 更新」，点击「申请 Root」，再在 Root 管理器中授权给 fastp2p。开启后，网关发起的更新在校验下载摘要、包名、签名和版本后由系统包管理器安装。静默安装失败时，客户端会发出手动安装通知。再次打开「Root 更新」可以关闭。
+
 ### NAT 等级的来源与显示
 
 控制台显示的是两个独立的结论，**不要混读**：
