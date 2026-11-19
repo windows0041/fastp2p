@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "2.0.22"
+#define FASTP2P_VERSION "2.0.23"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)
@@ -65,7 +65,7 @@ typedef struct {
     const char *node;      /* 8..31 ASCII; NULL/empty = hostname-based automatic name */
     uint64_t token;
     const char *ca_file;  /* NULL = system roots; chain + hostname always verified */
-    uint16_t public_port; /* Optional direct TCP listener, zero = ephemeral */
+    uint16_t public_port; /* TCP peer listener, zero = choose within 1024–9999 */
     fastp2p_event_fn on_event;
     void *user;
 } fastp2p_config;
@@ -78,6 +78,8 @@ FASTP2P_API int fastp2p_client_set_identity(fastp2p_client *, const char *device
 /* Borrowed strings, valid until destroy; node contents can change on login. */
 FASTP2P_API const char *fastp2p_client_device_id(const fastp2p_client *);
 FASTP2P_API const char *fastp2p_client_node(const fastp2p_client *);
+/* Bound TCP peer port, or zero when the client is stopped. */
+FASTP2P_API uint16_t fastp2p_client_public_port(const fastp2p_client *);
 typedef struct {
     size_t struct_size;
     const char *name;

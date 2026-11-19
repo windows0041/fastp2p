@@ -38,6 +38,9 @@ static int socket_error(void) {
     case WSAEADDRINUSE:
         errno = EADDRINUSE;
         break;
+    case WSAEACCES:
+        errno = EACCES;
+        break;
     case WSAENETUNREACH:
         errno = ENETUNREACH;
         break;

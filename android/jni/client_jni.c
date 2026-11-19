@@ -116,6 +116,13 @@ JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_step(JNIEnv *env, j
         return FASTP2P_EIO;
     return !rv && b->restart_requested ? STEP_RESTART_REQUESTED : rv;
 }
+JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_publicPort(JNIEnv *env, jclass cls,
+                                                                          jlong handle) {
+    (void)env;
+    (void)cls;
+    binding *b = (binding *)(intptr_t)handle;
+    return b ? fastp2p_client_public_port(b->client) : 0;
+}
 JNIEXPORT void JNICALL Java_top_fastp2p_cclient_NativeClient_destroy(JNIEnv *env, jclass cls,
                                                                         jlong handle) {
     (void)cls;

@@ -26,12 +26,11 @@ static void request_restart(void *user) {
     *(int *)user = 1;
 }
 static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
-    (void)c;
     (void)user;
     static const char *types[] = {"state", "error", "tunnel", "forward", "heartbeat"};
     if (e->state == FASTP2P_ONLINE && e->type == FASTP2P_EVENT_STATE) {
         was_online = 1;
-        fp_config_sync_online();
+        fp_config_sync_online(fastp2p_client_public_port(c));
         cleanup_online_since=op_monotonic_ns();cleanup_next=0;
     } else if(e->type==FASTP2P_EVENT_STATE) {
         cleanup_online_since=cleanup_next=0;

@@ -75,6 +75,20 @@ int main(void) {
                       .transport = FASTP2P_TRANSPORT_TCP};
     assert(fastp2p_client_add_forward(c, &f, NULL) == FASTP2P_EINVAL);
     fastp2p_client_destroy(c);
+    cfg.on_event = NULL;
+    assert(fastp2p_client_create(&cfg, &c) == FASTP2P_OK);
+    assert(fastp2p_client_start(c) == FASTP2P_OK);
+    uint16_t port = fastp2p_client_public_port(c);
+    assert(port >= 1024 && port <= 9999);
+    fastp2p_client *other = NULL;
+    assert(fastp2p_client_create(&cfg, &other) == FASTP2P_OK);
+    assert(fastp2p_client_start(other) == FASTP2P_OK);
+    assert(fastp2p_client_public_port(other) != port);
+    fastp2p_client_destroy(other);
+    assert(fastp2p_client_stop(c) == FASTP2P_OK && fastp2p_client_public_port(c) == 0);
+    assert(fastp2p_client_start(c) == FASTP2P_OK && fastp2p_client_public_port(c) == port);
+    fastp2p_client_destroy(c);
+    cfg.on_event = stop_from_callback;
     /* Prime TLS process caches before checking repeated lifecycle FD ownership. */
     for (int i = 0; i < 20; ++i) {
         assert(fastp2p_client_create(&cfg, &c) == FASTP2P_OK);

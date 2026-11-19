@@ -54,6 +54,12 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 
 高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则保存在网关数据库，节点重连后恢复。
 
+### TCP 业务端口
+
+客户端在 `1024–9999` 中按设备身份选择可用的 TCP 端口，IPv4 和 IPv6 使用同一端口。已安装的客户端首次上线后将它保存为 `network.PublicIPPort`。如需指定端口，可以在配置中设置 `PublicIPPort`，也可以用 `--publicipport PORT` 启动。
+
+在网关「设备详情」查看业务端口，在该设备的防火墙放行对应的 TCP 入站端口。若需要从公网 IPv4 访问位于路由器后的设备，可在路由器上把相同的公网 TCP 端口转发到设备的业务端口。双方都支持该功能时会先尝试业务端口直连，超时后继续打洞。
+
 设置 `FASTP2P_FORCE_RELAY=1` 可跳过打洞直接请求中继，用于验证中继链路；它只影响带该变量启动的进程，不写入配置。
 
 ## 构建与 SDK

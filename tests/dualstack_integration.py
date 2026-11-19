@@ -156,7 +156,7 @@ try:
         def client(name, host, apps=(), public_port=0):
             directory = runtime / name
             directory.mkdir(mode=0o700)
-            cfg = {'network': {'Node': name, 'Token': install_token, 'ServerHost': host,
+            cfg = {'product': 'fastp2p', 'network': {'Node': name, 'Token': install_token, 'ServerHost': host,
                                'ServerPort': 27183, 'ShareBandwidth': 0},
                    'CACertFile': str(certs / 'ca.crt'), 'LogLevel': 0, 'apps': list(apps)}
             if public_port:
@@ -189,13 +189,13 @@ try:
         results['per_family_nat_levels_reported_for_ipv6'] = True
 
         # --- forwarding across the IPv6 tunnel ------------------------------
-        def rule(device, name, port, peer):
+        def rule(device, name, port, peer, punch_priority=3):
             # A successful create answers 200 with an empty body, so the stored
             # rule is what proves the call landed.
             api('/api/v1/device/%s/app' % device,
                 {'appName': name, 'protocol': 'tcp', 'srcPort': port,
                  'peerNode': peer, 'dstHost': '127.0.0.1',
-                 'dstPort': echo_port, 'punchPriority': 4})
+                 'dstPort': echo_port, 'punchPriority': punch_priority})
             stored = api('/api/v1/device/%s/apps' % device).get('Apps') or []
             assert any(int(a.get('srcPort') or 0) == port for a in stored), \
                 'the rule for %s was not stored' % device
@@ -204,19 +204,31 @@ try:
         rule('dual-source-v6', 'v6-tunnel', rule_port, 'dual-target-v6')
         wait(lambda: tcp_roundtrip(rule_port), timeout=90, what='data through a v6 tunnel')
         text = (logs / 'dual-source-v6.log').read_text(errors='replace')
-        assert 'tunnel connected' in text, 'no tunnel was established for the IPv6 pair'
+        assert 'TCP peer listener connected' in text, 'IPv6 did not use the shared TCP listener'
+        peer_port = node_record('dual-target-v6')['publicIPPort']
+        assert 1024 <= peer_port <= 9999
+        profile = runtime / 'dual-target-v6' / 'config.json'
+        assert json.loads(profile.read_text())['network']['PublicIPPort'] == peer_port
         results['tunnel_and_forwarding_over_ipv6'] = True
 
         # --- the same gateway still serves IPv4 -----------------------------
-        client('dual-target-v4', '127.0.0.1')
+        client('dual-target-v4', '127.0.0.1', public_port=8234)
         client('dual-source-v4', '127.0.0.1')
         wait(lambda: (node_record('dual-source-v4') or {}).get('isActive') and
                      (node_record('dual-target-v4') or {}).get('isActive'),
              what='both IPv4 clients to register')
         v4_port = 26501
-        rule('dual-source-v4', 'v4-tunnel', v4_port, 'dual-target-v4')
-        wait(lambda: tcp_roundtrip(v4_port), timeout=90, what='data through a v4 tunnel')
-        results['ipv4_path_unchanged'] = True
+        assert node_record('dual-target-v4')['publicIPPort'] == 8234
+        blocked_port = ['OUTPUT', '-p', 'tcp', '--dport', '8234', '-j', 'DROP']
+        subprocess.run(['iptables', '-A', *blocked_port], check=True)
+        try:
+            rule('dual-source-v4', 'v4-tunnel', v4_port, 'dual-target-v4')
+            wait(lambda: tcp_roundtrip(v4_port), timeout=90, what='TCP punch after the peer listener times out')
+            text = (logs / 'dual-source-v4.log').read_text(errors='replace')
+            assert 'TCP punch connect attempt' in text and 'TCP peer listener connected' not in text
+        finally:
+            subprocess.run(['iptables', '-D', *blocked_port], check=True)
+        results['blocked_tcp_peer_listener_falls_back_to_punch'] = True
 
         # A v4-only client must still report exactly the historical fields, with
         # no IPv6 capability invented for it.
@@ -229,7 +241,7 @@ try:
         # dual-source-v4 has no IPv6 at all; asking it to reach the v6 node has
         # to fail over instead of stalling. Any outcome other than a hang is
         # acceptable, so the assertion is that both clients stay alive.
-        rule('dual-source-v4', 'mixed-family', 26502, 'dual-target-v6')
+        rule('dual-source-v4', 'mixed-family', 26502, 'dual-target-v6', punch_priority=4)
         time.sleep(12)
         assert all(p.poll() is None for p in processes), 'a mixed-family pair crashed a client'
         results['mixed_family_pair_degrades_without_hanging'] = True

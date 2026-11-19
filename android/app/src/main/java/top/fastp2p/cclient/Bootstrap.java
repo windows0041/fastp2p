@@ -58,18 +58,21 @@ final class Bootstrap {
             if (!preferences.edit().putString("deviceID", identity).commit()) throw new IllegalStateException();
         }
         String ca = pem.isEmpty() ? TrustStore.resolve(context, "") : "";
+        JSONObject root = preferences.contains("enrollment") ? new JSONObject(SecretStore.config(context)) : new JSONObject();
         JSONObject network = new JSONObject().put("AutoNode", true).put("DeviceID", identity)
                 .put("ServerHost", host).put("ServerPort", port).put("Token", 0);
-        JSONObject root = preferences.contains("enrollment") ? new JSONObject(SecretStore.config(context)) : new JSONObject();
+        JSONObject previousNetwork = root.optJSONObject("network");
+        if (previousNetwork != null && previousNetwork.has("PublicIPPort"))
+            network.put("PublicIPPort", previousNetwork.get("PublicIPPort"));
         root.put("product", "fastp2p").put("network", network);
         root.remove("CACertFile");
         if (pem.isEmpty()) root.remove("CACertBuiltin");
         else root.put("CACertBuiltin", digest(pem));
         return new Bootstrap(root.toString(), key, ca, fingerprint);
     }
-    void commit(Context context) throws Exception {
+    void commit(Context context, String verifiedConfig) throws Exception {
         SecretStore.saveToken(context, token);
-        SecretStore.saveConfig(context, config);
+        SecretStore.saveConfig(context, verifiedConfig);
         if (!SecretStore.preferences(context).edit().putString("ca", ca)
                 .putString("enrollment", fingerprint).putString("gatewayIdentity", fingerprint).putBoolean("enabled", true).commit())
             throw new IllegalStateException("无法保存接入配置");

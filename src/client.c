@@ -30,6 +30,9 @@
 #define TCP_PREDICT_PORTS 4
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
+#define PEER_PORT_MIN 1024u
+#define PEER_PORT_COUNT (9999u - PEER_PORT_MIN + 1u)
+#define TCP_DIRECT_WAIT (1500 * MS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
 #define NAT_FILTER_MAX_AGE (1200 * NS)
@@ -79,6 +82,8 @@ enum tunnel_state {
     T_REPLY,
     T_TIME,
     T_TCP_CONNECT,
+    T_TCP_DIRECT_CONNECT,
+    T_TCP_DIRECT_ACK,
     T_HANDSHAKE,
     T_ACTIVE,
     T_PUNCH,
@@ -148,6 +153,7 @@ typedef struct {
 typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
+    uint16_t tcp_direct_port;
     unsigned tcp_attempts;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
@@ -306,12 +312,8 @@ struct fastp2p_client {
     /* Curl writes the detailed TLS reason here; the short error code alone
      * cannot say whether the handshake was refused, reset, or rejected. */
     char curl_error[CURL_ERROR_SIZE];
-    /* The direct-punch listener, one per family: an IPv6 peer connects our v6
-     * listener, an IPv4 peer the v4 one. A v4-only run opens only the v4
-     * listener, as before. public_port stays the configured hint; the bound
-     * ports are recorded per family because they can differ. */
+    /* The shared TCP peer listener uses public_port on each enabled family. */
     op_socket listener[OP_FAM_COUNT];
-    uint16_t listener_port[OP_FAM_COUNT];
     /* Public observations, one per family, in canonical text. Index 0 is what
      * the old `ip`/`local_ip` fields held; an unset entry is an empty string,
      * never a stale 0.0.0.0 that a later bind would trust. */
@@ -604,6 +606,7 @@ static int resolve_any(const char *host, uint16_t port, op_addr *out) {
  * IPv4 any address, a v6 literal the IPv6 one, and an empty one keeps the
  * historical IPv4 any-address default, so behaviour is unchanged unless the
  * caller actually hands over an IPv6 text. */
+enum { BIND_DEFAULT, BIND_REUSE_PORT, BIND_PEER_LISTENER };
 static op_socket socket_bound_addr(int udp, const op_addr *a, uint16_t port, int reuse) {
     op_addr bind_to;
     memset(&bind_to, 0, sizeof(bind_to));
@@ -623,12 +626,23 @@ static op_socket socket_bound_addr(int udp, const op_addr *a, uint16_t port, int
      * Linux default (bindv6only=0) would make the v6 socket fail the v4 bind. */
     if (op_addr_family(&bind_to) == AF_INET6)
         op_setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
-    if (reuse && op_reuse_socket(fd)) {
+    /* The peer listener must have this port to itself. On POSIX, REUSEADDR
+     * alone still allows restart when previous connections are in TIME_WAIT. */
+#ifdef _WIN32
+    int listener_option = SO_EXCLUSIVEADDRUSE;
+#else
+    int listener_option = SO_REUSEADDR;
+#endif
+    if ((reuse == BIND_REUSE_PORT && op_reuse_socket(fd)) ||
+        (reuse == BIND_PEER_LISTENER &&
+         op_setsockopt(fd, SOL_SOCKET, listener_option, &one, sizeof(one)))) {
         op_close(fd);
         return -1;
     }
     if (op_bind(fd, &bind_to.u.sa, bind_to.len)) {
+        int error = errno;
         op_close(fd);
+        errno = error;
         return -1;
     }
     if (!udp) {
@@ -647,6 +661,39 @@ static op_socket socket_bound(int udp, const char *ip, uint16_t port, int reuse)
 static uint16_t socket_port(op_socket fd) {
     op_addr a;
     return op_addr_socketname(fd, &a) ? 0 : op_addr_port(&a);
+}
+static int bind_peer_listeners(fastp2p_client *c, uint16_t port) {
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        if (!family_wanted(c, family))
+            continue;
+        c->listener[family] = socket_bound(0, family == OP_FAM_V4 ? NULL : "::",
+                                           port, BIND_PEER_LISTENER);
+        if (c->listener[family] < 0 || op_listen(c->listener[family], 32)) {
+            int error = errno;
+            for (int i = 0; i < OP_FAM_COUNT; ++i) {
+                if (c->listener[i] >= 0)
+                    op_close(c->listener[i]);
+                c->listener[i] = -1;
+            }
+            return error;
+        }
+    }
+    c->public_port = port;
+    return 0;
+}
+
+static int start_peer_listeners(fastp2p_client *c) {
+    if (c->public_port)
+        return bind_peer_listeners(c, c->public_port);
+    const char *identity = c->device_id[0] ? c->device_id : c->node;
+    unsigned first = (unsigned)(op_node_id(identity) % PEER_PORT_COUNT);
+    for (unsigned offset = 0; offset < PEER_PORT_COUNT; ++offset) {
+        uint16_t port = (uint16_t)(PEER_PORT_MIN + (first + offset) % PEER_PORT_COUNT);
+        int error = bind_peer_listeners(c, port);
+        if (error != EADDRINUSE && error != EACCES)
+            return error;
+    }
+    return EADDRINUSE;
 }
 static int socket_family(op_socket fd) {
     op_addr a;
@@ -1494,7 +1541,7 @@ static void probe_complete(fastp2p_client *c, int index) {
      * create the listener lazily, only after a dial failed, so for a short window
      * the published endpoint - exactly what a LAN peer dials - had nothing behind
      * it, and the two ends ended up chasing different ports. */
-    if (t->transport == FASTP2P_TRANSPORT_TCP && tcp_punch_listen(c, index))
+    if (!strcmp(t->mode, "tcppunch") && tcp_punch_listen(c, index))
         return;
     json_object *j = json_object_new_object();
     op_js(j, "from", c->node);
@@ -1544,6 +1591,10 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_ju(j, "id", t->id);
     if (t->initiator) {
         op_js(j, "linkMode", t->mode);
+        /* Peers that understand the shared listener advertise its port in
+         * their reply. Other peers proceed with the existing punch. */
+        if (t->tcp_punch_immediate && c->public_port)
+            op_ju(j, "tcpDirect", 1);
         op_ju(j, "isServer", 1);
         op_ju(j, "lan", t->lan ? 1 : 0);
         op_js(j, "underlayProtocol", t->transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp");
@@ -1554,6 +1605,8 @@ static void probe_complete(fastp2p_client *c, int index) {
         uint64_t ts = (uint64_t)((int64_t)wall() - c->clock_delta) + 3 * NS;
         op_js(j, "to", t->peer);
         op_ju(j, "punchts", ts);
+        if (t->tcp_direct_port)
+            op_ju(j, "tcpDirectPort", t->tcp_direct_port);
         int family = t->family >= 0 ? t->family : OP_FAM_V4;
         /* Our mapping moves with every destination we contact, so tell the peer
          * where the next one is likely to land and let it spray that window. */
@@ -1564,9 +1617,11 @@ static void probe_complete(fastp2p_client *c, int index) {
             op_ju(j, "symUp", c->nat[family].type == NAT_EASY_SYM_INC ? 1 : 0);
         }
         push(c, t->peer, 2, j);
-        /* Peers that understand immediate TCP punching start as soon as they
-         * have the other's mapping. Keep the timestamp for older peers. */
-        t->at = mono() + (t->tcp_punch_immediate ? 0 : 3 * NS);
+        /* Give the initiator a short window to dial the shared listener.
+         * Immediate punch resumes after that window, or starts right away
+         * when the peer did not request a direct attempt. */
+        uint64_t delay = t->tcp_direct_port ? TCP_DIRECT_WAIT : t->tcp_punch_immediate ? 0 : 3 * NS;
+        t->at = mono() + delay;
         t->state = T_TIME;
         t->deadline = t->at + 10 * NS;
         if (!strcmp(t->mode, "tcp4") || !strcmp(t->mode, "intranet") || !strcmp(t->mode, "udp4"))
@@ -1785,6 +1840,23 @@ static void start_underlay(fastp2p_client *c, int index) {
          * merely because the successful socket was accepted instead of dialed. */
         uint64_t now = mono();
         t->deadline = now + 15 * NS;
+        uint16_t direct_port = t->tcp_direct_port;
+        t->tcp_direct_port = 0;
+        if (t->initiator && direct_port) {
+            op_addr endpoint = t->peer_addr;
+            op_addr_set_port(&endpoint, direct_port);
+            int family = op_family_index(op_addr_family(&endpoint));
+            t->fd = socket_bound(0, source_text(c, family), 0, BIND_DEFAULT);
+            if (t->fd >= 0) {
+                if (!op_connect(t->fd, &endpoint.u.sa, endpoint.len) || errno == EINPROGRESS) {
+                    t->state = T_TCP_DIRECT_CONNECT;
+                    t->tcp_attempt_deadline = now + TCP_DIRECT_WAIT;
+                    return;
+                }
+                op_close(t->fd);
+                t->fd = -1;
+            }
+        }
         t->state = T_TCP_CONNECT;
         if (t->family == OP_FAM_V4) {
             if (t->tcp_mapping == FP_TCP_MAP_STABLE && tcp_mapping_moves(t->peer_tcp_mapping))
@@ -2701,6 +2773,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 strcpy(t->mode, mode);
                 t->tcp_v2 = !strcmp(mode, "tcppunch") && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
+                if (t->tcp_punch_immediate && op_integer(j, "tcpDirect") == 1)
+                    t->tcp_direct_port = c->public_port;
                 learn_tcp_mapping(t, j);
                 if (v4_ok)
                     tunnel_learn_peer(t, peer_text, port);
@@ -2757,6 +2831,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     tunnel_learn_peer(t, peer_text6, port6);
                 t->tcp_v2 = t->tcp_v2 && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
+                uint64_t direct_port = op_integer(j, "tcpDirectPort");
+                if (t->tcp_punch_immediate && direct_port <= UINT16_MAX)
+                    t->tcp_direct_port = (uint16_t)direct_port;
                 learn_tcp_mapping(t, j);
                 int64_t delay = 0;
                 if (!t->tcp_punch_immediate) {
@@ -3376,6 +3453,45 @@ static void read_alternate(fastp2p_client *c, int ti) {
     }
     free(body);
 }
+static void tick_tcp_direct(fastp2p_client *c, int ti, uint64_t now) {
+    tunnel *t = &c->tunnels[ti];
+    if (now < t->tcp_attempt_deadline) {
+        if (t->state == T_TCP_DIRECT_CONNECT) {
+            int ready = connect_ready(t->fd);
+            if (!ready)
+                return;
+            if (ready > 0) {
+                uint8_t id[8];
+                op_put64(id, t->id);
+                if (!tframe(t, 2, id, sizeof(id)))
+                    t->state = T_TCP_DIRECT_ACK;
+            }
+        }
+        if (t->state == T_TCP_DIRECT_ACK && !flush(t->fd, &t->tx) &&
+            !read_socket(t->fd, &t->rx, 4096)) {
+            uint16_t main, sub;
+            uint8_t *body = NULL;
+            size_t length;
+            int frame = op_frame_take(&t->rx, &main, &sub, &body, &length);
+            if (!frame)
+                return;
+            int acknowledged = frame > 0 && main == 4 && sub == 3 && length == 8 &&
+                               op_u64(body) == t->id;
+            free(body);
+            if (acknowledged) {
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP peer listener connected");
+                tunnel_active(c, ti);
+                return;
+            }
+        }
+    }
+    op_close(t->fd);
+    t->fd = -1;
+    op_buffer_clear(&t->rx);
+    op_buffer_clear(&t->tx);
+    start_underlay(c, ti);
+}
+
 static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     if (!t->state)
@@ -3433,6 +3549,10 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             t->punch_started = now;
         } else
             start_underlay(c, ti);
+    }
+    if (t->state == T_TCP_DIRECT_CONNECT || t->state == T_TCP_DIRECT_ACK) {
+        tick_tcp_direct(c, ti, now);
+        return;
     }
     if (t->state == T_PUNCH) {
         op_addr peer = t->peer_addr;
@@ -3652,15 +3772,25 @@ static void tick_accept(fastp2p_client *c, uint64_t now) {
             if (ti >= 0) {
                 tunnel *t = &c->tunnels[ti];
                 op_addr expected;
-                if (t->state == T_DIRECT && t->server && !op_addr_from_text(&expected, t->ip, 0) &&
+                int family = op_family_index(op_addr_family(&p->peer));
+                int waiting = t->state == T_TIME && t->tcp_direct_port && family >= 0 &&
+                              t->peer_ready[family];
+                const char *wanted = waiting ? t->peer_text[family] : t->ip;
+                if ((waiting || t->state == T_DIRECT) && t->server &&
+                    !op_addr_from_text(&expected, wanted, 0) &&
                     op_addr_equal(&expected, &p->peer)) {
                     t->fd = p->fd;
                     p->fd = -1;
-                    tframe(t, 3, body, len);
-                    tunnel_active(c, ti);
-                    if (op_buffer_size(&p->rx))
-                        op_buffer_add(&t->rx, p->rx.data + p->rx.offset, op_buffer_size(&p->rx),
-                                      OP_QUEUE_LIMIT);
+                    if (tframe(t, 3, body, len))
+                        close_tunnel(c, ti, "TCP handshake acknowledgement could not be queued");
+                    else {
+                        if (waiting)
+                            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP peer listener accepted connection");
+                        tunnel_active(c, ti);
+                        if (op_buffer_size(&p->rx))
+                            op_buffer_add(&t->rx, p->rx.data + p->rx.offset, op_buffer_size(&p->rx),
+                                          OP_QUEUE_LIMIT);
+                    }
                 }
             }
             free(body);
@@ -3862,7 +3992,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             start_punch(c, ti);
                         }
                     } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
-                        (hard_self && hard_peer && !can_sample_tcp)) {
+                        (hard_self && hard_peer && !can_sample_tcp &&
+                         (a->transport != FASTP2P_TRANSPORT_TCP || a->attempts > 0))) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();
@@ -4869,7 +5000,6 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
     /* fds start closed: calloc leaves 0, which is a valid descriptor. */
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         c->listener[family] = -1;
-        c->listener_port[family] = 0;
         c->nat[family].fd = c->nat[family].fd2 = -1;
         c->nat[family].phase = 0;
     }
@@ -5035,25 +5165,6 @@ int fastp2p_client_start(fastp2p_client *c) {
                  (c->families_wanted & FAM_V6) ? "+IPv6" : "");
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
-    for (int family = 0; family < OP_FAM_COUNT; ++family) {
-        if (!family_wanted(c, family))
-            continue;
-        op_socket fd =
-            socket_bound(0, family == OP_FAM_V4 ? NULL : "::", c->public_port, 1);
-        if (fd < 0 || op_listen(fd, 32)) {
-            if (fd >= 0)
-                op_close(fd);
-            for (int other = 0; other < OP_FAM_COUNT; ++other)
-                if (c->listener[other] >= 0) {
-                    op_close(c->listener[other]);
-                    c->listener[other] = -1;
-                }
-            return FASTP2P_EIO;
-        }
-        c->listener[family] = fd;
-        c->listener_port[family] = socket_port(fd);
-    }
-    c->public_port = socket_port(c->listener[primary_family(c)]);
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && c->apps[i].fd < 0) {
             app *a = &c->apps[i];
@@ -5063,6 +5174,22 @@ int fastp2p_client_start(fastp2p_client *c) {
                 return FASTP2P_EIO;
             }
         }
+    int listener_error = start_peer_listeners(c);
+    if (listener_error) {
+        char message[160];
+        if (c->public_port)
+            snprintf(message, sizeof(message), "Cannot listen on configured TCP peer port %u: %s",
+                     (unsigned)c->public_port, strerror(listener_error));
+        else
+            snprintf(message, sizeof(message), "Cannot listen on a TCP peer port in 1024–9999: %s",
+                     strerror(listener_error));
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
+        fastp2p_client_stop(c);
+        return FASTP2P_EIO;
+    }
+    char peer_port_message[64];
+    snprintf(peer_port_message, sizeof(peer_port_message), "TCP peer listener port: %u", (unsigned)c->public_port);
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, peer_port_message);
     c->multi = curl_multi_init();
     if (!c->multi) {
         fastp2p_client_stop(c);
@@ -5237,7 +5364,6 @@ int fastp2p_client_stop(fastp2p_client *c) {
         if (c->listener[family] >= 0)
             op_close(c->listener[family]);
         c->listener[family] = -1;
-        c->listener_port[family] = 0;
         nat_discovery_close(&c->nat[family]);
         c->nat[family].phase = 0;
     }
@@ -5266,6 +5392,9 @@ void fastp2p_client_destroy(fastp2p_client *c) {
 }
 fastp2p_state fastp2p_client_state(const fastp2p_client *c) {
     return c ? c->state : FASTP2P_STOPPED;
+}
+uint16_t fastp2p_client_public_port(const fastp2p_client *c) {
+    return c && c->running ? c->public_port : 0;
 }
 const char *fastp2p_client_last_error(const fastp2p_client *c) {
     return c ? c->error : "invalid client";

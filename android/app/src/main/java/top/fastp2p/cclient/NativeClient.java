@@ -6,6 +6,7 @@ final class NativeClient {
     private NativeClient() {}
     static native long create(byte[] jsonUtf8, String decimalToken, String caPath, Object listener);
     static native int start(long handle);
+    static native int publicPort(long handle);
     static native int step(long handle);
     static native void destroy(long handle);
     static native String version();

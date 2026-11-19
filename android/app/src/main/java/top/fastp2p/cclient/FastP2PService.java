@@ -93,15 +93,21 @@ public final class FastP2PService extends Service {
                 handle = NativeClient.create(nativeConfig.toString().getBytes(StandardCharsets.UTF_8), token, ca, this);
                 if (handle == 0) throw new IllegalArgumentException("接入配置无效");
                 if (NativeClient.start(handle) != 0) throw new IllegalStateException();
+                JSONObject network = nativeConfig.getJSONObject("network");
+                int portToSave = network.optInt("PublicIPPort") == 0 ? NativeClient.publicPort(handle) : 0;
                 long deadline = SystemClock.elapsedRealtime() + 30000;
                 while (!stopping.get()) {
                     int step = NativeClient.step(handle);
                     restart = step == NativeClient.STEP_RESTART_REQUESTED;
                     if (step != 0 && !restart) throw new IllegalStateException();
-                    if (pending != null) {
-                        if (state == 2) { pending.commit(this); pending = null; }
-                        else if (SystemClock.elapsedRealtime() > deadline) throw new IllegalArgumentException("无法校验网关证书或安装 Token");
-                    }
+                    if (state == 2 && (pending != null || portToSave != 0)) {
+                        if (portToSave != 0) network.put("PublicIPPort", portToSave);
+                        nativeConfig.remove("UpdateDir");
+                        if (pending != null) { pending.commit(this, nativeConfig.toString()); pending = null; }
+                        else SecretStore.saveConfig(this, nativeConfig.toString());
+                        portToSave = 0;
+                    } else if (pending != null && SystemClock.elapsedRealtime() > deadline)
+                        throw new IllegalArgumentException("无法校验网关证书或安装 Token");
                     if (restart) break;
                 }
                 NativeClient.destroy(handle);

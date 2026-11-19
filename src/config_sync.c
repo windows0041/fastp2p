@@ -117,11 +117,30 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
      * until the installer migrates them to the writable config directory. */
     return client&&fastp2p_profile_writable(path)?fastp2p_client_set_config_handler(client,receive,NULL):0;
 }
-void fp_config_sync_online(void) {
+void fp_config_sync_online(uint16_t public_port) {
     sync_state.online=1;
-    if(!sync_state.pending||!sync_state.active||sync_state.reload)return;
-    json_object *meta=metadata(sync_state.active);
-    json_object_object_add(meta,"pending",json_object_new_boolean(0));
+    if(!sync_state.active||sync_state.reload)return;
+    json_object *network=get(sync_state.active,"network");
+    /* Installed clients keep their first successfully reported port for the
+     * firewall rule. Re-read before adding it so an operator edit wins. */
+    json_object *current=NULL;
+    if(public_port && !integer(network,"PublicIPPort") &&
+       !strcmp(string(sync_state.active,"product"),"fastp2p") &&
+       fastp2p_profile_writable(sync_state.path)) {
+        current=fastp2p_profile_read(sync_state.path);
+        if(current && json_object_equal(current,sync_state.active) &&
+           json_object_is_type(network,json_type_object) &&
+           json_object_is_type(get(current,"network"),json_type_object)) {
+            json_object_object_add(get(current,"network"),"PublicIPPort",json_object_new_int(public_port));
+            if(save(sync_state.path,current))
+                fputs("Cannot save the selected TCP peer port.\n",stderr);
+            else
+                json_object_object_add(network,"PublicIPPort",json_object_new_int(public_port));
+        }
+        if(current)json_object_put(current);
+    }
+    if(!sync_state.pending)return;
+    json_object_object_add(metadata(sync_state.active),"pending",json_object_new_boolean(0));
     if(save(sync_state.path,sync_state.active))fputs("Cannot save configuration completion marker.\n",stderr);
     sync_state.pending=0;
     if(sync_state.rollback)json_object_put(sync_state.rollback);
