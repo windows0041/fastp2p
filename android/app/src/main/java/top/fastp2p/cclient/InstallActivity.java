@@ -3,14 +3,16 @@ package top.fastp2p.cclient;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.widget.Toast;
 
-/** Transient enrollment entry point. No configuration screen or graphical UI. */
+/** Transient launcher, enrollment, and manual update entry point. */
 public final class InstallActivity extends Activity {
+    private static final String ROOT_UPDATE_PROMPT_SHOWN = "rootUpdatePromptShown";
     private String token;
     private String installPath;
     private boolean started;
@@ -37,7 +39,9 @@ public final class InstallActivity extends Activity {
             return;
         }
         if (token == null && !SecretStore.preferences(this).contains("enrollment")) {
-            Toast.makeText(this, "请使用网关控制台提供的安装链接接入", Toast.LENGTH_LONG).show(); finish(); return;
+            Toast.makeText(this, "请使用网关控制台提供的安装链接接入", Toast.LENGTH_LONG).show();
+            finishEntry();
+            return;
         }
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
@@ -57,6 +61,19 @@ public final class InstallActivity extends Activity {
         intent.putExtra("migrate", trusted && getIntent().getBooleanExtra("migrate", false));
         SecretStore.preferences(this).edit().putBoolean("enabled", true).apply();
         startForegroundService(intent);
+        finishEntry();
+    }
+    private void finishEntry() {
+        Intent launch = getIntent();
+        if (Intent.ACTION_MAIN.equals(launch.getAction()) && launch.hasCategory(Intent.CATEGORY_LAUNCHER)) {
+            SharedPreferences prefs = SecretStore.preferences(this);
+            if (!prefs.getBoolean(ROOT_UPDATE_PROMPT_SHOWN, false)) {
+                prefs.edit().putBoolean(ROOT_UPDATE_PROMPT_SHOWN, true).apply();
+                if (!RootUpdateInstaller.enabled(this)) {
+                    startActivity(new Intent(this, RootUpdateActivity.class));
+                }
+            }
+        }
         finish();
     }
 }

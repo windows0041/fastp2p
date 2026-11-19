@@ -35,7 +35,9 @@ Windows 客户端 2.0.3 修复了服务报告停止后 EXE 仍短暂被占用、
 | Windows | 下载校验后，新版本从临时目录启动一个助手：等旧服务停止、替换 `C:\Program Files\fastp2p\fastp2p.exe`、再启动服务 | 否 |
 | Linux | 新安装器的服务在 `/usr/local/fastp2p/bin` 中替换程序并重新执行，保活仍由 systemd/procd/OpenRC 管理 | 否 |
 | macOS | 同 Linux（launchd 不受影响） | 否 |
-| Android | 下载校验后弹出通知，点按通知进入前台界面交给系统安装器 | **是**，手机上必须点通知并确认安装 |
+| Android | 已启用 Root 静默更新时，自动安装同包名、同签名的更高版本。其他情况通过通知进入系统安装器 | Root 静默更新无需当次确认。系统安装器需要点通知并确认安装 |
+
+首次手动打开 Android 客户端时，可在「Root 静默更新」对话框中点「申请 Root」。也可从 FastP2P 通知中的「Root 更新」进入。使用 Magisk 31.1 时，先在「超级用户」页面点「＋」给 FastP2P 授权，再回到 FastP2P 开启静默更新。
 
 ## 安全模型
 
