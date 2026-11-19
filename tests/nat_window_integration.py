@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Punch with a peer that reports a predictable symmetric NAT.
+"""Punch with a peer that reports a symmetric NAT.
 
-The NAT window is only advertised when a peer classifies itself as EasySym, so
-without a matching NAT the path is never exercised.  The FASTP2P_NAT_TYPE
-diagnostic switch stands in for one: the responder is made to claim an
-incrementing symmetric mapping, which makes the initiator record a window and
-spray it during the punch.
+A symmetric peer cannot be reached at the port it publishes, so it also
+advertises a window around that port and the other side sprays it during the
+punch.  Without a matching NAT the path is never exercised, so the
+FASTP2P_NAT_TYPE diagnostic switch stands in for one: the responder claims an
+incrementing (3), a hard (2) or a cone (1, the control) mapping.
 
-The test asserts the session still completes and carries traffic, which is the
-regression this guards against: the extra fields and the burst must not disturb
-a punch that would otherwise succeed.
+The window is only advertised over the QUIC underlay, so `--transport quic` is
+the run that exercises the announcement; the TCP run guards the opposite
+property - the extra fields must not disturb a punch that uses port prediction
+instead.
+
+The test asserts the session still completes and carries traffic: the burst must
+not break a punch that would otherwise succeed.
 """
 import argparse
 import json
@@ -68,6 +72,8 @@ def main():
     parser.add_argument('--logs', required=True)
     parser.add_argument('--nat-type', default='3',
                         help='NAT type the responder claims; 1 is the control run')
+    parser.add_argument('--transport', default='tcp', choices=('tcp', 'quic'),
+                        help='underlay to punch over; the window is QUIC-only')
     args = parser.parse_args()
 
     client = str(Path(args.client).resolve())
@@ -130,12 +136,12 @@ def main():
         node('natwindow-target',
              [{'AppName': 'serve', 'Protocol': 'tcp', 'SrcPort': TARGET_PORT,
                'PeerNode': 'natwindow-source', 'DstHost': '127.0.0.1',
-               'DstPort': ECHO_PORT, 'UnderlayProtocol': 'tcp', 'Enabled': 1}],
+               'DstPort': ECHO_PORT, 'UnderlayProtocol': args.transport, 'Enabled': 1}],
              ['env', 'FASTP2P_NAT_TYPE=' + args.nat_type])
         node('natwindow-source',
              [{'AppName': 'fetch', 'Protocol': 'tcp', 'SrcPort': SOURCE_PORT,
                'PeerNode': 'natwindow-target', 'DstHost': '127.0.0.1',
-               'DstPort': ECHO_PORT, 'UnderlayProtocol': 'tcp', 'Enabled': 1}])
+               'DstPort': ECHO_PORT, 'UnderlayProtocol': args.transport, 'Enabled': 1}])
 
         wait(lambda: 'forward attached to tunnel' in log_text(logs / 'natwindow-source.log'),
              60, what='session attached while the peer advertises a window')
@@ -143,6 +149,7 @@ def main():
         assert roundtrip(SOURCE_PORT, payload, payload), 'echo mismatch over the windowed punch'
         results['session_with_peer_advertising_a_window'] = args.nat_type != '1'
         results['traffic_over_windowed_punch'] = True
+        results['transport'] = args.transport
         results['no_authentication_failures'] = 'authentication failed' not in log_text(
             logs / 'natwindow-source.log')
         results['success'] = True

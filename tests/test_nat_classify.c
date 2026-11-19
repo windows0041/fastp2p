@@ -51,6 +51,11 @@ static void tcp_punch_scheduling(void) {
         op_ju(reply, "coneNatPort", 12345);
         op_ju(reply, "id", 123);
         op_ju(reply, "tcpPunchV2", 1);
+        /* A window on the reply must be recorded by the same code path the
+         * request uses, so the opener can be sprayed as well as the answerer. */
+        op_ju(reply, "symBase", 12345);
+        op_ju(reply, "symCount", SYM_WINDOW_MAX);
+        op_ju(reply, "symUp", 1);
         if (immediate)
             op_ju(reply, "tcpPunchImmediate", 1); /* no shared clock needed */
         else
@@ -65,6 +70,7 @@ static void tcp_punch_scheduling(void) {
         uint64_t before = mono();
         control_message(c, 3, 2, packet, length + 16);
         assert(t->state == T_TIME && t->tcp_v2 && t->tcp_punch_immediate == immediate);
+        assert(t->sym_base == 12345 && t->sym_count == SYM_WINDOW_MAX && t->sym_up && !t->sym_split);
         assert(immediate ? t->at <= mono() : t->at >= before + 2 * NS);
         json_object_put(reply);
         close_tunnel(c, ti, NULL);
@@ -160,6 +166,214 @@ static void lan_punch_public_ipv4(void) {
     free(c);
 }
 
+/* The spray only helps if the datagram is addressed to the port the peer's next
+ * mapping actually landed on, so the burst has to cover exactly the announced
+ * window and nothing else. Consecutive loopback sockets stand in for a peer
+ * whose mapping moves by one port per destination; each one that lies inside the
+ * window must receive a punch datagram, and a port outside it must not. */
+static int drain(op_socket fd) {
+    int seen = 0;
+    uint8_t buffer[1024];
+    while (op_recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0)
+        ++seen;
+    return seen;
+}
+static void sym_spray_ports(void) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        op_socket peer[3] = {-1, -1, -1};
+        uint16_t port[3] = {0, 0, 0};
+        peer[0] = socket_bound(1, "127.0.0.1", 0, 0);
+        if (peer[0] < 0)
+            return;
+        port[0] = socket_port(peer[0]);
+        int complete = port[0] + 2 <= 65535;
+        for (int i = 1; complete && i < 3; ++i) {
+            port[i] = (uint16_t)(port[0] + i);
+            peer[i] = socket_bound(1, "127.0.0.1", port[i], 0);
+            complete = peer[i] >= 0;
+        }
+        if (!complete) {
+            /* The kernel handed out a port whose neighbours are busy. Retry. */
+            for (int i = 0; i < 3; ++i)
+                if (peer[i] >= 0)
+                    op_close(peer[i]);
+            continue;
+        }
+        /* One extra socket just outside the window: it must stay silent. */
+        op_socket outside = port[0] + 3 <= 65535
+                                ? socket_bound(1, "127.0.0.1", (uint16_t)(port[0] + 3), 0)
+                                : -1;
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+
+        /* Centred window: the direction is unknown, so both neighbours are hit. */
+        int ti = new_tunnel(c, "sym-peer", 501, FASTP2P_TRANSPORT_QUIC, 1);
+        assert(ti >= 0);
+        tunnel *t = &c->tunnels[ti];
+        t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+        assert(t->fd >= 0);
+        assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", port[1]));
+        t->remote_port = port[1];
+        t->sym_base = port[1];
+        t->sym_count = 2; /* one port either side */
+        t->sym_split = 1;
+        t->state = T_PUNCH;
+        t->punch_started = t->punch_next = t->sym_spray_at = 0;
+        t->deadline = mono() + 5 * NS;
+        tick_tunnel(c, ti, mono());
+        assert(drain(peer[0]) >= 1);
+        assert(drain(peer[1]) >= 1);
+        assert(drain(peer[2]) >= 1);
+        if (outside >= 0)
+            assert(drain(outside) == 0);
+        close_tunnel(c, ti, NULL);
+
+        /* Directional window: unchanged behaviour, walks up from the mapping. */
+        ti = new_tunnel(c, "easy-peer", 502, FASTP2P_TRANSPORT_QUIC, 1);
+        assert(ti >= 0);
+        t = &c->tunnels[ti];
+        t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+        assert(t->fd >= 0);
+        assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", port[0]));
+        t->remote_port = port[0];
+        t->sym_base = port[0];
+        t->sym_count = 2;
+        t->sym_up = 1;
+        t->sym_split = 0;
+        t->state = T_PUNCH;
+        t->punch_started = t->punch_next = t->sym_spray_at = 0;
+        t->deadline = mono() + 5 * NS;
+        tick_tunnel(c, ti, mono());
+        assert(drain(peer[0]) >= 1); /* the explicit punch target */
+        assert(drain(peer[1]) >= 1 && drain(peer[2]) >= 1);
+        if (outside >= 0)
+            assert(drain(outside) == 0);
+        close_tunnel(c, ti, NULL);
+
+        for (int i = 0; i < 3; ++i)
+            op_close(peer[i]);
+        if (outside >= 0)
+            op_close(outside);
+        free(c);
+        return;
+    }
+}
+/* A symmetric peer is unreachable at the port it published, because the punch
+ * reaches it from a different local port and therefore a different mapping.
+ * What it publishes instead is a window to spray. These checks pin the shape of
+ * that window: directional and narrow when the step is measurable, centred and
+ * wider when it is not, and nothing at all for a mapping that does not move. */
+static void sym_window_wire(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "peer", 77, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    t->mapped_port = 40000;
+    json_object *j = json_object_new_object();
+
+    /* A cone mapping answers at the port it published: no window, no burst. */
+    c->nat[OP_FAM_V4].type = NAT_CONE;
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symBase") && !op_integer(j, "symCount"));
+
+    /* Measurable step: keep the historical directional window unchanged. */
+    c->nat[OP_FAM_V4].type = NAT_EASY_SYM_INC;
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(op_integer(j, "symBase") == 40000);
+    assert(op_integer(j, "symCount") == SYM_WINDOW_MAX);
+    assert(op_integer(j, "symUp") == 1 && !op_integer(j, "symSplit"));
+    c->nat[OP_FAM_V4].type = NAT_EASY_SYM_DEC;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(op_integer(j, "symBase") == 40000 && op_integer(j, "symUp") == 0);
+    assert(op_integer(j, "symCount") == SYM_WINDOW_MAX);
+
+    /* Unpredictable step: the direction is unknown, so both sides are covered
+     * and the wider cap applies. */
+    c->nat[OP_FAM_V4].type = NAT_HARD_SYM;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(op_integer(j, "symBase") == 40000);
+    assert(op_integer(j, "symCount") == SYM_WINDOW_HARD);
+    assert(op_integer(j, "symSplit") == 1);
+
+    /* Unmeasured and LAN/relay punches stay silent: nothing is shifted there. */
+    c->nat[OP_FAM_V4].type = NAT_UNKNOWN;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symCount"));
+    c->nat[OP_FAM_V4].type = NAT_HARD_SYM;
+    t->lan = 1;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symCount"));
+    t->lan = 0;
+    t->relay_wait = 1;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symCount"));
+    t->relay_wait = 0;
+    /* Only the QUIC punch sprays; the TCP punch uses port prediction. */
+    t->transport = FASTP2P_TRANSPORT_TCP;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symCount"));
+    /* With no measured mapping there is no window origin to publish. */
+    t->transport = FASTP2P_TRANSPORT_QUIC;
+    t->mapped_port = 0;
+    json_object_put(j);
+    j = json_object_new_object();
+    announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(!op_integer(j, "symCount"));
+    json_object_put(j);
+    close_tunnel(c, ti, NULL);
+
+    /* Reading a peer's window: capped by the kind it declared, and dropped when
+     * it cannot describe two ports. */
+    fastp2p_client *reader = calloc(1, sizeof(*reader));
+    assert(reader);
+    ti = new_tunnel(reader, "peer", 78, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *r = &reader->tunnels[ti];
+    json_object *easy = json_object_new_object();
+    op_ju(easy, "symBase", 40000);
+    op_ju(easy, "symCount", 5000);
+    learn_sym_window(r, easy);
+    assert(r->sym_base == 40000 && r->sym_count == SYM_WINDOW_MAX && !r->sym_split);
+    json_object_put(easy);
+    json_object *hard = json_object_new_object();
+    op_ju(hard, "symBase", 40000);
+    op_ju(hard, "symCount", 5000);
+    op_ju(hard, "symSplit", 1);
+    op_ju(hard, "symUp", 0);
+    learn_sym_window(r, hard);
+    assert(r->sym_base == 40000 && r->sym_count == SYM_WINDOW_HARD && r->sym_split);
+    json_object_put(hard);
+    r->sym_base = r->sym_count = 0;
+    r->sym_split = 0;
+    json_object *tiny = json_object_new_object();
+    op_ju(tiny, "symBase", 40000);
+    op_ju(tiny, "symCount", 1);
+    learn_sym_window(r, tiny);
+    assert(!r->sym_count && !r->sym_base);
+    json_object_put(tiny);
+    json_object *out_of_range = json_object_new_object();
+    op_ju(out_of_range, "symBase", 70000);
+    op_ju(out_of_range, "symCount", SYM_WINDOW_MAX);
+    learn_sym_window(r, out_of_range);
+    assert(!r->sym_count);
+    json_object_put(out_of_range);
+    close_tunnel(reader, ti, NULL);
+    free(reader);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     tcp_retry();
@@ -268,5 +482,39 @@ int main(void) {
     assert(!nat_is_hard_sym(NAT_EASY_SYM_INC));
     assert(!nat_is_hard_sym(NAT_EASY_SYM_DEC));
     assert(!nat_is_hard_sym(NAT_UNKNOWN));
+
+    /* Which mapping behaviours get a window at all. */
+    assert(sym_window_kind(NAT_CONE) == 0);
+    assert(sym_window_kind(NAT_UNKNOWN) == 0);
+    assert(sym_window_kind(NAT_EASY_SYM_INC) == 1);
+    assert(sym_window_kind(NAT_EASY_SYM_DEC) == 1);
+    assert(sym_window_kind(NAT_HARD_SYM) == 2);
+
+    /* A centred window is capped wider than a directional one, because it has
+     * to cover both sides of the observation. */
+    assert(sym_window_hard_cap(200) == SYM_WINDOW_HARD);
+    assert(sym_window_hard_cap(SYM_WINDOW_HARD + 1) == SYM_WINDOW_HARD);
+    assert(sym_window_hard_cap(0) == 0);
+    assert(sym_window_hard_cap(2) == 2);
+
+    /* The centred window straddles the observation and skips the observed port,
+     * which is punched explicitly. */
+    uint16_t low = 0, high = 0;
+    assert(sym_split_window(40000, SYM_WINDOW_HARD, &low, &high));
+    assert(low == 40000 - SYM_WINDOW_HARD / 2 && high == 40000 + SYM_WINDOW_HARD / 2);
+    assert(sym_split_window(40000, 2, &low, &high) && low == 39999 && high == 40001);
+    /* Edges clamp to the port range instead of wrapping around. */
+    assert(sym_split_window(1, SYM_WINDOW_HARD, &low, &high) && low == 1);
+    assert(high == 1 + SYM_WINDOW_HARD / 2);
+    assert(sym_split_window(65535, SYM_WINDOW_HARD, &low, &high) && high == 65535);
+    assert(low == 65535 - SYM_WINDOW_HARD / 2);
+    assert(sym_split_window(1, 2, &low, &high) && low == 1 && high == 2);
+    assert(sym_split_window(65535, 2, &low, &high) && low == 65534 && high == 65535);
+    /* One port is not a window: the caller drops it instead of half-spraying. */
+    assert(!sym_split_window(40000, 1, &low, &high));
+    assert(!sym_split_window(40000, SYM_WINDOW_HARD, NULL, &high));
+
+    sym_window_wire();
+    sym_spray_ports();
     return 0;
 }
