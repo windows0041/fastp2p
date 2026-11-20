@@ -3,15 +3,23 @@
 #include <string.h>
 #include <openssl/crypto.h>
 
-void op_socks_reply(uint8_t out[10], unsigned status, const uint8_t ip[4], uint16_t port) {
-    memset(out, 0, 10);
+size_t op_socks_reply(uint8_t out[OP_SOCKS_MAX_REPLY], unsigned status, const op_addr *address) {
     out[0] = 5;
     out[1] = (uint8_t)status;
-    out[3] = 1;
-    if (ip)
-        memcpy(out + 4, ip, 4);
-    out[8] = (uint8_t)(port >> 8);
-    out[9] = (uint8_t)port;
+    out[2] = 0;
+    int family = address ? op_addr_family(address) : AF_UNSPEC;
+    size_t length = family == AF_INET6 ? 16 : 4;
+    out[3] = family == AF_INET6 ? 4 : 1;
+    if (family == AF_INET6)
+        memcpy(out + 4, &address->u.in6.sin6_addr, length);
+    else if (family == AF_INET)
+        memcpy(out + 4, &address->u.in.sin_addr, length);
+    else
+        memset(out + 4, 0, length);
+    uint16_t port = address ? op_addr_port(address) : 0;
+    out[4 + length] = (uint8_t)(port >> 8);
+    out[5 + length] = (uint8_t)port;
+    return length + 6;
 }
 int op_socks_address(const uint8_t *p, size_t n, char host[256], uint16_t *port) {
     if (!n)
@@ -22,6 +30,14 @@ int op_socks_address(const uint8_t *p, size_t n, char host[256], uint16_t *port)
         if (n < end + 2)
             return 0;
         snprintf(host, 256, "%u.%u.%u.%u", p[1], p[2], p[3], p[4]);
+    } else if (p[0] == 4) {
+        end = 17;
+        if (n < end + 2)
+            return 0;
+        struct in6_addr address;
+        memcpy(&address, p + 1, sizeof(address));
+        if (!inet_ntop(AF_INET6, &address, host, 256))
+            return -1;
     } else if (p[0] == 3) {
         if (n < 2)
             return 0;
@@ -41,7 +57,7 @@ int op_socks_address(const uint8_t *p, size_t n, char host[256], uint16_t *port)
     return (int)(end + 2);
 }
 int op_socks_step(op_socks *s, const uint8_t *p, size_t n, size_t *used, const char *user,
-                  const char *password, uint8_t out[10], size_t *out_len) {
+                  const char *password, uint8_t out[OP_SOCKS_MAX_REPLY], size_t *out_len) {
     *used = *out_len = 0;
     if (s->state == SOCKS_GREETING) {
         if (n < 2)
@@ -106,8 +122,7 @@ int op_socks_step(op_socks *s, const uint8_t *p, size_t n, size_t *used, const c
                 return 2;
             }
         }
-        op_socks_reply(out, failure, NULL, 0);
-        *out_len = 10;
+        *out_len = op_socks_reply(out, failure, NULL);
         return -1;
     }
     return -1;

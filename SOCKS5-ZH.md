@@ -48,7 +48,7 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.com/
 
 Windows 使用 `fastp2p.exe`、`curl.exe`。浏览器或其他应用配置 SOCKS5 地址 `127.0.0.1:1080`，启用通过代理解析 DNS。`socks5h` 表示把域名传给代理；目标地址始终由出口连接，因此 `127.0.0.1` 指出口节点本机。
 
-`UnderlayProtocol` 为 `tcp` 或 `quic`，省略时为 QUIC。这是 P2P 隧道类型，与代理中的 TCP/UDP 应用独立；UDP ASSOCIATE 也可使用 TCP 打洞隧道。打洞失败时链路自动改走第三节点中继，代理配置不需要改动。入口默认只监听本机回环，`BindIP` 可显式指定其他 IPv4 地址。
+`UnderlayProtocol` 为 `tcp` 或 `quic`，省略时为 QUIC。UDP ASSOCIATE 也可使用 TCP 打洞隧道。打洞失败后链路可以经第三节点中继。入口默认监听 `127.0.0.1`，`BindIP` 可指定 IPv4 或 IPv6 地址，例如 `::1`。
 
 同一配置可同时包含 `apps` 固定转发和 `socks5` 数组；可设置多个不同本地端口，选择不同出口。`Enabled:false` 暂停一条代理规则。
 
@@ -89,15 +89,15 @@ int result = fastp2p_client_add_socks5(client, &proxy, NULL);
 
 ## 行为与限制
 
-- IPv4 监听；目标支持 IPv4 和 ASCII/IDNA 域名的 IPv4 解析。IPv6 地址类型返回 8，BIND 返回 7。
+- 监听和目标地址支持 IPv4、IPv6。ASCII/IDNA 域名由出口解析。BIND 返回 7。
 - 只有出口连接成功并返回对应请求 ID 后，TCP CONNECT 才返回成功。出口 DNS 失败返回 4，连接失败返回 5。多个目标并发连接不会共用成功确认。
-- UDP 每个数据报包含独立目标地址，可在同一关联中访问不同目的地址；响应头包含实际远端 IPv4 和端口。
+- UDP 每个数据报包含独立目标地址，可在同一关联中访问不同目的地址。响应头包含实际远端 IPv4 或 IPv6 地址和端口。
 - UDP 关联由 TCP 控制连接持有，控制连接关闭后释放 UDP socket 和子流；只接受控制连接同源 IP，并校验请求的源端口或固定首个有效 UDP 源端口。
 - 不支持 UDP 分片，非零 FRAG 数据报丢弃；单个 UDP 载荷最多 4096 字节，每个关联最多 32 个目标流，子流空闲 300 秒回收。所有代理和固定转发共享每实例 256 条连接上限及原有队列限制。
 - 握手限时 10 秒，等待 P2P 隧道最多 45 秒，等待出口连接确认最多 15 秒。网关/隧道中断时，已有 TCP 代理连接关闭；客户端自动重连后，应用可新建 SOCKS5 会话。UDP 关联可在隧道恢复后创建新目标流。
-- 出口 DNS 沿用现有同步系统解析器；未增加异步 DNS 线程或 IPv6 数据面。
+- 出口 DNS 使用系统解析器。
 
-实现参考 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929)，上述范围不包含 BIND、IPv6、UDP 分片或 GSSAPI 认证。
+支持的方法和报文格式遵循 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) 和 [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929)。BIND、UDP 分片和 GSSAPI 认证返回协议错误或被丢弃。
 
 ## 验证
 

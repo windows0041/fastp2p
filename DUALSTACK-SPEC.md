@@ -37,7 +37,7 @@
 ## 5. 打洞协商（3/1 连接请求、3/2 应答）
 - 新增 `"fromIP6":"<文本>"`、`"coneNatPort6":<n>`。旧客户端只读 fromIP，不受影响。
 - 新客户端选择规则：`families(self)&families(peer)` 含 bit1 → **先试 v6**（v6 无 NAT 概率高），
-  超时/失败自动回退 v4 同流程；仅含 bit0 → 纯 v4。同 LAN 判定按同族比较。
+  失败后发起方以新会话重新协商，只公布 v4 端点。仅含 bit0 时走纯 v4。同 LAN 判定按同族比较。
 - 隧道内记录所用族 `t->family`，所有 sockaddr 用 storage+len。
 
 ## 6. 中继选择（5/0、5/1）
@@ -59,10 +59,9 @@
 - `bind_ip` 允许 v6 文本；默认仍 `127.0.0.1`。`resolve4`→`resolve_any`。
 - `TUN_OPEN.dstIP` 已是字符串：dstIP 为 v6 文本或域名时，出口用 `resolve_any`。
   出口回 `TUN_OPEN_ACK` 的 `boundIP/remoteIP` 可为 v6 文本；接收端按内容判族。
-  仅当两端 families 均含 v6 时才允许产生 v6 结果（入口侧控制，旧端不受影响）。
+  代理目标的地址族由出口连接决定，独立于两端隧道所用的地址族。
 - 本地 SOCKS5 入口：`socks.c` 支持 ATYP=4（16 字节），回包 22 字节；UDP ASSOCIATE
-  中继帧双长度（v6 ATYP=4）。`test_socks.c` 的 "ATYP=4→拒绝" 断言改为 "ATYP=4→支持"，
-  同步改 SOCKS5-ZH.md 能力声明（新增：需要 2.0.8+ 出口）。
+  的数据报按 ATYP 选用 IPv4 或 IPv6 地址头。入口和出口的配置见 [SOCKS5 代理](SOCKS5-ZH.md)。
 
 ## 9. NAT 等级（natLevel / tcpNatLevel）
 

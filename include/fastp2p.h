@@ -100,7 +100,7 @@ typedef struct {
     const char *name;
     const char *bind_ip; /* NULL = 127.0.0.1 */
     uint16_t local_port;
-    const char *peer_node; /* Exit node must run fastp2p 1.x. */
+    const char *peer_node; /* FastP2P exit node. */
     fastp2p_transport transport;
     const char *username; /* NULL/empty and password empty = no authentication. */
     const char *password; /* If supplied, both strings must be 1..255 bytes. */
@@ -108,9 +108,11 @@ typedef struct {
     int no_relay;           /* Optional; 1 = never fall back to a relay. */
 } fastp2p_socks5;
 
-/* All functions for an instance are called on one owning thread. No worker
- * threads are created. Strings are copied by create/add_forward. Event callbacks
- * may request stop, but must not reenter step, destroy, or change forwards.
+/* Call all functions for an instance from its owning thread. Event callbacks
+ * run on that thread and may request stop, but must not reenter step, destroy,
+ * or change forwards. When network.AutoPortMapping is enabled in JSON, an
+ * internal router mapping worker runs between start and stop. Stop and destroy
+ * wait for that worker. Strings are copied by create/add_forward.
  * struct_size + abi_version permit extending the API without exposing internals. */
 FASTP2P_API int fastp2p_client_create(const fastp2p_config *config, fastp2p_client **out);
 /* Parse the same UTF-8 configuration as the CLI. Override strings may be NULL.
@@ -121,7 +123,8 @@ FASTP2P_API int fastp2p_client_create_json(const char *json_utf8, const char *to
 FASTP2P_API int fastp2p_client_add_forward(fastp2p_client *client, const fastp2p_forward *forward,
                                      uint64_t *id);
 /* RFC 1928 CONNECT / UDP ASSOCIATE, RFC 1929 optional authentication.
- * Targets: IPv4 or DNS names resolved at the exit. BIND/IPv6/UDP fragments rejected.
+ * Targets: IPv4, IPv6 and DNS names resolved at the exit. BIND and UDP fragments
+ * are rejected.
  * Strings copied; listener lifetime matches add_forward. Existing ABI 1 is preserved. */
 FASTP2P_API int fastp2p_client_add_socks5(fastp2p_client *client, const fastp2p_socks5 *proxy, uint64_t *id);
 FASTP2P_API int fastp2p_client_start(fastp2p_client *client);

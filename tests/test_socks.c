@@ -3,7 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 int main(void) {
-    uint8_t out[10];
+    assert(!op_platform_init());
+    uint8_t out[OP_SOCKS_MAX_REPLY];
     size_t used, len;
     op_socks s = {.state = SOCKS_GREETING};
     const uint8_t greeting[] = {5, 2, 0, 2};
@@ -34,10 +35,20 @@ int main(void) {
     uint8_t unsupported[] = {5, 2, 0, 1, 127, 0, 0, 1, 0, 80};
     assert(op_socks_step(&s, unsupported, 10, &used, "", "", out, &len) == -1 && out[1] == 7);
     unsupported[1] = 1;
-    unsupported[3] = 4;
+    unsupported[3] = 5;
     assert(op_socks_step(&s, unsupported, 10, &used, "", "", out, &len) == -1 && out[1] == 8);
-    const uint8_t ip[] = {127, 0, 0, 1};
-    op_socks_reply(out, 0, ip, 1080);
+    op_addr ip;
+    assert(!op_addr_from_text(&ip, "127.0.0.1", 1080));
+    assert(op_socks_reply(out, 0, &ip) == 10);
     assert(!memcmp(out, (uint8_t[]){5, 0, 0, 1, 127, 0, 0, 1, 4, 56}, 10));
+    const uint8_t ipv6[22] = {5, 1, 0, 4, 0x20, 1, 0x0d, 0xb8, [19] = 1, 1, 187};
+    s.state = SOCKS_REQUEST;
+    for (size_t n = 0; n < sizeof(ipv6); ++n)
+        assert(op_socks_step(&s, ipv6, n, &used, "", "", out, &len) == 0);
+    assert(op_socks_step(&s, ipv6, sizeof(ipv6), &used, "", "", out, &len) == 2);
+    assert(used == sizeof(ipv6) && s.port == 443 && !strcmp(s.host, "2001:db8::1"));
+    assert(!op_addr_from_text(&ip, s.host, s.port));
+    assert(op_socks_reply(out, 0, &ip) == sizeof(ipv6));
+    assert(out[0] == 5 && out[1] == 0 && !memcmp(out + 2, ipv6 + 2, sizeof(ipv6) - 2));
     puts("SOCKS5 incremental greeting, authentication, addressing and rejection checks passed");
 }

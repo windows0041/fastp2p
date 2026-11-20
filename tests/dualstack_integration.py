@@ -18,6 +18,7 @@ import secrets
 import socket
 import socketserver
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -97,6 +98,45 @@ class TCPEcho(socketserver.BaseRequestHandler):
             pass
 
 
+class IPv6TCPEchoServer(socketserver.ThreadingTCPServer):
+    address_family = socket.AF_INET6
+
+
+class IPv6UDPEchoServer(socketserver.ThreadingUDPServer):
+    address_family = socket.AF_INET6
+
+
+class UDPEcho(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        sock.sendto(data, self.client_address)
+
+
+def socks_ipv6_roundtrip(proxy_port, target_port):
+    target = b'\x04' + socket.inet_pton(socket.AF_INET6, '::1') + struct.pack('!H', target_port)
+    for command in (1, 3):
+        with socket.create_connection(('::1', proxy_port), timeout=8) as sock, sock.makefile('rb') as reply:
+            sock.sendall(b'\x05\x01\x00')
+            assert reply.read(2) == b'\x05\x00'
+            requested = target if command == 1 else b'\x04' + bytes(18)
+            sock.sendall(bytes((5, command, 0)) + requested)
+            assert reply.read(4) == b'\x05\x00\x00\x04'
+            host = socket.inet_ntop(socket.AF_INET6, reply.read(16))
+            port, = struct.unpack('!H', reply.read(2))
+            payload = b'IPv6 SOCKS5 payload'
+            if command == 1:
+                sock.sendall(payload)
+                assert reply.read(len(payload)) == payload
+            else:
+                with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as udp:
+                    packet = bytes(3) + target + payload
+                    udp.settimeout(8)
+                    udp.connect((host, port))
+                    udp.send(packet)
+                    assert udp.recv(4096) == packet
+    return True
+
+
 def tcp_roundtrip(port, host='127.0.0.1'):
     payload = secrets.token_bytes(65536)
     with socket.create_connection((host, port), timeout=2) as sock:
@@ -153,19 +193,24 @@ try:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         echo_port = server.server_address[1]
 
-        def client(name, host, apps=(), public_port=0):
+        def client(name, host, apps=(), public_port=0, socks5=(), hosts=None):
             directory = runtime / name
             directory.mkdir(mode=0o700)
             cfg = {'product': 'fastp2p', 'network': {'Node': name, 'Token': install_token, 'ServerHost': host,
                                'ServerPort': 27183, 'ShareBandwidth': 0,
                                'UDPSTUNServers': [], 'TCPNatProbe': ''},
-                   'CACertFile': str(certs / 'ca.crt'), 'LogLevel': 0, 'apps': list(apps)}
+                   'CACertFile': str(certs / 'ca.crt'), 'LogLevel': 0,
+                   'apps': list(apps), 'socks5': list(socks5)}
             if public_port:
                 cfg['network']['PublicIPPort'] = public_port
             path = directory / 'config.json'
             path.write_text(json.dumps(cfg))
             path.chmod(0o600)
-            process = start([Path(args.c_client).resolve(), '--config', path], name, directory)
+            command = [Path(args.c_client).resolve(), '--config', path]
+            if hosts:
+                command = ['unshare', '--mount', '--propagation', 'private', '--', 'sh', '-c',
+                           'mount --bind "$1" /etc/hosts && shift && exec "$@"', 'sh', hosts, *command]
+            process = start(command, name, directory)
             c_processes.append((process, name))
             return process
 
@@ -224,6 +269,49 @@ try:
             assert 'UDP peer listener connected' in (logs / f'quic-source-{suffix}.log').read_text()
         assert (logs / 'dual-target-v6.log').read_text().count('UDP peer listener accepted connection') >= 2
         results['two_quic_peers_share_one_udp_listener'] = True
+
+        v6_tcp = IPv6TCPEchoServer(('::1', 0), TCPEcho)
+        v6_udp = IPv6UDPEchoServer(v6_tcp.server_address[:2], UDPEcho)
+        for echo in (v6_tcp, v6_udp):
+            echo.daemon_threads = True
+            echo_servers.append(echo)
+            threading.Thread(target=echo.serve_forever, daemon=True).start()
+        client('socks-v6-entry', '::1', socks5=[{'Name': 'socks-ipv6', 'SrcPort': 26506,
+                                               'BindIP': '::1', 'PeerNode': 'dual-target-v6',
+                                               'UnderlayProtocol': 'quic'}])
+        wait(lambda: (node_record('socks-v6-entry') or {}).get('isActive'), what='the SOCKS5 entry to register')
+        wait(lambda: socks_ipv6_roundtrip(26506, v6_tcp.server_address[1]),
+             what='SOCKS5 IPv6 CONNECT and UDP ASSOCIATE')
+        results['socks5_ipv6_tcp_and_udp'] = True
+
+        # IPv6 coordination still works while the IPv6 peer path drops traffic.
+        hosts = runtime / 'dualstack-hosts'
+        hosts.write_text('127.0.0.1 localhost\n::1 localhost\n')
+        fallback_rules = [
+            {'AppName': f'fallback-{transport}', 'Protocol': 'tcp', 'SrcPort': port,
+             'PeerNode': 'dual-target-both', 'DstHost': '127.0.0.1', 'DstPort': echo_port,
+             'UnderlayProtocol': transport}
+            for transport, port in (('quic', 26507), ('tcp', 26508))
+        ]
+        blocked_v6 = [['OUTPUT', '-d', '::1', '-p', proto, '!', '--dport', '27180:27183',
+                       '!', '--sport', '27180:27183', '-j', 'DROP'] for proto in ('tcp', 'udp')]
+        for block in blocked_v6:
+            subprocess.run(['ip6tables', '-A', *block], check=True)
+        try:
+            client('dual-target-both', 'localhost', hosts=hosts)
+            wait(lambda: (node_record('dual-target-both') or {}).get('families') == 3,
+                 what='dual-stack target registration')
+            client('dual-source-both', 'localhost', apps=fallback_rules, hosts=hosts)
+            wait(lambda: (node_record('dual-source-both') or {}).get('families') == 3,
+                 what='dual-stack source registration')
+            wait(lambda: tcp_roundtrip(26507) and tcp_roundtrip(26508),
+                 timeout=65, what='TCP and QUIC forwarding after IPv6 fails')
+            fallback_log = (logs / 'dual-source-both.log').read_text()
+            assert fallback_log.count('IPv6 direct attempt failed; retrying over IPv4') == 2
+        finally:
+            for block in blocked_v6:
+                subprocess.run(['ip6tables', '-D', *block], check=True)
+        results['dual_stack_tcp_and_quic_fall_back_to_ipv4'] = True
 
         # --- the same gateway still serves IPv4 -----------------------------
         client('dual-target-v4', '127.0.0.1', public_port=8234)

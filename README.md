@@ -54,6 +54,8 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 
 高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则保存在网关数据库，节点重连后恢复。
 
+SOCKS5 的 CONNECT 和 UDP ASSOCIATE 支持 IPv4、IPv6 以及由出口节点解析的域名。双栈节点优先直连 IPv6，失败时会重新协商 IPv4 直连。
+
 ### 业务端口
 
 客户端在 `1024–9999` 中按设备身份选择可用端口，TCP 和 UDP 共用端口号，IPv4 和 IPv6 也用同一个端口。已安装的客户端首次上线后将它保存为 `network.PublicIPPort`。如需指定端口，可以在配置中设置 `PublicIPPort`，也可以用 `--publicipport PORT` 启动。
@@ -61,6 +63,8 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 如果指定的 TCP 端口已占用或被系统保留，客户端会尝试在 `1024–9999` 中选择一个 TCP 和 UDP 都可用的端口，并把实际端口上报网关。下次启动仍优先尝试原配置端口。如果指定端口只能绑定 TCP，详情显示 TCP，QUIC 通过打洞连接。
 
 在网关「设备详情」查看业务端口及协议，在设备防火墙放行实际端口。可在路由器上把同号的公网 TCP 和 UDP 端口转发到设备，或设置 `network.AutoPortMapping` 为 `true`，让客户端在 IPv4 默认路由器上通过 UPnP IGD 或 NAT-PMP 申请并续租实际监听端口。自动映射默认关闭。仅发起方有可用 UDP 映射时，新客户端也可以让应答方反向发起 QUIC 连接。直连失败会回到打洞流程。如果外层还有 NAT，例如运营商 CGNAT，仍需由外层网络决定公网可达性。
+
+路由器 WAN 地址与客户端探测到的公网 IPv4 一致时，设备详情的「公网 IPv4 映射」会显示当前租约的外部 TCP、UDP 端口。映射状态会随租约更新，入站可达性还取决于防火墙。
 
 设置 `FASTP2P_FORCE_RELAY=1` 可跳过打洞直接请求中继，用于验证中继链路；它只影响带该变量启动的进程，不写入配置。
 

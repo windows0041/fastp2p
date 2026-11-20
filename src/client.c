@@ -217,14 +217,8 @@ typedef struct {
     uint16_t remote_ports[OP_FAM_COUNT], mapped_ports[OP_FAM_COUNT];
     /* 1 when the peer gave us a usable endpoint of that family. */
     int peer_ready[OP_FAM_COUNT];
-    uint64_t peer_families; /* peer families bitmap (SPEC §1), 0 = unknown */
     nat_probe probes[OP_FAM_COUNT];
-    /* `family` is the one this tunnel punches in; `fallback_family` is the one
-     * to retry when it times out (SPEC §5: a shared v6 is tried first, because
-     * it usually has no NAT at all, and IPv4 is the path an old peer can always
-     * answer). -1 means no alternative. `family_switched` bounds the retry to
-     * one, so a broken pair cannot ping-pong. */
-    int family, fallback_family, family_switched;
+    int family, ipv4_only, attempted_ipv6;
     uint16_t local_port, mapped_port, remote_port;
     /* The remote endpoint actually punched toward, with its family. Rebuilt
      * from peer_text/remote_ports whenever the family is chosen, so connect,
@@ -253,11 +247,11 @@ typedef struct {
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
-    int lan_tried, udp_direct_tried;
+    int lan_tried, udp_direct_tried, ipv4_retry;
     int no_relay;  /* operator disabled relay fallback for this rule */
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
-    uint64_t peer_nat, peer_tcp_nat, link_deadline;
+    uint64_t link_deadline;
     /* Relays that already failed for this rule; the gateway is asked to skip
      * them so one unreachable candidate cannot pin the link forever. */
     struct {
@@ -271,7 +265,6 @@ typedef struct {
      * as it did before. */
     char peer_lan[OP_ADDR_TEXT], peer_lan6[OP_ADDR_TEXT];
     uint32_t peer_public_ipv4;
-    uint64_t peer_families, peer_nat6, peer_tcp_nat6;
     /* The current attempt's session; relay offers create a fresh session. */
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
@@ -401,6 +394,7 @@ static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
 static void report_nat(fastp2p_client *);
+static int family_usable(const fastp2p_client *, const tunnel *, int);
 static void tick_nat(fastp2p_client *, uint64_t);
 static void close_overlay(fastp2p_client *, int, int);
 static void tunnel_message(fastp2p_client *, int, uint16_t, const uint8_t *, size_t);
@@ -869,15 +863,11 @@ enum { NAT_UNKNOWN = 314, NAT_CONE = 1, NAT_HARD_SYM = 2, NAT_EASY_SYM_INC = 3,
        NAT_EASY_SYM_DEC = 4 };
 /* A symmetric NAT is the only case where a direct punch is hopeless between two
  * peers, so both the relay decision and the gateway's candidate filter use it. */
-static int nat_is_hard_sym(uint64_t nat) { return nat == NAT_HARD_SYM; }
 static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
     /* Index 0 is the old single value: a v4-only run reports and decides
      * exactly as before. */
     return transport == FASTP2P_TRANSPORT_TCP ? c->tcp_nat.family[OP_FAM_V4].type
                                               : (uint64_t)c->nat[OP_FAM_V4].type;
-}
-static uint64_t peer_transport_nat(const app *a) {
-    return a->transport == FASTP2P_TRANSPORT_TCP ? a->peer_tcp_nat : a->peer_nat;
 }
 int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
     return fp_tcp_nat_configure(&c->tcp_nat, servers) ? FASTP2P_EINVAL : FASTP2P_OK;
@@ -889,12 +879,8 @@ int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
 static uint64_t punch_interval(uint64_t elapsed) {
     return elapsed < 500 * MS ? 50 * MS : 200 * MS;
 }
-/* Rounds of direct punching worth spending before asking for a relay.  Two is
- * the historical budget; when either side maps a fresh port per destination with
- * no pattern, the second round cannot help, so only one is spent. */
-static int direct_rounds_allowed(int hard_self, int hard_peer) {
-    return hard_self || hard_peer ? 1 : 2;
-}
+/* Each public round gets a fresh mapping and a new prediction window. */
+enum { PUBLIC_PUNCH_ROUNDS = 2 };
 /* Ports to hit when the peer's mapping shifts with every destination.  Returns
  * the first port of the window; the caller walks the span in one direction.
  * Zero span means the peer has no predictable mapping, or the window would run
@@ -1118,13 +1104,20 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].tunnel_index == index) {
             int was_synced = c->apps[i].synced;
-            if (c->apps[i].local && t->initiator && t->udp_direct_port && !was_synced) {
-                /* A failed listener dial does not spend the UDP punch budget. */
-                c->apps[i].udp_direct_tried = 1;
-                if (c->apps[i].attempts > 0)
-                    --c->apps[i].attempts;
-                if (t->lan)
-                    c->apps[i].lan_tried = 0;
+            if (reason && c->apps[i].local && t->initiator && !t->lan && !t->relay_wait && !was_synced) {
+                app *a = &c->apps[i];
+                int fallback = t->attempted_ipv6 && !a->ipv4_retry && family_usable(c, t, OP_FAM_V4);
+                if (fallback) {
+                    a->ipv4_retry = 1;
+                    a->udp_direct_tried = 0;
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "IPv6 direct attempt failed; retrying over IPv4");
+                } else if (t->udp_direct_port) {
+                    a->udp_direct_tried = 1;
+                }
+                /* Keep both public rounds available after switching families,
+                 * or after an unsuccessful shared UDP listener dial. */
+                if ((fallback || t->udp_direct_port) && a->attempts > 0)
+                    --a->attempts;
             }
             c->apps[i].tunnel_index = -1;
             c->apps[i].synced = 0;
@@ -1313,22 +1306,15 @@ static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
  * path an old peer can always answer. An old peer never publishes a v6
  * endpoint, so a mixed pair never leaves the v4 path here. */
 static int choose_punch_family(const fastp2p_client *c, const tunnel *t) {
-    if (family_usable(c, t, OP_FAM_V6))
+    if (!t->ipv4_only && family_usable(c, t, OP_FAM_V6))
         return OP_FAM_V6;
     if (family_usable(c, t, OP_FAM_V4))
         return OP_FAM_V4;
     return -1;
 }
-/* The family to fall back to if the chosen one does not connect. */
-static int punch_fallback(const fastp2p_client *c, const tunnel *t, int family) {
-    int other = family == OP_FAM_V6 ? OP_FAM_V4 : OP_FAM_V6;
-    return family_usable(c, t, other) ? other : -1;
-}
 /* Point the tunnel at `family`: active endpoints, the remote tuple and the
  * socket to punch with. For QUIC the probe socket of that family becomes the
- * punch socket (one UDP socket keeps the mapping the peer was told about); the
- * other family's socket is handed to the fallback slot so a timeout can switch
- * without another round of negotiation. */
+ * punch socket and keeps the mapping that was advertised to the peer. */
 static int use_punch_family(fastp2p_client *c, int index, int family) {
     tunnel *t = &c->tunnels[index];
     if (!family_usable(c, t, family))
@@ -1336,31 +1322,32 @@ static int use_punch_family(fastp2p_client *c, int index, int family) {
     op_addr peer;
     if (op_addr_from_text(&peer, t->peer_text[family], t->remote_ports[family]))
         return -1;
-    int other = family == OP_FAM_V6 ? OP_FAM_V4 : OP_FAM_V6;
     t->family = family;
-    t->fallback_family = punch_fallback(c, t, family);
+    t->attempted_ipv6 = family == OP_FAM_V6;
     address_copy(t->ip, t->peer_text[family]);
     address_copy(t->mapped_ip, t->mapped_text[family]);
     t->remote_port = t->remote_ports[family];
     t->mapped_port = t->mapped_ports[family];
     op_addr_copy(&t->peer_addr, &peer);
-    if (t->transport != FASTP2P_TRANSPORT_QUIC)
-        return 0;
-    if (t->probes[family].fd >= 0 && socket_family(t->probes[family].fd) == family) {
+    if (t->transport != FASTP2P_TRANSPORT_QUIC) {
+        if (t->probes[family].local_port)
+            t->local_port = t->probes[family].local_port;
+        if (t->listen_fd >= 0 && (socket_family(t->listen_fd) != family ||
+                                 socket_port(t->listen_fd) != t->local_port)) {
+            op_close(t->listen_fd);
+            t->listen_fd = -1;
+        }
+        return strcmp(t->mode, "tcppunch") ? 0 : tcp_punch_listen(c, index);
+    }
+    if (t->probes[family].fd >= 0) {
         if (t->fd >= 0 && t->fd != t->probes[family].fd)
             op_close(t->fd);
         t->fd = t->probes[family].fd;
         t->probes[family].fd = -1; /* t->fd owns the punch socket now */
-    } else if (t->probes[family].fd >= 0) {
-        /* A socket of the wrong family can never carry this punch; drop it so a
-         * v6 socket is not mistaken for the v4 path (or vice versa). */
-        op_close(t->probes[family].fd);
-        t->probes[family].fd = -1;
-    } else if (t->probes[other].fd >= 0 && t->fd == t->probes[other].fd) {
-        /* Switching back after a v6 attempt: the v4 socket is still in the
-         * other slot, untouched, so simply take it over. */
-        t->fd = t->probes[other].fd;
-        t->probes[other].fd = -1;
+    }
+    if (t->fd >= 0 && socket_family(t->fd) != family) {
+        op_close(t->fd);
+        t->fd = -1;
     }
     if (t->fd < 0) {
         t->fd = socket_bound(1, source_text(c, family), t->local_port, 1);
@@ -1441,7 +1428,7 @@ static int start_probe(fastp2p_client *c, int index) {
      * old sequence. */
     int started = 0;
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
-        if (!family_wanted(c, family) || !gateway_has(c, family))
+        if ((t->ipv4_only && family != OP_FAM_V4) || !family_wanted(c, family) || !gateway_has(c, family))
             continue;
         op_socket fd =
             socket_bound(t->transport == FASTP2P_TRANSPORT_QUIC, c->local_ip[family], 0, 1);
@@ -1724,12 +1711,21 @@ static int ordered_udp_role(const fastp2p_client *c, const tunnel *t) {
 
 /* The allocated port is valid on the router's WAN address. An outer NAT
  * can expose a different address and may not forward that port. */
-static uint16_t public_mapping_port(const tunnel *t, uint16_t port, uint32_t wan) {
+static uint16_t public_mapping_port(const char *observed_ip, uint16_t port, uint32_t wan) {
     op_addr probe;
-    if (!port || !wan || op_addr_from_text(&probe, t->mapped_text[OP_FAM_V4], 0) ||
+    if (!port || !wan || op_addr_from_text(&probe, observed_ip, 0) ||
         public_ipv4(&probe) != ntohl(wan))
         return 0;
     return port;
+}
+
+static void report_port_mapping(const fastp2p_client *c, json_object *j) {
+    const char *ip = c->ip[OP_FAM_V4];
+    uint16_t tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
+    uint16_t udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
+    op_js(j, "mappedIPv4", tcp || udp ? ip : "");
+    op_ju(j, "mappedTCPPort", tcp);
+    op_ju(j, "mappedUDPPort", udp);
 }
 
 static void probe_complete(fastp2p_client *c, int index) {
@@ -1797,7 +1793,8 @@ static void probe_complete(fastp2p_client *c, int index) {
             !t->relay_wait && has_udp_listener(c)) {
             op_ju(j, "udpDirect", 1);
             if (!t->lan && !strcmp(t->mode, "udppunch"))
-                t->udp_reverse_port = public_mapping_port(t, c->mapped_listener.udp, c->mapped_listener.udp_wan);
+                t->udp_reverse_port = public_mapping_port(t->mapped_text[OP_FAM_V4],
+                                                          c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_reverse_port)
                 op_ju(j, "udpReversePort", t->udp_reverse_port);
         }
@@ -1817,10 +1814,11 @@ static void probe_complete(fastp2p_client *c, int index) {
         op_ju(j, "punchts", ts);
         int reverse = 0;
         if (!t->lan && choose_punch_family(c, t) == OP_FAM_V4) {
-            uint16_t mapped_tcp = public_mapping_port(t, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
+            const char *ip = t->mapped_text[OP_FAM_V4];
+            uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
             if (t->tcp_direct_port && mapped_tcp)
                 t->tcp_direct_port = mapped_tcp;
-            uint16_t mapped_udp = public_mapping_port(t, c->mapped_listener.udp, c->mapped_listener.udp_wan);
+            uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
             } else if (t->udp_reverse_port) {
@@ -2433,9 +2431,9 @@ static void socks_failure(fastp2p_client *c, int oi, unsigned status) {
         tjson_sealed(c, &c->tunnels[o->tunnel_index], TUN_CLOSE, j);
         json_object_put(j);
     }
-    uint8_t reply[10];
-    op_socks_reply(reply, status, NULL, 0);
-    if (op_buffer_add(&o->tx, reply, sizeof(reply), OP_QUEUE_LIMIT)) {
+    uint8_t reply[OP_SOCKS_MAX_REPLY];
+    size_t length = op_socks_reply(reply, status, NULL);
+    if (op_buffer_add(&o->tx, reply, length, OP_QUEUE_LIMIT)) {
         o->socks_state = S_CLOSING;
         close_overlay(c, oi, 0);
         return;
@@ -2484,13 +2482,7 @@ static void socks_acknowledged(fastp2p_client *c, int oi, json_object *ack) {
     if (op_integer(ack, "id") != o->id)
         return;
     uint64_t status = op_integer(ack, "reply"), port = op_integer(ack, "boundPort");
-    op_addr address;
-    /* The local SOCKS5 entry answers with a 4-byte IPv4 endpoint (socks.c is
-     * still v4-only), so an exit that reports a v6 binding cannot be relayed to
-     * this listener and fails the same way a malformed answer did. */
-    if (!op_get(ack, "reply") || status > 8 || port > 65535 ||
-        op_addr_from_text(&address, op_string(ack, "boundIP"), (uint16_t)port) ||
-        op_addr_family(&address) != AF_INET) {
+    if (!op_get(ack, "reply") || status > 8 || port > UINT16_MAX) {
         socks_failure(c, oi, 1);
         return;
     }
@@ -2501,16 +2493,20 @@ static void socks_acknowledged(fastp2p_client *c, int oi, json_object *ack) {
     o->waiting = 0;
     if (o->socks_state == S_FLOW) {
         op_addr remote;
-        if (op_addr_from_text(&remote, op_string(ack, "remoteIP"), 0) ||
-            op_addr_family(&remote) != AF_INET)
+        if (op_addr_from_text(&remote, op_string(ack, "remoteIP"), o->socks.port))
             close_overlay(c, oi, 1);
         else
             op_addr_copy(&o->socks_peer, &remote);
         return;
     }
-    uint8_t reply[10];
-    op_socks_reply(reply, 0, (const uint8_t *)&address.u.in.sin_addr, (uint16_t)port);
-    if (op_buffer_add(&o->tx, reply, sizeof(reply), OP_QUEUE_LIMIT)) {
+    op_addr address;
+    if (op_addr_from_text(&address, op_string(ack, "boundIP"), (uint16_t)port)) {
+        socks_failure(c, oi, 1);
+        return;
+    }
+    uint8_t reply[OP_SOCKS_MAX_REPLY];
+    size_t length = op_socks_reply(reply, 0, &address);
+    if (op_buffer_add(&o->tx, reply, length, OP_QUEUE_LIMIT)) {
         close_overlay(c, oi, 1);
         return;
     }
@@ -2524,15 +2520,13 @@ static overlay *socks_parent(fastp2p_client *c, uint64_t id) {
 }
 static void socks_udp_reply(fastp2p_client *c, int oi, const uint8_t *data, size_t len) {
     overlay *o = &c->overlays[oi], *parent = socks_parent(c, o->socks_parent);
-    if (!parent || o->waiting || len > 4096 || !parent->socks_peer.len ||
-        op_addr_family(&o->socks_peer) != AF_INET)
+    if (!parent || o->waiting || len > 4096 || !parent->socks_peer.len || !o->socks_peer.len)
         return;
-    uint8_t packet[4106] = {0, 0, 0, 1};
-    memcpy(packet + 4, &o->socks_peer.u.in.sin_addr, 4);
-    packet[8] = (uint8_t)(o->socks.port >> 8);
-    packet[9] = (uint8_t)o->socks.port;
-    memcpy(packet + 10, data, len);
-    op_sendto(parent->socks_udp, packet, len + 10, MSG_DONTWAIT, &parent->socks_peer.u.sa,
+    uint8_t packet[4096 + OP_SOCKS_MAX_REPLY];
+    size_t header = op_socks_reply(packet, 0, &o->socks_peer);
+    packet[0] = 0;
+    memcpy(packet + header, data, len);
+    op_sendto(parent->socks_udp, packet, len + header, MSG_DONTWAIT, &parent->socks_peer.u.sa,
               parent->socks_peer.len);
 }
 static void tick_socks_udp(fastp2p_client *c, int index) {
@@ -2639,7 +2633,7 @@ static void tick_socks(fastp2p_client *c, uint64_t now) {
             continue;
         }
         for (int step = 0; step < 3 && o->socks_state == S_HANDSHAKE; ++step) {
-            uint8_t reply[10];
+            uint8_t reply[OP_SOCKS_MAX_REPLY];
             size_t used, length;
             int rv = op_socks_step(&o->socks,
                                    o->socks_rx.data ? o->socks_rx.data + o->socks_rx.offset : NULL,
@@ -2668,38 +2662,30 @@ static void tick_socks(fastp2p_client *c, uint64_t now) {
                 break;
             }
             op_addr requested;
-            /* The old check accepted INADDR_ANY and otherwise required the
-             * request to name this client's own source address. The local
-             * SOCKS5 entry is still IPv4-only (socks.c), so anything else is
-             * the same protocol error as before. */
+            /* The association accepts only datagrams from the TCP peer.
+             * An unspecified request leaves its UDP endpoint to be learned. */
             if (op_addr_from_text(&requested, o->socks.host, 0) ||
-                op_addr_family(&requested) != AF_INET ||
                 (!op_addr_equal(&requested, &o->source) &&
-                 strcmp(o->socks.host, "0.0.0.0"))) {
+                 strcmp(o->socks.host, "0.0.0.0") && strcmp(o->socks.host, "::"))) {
                 socks_failure(c, i, 2);
                 break;
             }
             op_addr local;
             memset(&local, 0, sizeof(local));
-            if (op_addr_socketname(o->fd, &local) || op_addr_family(&local) != AF_INET) {
+            if (op_addr_socketname(o->fd, &local)) {
                 socks_failure(c, i, 1);
                 break;
             }
-            char ip[OP_ADDR_TEXT];
-            if (op_addr_text(&local, ip, sizeof(ip))) {
-                socks_failure(c, i, 1);
-                break;
-            }
-            o->socks_udp = socket_bound(1, ip, 0, 0);
+            o->socks_udp = socket_bound_addr(1, &local, 0, 0);
             if (o->socks_udp < 0) {
                 socks_failure(c, i, 1);
                 break;
             }
             op_addr_copy(&o->socks_peer, &o->source);
             op_addr_set_port(&o->socks_peer, o->socks.port);
-            op_socks_reply(reply, 0, (const uint8_t *)&local.u.in.sin_addr,
-                           socket_port(o->socks_udp));
-            if (op_buffer_add(&o->tx, reply, 10, OP_QUEUE_LIMIT)) {
+            op_addr_set_port(&local, socket_port(o->socks_udp));
+            length = op_socks_reply(reply, 0, &local);
+            if (op_buffer_add(&o->tx, reply, length, OP_QUEUE_LIMIT)) {
                 close_overlay(c, i, 0);
                 break;
             }
@@ -2850,6 +2836,7 @@ static void rename_peer(fastp2p_client *c, const char *old_name, const char *nam
             a->attempts = 0;
             a->lan_tried = 0;
             a->udp_direct_tried = 0;
+            a->ipv4_retry = 0;
             a->relay_requested = 0;
             a->relay_failed_count = 0;
             a->retry = 0;
@@ -3057,7 +3044,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             int v4_ok = port > 0 && port <= 65535 &&
                         !op_addr_from_text(&ip, peer_text, (uint16_t)port) &&
                         op_family_index(op_addr_family(&ip)) == OP_FAM_V4;
-            int v6_ok = port6 > 0 && port6 <= 65535 &&
+            int v6_ok = !t->ipv4_only && port6 > 0 && port6 <= 65535 &&
                         !op_addr_from_text(&ip, peer_text6, (uint16_t)port6) &&
                         op_family_index(op_addr_family(&ip)) == OP_FAM_V6;
             if (t->state == T_REPLY && sender == t->peer_id &&
@@ -3199,34 +3186,9 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         if (valid_node(peer))
             for (int i = 0; i < NA; ++i)
                 if (c->apps[i].used && !strcmp(c->apps[i].peer, peer)) {
-                    c->apps[i].peer_nat = op_integer(j, "natType");
-                    uint64_t tcp = op_integer(j, "tcpNatType");
-                    c->apps[i].peer_tcp_nat = tcp == FP_NAT_STABLE || tcp == FP_NAT_DEPENDENT ? tcp : FP_NAT_UNKNOWN;
-                    uint64_t tcp6 = op_integer(j, "tcpNatType6");
-                    c->apps[i].peer_tcp_nat6 = tcp6 == FP_NAT_STABLE || tcp6 == FP_NAT_DEPENDENT
-                                                  ? tcp6
-                                                  : FP_NAT_UNKNOWN;
-                    c->apps[i].peer_nat6 = op_integer(j, "udpNatType6");
-                    c->apps[i].peer_families = op_integer(j, "families");
                     c->apps[i].peer_public_ipv4 = has_gateway_ipv4 ? public_ipv4(&gateway_ip) : 0;
                     address_text_out(c->apps[i].peer_lan, lan, OP_FAM_V4);
                     address_text_out(c->apps[i].peer_lan6, lan6, OP_FAM_V6);
-                    /* A late lookup can make a LAN attempt eligible after the
-                     * first attempt started. Keep established links and TCP
-                     * attempts on their current path. */
-                    if (c->apps[i].transport != FASTP2P_TRANSPORT_TCP && !c->apps[i].synced &&
-                        c->apps[i].peer_lan[0] && !c->apps[i].lan_tried &&
-                        c->apps[i].attempts >= 1 && lan_punch_possible(c, &c->apps[i])) {
-                        int index = c->apps[i].tunnel_index;
-                        if (index >= 0 && c->tunnels[index].state &&
-                            !c->tunnels[index].lan && !tunnel_ready(&c->tunnels[index]))
-                            close_tunnel(c, index, "peer LAN address reachable; trying a direct LAN punch");
-                        c->apps[i].tunnel_index = -1;
-                        /* The LAN branch needs an unspent round budget; it is taken at
-                         * most once because lan_tried is set when the punch starts. */
-                        c->apps[i].attempts = 0;
-                        c->apps[i].retry = mono();
-                    }
                 }
     } else if (main == 3 && sub == 21 && c->login_ok)
         rename_peer(c, op_string(j, "oldName"), op_string(j, "name"));
@@ -3904,8 +3866,11 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         int family = choose_punch_family(c, t);
         if (family < 0)
             family = t->family;
-        if (family >= 0 && family < OP_FAM_COUNT && use_punch_family(c, ti, family) == 0) {
-            /* Ready: peer_addr, mapping and (for QUIC) the punch socket agree. */
+        if (family_usable(c, t, family)) {
+            if (use_punch_family(c, ti, family)) {
+                close_tunnel(c, ti, "could not prepare the peer address family");
+                return;
+            }
         } else if (!t->peer_addr.len &&
                    op_addr_from_text(&t->peer_addr, t->ip, t->remote_port)) {
             close_tunnel(c, ti, "invalid peer address");
@@ -4073,7 +4038,9 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             for (int i = 0; i < NA; ++i)
                 if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == ti) {
                     c->apps[i].attempts = 0;
+                    c->apps[i].lan_tried = 0;
                     c->apps[i].udp_direct_tried = 0;
+                    c->apps[i].ipv4_retry = 0;
                     c->apps[i].relay_failed_count = 0;
                 }
             t->active_at = 0;
@@ -4211,6 +4178,10 @@ static void tick_port_mapping(fastp2p_client *c) {
                  (unsigned)c->public_port, (unsigned)c->mapped_listener.tcp, (unsigned)c->mapped_listener.udp);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
+    if (c->ws_connected && c->login_ok &&
+        (previous.tcp != c->mapped_listener.tcp || previous.udp != c->mapped_listener.udp ||
+         previous.tcp_wan != c->mapped_listener.tcp_wan || previous.udp_wan != c->mapped_listener.udp_wan))
+        report_nat(c);
 }
 
 static void tick_udp_listeners(fastp2p_client *c, uint64_t now) {
@@ -4402,25 +4373,14 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                          (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
                         in_progress = 1;
                 if (!in_progress) {
-                    int hard_self = nat_is_hard_sym(local_transport_nat(c, a->transport));
-                    int hard_peer = nat_is_hard_sym(peer_transport_nat(a));
-                    int rounds = direct_rounds_allowed(hard_self, hard_peer);
-                    /* A TCP dependent mapping report does not say whether its
-                     * ports are predictable. Let peers with enough destinations
-                     * take fresh samples before assuming they require a relay. */
-                    int can_sample_tcp = a->transport == FASTP2P_TRANSPORT_TCP &&
-                                         c->tcp_nat.family[OP_FAM_V4].destinations >= 3;
-                    if (lan_punch_possible(c, a) && !a->lan_tried && a->attempts < rounds && !c->force_relay) {
-                        if (a->transport != FASTP2P_TRANSPORT_TCP)
-                            ++a->attempts;
+                    if (lan_punch_possible(c, a) && !a->lan_tried && !c->force_relay) {
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
                             c->tunnels[ti].lan = 1;
                             a->lan_tried = 1;
                             start_punch(c, ti);
                         }
-                    } else if (a->relay_node[0] || a->attempts >= 2 || c->force_relay ||
-                        (hard_self && hard_peer && !can_sample_tcp && a->attempts > 0)) {
+                    } else if (a->relay_node[0] || a->attempts >= PUBLIC_PUNCH_ROUNDS || c->force_relay) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();
@@ -4463,14 +4423,16 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                                 a->relay_requested = 0;
                             } else {
                                 ws_json(c, 5, 0, j);
-                                json_object_put(j);
                             }
+                            json_object_put(j);
                         }
                     } else {
-                        ++a->attempts;
                         ti = app_tunnel(c, a, a->peer, a->transport);
-                        if (ti >= 0)
+                        if (ti >= 0) {
+                            ++a->attempts;
+                            c->tunnels[ti].ipv4_only = a->ipv4_retry;
                             start_punch(c, ti);
+                        }
                     }
                 }
             }
@@ -4575,6 +4537,7 @@ static void report_client(fastp2p_client *c) {
     op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
     op_ju(j, "publicIPPort", c->public_port);
     op_ju(j, "publicUDP", has_udp_listener(c));
+    report_port_mapping(c, j);
     op_ju(j, "configPush", c->config_handler != NULL);
     op_ju(j, "restart", c->restart_handler != NULL);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
@@ -4589,6 +4552,7 @@ static void report_client(fastp2p_client *c) {
 }
 static void report_nat(fastp2p_client *c) {
     json_object *j = json_object_new_object();
+    report_port_mapping(c, j);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);
     op_ju(j, "tcpNatSamples", c->tcp_nat.family[OP_FAM_V4].samples);
@@ -5507,8 +5471,8 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
                             f->bind_ip ? f->bind_ip : "127.0.0.1") ||
                 copy_string(a->name, sizeof(a->name), f->name ? f->name : "forward"))
                 return FASTP2P_EINVAL;
-            struct in_addr check;
-            if (inet_pton(AF_INET, a->bind_ip, &check) != 1)
+            op_addr bind_address;
+            if (op_addr_from_text(&bind_address, a->bind_ip, f->local_port))
                 return FASTP2P_EINVAL;
             a->id = random_id();
             a->session = random_id();
@@ -5519,7 +5483,7 @@ int fastp2p_client_add_forward(fastp2p_client *c, const fastp2p_forward *f, uint
             a->udp = !strcmp(f->protocol, "udp");
             a->transport = f->transport;
             a->local = a->used = 1;
-            a->fd = c->validate_only ? -1 : socket_bound(a->udp, a->bind_ip, a->port, 0);
+            a->fd = c->validate_only ? -1 : socket_bound_addr(a->udp, &bind_address, a->port, 0);
             if(c->validate_only) {if(id)*id=a->id;return FASTP2P_OK;}
             if (a->fd < 0 || (!a->udp && op_listen(a->fd, 64))) {
                 if (a->fd >= 0)

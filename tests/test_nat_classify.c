@@ -158,11 +158,12 @@ static void lan_punch_public_ipv4(void) {
                           "\"lanIP\":\"172.16.12.193\"}";
     control_message(c, 7, 1, (const uint8_t *)shared, sizeof(shared) - 1);
     assert(lan_punch_possible(c, a));
-    assert(a->attempts == 0 && a->tunnel_index == -1 && !c->tunnels[ti].state);
+    assert(a->attempts == 1 && a->tunnel_index == ti && c->tunnels[ti].state == T_TIME);
 
     const char ipv6_only[] = "{\"peerNode\":\"mobile-peer\",\"lanIP6\":\"fd00::11\"}";
     control_message(c, 7, 1, (const uint8_t *)ipv6_only, sizeof(ipv6_only) - 1);
     assert(!a->peer_lan[0] && lan_punch_possible(c, a));
+    close_tunnel(c, ti, NULL);
     free(c);
 }
 
@@ -470,6 +471,71 @@ static void sym_window_wire(void) {
     free(reader);
     free(c);
 }
+static void public_round_budget(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->state = FASTP2P_ONLINE;
+    c->families_wanted = c->gateway_families = FAM_V4 | FAM_V6;
+    assert(!op_addr_from_text(&c->gateway_addr[OP_FAM_V4], "127.0.0.1", 0));
+    assert(!op_addr_from_text(&c->gateway_addr[OP_FAM_V6], "::1", 0));
+    c->nat[OP_FAM_V4].type = NAT_HARD_SYM;
+    strcpy(c->ip[OP_FAM_V4], "198.51.100.10");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    app *a = &c->apps[0];
+    a->used = a->local = 1;
+    a->fd = a->tunnel_index = -1;
+    a->transport = FASTP2P_TRANSPORT_QUIC;
+    strcpy(a->peer, "remote-node");
+    tick_apps(c, mono());
+    int ti = a->tunnel_index;
+    assert(ti >= 0 && a->attempts == 1);
+    tunnel *t = &c->tunnels[ti];
+    uint64_t first = t->id;
+    strcpy(t->mapped_text[OP_FAM_V4], "198.51.100.10");
+    t->mapped_ports[OP_FAM_V4] = 12345;
+    assert(!tunnel_learn_peer(t, "198.51.100.10", 23456));
+    t->state = T_PUNCH;
+    t->attempted_ipv6 = 1;
+    t->deadline = 0;
+    tick_tunnel(c, ti, mono());
+    assert(a->ipv4_retry && !a->attempts && a->tunnel_index < 0);
+
+    a->retry = 0;
+    tick_apps(c, mono());
+    ti = a->tunnel_index;
+    assert(ti >= 0 && a->attempts == 1);
+    t = &c->tunnels[ti];
+    assert(t->id != first && t->ipv4_only && t->probes[OP_FAM_V6].fd < 0);
+    strcpy(c->local_ip[OP_FAM_V4], "192.168.1.1");
+    const char lookup[] = "{\"peerNode\":\"remote-node\",\"IPv4\":\"198.51.100.10\","
+                          "\"lanIP\":\"192.168.1.2\",\"natType\":2}";
+    control_message(c, 7, 1, (const uint8_t *)lookup, sizeof(lookup) - 1);
+    assert(lan_punch_possible(c, a) && a->attempts == 1 && a->tunnel_index == ti);
+    close_tunnel(c, ti, "test public failure");
+    a->retry = 0;
+    tick_apps(c, mono());
+    assert(a->lan_tried && a->attempts == 1);
+    if (a->tunnel_index >= 0) {
+        assert(c->tunnels[a->tunnel_index].lan);
+        c->tunnels[a->tunnel_index].udp_direct_port = 12345;
+        close_tunnel(c, a->tunnel_index, "test LAN failure");
+    }
+    assert(a->lan_tried && !a->udp_direct_tried && a->attempts == 1);
+
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    a->retry = 0;
+    tick_apps(c, mono());
+    assert(a->tunnel_index >= 0 && a->attempts == 2 && !a->relay_requested);
+    assert(c->tunnels[a->tunnel_index].ipv4_only && !c->tunnels[a->tunnel_index].lan);
+    close_tunnel(c, a->tunnel_index, "test second public failure");
+    control_message(c, 7, 1, (const uint8_t *)lookup, sizeof(lookup) - 1);
+    a->retry = 0;
+    tick_apps(c, mono());
+    assert(a->relay_requested && a->attempts == 2);
+    op_buffer_clear(&c->ws_tx);
+    free(c);
+}
+
 int main(void) {
     assert(!op_platform_init());
     tcp_retry();
@@ -478,17 +544,7 @@ int main(void) {
     peer_listener_port_conflict();
     udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();
-    /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
-    fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;
-    app rule={.transport=FASTP2P_TRANSPORT_TCP,.peer_nat=NAT_HARD_SYM,.peer_tcp_nat=FP_NAT_STABLE};
-    assert(local_transport_nat(&client,rule.transport)==FP_NAT_STABLE);
-    assert(peer_transport_nat(&rule)==FP_NAT_STABLE);
-    assert(direct_rounds_allowed(nat_is_hard_sym(local_transport_nat(&client,rule.transport)),
-                                nat_is_hard_sym(peer_transport_nat(&rule)))==2);
-    client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_UNKNOWN;rule.peer_tcp_nat=FP_NAT_UNKNOWN;
-    assert(!nat_is_hard_sym(local_transport_nat(&client,rule.transport)) && !nat_is_hard_sym(peer_transport_nat(&rule)));
-    rule.transport=FASTP2P_TRANSPORT_QUIC;
-    assert(local_transport_nat(&client,rule.transport)==NAT_HARD_SYM && peer_transport_nat(&rule)==NAT_HARD_SYM);
+    public_round_budget();
     /* Dense start: the first half second decides a cone-to-cone punch. */
     assert(punch_interval(0) == 50 * MS);
     assert(punch_interval(499 * MS) == 50 * MS);
@@ -563,23 +619,6 @@ int main(void) {
     assert(sym_window_base(40000, 0, 50) == 39999);
     /* Decrementing window starts count ports below it, never below 1. */
     assert(sym_window_base(40000, 1, 50) == 40001);
-
-    /* Punch ladder budget: a hard symmetric side wastes the second round. */
-    assert(direct_rounds_allowed(0, 0) == 2);
-    assert(direct_rounds_allowed(1, 0) == 1);
-    assert(direct_rounds_allowed(0, 1) == 1);
-    assert(direct_rounds_allowed(1, 1) == 1);
-    assert(direct_rounds_allowed(nat_is_hard_sym(NAT_CONE),
-                                 nat_is_hard_sym(NAT_EASY_SYM_INC)) == 2);
-    assert(direct_rounds_allowed(nat_is_hard_sym(NAT_EASY_SYM_DEC),
-                                 nat_is_hard_sym(NAT_HARD_SYM)) == 1);
-
-    /* Only the hard symmetric value feeds the relay decision. */
-    assert(nat_is_hard_sym(NAT_HARD_SYM));
-    assert(!nat_is_hard_sym(NAT_CONE));
-    assert(!nat_is_hard_sym(NAT_EASY_SYM_INC));
-    assert(!nat_is_hard_sym(NAT_EASY_SYM_DEC));
-    assert(!nat_is_hard_sym(NAT_UNKNOWN));
 
     /* Which mapping behaviours get a window at all. */
     assert(sym_window_kind(NAT_CONE) == 0);
