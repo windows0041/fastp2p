@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(fastp2p_c VERSION 2.0.30 LANGUAGES C)
+project(fastp2p_c VERSION 2.0.31 LANGUAGES C)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/fastp2p.h" FASTP2P_HEADER_VERSION
      REGEX "^#define FASTP2P_VERSION ")
 if(NOT FASTP2P_HEADER_VERSION STREQUAL "#define FASTP2P_VERSION \"${PROJECT_VERSION}\"")
@@ -187,8 +187,7 @@ if(BUILD_TESTING)
       # Requires an elevated isolated runner; the local CTest suite need not be admin.
     endif()
     if(NOT WIN32)
-      # The POSIX swap and precheck are pure filesystem logic: no execv, no
-      # service manager, so they can be exercised in a temporary directory.
+      # Exercise atomic replacement and restart with temporary fixtures.
       add_executable(test-update-posix tests/test_update_posix.c src/update.c)
       target_include_directories(test-update-posix PRIVATE src)
       target_link_libraries(test-update-posix PRIVATE ${FASTP2P_WEB_TARGET} ${FASTP2P_CRYPTO_TARGET})

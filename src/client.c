@@ -363,6 +363,7 @@ struct fastp2p_client {
     struct curl_slist *resolve;
     curl_socket_t ws_socket;
     int ws_connected;
+    uint64_t upgrade_stop_at;
     int gateway_tcp_probe_v2, gateway_tcp_probe_v3;
     size_t ws_remaining;
     op_buffer ws_rx, ws_tx;
@@ -3240,8 +3241,12 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
          * verify, then hand over to the new build. */
         const char *url = op_string(j, "url"), *sha = op_string(j, "sha256");
         const char *version = op_string(j, "version");
-        uint64_t size = op_integer(j, "size");
-        if (!*url || strlen(sha) != 64) {
+        uint64_t size = op_integer(j, "size"), upgrade = op_integer(j, "upgradeId");
+        const char *failure = NULL;
+        if (c->stopping || c->upgrade_stop_at) {
+            failure = "an update is already pending";
+        } else if (!*url || strlen(sha) != 64) {
+            failure = "invalid upgrade order";
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid upgrade order");
         } else {
             char staged[4200], error[256], message[192];
@@ -3249,10 +3254,13 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             snprintf(message, sizeof(message), "downloading build %s", *version ? version : "update");
             emit(c, FASTP2P_EVENT_STATE, 0, 0, message);
             if (fp_update_stage_path(staged, sizeof(staged))) {
-                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, "cannot locate the install directory");
+                failure = "cannot prepare the download directory";
+                emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, failure);
             } else if (fp_update_download(url, c->ca, c->ca_pem, c->tls_host ? c->resolve : NULL,
                                           staged, sha, size, error, sizeof(error))) {
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+                failure = "cannot download or verify the update package";
+                fp_update_discard(staged);
 #ifdef __ANDROID__
             } else {
                 /* Hand the verified APK to the Android install flow. */
@@ -3262,16 +3270,26 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             }
 #else
             } else if (fp_update_apply(staged, error, sizeof(error))) {
-                remove(staged);
+                fp_update_discard(staged);
                 emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+                failure = c->error;
             } else {
                 emit(c, FASTP2P_EVENT_STATE, 0, 0, "installing the new build");
                 /* Ask for a normal stop: the run loop then reports a clean exit,
                  * so a Windows service manager does not treat it as a failure and
                  * race the updater by restarting the old image. */
-                c->stopping = 1;
+                c->upgrade_stop_at = mono() + 500 * MS;
             }
 #endif
+        }
+        if (upgrade) {
+            json_object *result = json_object_new_object();
+            op_ju(result, "upgradeId", upgrade);
+            op_js(result, "state", failure ? "failed" : "accepted");
+            if (failure)
+                op_js(result, "detail", failure);
+            ws_json(c, 6, 10, result);
+            json_object_put(result);
         }
     } else if (main == 3 && sub == 9) {
         apply_rule(c, j);
@@ -5642,6 +5660,11 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     if (!c || !c->running || c->in_callback || c->stepping)
         return FASTP2P_ESTATE;
     c->stepping = 1;
+    if (c->upgrade_stop_at &&
+        (!op_buffer_size(&c->ws_tx) || mono() >= c->upgrade_stop_at)) {
+        c->upgrade_stop_at = 0;
+        c->stopping = 1;
+    }
     if (c->stopping) {
         c->stepping = 0;
         return fastp2p_client_stop(c);

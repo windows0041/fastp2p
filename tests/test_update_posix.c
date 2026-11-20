@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int write_file(const char *path, const char *text) {
@@ -12,7 +13,9 @@ static int write_file(const char *path, const char *text) {
     if (!file)
         return -1;
     size_t length = strlen(text);
-    int ok = fwrite(text, 1, length, file) == length && !fclose(file);
+    int ok = fwrite(text, 1, length, file) == length;
+    if (fclose(file))
+        ok = 0;
     return ok ? 0 : -1;
 }
 
@@ -61,50 +64,81 @@ static void swap_strategies(void) {
     assert(read_matches(own, "third-image"));
     assert(rollback[0] && read_matches(rollback, "new-image"));
 
-    char command[512];
-    snprintf(command, sizeof(command), "rm -rf '%s'", base);
-    assert(!system(command));
+    unlink(previous);
+    unlink(staged);
+    unlink(own);
+    assert(!rmdir(base));
 }
 
-/* The precheck runs while the client is online, so it has to reject the cases
- * that would otherwise fail silently after the service has stopped. */
-static void precheck(void) {
-    char self[4096], directory[4096], error[256], adjacent[4200];
+static void run_install(const char *installed, const char *package, int expected) {
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        char *argv[] = {(char *)installed, "--update-fixture", (char *)package, NULL};
+        execv(installed, argv);
+        _exit(127);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == expected);
+}
+
+static void restart_from_staged_package(void) {
+    char base[] = "/tmp/fp-update-install-XXXXXX";
+    assert(mkdtemp(base));
+    char self[4096], installed[512], previous[520], package[512], original_package[512];
     assert(!fp_update_own_path(self, sizeof(self)));
-    snprintf(directory, sizeof(directory), "%s", self);
-    char *slash = strrchr(directory, '/');
-    assert(slash);
-    slash[1] = 0;
+    snprintf(installed, sizeof(installed), "%s/installed", base);
+    snprintf(previous, sizeof(previous), "%s.old", installed);
+    FILE *in = fopen(self, "rb"), *out = fopen(installed, "wb");
+    assert(in && out);
+    char data[65536];
+    size_t bytes;
+    while ((bytes = fread(data, 1, sizeof(data), in)) > 0)
+        assert(fwrite(data, 1, bytes, out) == bytes);
+    assert(!ferror(in) && !fclose(in) && !fclose(out) && !chmod(installed, 0755));
 
-    snprintf(adjacent, sizeof(adjacent), "%s.fastp2p-update-test", directory);
-    assert(!write_file(adjacent, "package"));
-    assert(!fp_update_precheck(adjacent, error, sizeof(error)));
-    unlink(adjacent);
+    assert(!fp_update_stage_path(original_package, sizeof(original_package)));
+    assert(!strncmp(original_package, "/tmp/", 5));
+    assert(!write_file(original_package, "not an executable"));
+    run_install(installed, original_package, 42);
+    assert(access(installed, X_OK) == 0 && access(previous, F_OK) != 0);
+    assert(access(original_package, F_OK) != 0);
 
-    /* Nothing to install. */
-    memset(error, 0, sizeof(error));
-    assert(fp_update_precheck(adjacent, error, sizeof(error)));
-    assert(error[0]);
-
+    assert(!fp_update_stage_path(package, sizeof(package)));
+    char foreign[] = "/dev/shm/fp-update-package-XXXXXX";
 #ifdef __linux__
-    /* A package on another filesystem can never be renamed into place. */
-    struct stat here, there;
-    if (!stat(directory, &here) && !stat("/dev/shm", &there) && here.st_dev != there.st_dev) {
-        char foreign[4200];
-        snprintf(foreign, sizeof(foreign), "/dev/shm/fp-update-cross-%ld", (long)getpid());
-        if (!write_file(foreign, "package")) {
-            memset(error, 0, sizeof(error));
-            assert(fp_update_precheck(foreign, error, sizeof(error)));
-            assert(strstr(error, "different filesystem") != NULL);
-            unlink(foreign);
+    struct stat local, shared;
+    if (!stat(base, &local) && !stat("/dev/shm", &shared) && local.st_dev != shared.st_dev) {
+        int fd = mkstemp(foreign);
+        if (fd >= 0) {
+            close(fd);
+            fp_update_discard(package);
+            snprintf(package, sizeof(package), "%s", foreign);
         }
     }
+#else
+    (void)foreign;
 #endif
+    assert(!write_file(package, "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then echo 'fastp2p 2.0.31 ABI 1'; exit 0; fi\n"
+        "exit 23\n"));
+    run_install(installed, package, 23);
+    assert(access(previous, X_OK) == 0 && access(package, F_OK) != 0);
+    assert(!unlink(previous) && !unlink(installed) && !rmdir(base));
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--update-fixture")) {
+        char error[256];
+        if (fp_update_apply(argv[2], error, sizeof(error))) {
+            fp_update_discard(argv[2]);
+            return 42;
+        }
+        return fp_update_run_pending(argv) ? 43 : 44;
+    }
     swap_strategies();
-    precheck();
-    puts("POSIX update precheck and swap strategies passed");
+    restart_from_staged_package();
+    puts("POSIX atomic update and restart passed");
     return 0;
 }
