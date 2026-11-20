@@ -17,7 +17,8 @@ tools=Path(args.ndk)/'toolchains/llvm/prebuilt/linux-x86_64/bin'
 header=Path(__file__).resolve().parents[1]/'include/fastp2p.h'
 required=set(re.findall(r'FASTP2P_API\s+[^;\n]+?\b(fastp2p_\w+)\s*\(',header.read_text()))
 with zipfile.ZipFile(args.apk) as apk, tempfile.TemporaryDirectory(prefix='fastp2p-android-abi-') as temp:
-    for name in ['fastp2p-LICENSE','openssl-LICENSE.txt','curl-COPYING','ngtcp2-COPYING','json-c-COPYING']:
+    for name in ['fastp2p-LICENSE','openssl-LICENSE.txt','curl-COPYING','ngtcp2-COPYING',
+                 'json-c-COPYING','miniupnpc-LICENSE','libnatpmp-LICENSE']:
         assert len(apk.read('assets/licenses/'+name))>100,name
     # Identity and signing are what an install actually depends on, so they are
     # checked here rather than only in a build log.

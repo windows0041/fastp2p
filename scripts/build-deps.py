@@ -76,7 +76,7 @@ for name,item in manifest.items():
             tar.extractall(sources,filter='data')
         extracted=sources/top
         if extracted!=destination: extracted.rename(destination)
-    paths[name]=destination
+    paths[name]=destination/item.get('source', '')
 
 # json-c 0.18 compares a signed char with 0x1f in strict string parsing,
 # incorrectly classifying UTF-8 high bytes as control characters. Keep strict
@@ -198,6 +198,12 @@ def cmake(name,options):
 cmake('ngtcp2',ssl+['-DENABLE_LIB_ONLY=ON','-DENABLE_SHARED_LIB=OFF','-DENABLE_STATIC_LIB=ON',
                   '-DENABLE_GNUTLS=OFF','-DENABLE_OPENSSL=ON'])
 cmake('json-c',['-DDISABLE_WERROR=ON','-DBUILD_APPS=OFF','-DENABLE_THREADING=OFF'])
+igd = ['-DUPNPC_BUILD_SHARED=OFF', '-DUPNPC_BUILD_TESTS=OFF', '-DUPNPC_BUILD_SAMPLE=OFF']
+if args.target == 'windows-x86_64':
+    igd += ['-DMINIUPNPC_TARGET_WINDOWS_VERSION=0x0A00',
+            '-DCMAKE_C_FLAGS='+environment['CFLAGS']+' -DMINIUPNPC_SET_SOCKET_TIMEOUT']
+cmake('miniupnpc', igd)
+cmake('libnatpmp', ['-DCMAKE_POLICY_VERSION_MINIMUM=3.5'])
 curl=['-DBUILD_CURL_EXE=OFF','-DBUILD_EXAMPLES=OFF','-DBUILD_LIBCURL_DOCS=OFF','-DBUILD_MISC_DOCS=OFF',
       '-DCURL_DISABLE_LDAP=ON','-DCURL_DISABLE_LDAPS=ON',
       '-DUSE_LIBIDN2=OFF','-DCURL_USE_LIBPSL=OFF','-DCURL_BROTLI=OFF','-DCURL_ZSTD=OFF','-DCURL_ZLIB=OFF',

@@ -66,9 +66,9 @@ def nativeNotices = tasks.register('copyNativeNotices', Sync) {
     from('../../THIRD_PARTY.md') { into 'licenses' }
     def versions = new groovy.json.JsonSlurper().parse(file('../../deps.lock.json'))
     versions.each { name, entry ->
-        def license = name == 'openssl' ? 'LICENSE.txt' : 'COPYING'
+        def license = entry.license ?: (name == 'openssl' ? 'LICENSE.txt' : 'COPYING')
         from(new File(new File(depsBase).parentFile, "sources/${name}-${entry.version}/${license}")) {
-            into 'licenses'; rename { "${name}-${license}" }
+            into 'licenses'; rename { "${name}-${new File(license).name}" }
         }
     }
 }

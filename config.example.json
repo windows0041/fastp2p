@@ -3,7 +3,8 @@
     "AutoNode": true,
     "Token": 0,
     "ServerHost": "127.0.0.1",
-    "ServerPort": 27183
+    "ServerPort": 27183,
+    "AutoPortMapping": false
   },
   "CACertFile": "/absolute/path/to/ca.crt",
   "socks5": [],

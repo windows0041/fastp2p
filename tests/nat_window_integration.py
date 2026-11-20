@@ -12,8 +12,9 @@ the run that exercises the announcement; the TCP run guards the opposite
 property - the extra fields must not disturb a punch that uses port prediction
 instead.
 
-The test asserts the session still completes and carries traffic: the burst must
-not break a punch that would otherwise succeed.
+The test asserts the session still completes and carries traffic. It reserves
+the QUIC listener ports so the peers negotiate a punch instead of dialing the
+shared listener. When both sides are symmetric it also checks the punch roles.
 """
 import argparse
 import json
@@ -30,7 +31,6 @@ PASSWORD = 'natwindowpassword1'
 USER = 'natwindow-admin'
 ECHO_PORT = 9996
 SOURCE_PORT = 27000
-TARGET_PORT = 27001
 
 
 def run(command, check=True):
@@ -70,13 +70,16 @@ def main():
     parser.add_argument('--gateway', required=True)
     parser.add_argument('--cert-dir', required=True)
     parser.add_argument('--logs', required=True)
-    parser.add_argument('--nat-type', default='3',
+    parser.add_argument('--nat-type', default='3', choices=('1', '2', '3', '4'),
                         help='NAT type the responder claims; 1 is the control run')
+    parser.add_argument('--source-nat-type', default='1', choices=('1', '2', '3', '4'))
+    parser.add_argument('--legacy-source', help='Optional previous client to use for the initiator')
     parser.add_argument('--transport', default='tcp', choices=('tcp', 'quic'),
                         help='underlay to punch over; the window is QUIC-only')
     args = parser.parse_args()
 
     client = str(Path(args.client).resolve())
+    source_client = str(Path(args.legacy_source).resolve()) if args.legacy_source else client
     gateway = str(Path(args.gateway).resolve())
     certs = Path(args.cert_dir).resolve()
     logs = Path(args.logs).resolve()
@@ -91,6 +94,7 @@ def main():
                FASTP2P_PUBLIC_HOST='127.0.0.1')
 
     processes = []
+    reserved_udp = []
 
     def start(command, name, prefix=None):
         handle = (logs / (name + '.log')).open('w')
@@ -121,32 +125,44 @@ def main():
         start([gateway, '--bind', '127.0.0.1', '--apibind', '127.0.0.1'], 'gateway')
         wait(lambda: 'ready' in log_text(logs / 'gateway.log'), 25, what='gateway ready')
 
-        def node(name, apps, prefix=None):
+        def node(binary, name, apps, nat_type):
             config = {'product': 'fastp2p',
                       'network': {'ServerHost': '127.0.0.1', 'ServerPort': 27183,
                                   'Token': str(TOKEN), 'Node': name},
                       'CACertFile': str(certs / 'ca.crt'), 'apps': apps}
+            if args.transport == 'quic':
+                reserved = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                reserved.bind(('0.0.0.0', 0))
+                reserved_udp.append(reserved)
+                config['network']['PublicIPPort'] = reserved.getsockname()[1]
             path = runtime / (name + '.json')
             path.write_text(json.dumps(config))
             path.chmod(0o600)
-            return start([client, '--config', str(path)], name, prefix)
+            return start([binary, '--config', str(path)], name, ['env', 'FASTP2P_NAT_TYPE=' + nat_type])
 
-        # The responder claims an incrementing symmetric mapping, so the
-        # initiator records and sprays its window during the punch.
-        node('natwindow-target',
-             [{'AppName': 'serve', 'Protocol': 'tcp', 'SrcPort': TARGET_PORT,
-               'PeerNode': 'natwindow-source', 'DstHost': '127.0.0.1',
-               'DstPort': ECHO_PORT, 'UnderlayProtocol': args.transport, 'Enabled': 1}],
-             ['env', 'FASTP2P_NAT_TYPE=' + args.nat_type])
-        node('natwindow-source',
+        node(client, 'natwindow-target', [], args.nat_type)
+        node(source_client, 'natwindow-source',
              [{'AppName': 'fetch', 'Protocol': 'tcp', 'SrcPort': SOURCE_PORT,
                'PeerNode': 'natwindow-target', 'DstHost': '127.0.0.1',
-               'DstPort': ECHO_PORT, 'UnderlayProtocol': args.transport, 'Enabled': 1}])
+               'DstPort': ECHO_PORT, 'UnderlayProtocol': args.transport, 'Enabled': 1}], args.source_nat_type)
 
         wait(lambda: 'forward attached to tunnel' in log_text(logs / 'natwindow-source.log'),
              60, what='session attached while the peer advertises a window')
         payload = b'window-' + os.urandom(6)
         assert roundtrip(SOURCE_PORT, payload, payload), 'echo mismatch over the windowed punch'
+        if args.transport == 'quic':
+            source = log_text(logs / 'natwindow-source.log')
+            target = log_text(logs / 'natwindow-target.log')
+            both_symmetric = '1' not in (args.source_nat_type, args.nat_type)
+            ordered = both_symmetric and (args.source_nat_type, args.nat_type) != ('2', '2') and not args.legacy_source
+            if ordered:
+                receiver, sender = (source, target) if args.source_nat_type == '2' else (target, source)
+                assert 'UDP punch receiver prepared' in receiver
+                assert 'UDP punch sender started' in sender
+            else:
+                assert 'UDP punch receiver prepared' not in source + target
+                assert 'UDP punch sender started' not in source + target
+            results['ordered_udp_punch'] = bool(ordered)
         results['session_with_peer_advertising_a_window'] = args.nat_type != '1'
         results['traffic_over_windowed_punch'] = True
         results['transport'] = args.transport
@@ -163,6 +179,8 @@ def main():
                 process.kill()
             handle.close()
         echo.close()
+        for reserved in reserved_udp:
+            reserved.close()
 
     print(json.dumps(results, indent=2))
     return 0 if results.get('success') else 1

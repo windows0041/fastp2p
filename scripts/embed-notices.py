@@ -13,7 +13,7 @@ files = [('fastp2p LICENSE', root/'LICENSE'), ('Third-party notices', root/'THIR
 if args.prefix:
     sources = Path(args.prefix).parent.parent/'sources'
     for name, item in json.loads((root/'deps.lock.json').read_text()).items():
-        file = 'LICENSE.txt' if name == 'openssl' else 'COPYING'
+        file = item.get('license', 'LICENSE.txt' if name == 'openssl' else 'COPYING')
         files.append((name + ' ' + item['version'], sources/(name+'-'+item['version'])/file))
 data = b''.join(('\n===== '+name+' =====\n').encode() + path.read_bytes() + b'\n' for name, path in files)
 Path(args.output).write_text('static const unsigned char fastp2p_notices[] = {\n' +

@@ -191,6 +191,89 @@ static int drain(op_socket fd, uint64_t budget) {
     }
     return seen;
 }
+
+static void peer_listener_port_conflict(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->families_wanted = FAM_V4;
+    for (int family = 0; family < OP_FAM_COUNT; ++family)
+        c->listener[family] = c->udp_listener[family] = -1;
+    op_socket occupied = socket_bound(0, "0.0.0.0", 0, BIND_PEER_LISTENER);
+    assert(occupied >= 0 && !op_listen(occupied, 1));
+    uint16_t requested = socket_port(occupied);
+    c->requested_public_port = requested;
+    assert(!start_peer_listeners(c));
+    assert(c->public_port >= PEER_PORT_MIN && c->public_port < PEER_PORT_MIN + PEER_PORT_COUNT);
+    assert(c->public_port != requested && c->requested_public_port == requested);
+    assert(socket_port(c->listener[OP_FAM_V4]) == c->public_port);
+    assert(socket_port(c->udp_listener[OP_FAM_V4]) == c->public_port);
+    close_peer_listeners(c->listener);
+    close_peer_listeners(c->udp_listener);
+    op_close(occupied);
+    assert(!start_peer_listeners(c));
+    assert(c->public_port == requested);
+    close_peer_listeners(c->listener);
+    close_peer_listeners(c->udp_listener);
+    occupied = socket_bound(1, "0.0.0.0", requested, BIND_PEER_LISTENER);
+    assert(occupied >= 0);
+    assert(!start_peer_listeners(c));
+    assert(socket_port(c->listener[OP_FAM_V4]) == requested);
+    assert(!has_udp_listener(c));
+    close_peer_listeners(c->listener);
+    op_close(occupied);
+    free(c);
+}
+
+static void udp_punch_uses_winning_socket(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "regular-node", 503, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    op_socket peer = socket_bound(1, "127.0.0.1", 0, 0);
+    t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(peer >= 0 && t->fd >= 0);
+    assert(!op_addr_socketname(peer, &t->peer_addr));
+    t->state = T_PUNCH;
+    t->udp_punch_role = UDP_PUNCH_RECEIVE;
+    t->udp_punch_kind = 2;
+    t->sym_base = t->remote_port = socket_port(peer);
+    t->sym_count = SYM_WINDOW_MAX;
+    t->sym_up = 1;
+    t->punch_started = mono();
+    t->deadline = t->punch_started + 5 * NS;
+    tick_tunnel(c, ti, t->punch_started);
+    assert(t->udp_candidate_count == UDP_PUNCH_EXTRA_SOCKETS);
+    assert(drain(peer, SPRAY_WAIT));
+
+    op_socket winner = t->udp_candidates[1], primary = t->fd, other = t->udp_candidates[0];
+    op_addr local;
+    assert(!op_addr_socketname(winner, &local));
+    json_object *probe = json_object_new_object();
+    op_ju(probe, "id", t->id + 1);
+    assert(!udp_packet(peer, &local, 4, 0, probe));
+    tick_tunnel(c, ti, mono());
+    assert(t->state == T_PUNCH && t->fd == primary);
+    op_ju(probe, "id", t->id);
+    assert(!udp_packet(peer, &local, 4, 0, probe));
+    json_object_put(probe);
+    uint64_t until = mono() + NS;
+    while (t->state == T_PUNCH && mono() < until) {
+        tick_tunnel(c, ti, mono());
+        op_sleep_ms(2);
+    }
+    assert(t->state == T_UNDERLAY && t->fd == winner && !t->udp_candidate_count);
+    assert(t->local_port == op_addr_port(&local) && t->remote_port == socket_port(peer));
+    assert(op_addr_socketname(primary, &local) && op_addr_socketname(other, &local));
+    assert(drain(peer, SPRAY_WAIT));
+    tick_tunnel(c, ti, t->punch_next);
+    assert(drain(peer, SPRAY_WAIT));
+    close_tunnel(c, ti, NULL);
+    assert(op_addr_socketname(winner, &local));
+    op_close(peer);
+    free(c);
+}
 static void sym_spray_ports(void) {
     for (int attempt = 0; attempt < 8; ++attempt) {
         op_socket peer[3] = {-1, -1, -1};
@@ -392,6 +475,8 @@ int main(void) {
     tcp_retry();
     tcp_punch_scheduling();
     quic_uses_punch_endpoint();
+    peer_listener_port_conflict();
+    udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();
     /* A difficult UDP mapping must never suppress a stable or unknown TCP path. */
     fastp2p_client client={0};client.nat[OP_FAM_V4].type=NAT_HARD_SYM;client.tcp_nat.family[OP_FAM_V4].type=FP_NAT_STABLE;

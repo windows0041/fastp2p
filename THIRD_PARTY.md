@@ -24,9 +24,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-The native Linux build links system-provided ngtcp2 with the OpenSSL backend, libcurl, json-c and
-OpenSSL. The portable builds statically include OpenSSL 3.5.7 (Apache-2.0),
-ngtcp2 1.22.1 (MIT), curl 8.23.0 (curl license) and json-c 0.18 (MIT).
+The native Linux build links system-provided ngtcp2 with the OpenSSL backend, libcurl, json-c,
+OpenSSL, miniupnpc and libnatpmp. The portable builds statically include OpenSSL 3.5.7 (Apache-2.0),
+ngtcp2 1.22.1 (MIT), curl 8.23.0 (curl license), json-c 0.18 (MIT), miniupnpc 2.3.5
+(BSD-3-Clause) and libnatpmp 134fc89 (BSD-3-Clause).
 Source URLs and checksums are recorded in deps.lock.json. SDK packages include
 the corresponding complete upstream licenses in licenses/. Sources are fetched
 into the out-of-tree dependency cache, not vendored into this repository.

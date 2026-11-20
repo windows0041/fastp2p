@@ -10,6 +10,7 @@ int fp_client_tcp_level_config(fastp2p_client *client, json_object *probe);
 /* The PEM lives in static storage for the lifetime of the client. */
 void fp_client_set_ca_pem(fastp2p_client *client, const char *pem);
 void fp_client_set_tls_alias(fastp2p_client *client, const char *hostname, const char *pem);
+void fp_client_set_auto_port_mapping(fastp2p_client *client, int enabled);
 void fp_client_validation_mode(fastp2p_client *client);
 int fp_config_validate_json(const char *json);
 #endif

@@ -104,6 +104,12 @@ static int create_json(const char *text, const char *token_text, const char *ca,
         }
     }
     json_object *automatic = op_get(network, "AutoNode");
+    json_object *port_mapping = NULL;
+    if (network && json_object_object_get_ex(network, "AutoPortMapping", &port_mapping) &&
+        !json_object_is_type(port_mapping, json_type_boolean)) {
+        json_object_put(root);
+        return FASTP2P_EINVAL;
+    }
     if (automatic && !json_object_is_type(automatic, json_type_boolean)) {
         json_object_put(root);
         return FASTP2P_EINVAL;
@@ -119,6 +125,8 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                        .on_event = callback,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
+    if (!rv && port_mapping)
+        fp_client_set_auto_port_mapping(*out, json_object_get_boolean(port_mapping));
     if (!rv && ca_pem) fp_client_set_ca_pem(*out, ca_pem);
 #ifdef FASTP2P_BUILTIN_TRUST
     if (!rv) {

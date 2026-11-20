@@ -2,5 +2,7 @@
   "openssl": {"version":"3.5.7","url":"https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz","file":"openssl-3.5.7.tar.gz","sha256":"a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8"},
   "curl": {"version":"8.23.0","url":"https://curl.se/download/curl-8.23.0.tar.xz","file":"curl-8.23.0.tar.xz","sha256":"8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"},
   "ngtcp2": {"version":"1.22.1","url":"https://github.com/ngtcp2/ngtcp2/archive/refs/tags/v1.22.1.tar.gz","file":"ngtcp2-1.22.1.tar.gz","sha256":"a83f46b17e07ad91ff1c8b843adcba99578d1e62007ededa7d52cd097ef64a52"},
-  "json-c": {"version":"0.18","url":"https://s3.amazonaws.com/json-c_releases/releases/json-c-0.18.tar.gz","file":"json-c-0.18.tar.gz","sha256":"876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724"}
+  "json-c": {"version":"0.18","url":"https://s3.amazonaws.com/json-c_releases/releases/json-c-0.18.tar.gz","file":"json-c-0.18.tar.gz","sha256":"876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724"},
+  "miniupnpc": {"version":"2.3.5","url":"https://codeload.github.com/miniupnp/miniupnp/tar.gz/refs/tags/miniupnpc_2_3_5","file":"miniupnpc-2.3.5.tar.gz","sha256":"62858cfe25077481f53c54de51006f0e4eeb4528ddc81396d5fd37d5b664c9e2","source":"miniupnpc","license":"miniupnpc/LICENSE"},
+  "libnatpmp": {"version":"134fc89","url":"https://codeload.github.com/miniupnp/libnatpmp/tar.gz/134fc89e2781e154e40042641f4d8bcbe42579f1","file":"libnatpmp-134fc89.tar.gz","sha256":"be1864ed4e54a122590fd2de3824b085386b6e4aa9a91738c277c280ab8bf188","license":"LICENSE"}
 }

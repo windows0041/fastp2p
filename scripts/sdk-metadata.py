@@ -44,8 +44,8 @@ def main():
     manifest = json.loads((PROJECT / 'deps.lock.json').read_text(encoding='utf-8'))
     for name, item in manifest.items():
         source = args.work / 'sources' / f"{name}-{item['version']}"
-        filename = 'LICENSE.txt' if name == 'openssl' else 'COPYING'
-        shutil.copyfile(source / filename, notices / f'{name}-{filename}')
+        filename = Path(item.get('license', 'LICENSE.txt' if name == 'openssl' else 'COPYING'))
+        shutil.copyfile(source / filename, notices / f'{name}-{filename.name}')
     print('SDK metadata and third-party licenses:', sdk)
 
 

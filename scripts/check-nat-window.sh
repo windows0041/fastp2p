@@ -12,21 +12,21 @@ for binary in "$client" "$gateway"; do
 done
 # Keep artifacts on a persistent filesystem so a failed run can be inspected.
 base=${FASTP2P_TEST_ROOT:-/tmp}
-# transport:nat-type. 2 is hard symmetric (centred window), 3 is the predictable
-# symmetric mapping, 1 is the cone control.
-combinations=${FASTP2P_NAT_WINDOW_CASES:-"tcp:3 tcp:1 quic:3 quic:2 quic:1"}
+# transport:responder[:initiator]. 2 is hard symmetric, 3 and 4 are the
+# predictable incrementing and decrementing mappings, 1 is the cone control.
+combinations=${FASTP2P_NAT_WINDOW_CASES:-"tcp:3 tcp:1 quic:3 quic:2 quic:1 quic:3:4 quic:2:3 quic:3:2"}
 status=0
 for combination in $combinations; do
-  transport=${combination%%:*}
-  claimed=${combination##*:}
+  IFS=: read -r transport claimed initiator <<< "$combination"
+  initiator=${initiator:-1}
   runtime=$(mktemp -d "$base/fastp2p-nat-window.XXXXXXXX")
   chmod 700 "$runtime"
   bash "$repository/scripts/tls/generate-cert.sh" "$runtime/certs" localhost 127.0.0.1 \
     > "$runtime/certificate-generation.log" 2>&1
-  echo "NAT window check over $transport with the responder claiming type $claimed: $runtime"
+  echo "NAT window check over $transport with types $initiator and $claimed: $runtime"
   python3 "$repository/tests/nat_window_integration.py" \
     --client "$client" --gateway "$gateway" \
     --cert-dir "$runtime/certs" --logs "$runtime/logs" \
-    --nat-type "$claimed" --transport "$transport" || status=1
+    --nat-type "$claimed" --source-nat-type "$initiator" --transport "$transport" || status=1
 done
 exit $status
