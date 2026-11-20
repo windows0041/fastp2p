@@ -2867,6 +2867,16 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
     uint64_t src = op_integer(j, "srcPort"), dst = op_integer(j, "dstPort");
     int transport_tcp = (op_integer(j, "punchPriority") & 2) != 0;
     const char *protocol = op_string(j, "protocol");
+    const char *bind_ip = op_string(j, "whitelist");
+    json_object *bind_field;
+    op_addr bind_address;
+    if (json_object_object_get_ex(j, "whitelist", &bind_field) &&
+        (!json_object_is_type(bind_field, json_type_string) ||
+         strlen(bind_ip) != (size_t)json_object_get_string_len(bind_field) ||
+         (*bind_ip && op_addr_from_text(&bind_address, bind_ip, 0)))) {
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, "invalid forwarding listen address");
+        return;
+    }
     /* Re-applying a rule (edit, re-enable, or a fresh RULE_SYNC) replaces the
      * one with the same identity rather than being rejected as a duplicate. */
     if (src && src <= 65535 && *protocol)
@@ -2881,10 +2891,9 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
              * client request and resolved at the peer. The console still picks the
              * local entry port, so honour it here instead of requiring dstPort. */
             const char *user = op_string(j, "Username"), *password = op_string(j, "Password");
-            const char *bind = op_string(j, "whitelist");
             fastp2p_socks5 proxy = {.struct_size = sizeof(proxy),
                                    .name = op_string(j, "appName"),
-                                   .bind_ip = *bind ? bind : "127.0.0.1",
+                                   .bind_ip = *bind_ip ? bind_ip : NULL,
                                    .local_port = (uint16_t)src,
                                    .peer_node = op_string(j, "peerNode"),
                                    .transport = transport_tcp ? FASTP2P_TRANSPORT_TCP
@@ -2920,6 +2929,7 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
         } else if (src && src <= 65535 && dst && dst <= 65535) {
             fastp2p_forward f = {.struct_size = sizeof(f),
                               .name = op_string(j, "appName"),
+                              .bind_ip = *bind_ip ? bind_ip : NULL,
                               .local_port = (uint16_t)src,
                               .peer_node = op_string(j, "peerNode"),
                               .destination_host = op_string(j, "dstHost"),

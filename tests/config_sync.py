@@ -59,9 +59,9 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             s.bind(('127.0.0.1', 0))
             return s.getsockname()[1]
 
-    def listening(number):
+    def listening(number, address='127.0.0.1'):
         try:
-            with socket.create_connection(('127.0.0.1', number), timeout=.2):
+            with socket.create_connection((address, number), timeout=.2):
                 return True
         except OSError:
             return False
@@ -157,16 +157,20 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             # configuration file, and a key inside the rule that the renderer does
             # not know must survive the round trip.
             forward = port()
+            listen_address = '127.0.0.2'
             assert api('/api/v1/device/config-test-node/app',
-                       rule_forwards(forward, 'config-forward', {'customRuleKey': 42}))[0] == 200
-            wait(lambda: listening(forward) and forwards(forward),
+                       rule_forwards(forward, 'config-forward',
+                                     {'customRuleKey': 42, 'whitelist': listen_address}))[0] == 200
+            wait(lambda: listening(forward, listen_address) and forwards(forward),
                  what='the rule to reach fastp2p.conf and bind')
+            assert not listening(forward)
             saved = read_config()
             stored = [a for a in saved['apps'] if int(a.get('SrcPort', 0)) == forward]
             assert stored, 'the rule never reached fastp2p.conf'
             # A key the gateway's renderer does not understand still has to survive:
             # it round-trips through the stored rule payload rather than being dropped.
             assert stored[0]['customRuleKey'] == 42, stored[0]
+            assert stored[0]['BindIP'] == listen_address, stored[0]
             results['rule_reaches_config_file_and_unknown_keys_survive'] = True
 
             # Unmanaged local keys and the credential material stay untouched.
@@ -185,7 +189,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             assert api('/api/v1/device/config-test-node/app',
                        {'protocol': 'tcp', 'srcPort': 0, 'protocol0': 'tcp',
                         'srcPort0': forward})[0] == 200
-            wait(lambda: not forwards(forward) and not listening(forward),
+            wait(lambda: not forwards(forward) and not listening(forward, listen_address),
                  what='the first rule to disappear')
             assert listening(changed)
             results['rules_replace_as_a_set_and_disappear_when_deleted'] = True
