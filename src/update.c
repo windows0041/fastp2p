@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -445,6 +446,78 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
         return -1;
     return rename(staged, target) ? -1 : 0;
 }
+static void update_error(char *error, size_t length, const char *action, int code) {
+    char detail[160];
+    snprintf(detail, sizeof(detail), "%s: %s", action, strerror(code));
+    set_error(error, length, detail);
+}
+
+/* Check, while the client is still online and the control channel is open, the
+ * conditions the swap needs but cannot report afterwards: a single filesystem,
+ * a writable install directory and enough room for whichever strategy the swap
+ * will end up using. Failing here keeps the service running and the operator
+ * sees the reason in the gateway console instead of one stderr line in a log. */
+int fp_update_precheck(const char *staged, char *error, size_t error_length) {
+    char own[4096], directory[4096];
+    if (fp_update_own_path(own, sizeof(own))) {
+        set_error(error, error_length, "cannot locate the running executable");
+        return -1;
+    }
+    snprintf(directory, sizeof(directory), "%s", own);
+    char *slash = strrchr(directory, '/');
+    if (!slash) {
+        set_error(error, error_length, "cannot locate the install directory");
+        return -1;
+    }
+    slash[1] = 0;
+    struct stat own_stat, staged_stat;
+    if (stat(own, &own_stat) || stat(staged, &staged_stat)) {
+        update_error(error, error_length, "cannot inspect the update files", errno);
+        return -1;
+    }
+    /* rename and renameat2 both refuse to cross filesystems. */
+    if (own_stat.st_dev != staged_stat.st_dev) {
+        set_error(error, error_length, "the download is on a different filesystem");
+        return -1;
+    }
+    if (access(directory, W_OK | X_OK)) {
+        update_error(error, error_length, "the install directory is not writable", errno);
+        return -1;
+    }
+    /* Renaming only moves directory entries. The copy is the last resort, so
+     * probe the hard link here: when it works the swap never needs a second
+     * image, and a nearly full filesystem can still be updated. */
+    int needs_copy = 1;
+#if defined(SYS_renameat2) && defined(RENAME_EXCHANGE)
+    needs_copy = 0;
+#else
+    char probe[4200];
+    if (snprintf(probe, sizeof(probe), "%s.fastp2p-link-%ld", directory, (long)getpid()) > 0 &&
+        !link(own, probe)) {
+        unlink(probe);
+        needs_copy = 0;
+    }
+#endif
+    if (!needs_copy)
+        return 0;
+    struct statvfs space;
+    if (statvfs(directory, &space)) {
+        update_error(error, error_length, "cannot inspect free space", errno);
+        return -1;
+    }
+    uint64_t available = (uint64_t)space.f_bavail * (uint64_t)space.f_frsize;
+    uint64_t required = (uint64_t)staged_stat.st_size;
+    if (available >= required)
+        return 0;
+    char detail[224];
+    snprintf(detail, sizeof(detail),
+             "not enough free space for the update: need %llu MiB, %llu MiB available in %s",
+             (unsigned long long)((required + ((UINT64_C(1) << 20) - 1)) >> 20),
+             (unsigned long long)(available >> 20), directory);
+    set_error(error, error_length, detail);
+    return -1;
+}
+
 /* Recorded by fp_update_apply and installed once the client has shut down. */
 static char pending_update[4200];
 static int probe_executable(const char *path) {
@@ -508,6 +581,8 @@ int fp_update_apply(const char *staged, char *error, size_t error_length) {
         set_error(error, error_length, "package cannot run as a fastp2p executable");
         return -1;
     }
+    if (fp_update_precheck(staged, error, error_length))
+        return -1;
     snprintf(pending_update, sizeof(pending_update), "%s", staged);
     return 0;
 }
@@ -545,6 +620,84 @@ static int backup_executable(const char *source, const char *backup) {
     return ok ? 0 : -1;
 }
 
+/* Replace `own` with `staged`, keeping the previous image at `previous`.
+ *
+ * Every strategy before the copy moves directory entries only, so the peak disk
+ * usage stays at one image: an in-place update used to need two, and that is
+ * what made it fail on a filesystem with barely more free space than the new
+ * binary. The copy remains as the last resort for a directory the service
+ * account can neither hard-link into nor rename within.
+ *
+ * On success returns 0 and writes the path holding the previous image into
+ * rollback, which the caller needs to undo a failed execv. */
+int fp_update_swap_files(const char *own, const char *staged, const char *previous,
+                         char *rollback, size_t rollback_length, char *error,
+                         size_t error_length) {
+    if (rollback && rollback_length)
+        rollback[0] = 0;
+#if defined(SYS_renameat2) && defined(RENAME_EXCHANGE)
+    /* Exchange the two directory entries: no data blocks, and no requirement to
+     * own the root-owned image the service account replaced. */
+    if (!syscall(SYS_renameat2, AT_FDCWD, staged, AT_FDCWD, own, RENAME_EXCHANGE)) {
+        /* `staged` now holds the previous image. */
+        const char *kept = rename(staged, previous) ? staged : previous;
+        if (rollback && rollback_length)
+            snprintf(rollback, rollback_length, "%s", kept);
+        return 0;
+    }
+    int exchange_error = errno;
+    if (exchange_error != ENOSYS && exchange_error != EINVAL && exchange_error != EXDEV) {
+        update_error(error, error_length, "cannot exchange the installed build", exchange_error);
+        return -1;
+    }
+#endif
+    /* A hard link keeps `own` present for the whole swap. */
+    if (!link(own, previous)) {
+        if (!rename(staged, own)) {
+            if (rollback && rollback_length)
+                snprintf(rollback, rollback_length, "%s", previous);
+            return 0;
+        }
+        int saved = errno;
+        unlink(previous);
+        update_error(error, error_length, "cannot install the new build", saved);
+        return -1;
+    }
+    /* Linking a root-owned image is refused for the service account (protected
+     * hard links); renaming only needs write access to the directory. This
+     * leaves `own` absent between the two calls, which is still better than
+     * requiring room for a second image. */
+    if (!rename(own, previous)) {
+        if (!rename(staged, own)) {
+            if (rollback && rollback_length)
+                snprintf(rollback, rollback_length, "%s", previous);
+            return 0;
+        }
+        int saved = errno;
+        if (rename(previous, own))
+            update_error(error, error_length, "cannot install the new build or restore the "
+                                              "previous one", saved);
+        else
+            update_error(error, error_length, "cannot install the new build", saved);
+        return -1;
+    }
+    /* Nothing has moved yet, so the stale image name is free to reuse. */
+    unlink(previous);
+    if (backup_executable(own, previous)) {
+        update_error(error, error_length, "cannot save the previous build", errno);
+        return -1;
+    }
+    if (rename(staged, own)) {
+        int saved = errno;
+        unlink(previous);
+        update_error(error, error_length, "cannot install the new build", saved);
+        return -1;
+    }
+    if (rollback && rollback_length)
+        snprintf(rollback, rollback_length, "%s", previous);
+    return 0;
+}
+
 int fp_update_run_pending(char *const argv[]) {
     if (!pending_update[0])
         return 0;
@@ -555,39 +708,35 @@ int fp_update_run_pending(char *const argv[]) {
     char own[4096];
     if (fp_update_own_path(own, sizeof(own)))
         return -1;
-    /* Keep the installed path present throughout the swap. Save the old image
-     * before the staged file atomically replaces it. */
-    char previous[4200], backup[4240];
+    char previous[4200], rollback[4200], error[256];
     snprintf(previous, sizeof(previous), "%s.old", own);
-    snprintf(backup, sizeof(backup), "%s.backup", staged);
-    const char *rollback = NULL;
-#if defined(SYS_renameat2) && defined(RENAME_EXCHANGE)
-    /* Exchange the directory entries without copying a root-owned executable.
-     * The running service can rename files in its directory even when it is
-     * not allowed to hard-link the original binary. */
-    if (!syscall(SYS_renameat2, AT_FDCWD, staged, AT_FDCWD, own, RENAME_EXCHANGE))
-        rollback = rename(staged, previous) ? staged : previous;
-#endif
-    if (!rollback) {
-        if (backup_executable(own, backup) || rename(backup, previous) || rename(staged, own)) {
-            perror("fastp2p update swap failed");
-            remove(backup);
+    if (fp_update_swap_files(own, staged, previous, rollback, sizeof(rollback), error,
+                             sizeof(error))) {
+        /* The gateway session is already closed here, so this line is the whole
+         * record of why. Keep the previous reason in words, not perror's. */
+        fprintf(stderr, "fastp2p update swap failed: %s\n", error);
+        /* Drop the package only while the installed image still runs. When it
+         * does not, the verified download is the only way back to a runnable
+         * executable and is left in place. */
+        struct stat installed;
+        if (!stat(own, &installed))
             remove(staged);
-        } else {
-            rollback = previous;
-        }
-    }
-    if (rollback) {
-        execv(own, argv);
-        perror("fastp2p update start failed");
-        if (rename(rollback, own)) {
-            perror("fastp2p update rollback failed");
-            execv(rollback, argv);
-            return -1;
-        }
+        return -1;
     }
     execv(own, argv);
-    perror("fastp2p previous executable could not restart");
+    fprintf(stderr, "fastp2p update start failed: %s\n", strerror(errno));
+    if (!rollback[0]) {
+        execv(own, argv);
+        fprintf(stderr, "fastp2p no executable could be restarted: %s\n", strerror(errno));
+        return -1;
+    }
+    if (rename(rollback, own)) {
+        fprintf(stderr, "fastp2p update rollback failed: %s\n", strerror(errno));
+        execv(rollback, argv);
+        return -1;
+    }
+    execv(own, argv);
+    fprintf(stderr, "fastp2p previous executable could not restart: %s\n", strerror(errno));
     return -1;
 }
 void fp_update_cleanup(void) {

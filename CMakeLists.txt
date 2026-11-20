@@ -186,6 +186,16 @@ if(BUILD_TESTING)
       target_link_libraries(test-profile-probe PRIVATE fastp2p_cli_core fastp2p_bootstrap crypt32 advapi32 shell32 user32)
       # Requires an elevated isolated runner; the local CTest suite need not be admin.
     endif()
+    if(NOT WIN32)
+      # The POSIX swap and precheck are pure filesystem logic: no execv, no
+      # service manager, so they can be exercised in a temporary directory.
+      add_executable(test-update-posix tests/test_update_posix.c src/update.c)
+      target_include_directories(test-update-posix PRIVATE src)
+      target_link_libraries(test-update-posix PRIVATE ${FASTP2P_WEB_TARGET} ${FASTP2P_CRYPTO_TARGET})
+      target_compile_options(test-update-posix PRIVATE -UNDEBUG)
+      add_test(NAME update-posix COMMAND test-update-posix)
+      set_tests_properties(update-posix PROPERTIES TIMEOUT 20)
+    endif()
     add_executable(test-session-binding tests/test_session_binding.c)
     target_link_libraries(test-session-binding PRIVATE fastp2p_cli_core)
     target_compile_options(test-session-binding PRIVATE -UNDEBUG)

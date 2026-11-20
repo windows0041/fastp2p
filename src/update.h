@@ -50,6 +50,14 @@ int fp_update_swap(const char *staged, const char *target, const char *service);
 #include <wchar.h>
 /* Internal Windows helper: wait for a stopped process to release its image. */
 int fp_update_replace_file(const wchar_t *source, const wchar_t *target);
+#else
+/* Internal POSIX helpers, unit-tested directly. The precheck runs while the
+ * client is still online, so its message reaches the gateway console; the swap
+ * runs after the event loop has exited and can only report to stderr. */
+int fp_update_precheck(const char *staged, char *error, size_t error_length);
+int fp_update_swap_files(const char *own, const char *staged, const char *previous,
+                         char *rollback, size_t rollback_length, char *error,
+                         size_t error_length);
 #endif
 
 #endif
