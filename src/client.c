@@ -182,8 +182,8 @@ typedef struct {
 typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
-    uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port;
-    int skip_udp_direct;
+    uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port, udp_reverse_port6;
+    int skip_udp_direct, udp_reverse6_retry, udp_reverse6_supported;
     unsigned tcp_attempts;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
@@ -254,7 +254,7 @@ typedef struct {
     char socks_user[256], socks_password[256];
     uint16_t port, dst_port;
     int attempts, relay_wanted, relay_requested;
-    int lan_tried, udp_direct_tried, ipv4_retry;
+    int lan_tried, udp_direct_tried, udp_reverse6_retry, ipv4_retry;
     int no_relay;  /* operator disabled relay fallback for this rule */
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
@@ -1150,17 +1150,22 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             int was_synced = c->apps[i].synced;
             if (reason && c->apps[i].local && t->initiator && !t->lan && !t->relay_wait && !was_synced) {
                 app *a = &c->apps[i];
-                int fallback = t->attempted_ipv6 && !a->ipv4_retry && family_usable(c, t, OP_FAM_V4);
-                if (fallback) {
+                int reverse6 = t->attempted_ipv6 && t->udp_direct_port && t->udp_reverse_port6 &&
+                               t->udp_reverse6_supported && !t->udp_reverse6_retry;
+                int fallback = !reverse6 && t->attempted_ipv6 && !a->ipv4_retry &&
+                               family_usable(c, t, OP_FAM_V4);
+                a->udp_reverse6_retry = reverse6;
+                if (reverse6) {
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "IPv6 direct attempt failed; trying reverse UDP dialing");
+                } else if (fallback) {
                     a->ipv4_retry = 1;
                     a->udp_direct_tried = 0;
                     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "IPv6 direct attempt failed; retrying over IPv4");
                 } else if (t->udp_direct_port) {
                     a->udp_direct_tried = 1;
                 }
-                /* Keep both public rounds available after switching families,
-                 * or after an unsuccessful shared UDP listener dial. */
-                if ((fallback || t->udp_direct_port) && a->attempts > 0)
+                /* Listener attempts do not spend the ordinary punch rounds. */
+                if ((reverse6 || fallback || t->udp_direct_port) && a->attempts > 0)
                     --a->attempts;
             }
             c->apps[i].tunnel_index = -1;
@@ -1806,6 +1811,21 @@ static void report_port_mapping(const fastp2p_client *c, json_object *j) {
     op_ju(j, "mappedUDPPort", udp);
 }
 
+/* Advertise the shared listener only when the IPv6 probe retained its
+ * interface address and port. A translated IPv6 mapping would not establish
+ * whether the listener is reachable at the same port. */
+static uint16_t ipv6_udp_listener_port(const fastp2p_client *c, const tunnel *t) {
+    op_addr mapped, local;
+    if (c->udp_listener[OP_FAM_V6] < 0 || !t->mapped_ports[OP_FAM_V6] ||
+        t->mapped_ports[OP_FAM_V6] != t->probes[OP_FAM_V6].local_port ||
+        op_addr_from_text(&mapped, t->mapped_text[OP_FAM_V6], 0) ||
+        op_addr_family(&mapped) != AF_INET6 ||
+        op_addr_from_text(&local, c->local_ip[OP_FAM_V6], 0) ||
+        !op_addr_routable(&mapped) || !op_addr_equal(&mapped, &local))
+        return 0;
+    return c->public_port;
+}
+
 static void probe_complete(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     /* Listen on the port this client is about to advertise. The TCP punch used to
@@ -1870,11 +1890,18 @@ static void probe_complete(fastp2p_client *c, int index) {
         if (t->transport == FASTP2P_TRANSPORT_QUIC && !t->skip_udp_direct &&
             !t->relay_wait && has_udp_listener(c)) {
             op_ju(j, "udpDirect", 1);
-            if (!t->lan && !strcmp(t->mode, "udppunch"))
+            if (!t->lan && !strcmp(t->mode, "udppunch")) {
                 t->udp_reverse_port = public_mapping_port(t->mapped_text[OP_FAM_V4],
                                                           c->mapped_listener.udp, c->mapped_listener.udp_wan);
+                t->udp_reverse_port6 = ipv6_udp_listener_port(c, t);
+            }
             if (t->udp_reverse_port)
                 op_ju(j, "udpReversePort", t->udp_reverse_port);
+            if (t->udp_reverse_port6) {
+                op_ju(j, "udpReversePort6", t->udp_reverse_port6);
+                if (t->udp_reverse6_retry)
+                    op_ju(j, "udpReverse6", 1);
+            }
         }
         op_ju(j, "isServer", 1);
         op_ju(j, "lan", t->lan ? 1 : 0);
@@ -1893,8 +1920,9 @@ static void probe_complete(fastp2p_client *c, int index) {
         uint64_t ts = (uint64_t)((int64_t)wall() - c->clock_delta) + 3 * NS;
         op_js(j, "to", t->peer);
         op_ju(j, "punchts", ts);
-        int reverse = 0;
-        if (!t->lan && choose_punch_family(c, t) == OP_FAM_V4) {
+        uint16_t reverse_port = 0;
+        int family = choose_punch_family(c, t);
+        if (!t->lan && family == OP_FAM_V4) {
             const char *ip = t->mapped_text[OP_FAM_V4];
             uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
             if (t->tcp_direct_port && mapped_tcp)
@@ -1902,17 +1930,24 @@ static void probe_complete(fastp2p_client *c, int index) {
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
-            } else if (t->udp_reverse_port) {
-                reverse = 1;
-                t->server = 0;
-                t->udp_direct_port = t->udp_reverse_port;
-                op_ju(j, "udpReverse", 1);
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "Dialing the initiator's mapped UDP listener");
+            } else {
+                reverse_port = t->udp_reverse_port;
             }
+        } else if (!t->lan && family == OP_FAM_V6 && t->udp_reverse_port6) {
+            op_ju(j, "udpReverse6Cap", 1);
+            if (t->udp_reverse6_retry || !t->udp_direct_port || c->udp_listener[OP_FAM_V6] < 0)
+                reverse_port = t->udp_reverse_port6;
+        }
+        if (reverse_port) {
+            t->server = 0;
+            t->udp_direct_port = reverse_port;
+            op_ju(j, family == OP_FAM_V6 ? "udpReverse6" : "udpReverse", 1);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, family == OP_FAM_V6
+                ? "Dialing the initiator's IPv6 UDP listener" : "Dialing the initiator's mapped UDP listener");
         }
         if (t->tcp_direct_port)
             op_ju(j, "tcpDirectPort", t->tcp_direct_port);
-        if (t->udp_direct_port && !reverse)
+        if (t->udp_direct_port && !reverse_port)
             op_ju(j, "udpDirectPort", t->udp_direct_port);
         t->udp_punch_role = ordered_udp_role(c, t);
         if (t->udp_punch_role) {
@@ -1924,10 +1959,10 @@ static void probe_complete(fastp2p_client *c, int index) {
         /* Give the initiator a short window to dial the shared listener.
          * Immediate punch resumes after that window, or starts right away
          * when the peer did not request a direct attempt. */
-        uint64_t delay = reverse ? 100 * MS : t->tcp_direct_port ? TCP_DIRECT_WAIT
+        uint64_t delay = reverse_port ? 100 * MS : t->tcp_direct_port ? TCP_DIRECT_WAIT
                          : t->tcp_punch_immediate || t->udp_punch_role ? 0 : 3 * NS;
         t->at = mono() + delay;
-        t->state = t->udp_direct_port && !reverse ? T_UDP_DIRECT : T_TIME;
+        t->state = t->udp_direct_port && !reverse_port ? T_UDP_DIRECT : T_TIME;
         t->deadline = t->udp_direct_port ? mono() + UDP_DIRECT_WAIT + 2 * NS : t->at + 10 * NS;
         if (!strcmp(t->mode, "tcp4") || !strcmp(t->mode, "intranet") || !strcmp(t->mode, "udp4"))
             t->at = mono();
@@ -2298,6 +2333,7 @@ static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport
         return -1;
     tunnel *t = &c->tunnels[ti];
     t->skip_udp_direct = a->udp_direct_tried;
+    t->udp_reverse6_retry = a->udp_reverse6_retry;
     /* A retry must not reset AEAD counters under a previously used key. */
     a->session = t->session;
     memcpy(a->secret, t->secret, FP_SESSION_SECRET);
@@ -2920,6 +2956,7 @@ static void rename_peer(fastp2p_client *c, const char *old_name, const char *nam
             a->attempts = 0;
             a->lan_tried = 0;
             a->udp_direct_tried = 0;
+            a->udp_reverse6_retry = 0;
             a->ipv4_retry = 0;
             a->relay_requested = 0;
             a->relay_failed_count = 0;
@@ -3082,6 +3119,13 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     !op_integer(j, "lan") && v4_ok && reverse_port <= UINT16_MAX &&
                     !op_addr_from_text(&peer_ip, peer_text, 0) && public_ipv4(&peer_ip))
                     t->udp_reverse_port = (uint16_t)reverse_port;
+                uint64_t reverse6_port = op_integer(j, "udpReversePort6");
+                if (!strcmp(mode, "udppunch") && op_integer(j, "udpDirect") == 1 &&
+                    !op_integer(j, "lan") && v6_ok && reverse6_port && reverse6_port <= UINT16_MAX &&
+                    !op_addr_from_text(&peer_ip, peer_text6, 0) && op_addr_routable(&peer_ip)) {
+                    t->udp_reverse_port6 = (uint16_t)reverse6_port;
+                    t->udp_reverse6_retry = op_integer(j, "udpReverse6") == 1;
+                }
                 t->udp_punch_order = op_integer(j, "udpPunchOrder") == 1;
                 t->udp_dual_punch = op_integer(j, "udpPunchDual") == 1;
                 t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
@@ -3151,13 +3195,26 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     t->udp_direct_port = (uint16_t)udp_port;
                 learn_tcp_mapping(t, j);
                 learn_sym_window(t, j);
-                if (t->udp_reverse_port && op_integer(j, "udpReverse") == 1 &&
-                    choose_punch_family(c, t) == OP_FAM_V4) {
+                int family = choose_punch_family(c, t);
+                t->udp_reverse6_supported = family == OP_FAM_V6 && t->udp_reverse_port6 &&
+                                            op_integer(j, "udpReverse6Cap") == 1;
+                uint16_t reverse = 0;
+                if (t->udp_reverse6_supported && op_integer(j, "udpReverse6") == 1) {
+                    reverse = t->udp_reverse_port6;
+                    t->udp_reverse6_retry = 1;
+                } else if (family == OP_FAM_V4 && op_integer(j, "udpReverse") == 1) {
+                    reverse = t->udp_reverse_port;
+                }
+                if (reverse) {
                     t->server = 1;
-                    t->udp_direct_port = t->udp_reverse_port;
+                    t->family = family;
+                    t->attempted_ipv6 = family == OP_FAM_V6;
+                    t->udp_direct_port = reverse;
                     t->state = T_UDP_DIRECT;
                     t->deadline = mono() + UDP_DIRECT_WAIT + 2 * NS;
-                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "Waiting on the mapped UDP listener for reverse dialing");
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, family == OP_FAM_V6
+                        ? "Waiting on the IPv6 UDP listener for reverse dialing"
+                        : "Waiting on the mapped UDP listener for reverse dialing");
                     json_object_put(j);
                     return;
                 }
@@ -4161,6 +4218,7 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                     c->apps[i].attempts = 0;
                     c->apps[i].lan_tried = 0;
                     c->apps[i].udp_direct_tried = 0;
+                    c->apps[i].udp_reverse6_retry = 0;
                     c->apps[i].ipv4_retry = 0;
                     c->apps[i].relay_failed_count = 0;
                 }
@@ -4269,6 +4327,7 @@ static void dispatch_udp_listener(fastp2p_client *c, int family, const op_addr *
     tunnel *t = &c->tunnels[index];
     op_addr expected;
     if (t->state != T_UDP_DIRECT || !t->server || !t->peer_ready[family] || now >= t->deadline ||
+        (t->initiator && t->udp_reverse6_retry && family != OP_FAM_V6) ||
         op_addr_from_text(&expected, t->peer_text[family], 0) || !op_addr_equal(&expected, peer))
         return;
     opq *q = opq_accept_listener(c->udp_listener[family], &peer->u.sa, peer->len);
@@ -4494,7 +4553,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                          (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
                         in_progress = 1;
                 if (!in_progress) {
-                    if (lan_punch_possible(c, a) && !a->lan_tried && !c->force_relay) {
+                    if (!a->udp_reverse6_retry && lan_punch_possible(c, a) && !a->lan_tried && !c->force_relay) {
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
                             c->tunnels[ti].lan = 1;

@@ -72,6 +72,8 @@ int main(void) {
     assert(!op_addr_routable(&loop6) && !op_addr_private(&loop6));
     assert(!op_addr_routable(&link6) && op_addr_private(&link6));
     assert(!op_addr_routable(&ula) && op_addr_private(&ula));
+    op_addr global6 = addr("2409:8a55::1", 0), reserved6 = addr("6000::1", 0);
+    assert(op_addr_routable(&global6) && !op_addr_routable(&reserved6));
 
     /* A socket reports both endpoints with the family it actually used. This
      * replaces the old habit of extracting only the port into a 16-byte IPv4

@@ -589,6 +589,111 @@ static void udp_dual_window_packets(void) {
     op_close(base);
 }
 
+static void deliver_control(fastp2p_client *from, fastp2p_client *to) {
+    uint16_t main, sub;
+    uint8_t *body;
+    size_t length;
+    int result;
+    while ((result = op_frame_take(&from->ws_tx, &main, &sub, &body, &length)) == 1) {
+        control_message(to, main, sub, body, length);
+        free(body);
+    }
+    assert(!result);
+}
+
+static void ipv6_reverse_quic(void) {
+    op_socket listeners[] = {socket_bound(1, "::1", 0, 0), socket_bound(1, "::1", 0, 0)};
+    if (listeners[0] < 0 || listeners[1] < 0) {
+        for (int i = 0; i < 2; ++i)
+            if (listeners[i] >= 0)
+                op_close(listeners[i]);
+        return; /* IPv6 can be disabled by the local test runner. */
+    }
+    fastp2p_client *router = calloc(1, sizeof(*router)), *phone = calloc(1, sizeof(*phone));
+    assert(router && phone);
+    fastp2p_client *peers[] = {router, phone};
+    const char *names[] = {"reverse-router", "reverse-phone"};
+    const char *public_ips[] = {"2409:8a55::1", "2409:895a::1"};
+    for (int i = 0; i < 2; ++i) {
+        fastp2p_client *c = peers[i];
+        strcpy(c->node, names[i]);
+        c->node_id = op_node_id(c->node);
+        c->ws = (struct lws *)c; /* Route the framed control messages in memory. */
+        c->running = 1;
+        c->families_wanted = c->gateway_families = FAM_V6;
+        strcpy(c->local_ip[OP_FAM_V6], "::1");
+        assert(!op_addr_from_text(&c->gateway_addr[OP_FAM_V6], "::1", 0));
+        c->udp_listener[OP_FAM_V4] = -1;
+        c->udp_listener[OP_FAM_V6] = listeners[i];
+        c->public_port = socket_port(listeners[i]);
+    }
+    app *rule = &router->apps[0];
+    rule->used = rule->local = rule->socks = 1;
+    rule->transport = FASTP2P_TRANSPORT_QUIC;
+    strcpy(rule->peer, phone->node);
+    for (int retry = 0; retry < 2; ++retry) {
+        int opening = app_tunnel(router, rule, phone->node, FASTP2P_TRANSPORT_QUIC);
+        assert(opening >= 0);
+        tunnel *out = &router->tunnels[opening];
+        assert(out->udp_reverse6_retry == retry);
+        ++rule->attempts;
+        strcpy(out->mode, "udppunch");
+        strcpy(router->local_ip[OP_FAM_V6], public_ips[0]);
+        strcpy(out->mapped_text[OP_FAM_V6], public_ips[0]);
+        out->mapped_ports[OP_FAM_V6] = out->probes[OP_FAM_V6].local_port = 45678;
+        assert(ipv6_udp_listener_port(router, out) == router->public_port);
+        ++out->mapped_ports[OP_FAM_V6];
+        assert(!ipv6_udp_listener_port(router, out));
+        --out->mapped_ports[OP_FAM_V6];
+        probe_complete(router, opening);
+        deliver_control(router, phone);
+        int answering = tunnel_by_id(phone, out->id);
+        assert(answering >= 0);
+        tunnel *in = &phone->tunnels[answering];
+        assert(in->udp_reverse6_retry == retry && in->udp_reverse_port6 == router->public_port);
+        strcpy(in->mapped_text[OP_FAM_V6], public_ips[1]);
+        in->mapped_ports[OP_FAM_V6] = in->probes[OP_FAM_V6].local_port;
+        probe_complete(phone, answering);
+        deliver_control(phone, router);
+
+        if (!retry) {
+            assert(out->udp_reverse6_supported && out->state == T_TIME);
+            assert(out->udp_direct_port == phone->public_port && in->state == T_UDP_DIRECT);
+            out->attempted_ipv6 = 1;
+            close_tunnel(router, opening, "test forward IPv6 timeout");
+            close_tunnel(phone, answering, NULL);
+            assert(rule->udp_reverse6_retry && !rule->ipv4_retry && !rule->attempts);
+            continue;
+        }
+        assert(out->state == T_UDP_DIRECT && out->server && out->attempted_ipv6);
+        assert(in->state == T_TIME && !in->server && in->udp_direct_port == router->public_port);
+        /* Public addresses exercise the negotiation gate. The in-process
+         * transport uses loopback IPv6 with the very same negotiated ports. */
+        strcpy(in->peer_text[OP_FAM_V6], "::1");
+        strcpy(out->peer_text[OP_FAM_V6], "::1");
+        uint64_t until = mono() + 5 * NS;
+        while ((!tunnel_ready(out) || !tunnel_ready(in)) && mono() < until) {
+            uint64_t now = mono();
+            tick_udp_listeners(router, now);
+            tick_tunnel(router, opening, now);
+            tick_tunnel(phone, answering, now);
+            deliver_control(router, phone);
+            deliver_control(phone, router);
+            op_sleep_ms(2);
+        }
+        assert(tunnel_ready(out) && tunnel_ready(in));
+        assert(in->family == OP_FAM_V6 && op_addr_port(&in->peer_addr) == router->public_port);
+        assert(out->cert_checked && in->cert_checked && out->session == in->session);
+        close_tunnel(router, opening, NULL);
+        close_tunnel(phone, answering, NULL);
+    }
+    for (int i = 0; i < 2; ++i) {
+        op_close(listeners[i]);
+        op_buffer_clear(&peers[i]->ws_tx);
+        free(peers[i]);
+    }
+}
+
 static void public_round_budget(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -781,5 +886,6 @@ int main(void) {
     sym_spray_ports();
     udp_dual_window_wire();
     udp_dual_window_packets();
+    ipv6_reverse_quic();
     return 0;
 }

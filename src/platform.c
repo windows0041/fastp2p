@@ -421,7 +421,7 @@ int op_addr_routable(const op_addr *a) {
             return 0; /* :: and ::1 are not globally reachable */
         if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
             return 0; /* fe80::/10 link-local */
-        return (b[0] & 0x2Fu) == 0x20u; /* 2000::/3 global unicast */
+        return (b[0] & 0xE0u) == 0x20u; /* 2000::/3 global unicast */
     }
     return 0;
 }
