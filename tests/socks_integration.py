@@ -194,7 +194,12 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-socks-') as temporary:
         with socket.create_connection(('127.0.0.1',ports['tcp',True]),timeout=3) as sock:
             sock.settimeout(3);sock.sendall(b'\x05\x01\x02');assert exact(sock,2)==b'\x05\x02'
             sock.sendall(b'\x01\x05alice\x05wrong');assert exact(sock,2)==b'\x01\x01' and sock.recv(1)==b''
-        for request,code in [(b'\x05\x02\0'+address('127.0.0.1',80),7),(b'\x05\x01\0\x04'+b'\0'*18,8),(b'\x05\x01\x01'+address('127.0.0.1',80),1)]:
+        # ATYP=4 is a supported address type now, so the rejected case uses a
+        # type the client must keep refusing. The IPv6 round trip lives in
+        # dualstack_integration.py.
+        for request,code in [(b'\x05\x02\0'+address('127.0.0.1',80),7),
+                             (b'\x05\x01\0\x05'+b'\0'*18,8),
+                             (b'\x05\x01\x01'+address('127.0.0.1',80),1)]:
             with greeting(port) as sock:sock.sendall(request);assert exact(sock,10)[1]==code and sock.recv(1)==b''
         results['authentication_and_unsupported_requests_rejected']=True
         # Both incomplete greetings and authenticated request abandonment release sockets.
