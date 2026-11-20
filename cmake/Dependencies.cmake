@@ -26,6 +26,11 @@ if(FASTP2P_DEPS_ROOT)
   if(WIN32)
     set_property(TARGET fastp2p_crypto PROPERTY INTERFACE_LINK_LIBRARIES "ws2_32;crypt32;bcrypt;advapi32")
     set_property(TARGET fastp2p_curl PROPERTY INTERFACE_LINK_LIBRARIES "ws2_32;crypt32;bcrypt;secur32;normaliz;iphlpapi;advapi32;wldap32")
+    # miniupnpc's static archive calls Winsock and the IP helper API directly
+    # (in6addr_any, getnameinfo, GetAdaptersAddresses). A static archive only
+    # resolves those when the system libraries follow it on the link line, so
+    # they belong to the miniupnpc target instead of to one of its users.
+    set_property(TARGET fastp2p_igd PROPERTY INTERFACE_LINK_LIBRARIES "ws2_32;iphlpapi")
   else()
     find_package(Threads REQUIRED)
     set_property(TARGET fastp2p_crypto PROPERTY INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS}")
@@ -59,4 +64,9 @@ else()
   set(FASTP2P_CRYPTO_TARGET OpenSSL::Crypto)
   set(FASTP2P_MAPPING_TARGETS PkgConfig::IGD fastp2p_natpmp)
   set_property(TARGET PkgConfig::QUIC APPEND PROPERTY INTERFACE_LINK_LIBRARIES OpenSSL::SSL)
+  if(WIN32)
+    # Same reason as the pinned prefix above: miniupnpc needs Winsock and the IP
+    # helper API to follow its archive on the link line.
+    set_property(TARGET PkgConfig::IGD APPEND PROPERTY INTERFACE_LINK_LIBRARIES ws2_32 iphlpapi)
+  endif()
 endif()
