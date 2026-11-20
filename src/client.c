@@ -264,7 +264,7 @@ typedef struct {
      * filled when the peer reports one, so an old peer looks LAN-less exactly
      * as it did before. */
     char peer_lan[OP_ADDR_TEXT], peer_lan6[OP_ADDR_TEXT];
-    uint32_t peer_public_ipv4;
+    uint32_t peer_observed_ipv4;
     /* The current attempt's session; relay offers create a fresh session. */
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
@@ -498,22 +498,26 @@ static int valid_gateway_host(const char *host) {
         return 0;
     return op_addr_from_text(&scratch, host, 0) == 0 && op_addr_family(&scratch) == AF_INET6;
 }
-static uint32_t public_ipv4(const op_addr *address) {
+static uint32_t observed_ipv4(const op_addr *address) {
     if (op_addr_family(address) != AF_INET || !op_addr_routable(address))
         return 0;
-    uint32_t ip = ntohl(address->u.in.sin_addr.s_addr);
+    return ntohl(address->u.in.sin_addr.s_addr);
+}
+static uint32_t public_ipv4(const op_addr *address) {
+    uint32_t ip = observed_ipv4(address);
     /* Shared carrier space can also be observed by a privately hosted gateway. */
     return (ip & 0xffc00000u) == 0x64400000u ? 0 : ip;
 }
 
-/* Different public IPv4 observations rule out a LAN attempt between sites.
- * Private gateways and IPv6-only peers can lack a comparable observation.
+/* Different egress IPv4 observations, including shared carrier addresses,
+ * rule out a LAN attempt between sites. A private gateway or an IPv6-only
+ * peer can lack a comparable observation.
  * The LAN candidates still need private addresses in the same family. */
 static int lan_punch_possible(const fastp2p_client *c, const app *a) {
-    op_addr local_public;
-    if (a->peer_public_ipv4 && !op_addr_from_text(&local_public, c->ip[OP_FAM_V4], 0)) {
-        uint32_t local_ip = public_ipv4(&local_public);
-        if (local_ip && local_ip != a->peer_public_ipv4)
+    op_addr local_observed;
+    if (a->peer_observed_ipv4 && !op_addr_from_text(&local_observed, c->ip[OP_FAM_V4], 0)) {
+        uint32_t local_ip = observed_ipv4(&local_observed);
+        if (local_ip && local_ip != a->peer_observed_ipv4)
             return 0;
     }
     for (int index = 0; index < OP_FAM_COUNT; ++index) {
@@ -3186,7 +3190,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         if (valid_node(peer))
             for (int i = 0; i < NA; ++i)
                 if (c->apps[i].used && !strcmp(c->apps[i].peer, peer)) {
-                    c->apps[i].peer_public_ipv4 = has_gateway_ipv4 ? public_ipv4(&gateway_ip) : 0;
+                    c->apps[i].peer_observed_ipv4 = has_gateway_ipv4 ? observed_ipv4(&gateway_ip) : 0;
                     address_text_out(c->apps[i].peer_lan, lan, OP_FAM_V4);
                     address_text_out(c->apps[i].peer_lan6, lan6, OP_FAM_V6);
                 }
@@ -5049,10 +5053,8 @@ static void nat_stun_send(fastp2p_client *c) {
     s->deadline = mono() + 1200 * MS;
 }
 static void nat_filter_record(nat_filter *filter, int level, uint64_t now) {
-    if (level) {
-        filter->level = level;
-        filter->measured_at = now;
-    }
+    filter->level = level;
+    filter->measured_at = level ? now : 0;
     filter->next_at = now + (level ? NAT_FILTER_REFRESH : NAT_FILTER_RETRY);
 }
 static int nat_filter_level(const nat_filter *filter, uint64_t now) {

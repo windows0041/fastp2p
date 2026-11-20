@@ -112,7 +112,8 @@ typedef struct {
  * run on that thread and may request stop, but must not reenter step, destroy,
  * or change forwards. When network.AutoPortMapping is enabled in JSON, an
  * internal router mapping worker runs between start and stop. Stop and destroy
- * wait for that worker. Strings are copied by create/add_forward.
+ * wait for the worker, which has a two-second deadline for router I/O during
+ * shutdown. Strings are copied by create/add_forward.
  * struct_size + abi_version permit extending the API without exposing internals. */
 FASTP2P_API int fastp2p_client_create(const fastp2p_config *config, fastp2p_client **out);
 /* Parse the same UTF-8 configuration as the CLI. Override strings may be NULL.

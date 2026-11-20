@@ -149,8 +149,19 @@ static void lan_punch_public_ipv4(void) {
     assert(a->attempts == 1 && a->retry == NS);
     assert(a->tunnel_index == ti && c->tunnels[ti].state == T_TIME);
 
-    /* No public observation is available through a private gateway. */
+    /* A shared-carrier address is comparable, including against a public one. */
     strcpy(c->ip[OP_FAM_V4], "100.64.0.10");
+    assert(!lan_punch_possible(c, a));
+    const char carrier[] = "{\"peerNode\":\"mobile-peer\",\"IPv4\":\"100.65.0.11\","
+                            "\"lanIP\":\"172.16.12.193\"}";
+    control_message(c, 7, 1, (const uint8_t *)carrier, sizeof(carrier) - 1);
+    assert(!lan_punch_possible(c, a));
+    strcpy(c->ip[OP_FAM_V4], "198.51.100.10");
+    assert(!lan_punch_possible(c, a));
+    strcpy(c->ip[OP_FAM_V4], "100.65.0.11");
+    assert(lan_punch_possible(c, a));
+    /* Private addresses alone are not comparable across sites. */
+    strcpy(c->ip[OP_FAM_V4], "192.168.1.10");
     assert(lan_punch_possible(c, a));
     strcpy(c->ip[OP_FAM_V4], "198.51.100.10");
 
@@ -586,9 +597,17 @@ int main(void) {
     assert(nat_filter_level(&filters, NS) == 0 && filters.next_at == NS + NAT_FILTER_RETRY);
     nat_filter_record(&filters, 3, 2 * NS);
     assert(filters.next_at == 2 * NS + NAT_FILTER_REFRESH);
-    nat_filter_record(&filters, 0, filters.next_at);
     assert(nat_filter_level(&filters, filters.next_at) == 3);
     assert(nat_filter_level(&filters, 2 * NS + NAT_FILTER_MAX_AGE) == 0);
+    uint64_t refresh = filters.next_at;
+    nat_filter_record(&filters, 0, refresh);
+    assert(nat_filter_level(&filters, refresh) == 0 && filters.next_at == refresh + NAT_FILTER_RETRY);
+    nat_filter_record(&levels.udp_filter, 3, mono());
+    nat_filter_record(&levels.tcp_filter, 2, mono());
+    assert(nat_level(&levels) == 3 && tcp_nat_level(&levels) == 2);
+    nat_filter_record(&levels.udp_filter, 0, mono());
+    nat_filter_record(&levels.tcp_filter, 0, mono());
+    assert(nat_level(&levels) == 5 && tcp_nat_level(&levels) == 0);
 
     assert(nat_classify(40000, 40000, 0) == NAT_CONE);    assert(nat_classify(40000, 40001, 0) == NAT_HARD_SYM);
     assert(nat_classify(40000, 40001, 40000) == NAT_CONE);
