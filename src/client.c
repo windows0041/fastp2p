@@ -45,6 +45,9 @@
  * guess is wrong half the time and wastes the entire burst. Every port in the
  * window is a real datagram, so this is also the cap a peer may ask for. */
 #define SYM_WINDOW_HARD 128
+#define UDP_MAPPING_PROBE_PORT 27180
+#define UDP_MAPPING_SAMPLES 4
+#define UDP_MAPPING_SAMPLE_WAIT (250 * MS)
 /* Repeat the spray once. The repeat reuses the same destination ports, so it
  * does not multiply NAT mappings; it buys two things instead: a punch timestamp
  * that is a few hundred milliseconds off still lands inside an open filter, and
@@ -132,6 +135,9 @@ typedef struct {
     /* Advisory families (anything but the primary one) get their own, shorter
      * budget so an unreachable v6 probe cannot hold up the v4 answer. */
     uint64_t deadline;
+    int sample_udp_ports;
+    uint16_t udp_ports[UDP_MAPPING_SAMPLES];
+    uint32_t udp_ips[UDP_MAPPING_SAMPLES];
 } nat_probe;
 /* Per-family NAT classification state. Running the old single probe sequence
  * once per family is what keeps the IPv4 run byte-identical while letting IPv6
@@ -197,10 +203,11 @@ typedef struct {
      * `sym_split` marks a window centred on `sym_base` (direction unknown,
      * used for a peer with an unpredictable step); otherwise the window starts
      * one port past `sym_base` and walks in the `sym_up` direction. */
-    uint16_t sym_base, sym_count;
+    uint16_t sym_base, sym_count, sym_alt_base;
     int sym_up, sym_sprayed, sym_split;
     uint64_t sym_spray_at;
     int udp_punch_order, udp_punch_kind, udp_punch_role, udp_punch_ready;
+    int udp_dual_punch, udp_peer_cone;
     unsigned udp_candidate_count;
     op_socket udp_candidates[UDP_PUNCH_EXTRA_SOCKETS];
     uint64_t udp_punch_ack_until;
@@ -947,11 +954,40 @@ static int sym_window_kind(int nat_type) {
         return 2;
     return 0;
 }
+/* Require two close observations in each of two well-separated ranges, all
+ * on the same external address. The replies can arrive in any order. */
+static uint16_t udp_alternate_mapping(const nat_probe *p) {
+    uint16_t base = p->udp_ports[0], low = UINT16_MAX, high = 0;
+    int nearby = 0;
+    if (!base)
+        return 0;
+    for (int i = 1; i < UDP_MAPPING_SAMPLES; ++i) {
+        uint16_t port = p->udp_ports[i];
+        int gap = abs((int)port - base);
+        if (!port || p->udp_ips[i] != p->udp_ips[0])
+            return 0;
+        if (gap <= SYM_WINDOW_MAX) {
+            if (port == base)
+                return 0;
+            ++nearby;
+        } else if (gap >= 2 * SYM_WINDOW_HARD) {
+            if (port < low)
+                low = port;
+            if (port > high)
+                high = port;
+        } else {
+            return 0;
+        }
+    }
+    return nearby == 1 && high > low && high - low <= SYM_WINDOW_MAX ? high : 0;
+}
 /* Read a peer's advertised window. Kept in one place because both the request
  * and the reply carry it, and an old peer sends neither. A window that cannot
  * describe at least two ports is dropped rather than half-honoured. */
 static void learn_sym_window(tunnel *t, json_object *j) {
     uint64_t base = op_integer(j, "symBase"), count = op_integer(j, "symCount");
+    uint64_t alt = op_integer(j, "symAltBase");
+    t->sym_alt_base = 0;
     int split = op_integer(j, "symSplit") == 1;
     uint16_t width = 0;
     if (base && base <= 65535 && count)
@@ -966,6 +1002,9 @@ static void learn_sym_window(tunnel *t, json_object *j) {
     t->sym_count = width;
     t->sym_split = split;
     t->sym_up = op_integer(j, "symUp") ? 1 : 0;
+    if (split && width >= 4 && base == op_integer(j, "coneNatPort") &&
+        alt && alt <= UINT16_MAX && abs((int)alt - (int)base) >= 2 * SYM_WINDOW_HARD)
+        t->sym_alt_base = (uint16_t)alt;
 }
 /* Decide the mapping behaviour from observed mapped ports.  The first two come
  * from the same local socket talking to two different destinations, which is
@@ -1391,10 +1430,7 @@ static int start_probe(fastp2p_client *c, int index) {
     for (int i = 0; i < OP_FAM_COUNT; ++i) {
         if (t->probes[i].fd >= 0 && t->probes[i].fd != t->fd)
             op_close(t->probes[i].fd);
-        t->probes[i].state = PROBE_FREE;
-        t->probes[i].fd = -1;
-        t->probes[i].mapped_ip[0] = 0;
-        t->probes[i].response_len = 0;
+        t->probes[i] = (nat_probe){.fd = -1};
         t->mapped_ports[i] = 0;
         t->mapped_text[i][0] = 0;
     }
@@ -1445,7 +1481,7 @@ static int start_probe(fastp2p_client *c, int index) {
         t->probes[family].last_rx = mono();
         t->probes[family].deadline = mono() + (family == OP_FAM_V4 ? 5 * NS : 2 * NS);
         op_addr peer = c->gateway_addr[family];
-        op_addr_set_port(&peer, 27180);
+        op_addr_set_port(&peer, UDP_MAPPING_PROBE_PORT);
         if (t->transport == FASTP2P_TRANSPORT_QUIC) {
             t->probes[family].state = PROBE_UDP;
             if (udp_packet(fd, &peer, 2, 0, NULL)) {
@@ -1453,6 +1489,13 @@ static int start_probe(fastp2p_client *c, int index) {
                 t->probes[family].fd = -1;
                 t->probes[family].state = PROBE_FREE;
                 continue;
+            }
+            if (family == OP_FAM_V4 && !t->relay_wait && sym_window_kind(c->nat[family].type)) {
+                t->probes[family].sample_udp_ports = 1;
+                for (uint16_t i = 1; i < UDP_MAPPING_SAMPLES; ++i) {
+                    op_addr_set_port(&peer, (uint16_t)(UDP_MAPPING_PROBE_PORT + i));
+                    udp_packet(fd, &peer, 2, 0, NULL);
+                }
             }
         } else {
             t->probes[family].state = PROBE_CONNECT;
@@ -1470,6 +1513,40 @@ static int start_probe(fastp2p_client *c, int index) {
     t->state = T_PROBE;
     return 0;
 }
+static void read_udp_mapping(fastp2p_client *c, nat_probe *p, int family, uint64_t now) {
+    int count = p->sample_udp_ports ? UDP_MAPPING_SAMPLES : 1;
+    for (int i = 0; i < count; ++i) {
+        uint8_t data[1024];
+        op_addr from = {0};
+        from.len = (op_socklen)sizeof(from.u.storage);
+        op_ssize n = op_recvfrom(p->fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
+        if (n < 0)
+            break;
+        int slot = (int)op_addr_port(&from) - UDP_MAPPING_PROBE_PORT;
+        if (n < 8 || slot < 0 || slot >= count || p->udp_ports[slot] ||
+            op_u16(data + 4) != 2 || op_u16(data + 6) != 0 ||
+            op_u32(data) != (uint32_t)(n - 8) || !op_addr_equal(&from, &c->gateway_addr[family]))
+            continue;
+        json_object *j = op_json(data + 8, (size_t)n - 8);
+        uint64_t port = op_integer(j, "port");
+        op_addr mapped;
+        if (port && port <= UINT16_MAX &&
+            !op_addr_from_text(&mapped, op_string(j, "IP"), (uint16_t)port) &&
+            op_addr_family(&mapped) == op_index_family(family)) {
+            p->udp_ports[slot] = (uint16_t)port;
+            if (family == OP_FAM_V4)
+                p->udp_ips[slot] = mapped.u.in.sin_addr.s_addr;
+            if (!slot) {
+                p->mapped_port = (uint16_t)port;
+                op_addr_text(&mapped, p->mapped_ip, sizeof(p->mapped_ip));
+                p->last_rx = now;
+            }
+        }
+        if (j)
+            json_object_put(j);
+    }
+}
+
 /* One round of the per-family mapping probes a tunnel is waiting on. Returns 1
  * when the negotiation has been published, -1 when the tunnel was closed, 0
  * while still waiting.
@@ -1497,8 +1574,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
             p->state = PROBE_FREE;
             continue;
         }
-        int expired = family == required ? now > t->deadline : now > p->deadline;
-        if (expired) {
+        uint64_t probe_deadline = family == required ? t->deadline : p->deadline;
+        if (now > probe_deadline) {
             if (family == required) {
                 close_tunnel(c, index, "peer NAT mapping discovery timed out");
                 return -1;
@@ -1592,35 +1669,15 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
             continue;
         }
         if (p->state == PROBE_UDP) {
-            uint8_t data[1024];
-            op_addr from;
-            memset(&from, 0, sizeof(from));
-            from.len = (op_socklen)sizeof(from.u.storage);
-            op_ssize n = op_recvfrom(p->fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
-            if (n < 8)
-                continue;
-            op_addr expect = c->gateway_addr[family];
-            op_addr_set_port(&expect, 27180);
-            if (op_u16(data + 4) != 2 || op_u32(data) != (uint32_t)(n - 8) ||
-                !op_address_equal(&from.u.sa, from.len, &expect.u.sa, expect.len))
-                continue;
-            json_object *j = op_json(data + 8, (size_t)n - 8);
-            uint64_t port = op_integer(j, "port");
-            const char *text = op_string(j, "IP");
-            /* SPEC §2: the response field names are unchanged and now carry an
-             * observed source of either family. Only accept an answer of the
-             * family this probe socket speaks; a stray other-family reply must
-             * not be mistaken for a mapping of the wrong interface. */
-            if (port > 0 && port <= 65535 && address_of_family(text, family)) {
-                snprintf(p->mapped_ip, sizeof(p->mapped_ip), "%s", text);
-                p->mapped_port = (uint16_t)port;
+            read_udp_mapping(c, p, family, now);
+            if (p->mapped_port &&
+                (!p->sample_udp_ports || (p->udp_ports[1] && p->udp_ports[2] && p->udp_ports[3]) ||
+                 now - p->last_rx >= UDP_MAPPING_SAMPLE_WAIT ||
+                 now + UDP_MAPPING_SAMPLE_WAIT >= probe_deadline)) {
                 p->state = PROBE_DONE;
                 ++answered;
                 --pending;
             }
-            if (j)
-                json_object_put(j);
-            continue;
         }
     }
     if (!answered || pending)
@@ -1689,6 +1746,11 @@ static int announce_sym_window(fastp2p_client *c, tunnel *t, json_object *j, int
     int kind = sym_window_kind(c->nat[index].type);
     if (!kind)
         return 0;
+    uint16_t alternate = index == OP_FAM_V4 ? udp_alternate_mapping(&t->probes[index]) : 0;
+    if (alternate) {
+        kind = 2;
+        op_ju(j, "symAltBase", alternate);
+    }
     op_ju(j, "symBase", t->mapped_port);
     if (kind == 1) {
         op_ju(j, "symCount", SYM_WINDOW_MAX);
@@ -1705,10 +1767,21 @@ static int announce_sym_window(fastp2p_client *c, tunnel *t, json_object *j, int
  * The less predictable side receives. With two predictable sides, the node
  * answering the control-plane request receives. Both derive the same roles. */
 static int ordered_udp_role(const fastp2p_client *c, const tunnel *t) {
-    if (!t->udp_punch_order || !t->udp_punch_kind || t->lan || t->relay_wait ||
-        t->udp_direct_port || strcmp(t->mode, "udppunch") || t->family != OP_FAM_V4 ||
-        !t->sym_count || t->sym_base != t->remote_ports[OP_FAM_V4] ||
-        choose_punch_family(c, t) != OP_FAM_V4 || (t->udp_punch_kind == 2 && t->sym_split))
+    if (t->lan || t->relay_wait || t->udp_direct_port || strcmp(t->mode, "udppunch") ||
+        t->family != OP_FAM_V4 || choose_punch_family(c, t) != OP_FAM_V4)
+        return UDP_PUNCH_LEGACY;
+    if (t->udp_dual_punch) {
+        /* The cone must open its address/port filter before the symmetric
+         * side creates its mapping to the cone's stable public endpoint. */
+        if (t->sym_alt_base && t->sym_base == t->remote_ports[OP_FAM_V4] &&
+            c->nat[OP_FAM_V4].type == NAT_CONE)
+            return UDP_PUNCH_RECEIVE;
+        if (t->udp_punch_kind == 2 && t->udp_peer_cone && !t->sym_count &&
+            udp_alternate_mapping(&t->probes[OP_FAM_V4]))
+            return UDP_PUNCH_SEND;
+    }
+    if (!t->udp_punch_order || !t->udp_punch_kind || !t->sym_count ||
+        t->sym_base != t->remote_ports[OP_FAM_V4] || (t->udp_punch_kind == 2 && t->sym_split))
         return UDP_PUNCH_LEGACY;
     int receiver = t->udp_punch_kind == 2 || (!t->sym_split && !t->initiator);
     return receiver ? UDP_PUNCH_RECEIVE : UDP_PUNCH_SEND;
@@ -1810,6 +1883,9 @@ static void probe_complete(fastp2p_client *c, int index) {
                              !strcmp(t->mode, "udppunch");
         if (t->udp_punch_order)
             op_ju(j, "udpPunchOrder", 1);
+        if (t->transport == FASTP2P_TRANSPORT_QUIC && !t->lan && !t->relay_wait &&
+            t->mapped_ports[OP_FAM_V4] && !strcmp(t->mode, "udppunch"))
+            op_ju(j, "udpPunchDual", 1);
         push(c, t->peer, PUSH_CONNECT, j);
         t->state = T_REPLY;
         t->deadline = mono() + 12 * NS;
@@ -1839,8 +1915,11 @@ static void probe_complete(fastp2p_client *c, int index) {
         if (t->udp_direct_port && !reverse)
             op_ju(j, "udpDirectPort", t->udp_direct_port);
         t->udp_punch_role = ordered_udp_role(c, t);
-        if (t->udp_punch_role)
+        if (t->udp_punch_role) {
             op_ju(j, "udpPunchOrder", 1);
+            if (t->udp_dual_punch)
+                op_ju(j, "udpPunchDual", 1);
+        }
         push(c, t->peer, 2, j);
         /* Give the initiator a short window to dial the shared listener.
          * Immediate punch resumes after that window, or starts right away
@@ -3004,6 +3083,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     !op_addr_from_text(&peer_ip, peer_text, 0) && public_ipv4(&peer_ip))
                     t->udp_reverse_port = (uint16_t)reverse_port;
                 t->udp_punch_order = op_integer(j, "udpPunchOrder") == 1;
+                t->udp_dual_punch = op_integer(j, "udpPunchDual") == 1;
+                t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
                 learn_tcp_mapping(t, j);
                 learn_sym_window(t, j);
                 if (v4_ok)
@@ -3080,6 +3161,8 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     json_object_put(j);
                     return;
                 }
+                t->udp_dual_punch = op_integer(j, "udpPunchDual") == 1;
+                t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
                 if (op_integer(j, "udpPunchOrder") == 1)
                     t->udp_punch_role = ordered_udp_role(c, t);
                 int64_t delay = 0;
@@ -3713,32 +3796,48 @@ static void tick_tcp_direct(fastp2p_client *c, int ti, uint64_t now) {
     start_underlay(c, ti);
 }
 
+static void send_udp_centered(op_socket fd, op_addr peer, json_object *message,
+                              uint16_t base, uint16_t count, int closest_first) {
+    uint16_t low, high;
+    if (!sym_split_window(base, count, &low, &high))
+        return;
+    if (closest_first) {
+        /* The receiver's extra sockets cover the first few new mappings
+         * we allocate. Try the closest destinations before the edges. */
+        for (int offset = 1; offset <= count / 2; ++offset) {
+            int ports[] = {base + offset, base - offset};
+            for (unsigned i = 0; i < 2; ++i) {
+                if (ports[i] < low || ports[i] > high)
+                    continue;
+                op_addr_set_port(&peer, (uint16_t)ports[i]);
+                udp_packet(fd, &peer, 4, 0, message);
+            }
+        }
+        return;
+    }
+    for (uint32_t port = low; port <= high; ++port) {
+        if (port == base)
+            continue;
+        op_addr_set_port(&peer, (uint16_t)port);
+        udp_packet(fd, &peer, 4, 0, message);
+    }
+}
+
 static void send_udp_punch_window(const tunnel *t, op_socket fd, op_addr peer,
                                   json_object *message, uint16_t count) {
     if (t->sym_split) {
-        uint16_t low, high;
-        if (!sym_split_window(t->sym_base, count, &low, &high))
-            return;
-        if (t->udp_punch_role == UDP_PUNCH_SEND) {
-            /* The receiver's extra sockets cover the first few new mappings
-             * we allocate. Try the closest destinations before the edges. */
-            for (int offset = 1; offset <= count / 2; ++offset) {
-                int ports[] = {t->sym_base + offset, t->sym_base - offset};
-                for (unsigned i = 0; i < 2; ++i) {
-                    if (ports[i] < low || ports[i] > high)
-                        continue;
-                    op_addr_set_port(&peer, (uint16_t)ports[i]);
-                    udp_packet(fd, &peer, 4, 0, message);
-                }
-            }
-            return;
-        }
-        for (uint32_t port = low; port <= high; ++port) {
-            if (port == t->sym_base)
-                continue;
-            op_addr_set_port(&peer, (uint16_t)port);
+        int closest_first = t->udp_punch_role == UDP_PUNCH_SEND;
+        if (t->sym_alt_base && t->family == OP_FAM_V4 && count >= 4) {
+            /* Reserve part of the existing burst for the second window. Its
+             * centre also counts against the budget. */
+            uint16_t alternate_count = (uint16_t)((count / 2) & ~1u);
+            op_addr_set_port(&peer, t->sym_alt_base);
             udp_packet(fd, &peer, 4, 0, message);
+            send_udp_centered(fd, peer, message, t->sym_alt_base, (uint16_t)(alternate_count - 2),
+                              closest_first);
+            count = (uint16_t)(count - alternate_count);
         }
+        send_udp_centered(fd, peer, message, t->sym_base, count, closest_first);
         return;
     }
     uint16_t start = sym_window_base(t->sym_base, t->sym_up, count);

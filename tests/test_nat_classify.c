@@ -482,6 +482,113 @@ static void sym_window_wire(void) {
     free(reader);
     free(c);
 }
+static void udp_dual_window_wire(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "regular-node", 504, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "udppunch");
+    nat_probe *p = &t->probes[OP_FAM_V4];
+    const uint16_t samples[] = {15692, 45660, 15694, 45661};
+    for (unsigned i = 0; i < UDP_MAPPING_SAMPLES; ++i) {
+        p->udp_ports[i] = samples[i];
+        p->udp_ips[i] = 1;
+    }
+    assert(udp_alternate_mapping(p) == 45661);
+    p->udp_ips[2] = 2;
+    assert(!udp_alternate_mapping(p));
+    p->udp_ips[2] = 1;
+    p->udp_ports[3] = 0;
+    assert(!udp_alternate_mapping(p));
+    p->udp_ports[3] = samples[3];
+
+    t->mapped_ports[OP_FAM_V4] = t->mapped_port = samples[0];
+    strcpy(t->mapped_text[OP_FAM_V4], "198.51.100.10");
+    assert(!tunnel_learn_peer(t, "198.51.100.20", 31000));
+    t->udp_dual_punch = t->udp_peer_cone = 1;
+    c->nat[OP_FAM_V4].type = NAT_EASY_SYM_INC;
+    json_object *j = json_object_new_object();
+    op_ju(j, "coneNatPort", samples[0]);
+    t->udp_punch_kind = announce_sym_window(c, t, j, OP_FAM_V4);
+    assert(t->udp_punch_kind == 2 && op_integer(j, "symAltBase") == 45661);
+    assert(op_integer(j, "symBase") == samples[0] && op_integer(j, "symCount") == SYM_WINDOW_HARD);
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_SEND);
+
+    c->nat[OP_FAM_V4].type = NAT_CONE;
+    t->udp_punch_kind = 0;
+    assert(!tunnel_learn_peer(t, "198.51.100.20", samples[0]));
+    learn_sym_window(t, j);
+    assert(t->sym_alt_base == 45661 && ordered_udp_role(c, t) == UDP_PUNCH_RECEIVE);
+    t->udp_dual_punch = 0;
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_LEGACY);
+    op_ju(j, "symAltBase", 65536);
+    learn_sym_window(t, j);
+    assert(!t->sym_alt_base && t->sym_count == SYM_WINDOW_HARD);
+    json_object_put(j);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+
+static void udp_dual_window_packets(void) {
+    op_socket base = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(base >= 0);
+    uint16_t first = socket_port(base);
+    uint16_t alternate_start = first < 32768 ? 50000 : 12000;
+    op_socket second = -1, neighbor = -1;
+    for (int i = 0; i < 16; ++i) {
+        uint16_t port = (uint16_t)(alternate_start + 2 * i);
+        second = socket_bound(1, "127.0.0.1", port, 0);
+        if (second < 0)
+            continue;
+        neighbor = socket_bound(1, "127.0.0.1", (uint16_t)(port + 1), 0);
+        if (neighbor >= 0)
+            break;
+        op_close(second);
+    }
+    assert(neighbor >= 0);
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "regular-node", 505, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(t->fd >= 0);
+    assert(!op_addr_socketname(base, &t->peer_addr));
+    t->state = T_PUNCH;
+    t->sym_split = 1;
+    t->sym_base = t->remote_port = first;
+    t->sym_alt_base = socket_port(second);
+    t->sym_count = 8;
+    t->udp_punch_role = UDP_PUNCH_RECEIVE;
+    tick_udp_punch(c, ti, mono());
+    assert(drain(second, SPRAY_WAIT) == 1);
+    assert(drain(neighbor, SPRAY_WAIT) == 1);
+
+    /* The symmetric peer answers from the alternate window, not its
+     * initially advertised source port. Keep the tuple that actually worked. */
+    op_addr local;
+    assert(!op_addr_socketname(t->fd, &local));
+    json_object *reply = json_object_new_object();
+    op_ju(reply, "id", t->id);
+    assert(!udp_packet(neighbor, &local, 4, 0, reply));
+    json_object_put(reply);
+    uint64_t until = mono() + NS;
+    while (t->state == T_PUNCH && mono() < until) {
+        tick_udp_punch(c, ti, mono());
+        op_sleep_ms(2);
+    }
+    assert(t->state == T_UNDERLAY && t->remote_port == socket_port(neighbor));
+    assert(op_addr_port(&t->peer_addr) == t->remote_port);
+    assert(drain(neighbor, SPRAY_WAIT));
+    close_tunnel(c, ti, NULL);
+    op_buffer_clear(&c->ws_tx);
+    free(c);
+    op_close(neighbor);
+    op_close(second);
+    op_close(base);
+}
+
 static void public_round_budget(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -672,5 +779,7 @@ int main(void) {
 
     sym_window_wire();
     sym_spray_ports();
+    udp_dual_window_wire();
+    udp_dual_window_packets();
     return 0;
 }
