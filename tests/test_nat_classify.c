@@ -37,7 +37,7 @@ static void tcp_retry(void) {
      * refused dial is retried instead of switching to listen after one try. */
     assert(t->tcp_attempts>=2 && t->listen_fd<0 && t->session_owner);
     /* The listen fallback still exists, but only once the retry budget is spent. */
-    t->tcp_attempts=TCP_PUNCH_ATTEMPTS;
+    t->tcp_attempts=TCP_PUNCH_ATTEMPTS_RESPONDER;
     until=mono()+2*NS;
     while(t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
     assert(t->listen_fd>=0 && t->fd<0);

@@ -39,7 +39,16 @@
  * refused dial is retried quickly and for the whole window rather than once.
  * A carrier NAT refuses in ~5 ms, so the retry interval is short; the jitter
  * keeps two peers from retrying in lockstep and missing each other. */
-#define TCP_PUNCH_ATTEMPTS 400u
+/* The two sides play different roles. The initiator dials a few times, which opens
+ * its mapping and its filter for the peer, and then listens on the same port: a
+ * peer behind a port-restricted carrier NAT can only reach a listener that has
+ * already sent it something. The responder keeps dialling for the whole window,
+ * because those dials are what the initiator's now-open filter lets through.
+ * Dialling forever on both sides is worse than useless: a carrier NAT answers an
+ * unknown 5-tuple with a reset, and that reset tears the peer's socket down just
+ * as it was about to cross. */
+#define TCP_PUNCH_ATTEMPTS 4u
+#define TCP_PUNCH_ATTEMPTS_RESPONDER 400u
 #define TCP_PUNCH_RETRY_MS 20u
 #define TCP_PUNCH_RETRY_JITTER_MS 60u
 /* Per-attempt wait for a non-blocking connect; a dropped dial must not eat the
@@ -48,7 +57,7 @@
 /* How far a TCP dial walks around the port the peer reported: a carrier NAT picks
  * the mapping for a new destination out of a pool, so the reachable port is close
  * to, but not equal to, the one reported for a different destination. */
-#define TCP_PUNCH_SCAN 512
+#define TCP_PUNCH_SCAN 0
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -2014,17 +2023,6 @@ static void probe_complete(fastp2p_client *c, int index) {
                  * port that was never open. t->mapped_port is what the gateway's
                  * probe observed for the very socket this punch will use. */
                 t->tcp_direct_port = t->mapped_port;
-            {
-                /* A host with a public address is reachable at the port it
-                 * listens on; its probe port is an ephemeral socket nothing
-                 * accepts on, which is what a relay node must not advertise.
-                 * A CGNAT address fails public_ipv4(), so NAT'ed peers keep the
-                 * punch mapping above. */
-                op_addr own;
-                if (t->tcp_direct_port && c->public_port &&
-                    !op_addr_from_text(&own, c->ip[OP_FAM_V4], 0) && public_ipv4(&own))
-                    t->tcp_direct_port = c->public_port;
-            }
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
@@ -2125,7 +2123,7 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
      * while switching to listen-only throws away the mapping that lets the peer
      * in. Measured across two carrier NATs: one side crossed on its first try,
      * the other needed ten. */
-    unsigned limit = TCP_PUNCH_ATTEMPTS;
+    unsigned limit = TCP_PUNCH_ATTEMPTS_RESPONDER;
     if (t->tcp_scan < TCP_PUNCH_SCAN)
         ++t->tcp_scan;
     if (t->tcp_attempts >= limit) {
@@ -2201,11 +2199,13 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     if (c->local_ip[family_index])
         snprintf(local, sizeof(local), "%s", c->local_ip[family_index]);
     char message[192];
-    /* Print the port: without it a dial to the wrong port of the right host looks
-     * identical to a NAT problem, which is the one thing this log must separate. */
-    snprintf(message, sizeof(message), "TCP punch connect attempt %u to %s:%u from %s:%u%s",
-             t->tcp_attempts, target, (unsigned)op_addr_port(&shown), local,
-             (unsigned)t->local_port, t->lan ? " (LAN)" : "");
+    /* Name the port dialled and the port this side advertises: with a cone mapping
+     * the peer can only reach us at the advertised port, so the two have to be the
+     * mapping and the local port of the very same socket. */
+    snprintf(message, sizeof(message),
+             "TCP punch connect attempt %u to %s:%u from %s:%u adv=%u%s", t->tcp_attempts,
+             target, (unsigned)op_addr_port(&shown), local, (unsigned)t->local_port,
+             (unsigned)t->mapped_port, t->lan ? " (LAN)" : "");
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
     if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS)) {
         /* Record why the dial did not even start: refused, unreachable and a full
@@ -4072,7 +4072,13 @@ static void read_alternate(fastp2p_client *c, int ti) {
     uint8_t *body = NULL;
     size_t len;
     int rv = bad ? 0 : op_frame_take(&t->alternate_rx, &main, &sub, &body, &len);
-    if (rv > 0 && main == 4 && sub == 2 && len == 8 && op_u64(body) == t->id) {
+    /* The dialler announces itself with the hello (2/0); a confirming peer uses 4/2.
+     * Both identify the same tunnel the same way, and either one proves this
+     * accepted socket is the punched connection and not a stray probe. Waiting only
+     * for 4/2 left every simultaneous open with a live socket that the handshake
+     * never adopted, so the tunnel died on the first missing heartbeat. */
+    int announce = (main == 4 && sub == 2) || (main == 2 && sub == 0);
+    if (rv > 0 && announce && len == 8 && op_u64(body) == t->id) {
         if (t->fd >= 0)
             op_close(t->fd);
         t->fd = t->alternate_fd;
