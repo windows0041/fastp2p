@@ -39,12 +39,16 @@
  * refused dial is retried quickly and for the whole window rather than once.
  * A carrier NAT refuses in ~5 ms, so the retry interval is short; the jitter
  * keeps two peers from retrying in lockstep and missing each other. */
-#define TCP_PUNCH_ATTEMPTS 120u
+#define TCP_PUNCH_ATTEMPTS 400u
 #define TCP_PUNCH_RETRY_MS 20u
 #define TCP_PUNCH_RETRY_JITTER_MS 60u
 /* Per-attempt wait for a non-blocking connect; a dropped dial must not eat the
  * whole retry budget the way a 3 s deadline would. */
-#define TCP_PUNCH_ATTEMPT_MS 700u
+#define TCP_PUNCH_ATTEMPT_MS 250u
+/* How far a TCP dial walks around the port the peer reported: a carrier NAT picks
+ * the mapping for a new destination out of a pool, so the reachable port is close
+ * to, but not equal to, the one reported for a different destination. */
+#define TCP_PUNCH_SCAN 512
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -102,7 +106,7 @@ enum {
     PUSH_ONLINE = 15
 };
 enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
-/* Address-family bitmaps (SPEC §1). The gateway uses the same two values, so
+/* Address-family bitmaps (SPEC 搂1). The gateway uses the same two values, so
  * these numbers are protocol, not local policy. */
 enum { FAM_V4 = 1, FAM_V6 = 2, FAM_BOTH = 3 };
 enum tunnel_state {
@@ -132,7 +136,7 @@ enum { TCP_PREDICT_NONE, TCP_PREDICT_OPEN, TCP_PREDICT_DIAL, TCP_PREDICT_PAIR };
 enum { UDP_PUNCH_LEGACY, UDP_PUNCH_SEND, UDP_PUNCH_RECEIVE };
 /* One address-family mapping probe. A dual-stack client runs the identical
  * sequence once per family, against the gateway's address of that family
- * (SPEC §2); a v4-only client keeps exactly one, which is the old behaviour.
+ * (SPEC 搂2); a v4-only client keeps exactly one, which is the old behaviour.
  * The socket in `fd` is the source port the mapping was measured from, so it
  * doubles as the LAN/punch socket of that family until the tunnel adopts it. */
 enum { PROBE_FREE = 0, PROBE_CONNECT, PROBE_READ, PROBE_UDP, PROBE_DONE };
@@ -153,7 +157,7 @@ typedef struct {
 } nat_probe;
 /* Per-family NAT classification state. Running the old single probe sequence
  * once per family is what keeps the IPv4 run byte-identical while letting IPv6
- * be measured the same way (SPEC §2/§4). */
+ * be measured the same way (SPEC 搂2/搂4). */
 typedef struct {
     int phase, type;
     op_socket fd, fd2;
@@ -201,6 +205,10 @@ typedef struct {
     fp_tcp_family *tcp_sample;
     unsigned tcp_mapping, peer_tcp_mapping;
     uint16_t tcp_last_port, peer_tcp_last_port;
+    /* How far the dial has walked around the port the peer reported. A carrier NAT
+     * allocates the mapping for a new destination from a pool, so the port that is
+     * reachable from this side is near, but not equal to, the reported one. */
+    int tcp_scan;
     int peer_tcp_pair, tcp_predict_role, tcp_predict_ready, tcp_predict_ready_sent;
     int tcp_peer_ip_verified;
     uint64_t tcp_predict_wait, tcp_predict_until;
@@ -231,7 +239,7 @@ typedef struct {
      * both and the punch may still have to fall back from one to the other. */
     char peer[32], ip[OP_ADDR_TEXT], mapped_ip[OP_ADDR_TEXT], mode[16], probe[96];
     size_t probe_len;
-    /* Peer endpoints and our own mapping observations, by family (SPEC §5). */
+    /* Peer endpoints and our own mapping observations, by family (SPEC 搂5). */
     char peer_text[OP_FAM_COUNT][OP_ADDR_TEXT], mapped_text[OP_FAM_COUNT][OP_ADDR_TEXT];
     uint16_t remote_ports[OP_FAM_COUNT], mapped_ports[OP_FAM_COUNT];
     /* 1 when the peer gave us a usable endpoint of that family. */
@@ -278,7 +286,7 @@ typedef struct {
         uint64_t until;
     } relay_failed[4];
     int relay_failed_count;
-    /* The peer's own local address, per family (SPEC §5: same-LAN detection
+    /* The peer's own local address, per family (SPEC 搂5: same-LAN detection
      * compares within a family). lanIP stays IPv4 as before; lanIP6 is only
      * filled when the peer reports one, so an old peer looks LAN-less exactly
      * as it did before. */
@@ -339,7 +347,7 @@ struct fastp2p_client {
     int64_t clock_delta;
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
-    /* NAT classification is per family (DUALSTACK-SPEC §2/§4). Index 0 holds
+    /* NAT classification is per family (DUALSTACK-SPEC 搂2/搂4). Index 0 holds
      * exactly the values the old single fields carried, so a v4-only run
      * reports and logs byte-identical numbers. */
     nat_discovery nat[OP_FAM_COUNT];
@@ -376,7 +384,7 @@ struct fastp2p_client {
      * uses `gateway` (the preferred one); probes and CURLOPT_RESOLVE use all. */
     op_addr gateway, gateway_addr[OP_FAM_COUNT];
     int gateway_families; /* bitmap: 1 = v4, 2 = v6 */
-    int families_wanted;  /* what we publish: observed ∩ configured intent */
+    int families_wanted;  /* what we publish: observed 鈭?configured intent */
     CURLM *multi;
     CURL *ws;
     struct curl_slist *resolve;
@@ -446,7 +454,7 @@ static int valid_node(const char *s) {
             return 0;
     return 1;
 }
-/* Families bitmap helpers (SPEC §1). `nat` is IPv4-only in the old sense; the
+/* Families bitmap helpers (SPEC 搂1). `nat` is IPv4-only in the old sense; the
  * per-family helpers below are what makes a v6 measurement possible without
  * changing any v4 number. */
 static int family_bit(int index) { return index == OP_FAM_V4 ? FAM_V4 : FAM_V6; }
@@ -458,7 +466,7 @@ static int family_index(unsigned bit) { return bit == FAM_V6 ? OP_FAM_V6 : OP_FA
 static int primary_family(const fastp2p_client *c) {
     return family_index((c->families_wanted & FAM_V4) ? FAM_V4 : FAM_V6);
 }
-/* 1 when this client intends to probe/publish `index` (SPEC §1). The default is
+/* 1 when this client intends to probe/publish `index` (SPEC 搂1). The default is
  * IPv4-only, so a dual-stack hostname does not silently add v6 latency to a
  * previously working v4 link. */
 static int family_wanted(const fastp2p_client *c, int index) {
@@ -497,7 +505,7 @@ static void address_copy(char out[OP_ADDR_TEXT], const char *text) {
 }
 /* A gateway host is either a name we may look up, or a literal address of
  * either family. Colons belong to IPv6 literals, so a host holding one is only
- * accepted when it really parses as one (SPEC §7). The old check rejected every
+ * accepted when it really parses as one (SPEC 搂7). The old check rejected every
  * colon, which made "::1" and "2001:db8::1" unusable as ServerHost. */
 static int valid_gateway_host(const char *host) {
     int colons = 0;
@@ -550,10 +558,36 @@ static int lan_punch_possible(const fastp2p_client *c, const app *a) {
             op_addr_from_text(&peer, peer_text, 0) ||
             op_addr_from_text(&local, c->local_ip[index], 0))
             continue;
-        if (op_addr_private(&peer) && op_addr_private(&local))
+        if (op_addr_private(&peer) && op_addr_private(&local)) {
+            /* Only a peer on *our* subnet is reachable without a route between
+             * the two LANs. Treating any two private addresses as neighbours
+             * wastes a whole punch round on an address nothing can answer. */
+            if (peer.u.in.sin_family == AF_INET && local.u.in.sin_family == AF_INET &&
+                memcmp(&peer.u.in.sin_addr, &local.u.in.sin_addr, 3))
+                continue;
             return 1;
+        }
     }
     return 0;
+}
+/* A peer may publish an address that is actually ours: both nodes can egress the
+ * same carrier NAT, or the peer's probe can leave through our line. Dialling it
+ * only reaches our own NAT, which has no hairpin, so fall back to the address the
+ * gateway observed for that peer. */
+static const char *punch_peer_text(const fastp2p_client *c, const char *peer, const char *text,
+                                   char *out, size_t length) {
+    if (!text || !*text || !c->ip[OP_FAM_V4][0] || strcmp(text, c->ip[OP_FAM_V4]))
+        return text;
+    for (int i = 0; i < NA; ++i) {
+        const app *a = &c->apps[i];
+        if (!a->used || !a->peer_observed_ipv4 || (peer && strcmp(a->peer, peer)))
+            continue;
+        uint32_t ip = a->peer_observed_ipv4;
+        snprintf(out, length, "%u.%u.%u.%u", (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255),
+                 (unsigned)((ip >> 8) & 255), (unsigned)(ip & 255));
+        return out;
+    }
+    return text;
 }
 static size_t node_base(char out[32], const char *hostname) {
     size_t used = 0;
@@ -1384,7 +1418,7 @@ static int probe_running(const tunnel *t) {
     return 0;
 }
 /* 1 when the peer published a usable endpoint of `family` and we can answer it
- * in that family too — our side needs either a mapping observation or, for a
+ * in that family too 鈥?our side needs either a mapping observation or, for a
  * LAN punch, a local address of the same family. */
 static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
     if (family < 0 || family >= OP_FAM_COUNT)
@@ -1395,7 +1429,7 @@ static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
         return address_of_family(c->local_ip[family], family);
     return t->mapped_ports[family] && address_of_family(t->mapped_text[family], family);
 }
-/* Which family to punch in (SPEC §5): a shared IPv6 is tried first because it
+/* Which family to punch in (SPEC 搂5): a shared IPv6 is tried first because it
  * usually has no NAT in front of it at all, and IPv4 stays the compatibility
  * path an old peer can always answer. An old peer never publishes a v6
  * endpoint, so a mixed pair never leaves the v4 path here. */
@@ -1451,7 +1485,7 @@ static int use_punch_family(fastp2p_client *c, int index, int family) {
     t->local_port = socket_port(t->fd);
     return 0;
 }
-/* Record one endpoint a peer published (SPEC §5). `text` is canonical, so a
+/* Record one endpoint a peer published (SPEC 搂5). `text` is canonical, so a
  * v4-only peer only ever fills the v4 slot and every historical decision (the
  * active `ip`/`remote_port`, the punch target) sees the same values it did
  * before. A v6 endpoint is remembered alongside and only becomes active when
@@ -1491,7 +1525,7 @@ static int start_probe(fastp2p_client *c, int index) {
          * LAN.  Going through the public address instead would need NAT
          * hairpin support, which is what made these links fail. The LAN socket
          * is opened in whichever family the two ends actually share, falling
-         * back to IPv4 when only IPv4 is in common — the old behaviour. */
+         * back to IPv4 when only IPv4 is in common 鈥?the old behaviour. */
         int family = family_wanted(c, OP_FAM_V6) &&
                              address_of_family(c->local_ip[OP_FAM_V6], OP_FAM_V6) &&
                              t->peer_ready[OP_FAM_V6]
@@ -1884,7 +1918,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_js(j, "from", c->node);
     /* On a LAN punch the peers exchange private addresses and local ports; the
      * gateway-observed address is only meaningful when a NAT is in between.
-     * fromIP/coneNatPort stay strictly the IPv4 observation (SPEC §5): an old
+     * fromIP/coneNatPort stay strictly the IPv4 observation (SPEC 搂5): an old
      * peer reads only these two and must see exactly what the old build
      * published. fromIP6/coneNatPort6 are new fields an old peer ignores, and
      * they are only sent when this client actually measured an IPv6 mapping. */
@@ -1905,7 +1939,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     }
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
-     * old peer reads (SPEC §5). */
+     * old peer reads (SPEC 搂5). */
     op_ju(j, "coneNatPort", t->mapped_ports[OP_FAM_V4]);
     if (t->mapped_ports[OP_FAM_V6]) {
         op_js(j, "fromIP6",
@@ -1980,6 +2014,17 @@ static void probe_complete(fastp2p_client *c, int index) {
                  * port that was never open. t->mapped_port is what the gateway's
                  * probe observed for the very socket this punch will use. */
                 t->tcp_direct_port = t->mapped_port;
+            {
+                /* A host with a public address is reachable at the port it
+                 * listens on; its probe port is an ephemeral socket nothing
+                 * accepts on, which is what a relay node must not advertise.
+                 * A CGNAT address fails public_ipv4(), so NAT'ed peers keep the
+                 * punch mapping above. */
+                op_addr own;
+                if (t->tcp_direct_port && c->public_port &&
+                    !op_addr_from_text(&own, c->ip[OP_FAM_V4], 0) && public_ipv4(&own))
+                    t->tcp_direct_port = c->public_port;
+            }
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
@@ -2049,6 +2094,19 @@ static int tcp_punch_listen(fastp2p_client *c, int index) {
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP punch fallback listening on the mapped source port");
     return 0;
 }
+/* Interleave the walk so the reported port is tried first and the window grows
+ * evenly on both sides: 0, +1, -1, +2, -2, ... */
+static uint16_t tcp_scan_port(uint16_t base, int step) {
+    int delta = (step + 1) / 2;
+    if (step > 0 && (step & 1) == 0)
+        delta = -delta;
+    int port = (int)base + delta;
+    if (port < 1)
+        port += 65535;
+    if (port > 65535)
+        port -= 65535;
+    return (uint16_t)port;
+}
 static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     {
@@ -2068,6 +2126,8 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
      * in. Measured across two carrier NATs: one side crossed on its first try,
      * the other needed ten. */
     unsigned limit = TCP_PUNCH_ATTEMPTS;
+    if (t->tcp_scan < TCP_PUNCH_SCAN)
+        ++t->tcp_scan;
     if (t->tcp_attempts >= limit) {
         t->tcp_retry_at = 0;
         (void)tcp_punch_listen(c, index);
@@ -2079,11 +2139,57 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         close_tunnel(c, index, "invalid TCP punch peer address");
         return;
     }
+    /* A peer may publish an address that is ours (both nodes can egress the same
+     * carrier NAT). Dialling it reaches our own NAT, which has no hairpin, so swap in
+     * the address the gateway observed and, while that answer is still missing, skip
+     * the round instead of burning the budget on ourselves. */
+    {
+        int index_family = t->family >= 0 ? t->family : OP_FAM_V4;
+        char substitute[OP_ADDR_TEXT];
+        const char *chosen = punch_peer_text(c, t->peer, t->peer_text[index_family], substitute,
+                                             sizeof(substitute));
+        if (chosen && strcmp(chosen, t->peer_text[index_family]) &&
+            !op_addr_from_text(&t->peer_addr, chosen, t->remote_ports[index_family]))
+            snprintf(t->peer_text[index_family], OP_ADDR_TEXT, "%s", chosen);
+        else if (c->ip[OP_FAM_V4][0] && !strcmp(t->peer_text[index_family], c->ip[OP_FAM_V4])) {
+            /* Ask the gateway who the peer really is, then retry. */
+            json_object *ask = json_object_new_object();
+            op_js(ask, "peerNode", t->peer);
+            ws_json(c, 7, 0, ask);
+            json_object_put(ask);
+            t->tcp_retry_at = now + 300 * MS;
+            return;
+        }
+    }
     ++t->tcp_attempts;
     t->tcp_retry_at = 0;
+    /* Walk a small window around the port the peer reported: the mapping a carrier
+     * NAT allocates for *this* destination is close to, but not necessarily equal
+     * to, the port it observed towards another one. Attempt zero keeps the reported
+     * port, so a pair that works today is unaffected. */
+    {
+        int walk_family = t->family >= 0 ? t->family : OP_FAM_V4;
+        uint16_t reported = t->remote_ports[walk_family];
+        if (reported && t->tcp_scan)
+            op_addr_set_port(&t->peer_addr, tcp_scan_port(reported, t->tcp_scan));
+    }
     /* A refused dial returns at once, but a silently dropped one would spend the
      * whole window on a single attempt. Bound it so the retry budget survives. */
     t->tcp_attempt_deadline = now + TCP_PUNCH_ATTEMPT_MS * MS;
+    /* Release everything already holding the punch port before binding it again:
+     * the fallback listener, and the probe socket that a family switch hands over
+     * as t->fd ("t->fd owns the punch socket now"). That socket is still connected
+     * to the gateway probe, so a second bind of the same port fails - silently on
+     * Windows, which is why every attempt reported "unknown" while no SYN was ever
+     * sent and the peer's own SYN met a reset. */
+    if (t->listen_fd >= 0) {
+        op_close(t->listen_fd);
+        t->listen_fd = -1;
+    }
+    if (t->fd >= 0) {
+        op_close(t->fd);
+        t->fd = -1;
+    }
     t->fd = socket_bound(0, c->local_ip[t->family >= 0 ? t->family : OP_FAM_V4], t->local_port, 1);
     /* Name the address actually dialled: the old wording claimed "the mapped
      * source port" even on a LAN punch, which made a failed direct attempt
@@ -2095,8 +2201,11 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     if (c->local_ip[family_index])
         snprintf(local, sizeof(local), "%s", c->local_ip[family_index]);
     char message[192];
-    snprintf(message, sizeof(message), "TCP punch connect attempt %u to %s from %s:%u%s",
-             t->tcp_attempts, target, local, (unsigned)t->local_port, t->lan ? " (LAN)" : "");
+    /* Print the port: without it a dial to the wrong port of the right host looks
+     * identical to a NAT problem, which is the one thing this log must separate. */
+    snprintf(message, sizeof(message), "TCP punch connect attempt %u to %s:%u from %s:%u%s",
+             t->tcp_attempts, target, (unsigned)op_addr_port(&shown), local,
+             (unsigned)t->local_port, t->lan ? " (LAN)" : "");
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
     if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS)) {
         /* Record why the dial did not even start: refused, unreachable and a full
@@ -2240,7 +2349,9 @@ static void start_underlay(fastp2p_client *c, int index) {
          * retrying. Protocol client/server and session ownership never change
          * merely because the successful socket was accepted instead of dialed. */
         uint64_t now = mono();
-        t->deadline = now + 15 * NS;
+        /* Long enough for the port walk to cover its window: a refused dial costs
+         * a few milliseconds, so the budget is spent on breadth, not on waiting. */
+        t->deadline = now + 30 * NS;
         uint16_t direct_port = t->tcp_direct_port;
         t->tcp_direct_port = 0;
         if (t->initiator && direct_port) {
@@ -3165,7 +3276,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             }
             c->login_ok = 1;
             c->gateway_tcp_probe_v2 = op_integer(j, "tcpProbeV2") == 1;
-            /* SPEC §3: only a V3 gateway brackets an IPv6 echo record; without
+            /* SPEC 搂3: only a V3 gateway brackets an IPv6 echo record; without
              * it this client keeps the legacy v4-only echo parsing. */
             c->gateway_tcp_probe_v3 = op_integer(j, "tcpProbeV3") == 1;
             /* A working login means the earlier failures were transient; without
@@ -3192,7 +3303,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         const char *peer_text = op_string(j, "fromIP");
         const char *peer_text6 = op_string(j, "fromIP6");
         op_addr peer_ip;
-        /* SPEC §5: the two families are independent fields. Accept the request
+        /* SPEC 搂5: the two families are independent fields. Accept the request
          * when *either* measured endpoint is usable, so a v6-only peer (which
          * has nothing valid for the v4 fields an old peer reads) is no longer
          * rejected by the IPv4-only check. */
@@ -3236,10 +3347,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
                 learn_tcp_mapping(t, j);
                 learn_sym_window(t, j);
-                if (v4_ok)
-                    tunnel_learn_peer(t, peer_text, port);
-                if (v6_ok)
-                    tunnel_learn_peer(t, peer_text6, port6);
+                {
+                    char punch_text[OP_ADDR_TEXT];
+                    if (v4_ok)
+                        tunnel_learn_peer(t, punch_peer_text(c, t->peer, peer_text, punch_text,
+                                                             sizeof(punch_text)), port);
+                    if (v6_ok)
+                        tunnel_learn_peer(t, peer_text6, port6);
+                }
                 t->server = op_integer(j, "isServer") != 0;
                 t->lan = op_integer(j, "lan") != 0;
                 if (t->lan) {
@@ -3285,10 +3400,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             if (t->state == T_REPLY && sender == t->peer_id &&
                 !strcmp(t->peer, op_string(j, "from")) && !op_integer(j, "error") &&
                 (v4_ok || v6_ok)) {
-                if (v4_ok)
-                    tunnel_learn_peer(t, peer_text, port);
-                if (v6_ok)
-                    tunnel_learn_peer(t, peer_text6, port6);
+                {
+                    char punch_text[OP_ADDR_TEXT];
+                    if (v4_ok)
+                        tunnel_learn_peer(t, punch_peer_text(c, t->peer, peer_text, punch_text,
+                                                             sizeof(punch_text)), port);
+                    if (v6_ok)
+                        tunnel_learn_peer(t, peer_text6, port6);
+                }
                 t->tcp_v2 = t->tcp_v2 && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
                 uint64_t direct_port = op_integer(j, "tcpDirectPort");
@@ -3419,7 +3538,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     !strcmp(t->peer, peer) && op_addr_equal(&gateway_ip, &t->peer_addr))
                     t->tcp_peer_ip_verified = 1;
             }
-        /* SPEC §4: the gateway's 7/1 answer carries the family bitmap and the
+        /* SPEC 搂4: the gateway's 7/1 answer carries the family bitmap and the
          * parallel v6 levels. It has no separate v6 LAN column; `IPv6` is the
          * address observed for the peer, so it is used as the v6 LAN endpoint
          * only when it is a private (ULA) address. A global v6 is a public
@@ -3859,7 +3978,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
                 o->tunnel_index = ti;
                 o->udp = !strcmp(proto, "udp");
                 o->socks_exit = op_integer(j, "socks5") == 1;
-                /* SPEC §8: a v6/domain destination resolves through the same
+                /* SPEC 搂8: a v6/domain destination resolves through the same
                  * helper as everything else and the exit socket binds the
                  * destination's own family. v4 keeps the historical any-address
                  * bind. */
@@ -4848,7 +4967,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
         }
     }
 }
-/* SPEC §1/§4: the family bitmap and the parallel v6 levels ride on both the
+/* SPEC 搂1/搂4: the family bitmap and the parallel v6 levels ride on both the
  * registration frame (6/0) and the refresh frame (6/9). IPv4 fields keep their
  * historical names and values; a v4-only run reports families=1 and the v6
  * slots stay at their sentinel values, exactly as an old client read them. */
@@ -4972,7 +5091,7 @@ static void connect_gateway(fastp2p_client *c) {
      * before IPv6 came up, a family that lost its route), and the login query
      * is what tells the gateway which families this node speaks. */
     refresh_families(c);
-    /* SPEC §7: a v6 literal host must be bracketed in the URL authority, while
+    /* SPEC 搂7: a v6 literal host must be bracketed in the URL authority, while
      * a plain name or v4 literal is unchanged. */
     char urlhost[300];
     const char *tls_host = c->tls_host ? c->tls_host : c->host;
@@ -4994,7 +5113,7 @@ static void connect_gateway(fastp2p_client *c) {
                  c->device_id, hostname);
     }
     /* One pinned answer per *usable* family, v4 first so the preferred family
-     * keeps the historical order (SPEC §7). A family this host cannot route to
+     * keeps the historical order (SPEC 搂7). A family this host cannot route to
      * is deliberately left out: pinning it would let curl start the connection
      * on an address that will never answer and burn the whole connect timeout
      * before it falls back, which is exactly what happens on a host that
@@ -5429,7 +5548,7 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     else if (s->no_nat)
         /* No translation, so the "levels" describe the host firewall instead:
          * reachable from elsewhere is an open internet host, and a path that
-         * answers nothing is a symmetric UDP firewall (RFC 3489 §5). */
+         * answers nothing is a symmetric UDP firewall (RFC 3489 搂5). */
         level = (s->port_changed || s->ip_changed) ? 6 : (port_evidence ? 7 : 0);
     else if (!s->mapped_same)
         level = 4;
@@ -5696,7 +5815,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
         free(c);
         return FASTP2P_EINVAL;
     }
-    /* SPEC §7: a gateway host may now be an IPv6 literal; every other character
+    /* SPEC 搂7: a gateway host may now be an IPv6 literal; every other character
      * still has to be a name character, so the old rejection of odd hosts is
      * unchanged. */
     if (!valid_gateway_host(c->host)) {
@@ -5954,7 +6073,7 @@ int fastp2p_client_start(fastp2p_client *c) {
     op_once_run(&curl_once, initialize_curl);
     if (curl_initialization != CURLE_OK)
         return FASTP2P_EIO;
-    /* SPEC §7: resolve both families. Probe every family this host can actually
+    /* SPEC 搂7: resolve both families. Probe every family this host can actually
      * reach the gateway on, so a dual-stack pair can negotiate v6, but keep the
      * historical v4 preference for the login and the reply address. */
     int found = resolve_any_families(c->host, c->port, FAM_BOTH, &c->gateway, c->gateway_addr);
@@ -5991,7 +6110,7 @@ int fastp2p_client_start(fastp2p_client *c) {
             snprintf(message, sizeof(message), "Cannot listen on configured TCP peer port %u: %s",
                      (unsigned)c->public_port, strerror(listener_error));
         else
-            snprintf(message, sizeof(message), "Cannot listen on a TCP peer port in 1024–9999: %s",
+            snprintf(message, sizeof(message), "Cannot listen on a TCP peer port in 1024鈥?999: %s",
                      strerror(listener_error));
         emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
         fastp2p_client_stop(c);
