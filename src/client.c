@@ -4429,10 +4429,15 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                 if (t->listen_fd >= 0)
                     op_close(t->listen_fd);
                 t->listen_fd = -1;
-                uint8_t id[8];
-                op_put64(id, t->id);
-                tframe(t, 2, id, 8);
             }
+            /* This socket completed a dial, so it is live in both directions: say so,
+             * with the hello a peer adopts on and with the 4/2 it may be waiting for
+             * instead. Both carry the tunnel id, and a peer that already adopted on
+             * the hello simply ignores the trailing frame. */
+            uint8_t id[8];
+            op_put64(id, t->id);
+            tframe(t, 2, id, 8);
+            tframe(t, 4, id, 8);
         }
     }
     accept_punch(c, ti);
