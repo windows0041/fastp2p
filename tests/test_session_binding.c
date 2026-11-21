@@ -1,7 +1,19 @@
 /* Exercise the private state machine with reordered control-plane delivery.
  * Including it here keeps the production C ABI unchanged. */
+#define fp_sdwan_write capture_sdwan_write
 #include "../src/client.c"
+#undef fp_sdwan_write
 #include <assert.h>
+
+static uint8_t sdwan_packet[FP_SDWAN_MTU];
+static size_t sdwan_packet_size;
+
+void capture_sdwan_write(fp_sdwan *state, const uint8_t *packet, size_t length) {
+    assert(fp_sdwan_active(state));
+    assert(length <= sizeof(sdwan_packet));
+    memcpy(sdwan_packet, packet, length);
+    sdwan_packet_size = length;
+}
 
 static fastp2p_client *fixture(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
@@ -141,6 +153,50 @@ static void retries_use_fresh_keys(void) {
     close_tunnel(c, first, NULL);
     assert(app_tunnel(c, &a, "sender-node", FASTP2P_TRANSPORT_QUIC) >= 0);
     assert(a.session != previous && memcmp(secret, a.secret, sizeof(secret)));
+    dispose(c);
+}
+
+static void sdwan_ingress_reaches_active_adapter(void) {
+    fastp2p_client *c = fixture();
+    int ti = receiver(c, 200, 42000, 1);
+    uint8_t secret[FP_SESSION_SECRET] = {4};
+    key(c, 200, 999, 62000, secret);
+    c->tunnels[ti].key_acked = 1;
+    c->tunnels[ti].cert_checked = 1;
+    assert(tunnel_ready(&c->tunnels[ti]));
+    strcpy(c->apps[0].peer, "sender-node");
+
+    fp_sdwan sdwan = {
+        .fd = -1,
+        .peer_count = 1,
+        .peers = {{.app_index = 0}},
+        .route_count = 2,
+        .routes = {{.network = 0x0a030214, .bits = 32, .owner = 0},
+                   {.network = 0x0a03020a, .bits = 32, .owner = FP_SDWAN_LOCAL}}
+    };
+    c->sdwan = &sdwan;
+    const uint8_t packet[28] = {
+        0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, 10, 3, 2, 20, 10, 3, 2, 10
+    };
+    fp_crypto peer;
+    assert(!fp_crypto_init(&peer, secret, 999, c->tunnels[ti].peer_id, c->node_id, 1));
+    uint8_t sealed[80];
+    size_t n;
+    assert(!fp_seal(&peer, TUN_SDWAN_IPV4, 0, packet, sizeof(packet), sealed, sizeof(sealed), &n));
+    sdwan_packet_size = 0;
+    tunnel_message(c, ti, TUN_SDWAN_IPV4, sealed, n);
+    assert(!sdwan_packet_size);
+
+#ifdef _WIN32
+    /* An active Wintun session has no POSIX file descriptor. */
+    sdwan.windows = (struct fp_sdwan_windows *)(void *)&sdwan;
+#else
+    sdwan.fd = 0;
+#endif
+    assert(!fp_seal(&peer, TUN_SDWAN_IPV4, 0, packet, sizeof(packet), sealed, sizeof(sealed), &n));
+    tunnel_message(c, ti, TUN_SDWAN_IPV4, sealed, n);
+    assert(sdwan_packet_size == sizeof(packet) && !memcmp(sdwan_packet, packet, sizeof(packet)));
+    c->sdwan = NULL;
     dispose(c);
 }
 
@@ -294,6 +350,7 @@ int main(void) {
     reordered_and_duplicate_keys();
     acknowledgement_and_certificate();
     retries_use_fresh_keys();
-    puts("Connection IDs, reordered keys, duplicate delivery, ACK/certificate gates and fresh retry keys passed");
+    sdwan_ingress_reaches_active_adapter();
+    puts("Connection IDs, reordered keys, duplicate delivery, ACK/certificate gates, fresh retry keys and SD-WAN ingress passed");
     return 0;
 }

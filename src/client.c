@@ -3630,7 +3630,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
             close_tunnel(c, ti, "relay forwarding failed");
         return;
     }
-    if (sub == TUN_SDWAN_IPV4 && (!c->sdwan || c->sdwan->fd < 0 || !tunnel_ready(t)))
+    if (sub == TUN_SDWAN_IPV4 && (!fp_sdwan_active(c->sdwan) || !tunnel_ready(t)))
         return;
     uint8_t plain[4096 + 256];
     size_t n = 0;
