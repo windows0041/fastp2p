@@ -93,7 +93,8 @@ chmod 700 "$work/fastp2p"
 version=$("$work/fastp2p" --version) || fail "程序无法在 $cpu 上运行，原服务尚未卸载。"
 case "$version" in "fastp2p $expected_version ABI "*) ;; *) fail '安装包版本不符。' ;; esac
 [ "$("$work/fastp2p" --installer-abi 2>/dev/null)" = 2 ] || fail '安装需要 fastp2p 客户端 2.0.4 或更新版本。'
-[ "$("$work/fastp2p" --service-profile)" = "$profile" ] ||
+[ "$("$work/fastp2p" --service-profile)" = "$profile" ] &&
+    [ "$("$work/fastp2p" --service-executable 2>/dev/null)" = /usr/local/fastp2p/fastp2p ] ||
     fail '安装包使用旧目录，请先同步新版客户端。'
 prepared=$profile
 if [ ! -e "$profile" ] && [ ! -L "$profile" ]; then

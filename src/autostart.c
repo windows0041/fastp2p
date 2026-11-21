@@ -289,8 +289,7 @@ static int remove_profile(void) {
 }
 
 static int delete_installation(int keep_config) {
-    if (protected_directory(FASTP2P_SYSTEM_DIR) < 0 ||
-        protected_directory(FASTP2P_SYSTEM_DIR "/bin") < 0)
+    if (protected_directory(FASTP2P_SYSTEM_DIR) < 0)
         return -1;
     if (!keep_config && remove_profile())
         return -1;
@@ -300,20 +299,19 @@ static int delete_installation(int keep_config) {
         close(log);
         (void)rmdir(FASTP2P_LOG_DIR);
     }
-    if (unlink_managed(FASTP2P_SYSTEM_DIR "/bin/fastp2p.old") ||
-        unlink_managed(FASTP2P_SYSTEM_DIR "/bin/fastp2p"))
+    if (unlink_managed(FASTP2P_SYSTEM_BINARY ".old") ||
+        unlink_managed(FASTP2P_SYSTEM_BINARY))
         return -1;
 #ifdef __linux__
     char target[4096];
     ssize_t used = readlink("/usr/local/bin/fastp2p", target, sizeof(target) - 1);
     if (used >= 0) {
         target[used] = 0;
-        if (!strcmp(target, FASTP2P_SYSTEM_DIR "/bin/fastp2p") &&
+        if (!strcmp(target, FASTP2P_SYSTEM_BINARY) &&
             unlink_managed("/usr/local/bin/fastp2p"))
             return -1;
     }
 #endif
-    (void)rmdir(FASTP2P_SYSTEM_DIR "/bin");
     (void)rmdir(FASTP2P_SYSTEM_DIR);
     puts(keep_config ? "fastp2p removed; configuration retained." :
                        "fastp2p service and client configuration removed.");

@@ -191,7 +191,7 @@ esac
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
             return result
         profile = Path('/etc/fastp2p/config.conf')
-        binary = Path('/usr/local/fastp2p/bin/fastp2p')
+        binary = Path('/usr/local/fastp2p/fastp2p')
         cli = Path('/usr/local/bin/fastp2p')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
         adjacent = Path('/etc/fastp2p/gateway.env')
@@ -243,6 +243,7 @@ esac
                     command('mount','-o',f'remount,size={original_size}','/usr/local')
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             assert binary.read_bytes() == payload and cli.is_symlink() and binary.samefile(cli)
+            assert not (binary.parent/'bin').exists()
             assert profile.stat().st_uid == 0 and profile.stat().st_mode & 0o777 == 0o600
             assert subprocess.check_output([str(client),'--service-profile'],text=True).strip() == str(profile)
             config = json.loads(profile.read_text())

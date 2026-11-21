@@ -3,7 +3,7 @@
 set -eu
 umask 077
 prefix=/usr/local/fastp2p
-binary=$prefix/bin/fastp2p
+binary=$prefix/fastp2p
 cli=/usr/local/bin/fastp2p
 config_dir=/etc/fastp2p
 profile=$config_dir/config.conf
@@ -56,7 +56,7 @@ TimeoutStopSec=30
 NoNewPrivileges=true
 ProtectSystem=$protection
 ProtectHome=true
-ReadWriteDirectories=$prefix/bin $config_dir /tmp
+ReadWriteDirectories=$prefix $config_dir /tmp
 
 [Install]
 WantedBy=multi-user.target
@@ -150,7 +150,7 @@ finish() {
         rmdir "$stage"
     fi
     if $installing && [ "$status" -ne 0 ]; then
-        rmdir "$prefix/bin" "$prefix" "$config_dir" 2>/dev/null
+        rmdir "$prefix" "$config_dir" 2>/dev/null
     fi
     rmdir "$lock"
     exit "$status"
@@ -162,7 +162,7 @@ trap 'exit 143' TERM
 
 if [ "$1" = uninstall ]; then
     case "$#:${2:-}" in 1:|2:--keep-config) ;; *) fail '卸载参数无效。' ;; esac
-    trusted_directory "$prefix" && trusted_directory "$prefix/bin" || fail '程序目录权限无效。'
+    trusted_directory "$prefix" || fail '程序目录权限无效。'
     if [ -e "$config_dir" ] || [ -L "$config_dir" ]; then
         trusted_directory "$config_dir" || fail '配置目录权限无效。'
     fi
@@ -176,17 +176,19 @@ if [ "$1" = uninstall ]; then
         rm -f -- /tmp/fastp2p/fastp2p.log
         rmdir /tmp/fastp2p 2>/dev/null || true
     fi
-    rmdir "$prefix/bin" "$prefix" 2>/dev/null || true
+    rmdir "$prefix" 2>/dev/null || true
     printf '%s\n' 'FastP2P 已卸载。'
     exit 0
 fi
 
 [ "$#" -eq 3 ] && [ -f "$2" ] && [ -f "$3" ] && [ ! -L "$3" ] || fail '缺少已校验的程序或配置。'
 "$0" check >/dev/null
-[ "$("$2" --service-profile)" = "$profile" ] || fail '客户端和安装器的配置路径不一致。'
+[ "$("$2" --service-profile)" = "$profile" ] &&
+    [ "$("$2" --service-executable 2>/dev/null)" = "$binary" ] ||
+    fail '安装包使用旧目录，请先同步新版客户端。'
 if [ "${FASTP2P_SDWAN:-0}" -eq 1 ]; then "$2" --check-sdwan; fi
 trusted_directory /usr/local || fail '/usr/local 必须归 root 且禁止其他用户写入。'
-for path in "$prefix" "$prefix/bin" "$config_dir"; do
+for path in "$prefix" "$config_dir"; do
     if [ ! -e "$path" ] && [ ! -L "$path" ]; then mkdir -m 755 "$path"; fi
     trusted_directory "$path" || fail "目录权限无效：$path"
 done

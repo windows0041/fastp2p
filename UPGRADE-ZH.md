@@ -33,7 +33,7 @@ Windows 客户端 2.0.3 修复了服务报告停止后 EXE 仍短暂被占用、
 | 平台 | 行为 | 是否需要人工确认 |
 |---|---|---|
 | Windows | 下载校验后，新版本从临时目录启动一个助手：等旧服务停止、替换 `C:\Program Files\fastp2p\fastp2p.exe`、再启动服务 | 否 |
-| Linux | 新安装器的服务在 `/usr/local/fastp2p/bin` 中替换程序并重新执行，保活仍由 systemd/procd/OpenRC 管理 | 否 |
+| Linux | 新安装器的服务在 `/usr/local/fastp2p` 中替换程序并重新执行，保活仍由 systemd/procd/OpenRC 管理 | 否 |
 | macOS | 同 Linux（launchd 不受影响） | 否 |
 | Android | 已启用 Root 静默更新时，自动安装同包名、同签名的更高版本。其他情况通过通知进入系统安装器 | Root 静默更新无需当次确认。系统安装器需要点通知并确认安装 |
 
@@ -84,7 +84,7 @@ Android 还额外要求 APK 的 `versionCode` **严格大于**已安装版本：
 本次构建（Windows 双击安装包、Android 安装 APK、Linux 执行控制台下载的脚本）。
 完成这一次之后，后续版本都可以从控制台远程下发。
 
-从旧安装布局切至 Linux、macOS、Windows 或 Android 的新布局时，先使用旧版卸载，再安装新版并重新接入。Linux 和 macOS 的程序位于 `/usr/local/fastp2p/bin/fastp2p`，配置位于 `/etc/fastp2p/config.conf`，日志位于 `/tmp/fastp2p/fastp2p.log`。后续原地升级使用当前服务的安装路径。Windows 的远程替换仍由系统服务执行。
+从旧安装布局切至 Linux、macOS、Windows 或 Android 的新布局时，先使用旧版卸载，再安装新版并重新接入。Linux 和 macOS 的程序位于 `/usr/local/fastp2p/fastp2p`，配置位于 `/etc/fastp2p/config.conf`，日志位于 `/tmp/fastp2p/fastp2p.log`。后续原地升级使用当前服务的安装路径。Windows 的远程替换仍由系统服务执行。
 
 ## 回滚
 

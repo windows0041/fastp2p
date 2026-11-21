@@ -23,7 +23,7 @@ fastp2p --licenses
 
 安装 Token 为 16 位数字，网关地址、端口和公开 CA 已预置于专用客户端包。安装先完成 TLS 主机名校验及网关认证，成功后原子保存配置。错误凭据不会替换旧配置。支持 `--token`、`FASTP2P_INSTALL_TOKEN`、`--node`、`--config`、`--no-service`。
 
-在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/bin/fastp2p`。各 Linux 发行版统一使用 `/etc/fastp2p/config.conf`，日志写入 `/tmp/fastp2p/fastp2p.log`。手动下载脚本时请保留文件名中的 Token。
+在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/fastp2p`。各 Linux 发行版统一使用 `/etc/fastp2p/config.conf`，日志写入 `/tmp/fastp2p/fastp2p.log`。手动下载脚本时请保留文件名中的 Token。
 
 脚本先在私有临时目录验证接入和合并配置，通过后才停止旧服务。安装后的服务默认以 root 运行，配置及包含凭据的目录由 root 私有。安装器验证监听端口、网关认证和服务运行状态，失败时恢复旧文件、目录权限和开机启动状态。在旧版安装上重新运行新版安装命令即可迁移服务权限并保留节点身份。若旧网关仍在共享客户端的数据目录，请先迁移网关。
 
@@ -46,7 +46,7 @@ sudo journalctl -u fastp2p-client -n 50 --no-pager
 
 Alpine/OpenRC 用 `rc-service fastp2p status`，OpenWrt 用 `/etc/init.d/fastp2p status`。安装完成后程序在后台运行，不需要保持安装终端在线。
 
-在 Linux 和 macOS 用 root 运行 `/usr/local/fastp2p/bin/fastp2p stop` 可停止服务，运行 `/usr/local/fastp2p/bin/fastp2p uninstall` 可卸载。加 `--keep-config` 可保留当前布局中的配置和节点身份。
+在 Linux 和 macOS 用 root 运行 `/usr/local/fastp2p/fastp2p stop` 可停止服务，运行 `/usr/local/fastp2p/fastp2p uninstall` 可卸载。加 `--keep-config` 可保留当前布局中的配置和节点身份。
 
 macOS 在网关控制台的「安装客户端 → Mac」下载通用安装脚本。保留文件名，在终端执行 `sh ./fastp2p-macos-<16位数字>.sh` 并按提示输入管理员密码。脚本支持 macOS 13 及以上，自动下载 Apple Silicon 或 Intel 版本。程序、配置和日志与 Linux 使用相同路径，LaunchDaemon 随系统开机启动。
 

@@ -98,6 +98,12 @@ static int client_main(int argc, char **argv) {
         return 0;
     }
 #endif
+#ifndef _WIN32
+    if (argc == 2 && !strcmp(argv[1], "--service-executable")) {
+        puts(FASTP2P_SYSTEM_BINARY);
+        return 0;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--check-sdwan")) {
         const char *error = fp_sdwan_check();
         if (error) {

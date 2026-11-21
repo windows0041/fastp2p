@@ -10,6 +10,7 @@ int fastp2p_default_profile(char out[4096]);
 int fastp2p_service_profile(char out[4096]);
 #ifndef _WIN32
 #define FASTP2P_SYSTEM_DIR "/usr/local/fastp2p"
+#define FASTP2P_SYSTEM_BINARY FASTP2P_SYSTEM_DIR "/fastp2p"
 #define FASTP2P_SYSTEM_PROFILE "/etc/fastp2p/config.conf"
 #define FASTP2P_LOG_DIR "/tmp/fastp2p"
 #define FASTP2P_LOG_FILE FASTP2P_LOG_DIR "/fastp2p.log"
