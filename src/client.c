@@ -580,7 +580,27 @@ static int lan_punch_possible(const fastp2p_client *c, const app *a) {
     }
     return 0;
 }
-/* A peer may publish an address that is actually ours: both nodes can egress the
+/* A peer this host can reach without a NAT in between: loopback or a private
+ * address. Such a peer dials our listener, which is the opposite of what a
+ * carrier-NAT peer needs, so the two cases must not share one strategy. */
+static int peer_is_local(const op_addr *a) {
+    if (!a || !a->len)
+        return 0;
+    if (op_addr_private(a))
+        return 1;
+    op_addr x = *a;
+    op_addr_normalize(&x);
+    if (x.u.sa.sa_family == AF_INET)
+        return (ntohl(x.u.in.sin_addr.s_addr) >> 24) == 127;
+    if (x.u.sa.sa_family == AF_INET6) {
+        const uint8_t *b = x.u.in6.sin6_addr.s6_addr;
+        for (int i = 0; i < 15; ++i)
+            if (b[i])
+                return 0;
+        return b[15] == 1;
+    }
+    return 0;
+}/* A peer may publish an address that is actually ours: both nodes can egress the
  * same carrier NAT, or the peer's probe can leave through our line. Dialling it
  * only reaches our own NAT, which has no hairpin, so fall back to the address the
  * gateway observed for that peer. */
@@ -2017,6 +2037,12 @@ static void probe_complete(fastp2p_client *c, int index) {
             uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
             if (t->tcp_direct_port && mapped_tcp)
                 t->tcp_direct_port = mapped_tcp;
+            else if (t->tcp_direct_port && (t->lan || peer_is_local(&t->peer_addr)))
+                /* A peer on the same host or LAN reaches the listener this client
+                 * keeps for it, so that port is the one to publish. Swapping in the
+                 * probe mapping here is what stopped the two local test clients from
+                 * ever finding each other. */
+                t->tcp_direct_port = c->public_port;
             else if (t->tcp_direct_port && t->mapped_port)
                 /* Without UPnP the only port the peer can reach is the one the
                  * carrier NAT actually allocated: a CGNAT rewrites the source
@@ -2132,6 +2158,7 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
         (void)tcp_punch_listen(c, index);
     } else t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
 }
+
 static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     if (!t->peer_addr.len) {
@@ -2175,17 +2202,36 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     /* A refused dial returns at once, but a silently dropped one would spend the
      * whole window on a single attempt. Bound it so the retry budget survives. */
     t->tcp_attempt_deadline = now + TCP_PUNCH_ATTEMPT_MS * MS;
-    /* Release everything already holding the punch port before binding it again:
-     * the fallback listener, and the probe socket that a family switch hands over
-     * as t->fd ("t->fd owns the punch socket now"). That socket is still connected
-     * to the gateway probe, so a second bind of the same port fails - silently on
-     * Windows, which is why every attempt reported "unknown" while no SYN was ever
-     * sent and the peer's own SYN met a reset. */
-    if (t->listen_fd >= 0) {
+    /* The v1 punch has no initiator role to answer with: both ends keep their
+     * listener and both dial, so the port must not be taken away from them. */
+    if (!t->tcp_v2) {
+        /* Historical scheme, unchanged. */
+    } else if (!t->initiator && peer_is_local(&t->peer_addr)) {
+        /* The v2 punch does have one. A peer on the same host or LAN is reached by
+         * dialling our listener, so the responder parks there and lets the
+         * initiator's connection arrive instead of fighting it for the port. */
+        if (t->fd >= 0) {
+            op_close(t->fd);
+            t->fd = -1;
+        }
+        if (t->listen_fd < 0 && tcp_punch_listen(c, index)) {
+            close_tunnel(c, index, "TCP punch listener failed");
+            return;
+        }
+        t->tcp_attempts = TCP_PUNCH_ATTEMPTS_RESPONDER;
+        t->tcp_retry_at = 0;
+        return;
+    }
+    /* Everything else dials, and on v2 the dial has to own the port: a carrier NAT
+     * only admits the answer while a mapping is alive, and nothing stays mapped for
+     * a port this process is not sending from. The listener and any earlier attempt
+     * socket are closed for that, which is also why the "unknown" bind failures
+     * disappeared once the port was released here. */
+    if (t->tcp_v2 && t->listen_fd >= 0) {
         op_close(t->listen_fd);
         t->listen_fd = -1;
     }
-    if (t->fd >= 0) {
+    if (t->tcp_v2 && t->fd >= 0) {
         op_close(t->fd);
         t->fd = -1;
     }

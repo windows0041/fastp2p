@@ -8,9 +8,12 @@ static op_socket bound_port(uint16_t *port) {
 static void tcp_retry(void) {
     fastp2p_client *c=calloc(1,sizeof(*c));assert(c);strcpy(c->local_ip[OP_FAM_V4],"127.0.0.1");
     uint16_t remote,local;op_socket endpoint=bound_port(&remote),reserve=bound_port(&local);op_close(reserve);
-    int ti=new_tunnel(c,"retry-target",100,FASTP2P_TRANSPORT_TCP,0);assert(ti>=0);
+    /* A loopback peer is reached the other way round: the initiator dials and the
+     * responder parks on its listener, so the dialling side is the one under test
+     * here. */
+    int ti=new_tunnel(c,"retry-target",100,FASTP2P_TRANSPORT_TCP,1);assert(ti>=0);
     tunnel *t=&c->tunnels[ti];strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");
-    t->local_port=local;t->remote_port=remote;t->tcp_v2=1;t->server=1;
+    t->local_port=local;t->remote_port=remote;t->tcp_v2=1;t->server=0;
     assert(!op_addr_from_text(&t->peer_addr,"127.0.0.1",remote));
     /* BSD may leave the first connect pending until the production 3-second
      * attempt deadline instead of reporting an immediate loopback refusal. */
@@ -19,7 +22,7 @@ static void tcp_retry(void) {
         if(t->tcp_attempts>=2 && !listening){assert(!op_listen(endpoint,4));listening=1;}
         tick_tunnel(c,ti,mono());op_sleep_ms(2);
     }
-    assert(listening && t->state==T_HANDSHAKE && t->tcp_attempts>=2 && t->tcp_attempts<=8 && t->server==1);
+    assert(listening && t->state==T_HANDSHAKE && t->tcp_attempts>=2 && t->tcp_attempts<=8);
     struct sockaddr_in peer;op_socklen length=sizeof(peer);op_socket accepted=op_accept(endpoint,(struct sockaddr *)&peer,&length);
     assert(accepted>=0 && ntohs(peer.sin_port)==local);
     /* Transport establishment does not bypass session authentication. */
