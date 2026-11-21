@@ -34,7 +34,17 @@
 #define MS UINT64_C(1000000)
 #define PEER_PORT_MIN 1024u
 #define PEER_PORT_COUNT (9999u - PEER_PORT_MIN + 1u)
-#define TCP_DIRECT_WAIT (1500 * MS)
+#define TCP_DIRECT_WAIT (10 * NS)
+/* Simultaneous open: both sides must be in SYN_SENT at the same instant, so a
+ * refused dial is retried quickly and for the whole window rather than once.
+ * A carrier NAT refuses in ~5 ms, so the retry interval is short; the jitter
+ * keeps two peers from retrying in lockstep and missing each other. */
+#define TCP_PUNCH_ATTEMPTS 120u
+#define TCP_PUNCH_RETRY_MS 20u
+#define TCP_PUNCH_RETRY_JITTER_MS 60u
+/* Per-attempt wait for a non-blocking connect; a dropped dial must not eat the
+ * whole retry budget the way a 3 s deadline would. */
+#define TCP_PUNCH_ATTEMPT_MS 700u
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -1963,6 +1973,13 @@ static void probe_complete(fastp2p_client *c, int index) {
             uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
             if (t->tcp_direct_port && mapped_tcp)
                 t->tcp_direct_port = mapped_tcp;
+            else if (t->tcp_direct_port && t->mapped_port)
+                /* Without UPnP the only port the peer can reach is the one the
+                 * carrier NAT actually allocated: a CGNAT rewrites the source
+                 * port, so advertising the local listener port gives the peer a
+                 * port that was never open. t->mapped_port is what the gateway's
+                 * probe observed for the very socket this punch will use. */
+                t->tcp_direct_port = t->mapped_port;
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
@@ -2044,11 +2061,17 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     }
     if (t->fd >= 0) op_close(t->fd);
     t->fd = -1;
-    unsigned limit = t->initiator ? 1 : 5;
+    /* Keep dialling for the whole window instead of giving up after one attempt.
+     * Simultaneous open needs both sides in SYN_SENT at the same moment: a
+     * refused dial comes back in a few milliseconds, so a retry is nearly free,
+     * while switching to listen-only throws away the mapping that lets the peer
+     * in. Measured across two carrier NATs: one side crossed on its first try,
+     * the other needed ten. */
+    unsigned limit = TCP_PUNCH_ATTEMPTS;
     if (t->tcp_attempts >= limit) {
         t->tcp_retry_at = 0;
         (void)tcp_punch_listen(c, index);
-    } else t->tcp_retry_at = now + (50 + random_id() % 151) * MS;
+    } else t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
 }
 static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
@@ -2058,7 +2081,9 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     }
     ++t->tcp_attempts;
     t->tcp_retry_at = 0;
-    t->tcp_attempt_deadline = now + 3 * NS;
+    /* A refused dial returns at once, but a silently dropped one would spend the
+     * whole window on a single attempt. Bound it so the retry budget survives. */
+    t->tcp_attempt_deadline = now + TCP_PUNCH_ATTEMPT_MS * MS;
     t->fd = socket_bound(0, c->local_ip[t->family >= 0 ? t->family : OP_FAM_V4], t->local_port, 1);
     /* Name the address actually dialled: the old wording claimed "the mapped
      * source port" even on a LAN punch, which made a failed direct attempt

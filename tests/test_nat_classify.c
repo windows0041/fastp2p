@@ -19,7 +19,7 @@ static void tcp_retry(void) {
         if(t->tcp_attempts>=2 && !listening){assert(!op_listen(endpoint,4));listening=1;}
         tick_tunnel(c,ti,mono());op_sleep_ms(2);
     }
-    assert(listening && t->state==T_HANDSHAKE && t->tcp_attempts>=2 && t->tcp_attempts<=5 && t->server==1);
+    assert(listening && t->state==T_HANDSHAKE && t->tcp_attempts>=2 && t->tcp_attempts<=8 && t->server==1);
     struct sockaddr_in peer;op_socklen length=sizeof(peer);op_socket accepted=op_accept(endpoint,(struct sockaddr *)&peer,&length);
     assert(accepted>=0 && ntohs(peer.sin_port)==local);
     /* Transport establishment does not bypass session authentication. */
@@ -30,8 +30,17 @@ static void tcp_retry(void) {
     strcpy(t->ip,"127.0.0.1");strcpy(t->mode,"tcppunch");t->local_port=local;t->remote_port=remote;t->tcp_v2=1;
     assert(!op_addr_from_text(&t->peer_addr,"127.0.0.1",remote));
     start_underlay(c,ti);until=mono()+6*NS;
-    while(t->state==T_TCP_CONNECT && t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
-    assert(t->state==T_TCP_CONNECT && t->listen_fd>=0 && t->fd<0 && t->tcp_attempts==1 && t->session_owner);
+    while(t->state==T_TCP_CONNECT && t->listen_fd<0 && t->tcp_attempts<3 && mono()<until){
+        tick_tunnel(c,ti,mono());op_sleep_ms(2);
+    }
+    /* Simultaneous open needs both peers in SYN_SENT at the same moment, so a
+     * refused dial is retried instead of switching to listen after one try. */
+    assert(t->tcp_attempts>=2 && t->listen_fd<0 && t->session_owner);
+    /* The listen fallback still exists, but only once the retry budget is spent. */
+    t->tcp_attempts=TCP_PUNCH_ATTEMPTS;
+    until=mono()+2*NS;
+    while(t->listen_fd<0 && mono()<until){tick_tunnel(c,ti,mono());op_sleep_ms(2);}
+    assert(t->listen_fd>=0 && t->fd<0);
     assert(!t->tcp_retry_at && !tunnel_ready(t));close_tunnel(c,ti,NULL);op_close(endpoint);free(c);
 }
 static void tcp_punch_scheduling(void) {
