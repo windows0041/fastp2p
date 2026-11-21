@@ -384,6 +384,7 @@ struct fastp2p_client {
     int validate_only;
     void *user;
     fp_sdwan *sdwan;
+    uint64_t sdwan_report_at;
     tunnel tunnels[NT];
     app apps[NA];
     overlay overlays[NO];
@@ -2849,6 +2850,38 @@ static void report_apps(fastp2p_client *c) {
     ws_json(c, 6, 3, root);
     json_object_put(root);
 }
+static void report_sdwan(fastp2p_client *c, uint64_t now) {
+    fp_sdwan *state = c->sdwan;
+    if (!fp_sdwan_active(state) || c->state != FASTP2P_ONLINE || now < c->sdwan_report_at)
+        return;
+    c->sdwan_report_at = now + 5 * NS;
+    json_object *root = json_object_new_object(), *links = json_object_new_array();
+    op_js(root, "mode", state->central ? "central" : "mesh");
+    if (state->central)
+        op_js(root, "center", state->center);
+    json_object_object_add(root, "links", links);
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        int index = state->peers[i].app_index;
+        if (index < 0)
+            continue;
+        const app *a = &c->apps[index];
+        const tunnel *t = a->tunnel_index >= 0 ? &c->tunnels[a->tunnel_index] : NULL;
+        json_object *link = json_object_new_object();
+        op_js(link, "peer", a->peer);
+        if (a->synced && t && tunnel_ready(t)) {
+            op_js(link, "state", t->relay_wait ? "relay" : "direct");
+            if (t->relay_wait)
+                op_js(link, "relay", t->peer);
+            else if (t->family >= 0)
+                op_ju(link, "family", t->family == OP_FAM_V6 ? 6 : 4);
+        } else
+            op_js(link, "state", "connecting");
+        json_object_array_add(links, link);
+    }
+    ws_json(c, 6, 11, root);
+    json_object_put(root);
+}
+
 static int rule_protocol(fastp2p_client *c, int index, const char *protocol) {
     app *a = &c->apps[index];
     if (!strcmp(protocol, "socks5"))
@@ -3467,6 +3500,50 @@ static int tseal(fastp2p_client *c, tunnel *t, uint16_t sub, const void *data, s
         return -1;
     return tframe(t, sub, buffer, written);
 }
+static void sdwan_send(fastp2p_client *c, int owner, const uint8_t *packet, size_t length) {
+    const fp_sdwan *state = c->sdwan;
+    if (state->central && state->center_index != FP_SDWAN_LOCAL)
+        owner = state->center_index;
+    if (owner < 0 || state->peers[owner].app_index < 0)
+        return;
+    const app *a = &c->apps[state->peers[owner].app_index];
+    if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
+        (void)tseal(c, &c->tunnels[a->tunnel_index], TUN_SDWAN_IPV4, packet, length);
+}
+
+static void sdwan_receive(fastp2p_client *c, const tunnel *t, uint8_t *packet, size_t length) {
+    fp_sdwan *state = c->sdwan;
+    uint32_t source, destination;
+    if (fp_sdwan_ipv4(packet, length, &source, &destination))
+        return;
+    int from = fp_sdwan_owner(state, source), to = fp_sdwan_owner(state, destination);
+    if (from < 0 || to == FP_SDWAN_NO_ROUTE)
+        return;
+    int hub = state->central && state->center_index == FP_SDWAN_LOCAL;
+    int incoming = state->central && !hub ? state->center_index : from;
+    const char *peer = t->relay_wait ? t->relay_peer : t->peer;
+    if (incoming < 0 || state->peers[incoming].app_index < 0 ||
+        strcmp(peer, c->apps[state->peers[incoming].app_index].peer))
+        return;
+    if (to == FP_SDWAN_LOCAL) {
+        fp_sdwan_write(state, packet, length);
+        return;
+    }
+    if (!hub || from == to || packet[8] <= 1)
+        return;
+    --packet[8];
+    /* Route between authenticated branches without passing through the host's IP stack. */
+    packet[10] = packet[11] = 0;
+    unsigned sum = 0;
+    for (unsigned i = 0; i < (unsigned)(packet[0] & 15) * 4; i += 2)
+        sum += ((unsigned)packet[i] << 8) | packet[i + 1];
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    packet[10] = (uint8_t)(~sum >> 8);
+    packet[11] = (uint8_t)~sum;
+    sdwan_send(c, to, packet, length);
+}
+
 /* Returns 0 on success, 1 when the frame is a duplicate and must be ignored,
  * and -1 when the tunnel must be closed. */
 static int topen(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, size_t len,
@@ -3638,14 +3715,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
     if (rv)
         return;
     if (sub == TUN_SDWAN_IPV4) {
-        uint32_t source, destination;
-        if (fp_sdwan_ipv4(plain, n, &source, &destination) ||
-            fp_sdwan_owner(c->sdwan, destination) != FP_SDWAN_LOCAL)
-            return;
-        int owner = fp_sdwan_owner(c->sdwan, source);
-        const char *peer = t->relay_wait ? t->relay_peer : t->peer;
-        if (owner >= 0 && !strcmp(peer, c->apps[c->sdwan->peers[owner].app_index].peer))
-            fp_sdwan_write(c->sdwan, plain, n);
+        sdwan_receive(c, t, plain, n);
         return;
     }
     if (sub == TUN_DATA) {
@@ -4752,8 +4822,11 @@ static void report_client(fastp2p_client *c) {
     op_ju(j, "configPush", c->config_handler != NULL);
 #ifdef __linux__
     op_ju(j, "sdwanPush", c->config_handler != NULL);
+    op_ju(j, "sdwanTopology", c->config_handler != NULL);
 #elif defined(_WIN32)
-    op_ju(j, "sdwanPush", c->config_handler && !fp_sdwan_check());
+    int sdwan_supported = c->config_handler && !fp_sdwan_check();
+    op_ju(j, "sdwanPush", sdwan_supported);
+    op_ju(j, "sdwanTopology", sdwan_supported);
 #endif
     op_ju(j, "restart", c->restart_handler != NULL);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
@@ -5758,15 +5831,28 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
     unsigned available = 0;
     for (int i = 0; i < NA; ++i)
         available += !c->apps[i].used;
+    if (state->central && !strcmp(state->center, c->node))
+        state->center_index = FP_SDWAN_LOCAL;
     for (unsigned i = 0; i < state->peer_count; ++i) {
         const char *peer = state->peers[i].node;
-        if (i >= available || !valid_node(peer) || !strcmp(c->node, peer)) {
+        if (!valid_node(peer) || !strcmp(c->node, peer)) {
             free(state);
             return FASTP2P_EINVAL;
         }
+        if (state->central && !strcmp(state->center, peer))
+            state->center_index = (int)i;
+    }
+    unsigned needed = !state->central || state->center_index == FP_SDWAN_LOCAL ? state->peer_count :
+                      state->center_index >= 0 ? 1 : 0;
+    if (needed > available ||
+        (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE)) {
+        free(state);
+        return FASTP2P_EINVAL;
     }
     int slot = 0;
     for (unsigned i = 0; i < state->peer_count; ++i) {
+        if (state->central && state->center_index != FP_SDWAN_LOCAL && state->center_index != (int)i)
+            continue;
         while (c->apps[slot].used)
             ++slot;
         fp_sdwan_peer *peer = &state->peers[i];
@@ -5807,9 +5893,7 @@ static void tick_sdwan(fastp2p_client *c) {
         int owner = fp_sdwan_owner(state, destination);
         if (owner < 0)
             continue;
-        app *a = &c->apps[state->peers[owner].app_index];
-        if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
-            (void)tseal(c, &c->tunnels[a->tunnel_index], TUN_SDWAN_IPV4, packet, (size_t)length);
+        sdwan_send(c, owner, packet, (size_t)length);
     }
 }
 
@@ -6003,6 +6087,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     tick_relays(c, now);
     tick_apps(c, now);
     tick_sdwan(c);
+    report_sdwan(c, now);
     tick_socks(c, now);
     tick_overlays(c, now);
     if (wait_ms > 10)

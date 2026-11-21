@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two Linux clients exchange IPv4 over IPv6-only links in isolated namespaces."""
+"""Linux clients exchange IPv4 over IPv6-only links in isolated namespaces."""
 
 import argparse
 from contextlib import ExitStack
@@ -56,13 +56,23 @@ def main():
     parser.add_argument('--client', required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--gateway', required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--managed', action='store_true', help='Apply and revoke topology through the gateway')
+    parser.add_argument('--topology', action='store_true', help='Test a three-member Mesh and center failover')
     args = parser.parse_args()
+    if args.topology:
+        args.managed = True
     for namespace in ('mnt', 'net'):
         if Path('/proc/self/ns/' + namespace).readlink() == Path('/proc/1/ns/' + namespace).readlink():
             parser.error('Run as root via unshare --mount --net --propagation private')
 
     names = ('vps-a', 'vps-b')
     lan_names = ('lan-a', 'lan-b')
+    lans = ('192.168.50', '192.168.15')
+    nodes = ('sdwan-vps-a', 'sdwan-vps-b')
+    if args.topology:
+        names += ('vps-c',)
+        lan_names += ('lan-c',)
+        lans += ('192.168.60',)
+        nodes += ('sdwan-vps-c',)
     gateway_ip = '2001:db8:3:2::1'
     unprivileged = ('setpriv', '--reuid=65534', '--regid=65534', '--clear-groups', '--no-new-privs')
     net_admin = ('--bounding-set=-all,+net_admin', '--inh-caps=+net_admin', '--ambient-caps=+net_admin')
@@ -123,9 +133,8 @@ def main():
                '--cert', str(certs / 'server.crt'), '--key', str(certs / 'server.key')], 'gateway', environment)
         client_env = {key: value for key, value in environment.items()
                       if key not in ('FASTP2P_USER', 'FASTP2P_PASSWORD', 'FASTP2P_TOKEN')}
-        lans = ('192.168.50', '192.168.15')
-        nodes = ('sdwan-vps-a', 'sdwan-vps-b')
         clients = []
+        profiles = []
         jwt = None
         tls = ssl.create_default_context(cafile=str(certs / 'ca.crt'))
 
@@ -172,8 +181,9 @@ def main():
                 profile.write_text(json.dumps(settings))
                 os.chown(profile, 65534, 65534)
                 profile.chmod(0o600)
-                clients.append(start(ns(name, *unprivileged, *net_admin, str(args.client), 'run',
-                                        '--config', str(profile)), name, client_env))
+                profiles.append(ns(name, *unprivileged, *net_admin, str(args.client), 'run',
+                                   '--config', str(profile)))
+                clients.append(start(profiles[-1], name, client_env))
 
             if args.managed:
                 wait_for(login, 'Could not sign in to the isolated SD-WAN gateway')
@@ -242,12 +252,44 @@ with socket.create_connection((sys.argv[1], 23456), timeout=6) as stream:
             command(*ns(lan_names[0], sys.executable, '-c', request, target), timeout=10)
             print('64 KiB of TCP payload forwarded across the remote subnet')
 
+            if args.topology:
+                path = '/api/v1/sdwan'
+
+                def links_ready(mode, center, count):
+                    plan = api(path)[1]
+                    return (plan['mode'] == mode and plan.get('activeCenter', '') == center and
+                            len(plan['links']) == count and
+                            all(link['state'] == 'direct' and link['family'] == 6 for link in plan['links']))
+
+                wait_for(lambda: links_ready('mesh', '', 3), 'The three Mesh paths were not reported as direct')
+                central = {'subnet': subnet, 'mode': 'central', 'center': nodes[2], 'members': members}
+                assert api(path, {**central, 'center': 'outside-node'})[0] == 400
+                assert api(path, central)[0] == 200
+                wait_for(lambda: links_ready('central', nodes[2], 2), 'The two center links did not come online')
+                assert all(nodes[2] in (link['a'], link['b']) for link in api(path)[1]['links'])
+                reply = output(*ns(names[0], 'ping', '-4', '-c', '1', '-W', '2', '10.3.2.2'))
+                assert 'ttl=63' in reply, reply
+                assert ping(lan_names[0], lans[1] + '.3') and ping(lan_names[1], lans[0] + '.3')
+                stop(clients[2])
+                wait_for(lambda: any(m['node'] == nodes[2] and m['state'] == 'offline'
+                                     for m in api(path)[1]['members']), 'The center did not go offline')
+                assert not ping(names[0], '10.3.2.2'), 'Branches bypassed the offline center'
+                wait_for(lambda: api(path)[1]['activeCenter'] == nodes[0] and ping(names[0], '10.3.2.2'),
+                         'The new center did not restore IPv4 traffic')
+                clients[2] = start(profiles[2], 'rejoined-center', client_env)
+                wait_for(lambda: links_ready('central', nodes[0], 2), 'The returning member did not use the new center')
+                assert api(path)[1]['center'] == nodes[2]
+                assert api(path, {'subnet': subnet, 'mode': 'mesh', 'members': members})[0] == 200
+                wait_for(lambda: links_ready('mesh', '', 3) and ping(names[0], '10.3.2.2'),
+                         'The clients did not return to Mesh')
+                print('Mesh and center link telemetry, transit IPv4, center failure and recovery verified')
+
             if args.managed:
                 assert api('/api/v1/sdwan', {'subnet': subnet, 'members': []})[0] == 200
                 wait_for(lambda: all('fastp2p0' not in output(*ns(n, 'ip', 'link', 'show')) for n in names),
                          'Revoking the network did not remove its TUN devices')
                 assert all(p.poll() is None for p in clients)
-                print('Gateway topology persisted, acknowledged, and removed while both clients stayed online')
+                print('Gateway topology persisted, acknowledged, and removed while the clients stayed online')
 
             for name, process in zip(names, clients):
                 stop(process)

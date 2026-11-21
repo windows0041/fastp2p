@@ -89,10 +89,22 @@ static int virtual_address(const char *text, uint32_t subnet, unsigned bits, uin
 }
 
 int fp_sdwan_parse(fp_sdwan *state, json_object *config) {
-    *state = (fp_sdwan){.fd = -1};
+    *state = (fp_sdwan){.fd = -1, .center_index = FP_SDWAN_NO_ROUTE};
     if (!json_object_is_type(config, json_type_object))
         return -1;
     json_object *value, *peers;
+    if (json_object_object_get_ex(config, "Mode", &value)) {
+        const char *mode = string_value(value);
+        if (!mode || (strcmp(mode, "central") && strcmp(mode, "mesh")))
+            return -1;
+        state->central = !strcmp(mode, "central");
+        if (state->central) {
+            const char *center = get_string(config, "Center");
+            if (!center || strlen(center) >= sizeof(state->center))
+                return -1;
+            strcpy(state->center, center);
+        }
+    }
     const char *pool = "10.3.2.0/24";
     uint32_t subnet;
     unsigned bits;
@@ -122,6 +134,7 @@ int fp_sdwan_parse(fp_sdwan *state, json_object *config) {
             if (!strcmp(state->peers[j].node, name))
                 return -1;
         strcpy(state->peers[i].node, name);
+        state->peers[i].app_index = -1;
     }
     state->peer_count = (unsigned)json_object_array_length(peers);
     return 0;

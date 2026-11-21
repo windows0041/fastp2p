@@ -28,6 +28,8 @@ typedef struct {
     struct fp_sdwan_windows *windows;
     char error[160];
 #endif
+    int central, center_index;
+    char center[32];
     uint32_t address;
     fp_sdwan_peer peers[FP_SDWAN_MAX_PEERS];
     unsigned peer_count;
