@@ -4752,6 +4752,8 @@ static void report_client(fastp2p_client *c) {
     op_ju(j, "configPush", c->config_handler != NULL);
 #ifdef __linux__
     op_ju(j, "sdwanPush", c->config_handler != NULL);
+#elif defined(_WIN32)
+    op_ju(j, "sdwanPush", c->config_handler && !fp_sdwan_check());
 #endif
     op_ju(j, "restart", c->restart_handler != NULL);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
@@ -5745,7 +5747,7 @@ int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64
     return FASTP2P_OK;
 }
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     fp_sdwan *state = malloc(sizeof(*state));
     if (!state)
         return FASTP2P_EIO;
@@ -5791,7 +5793,7 @@ int fastp2p_client_attach_sdwan_tun(fastp2p_client *c, int fd) {
 
 static void tick_sdwan(fastp2p_client *c) {
     fp_sdwan *state = c->sdwan;
-    if (!state || state->fd < 0)
+    if (!fp_sdwan_active(state))
         return;
     for (int i = 0; i < 32; ++i) {
         uint8_t packet[FP_SDWAN_MTU];

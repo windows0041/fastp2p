@@ -24,6 +24,10 @@ typedef struct {
 
 typedef struct {
     int fd;
+#ifdef _WIN32
+    struct fp_sdwan_windows *windows;
+    char error[160];
+#endif
     uint32_t address;
     fp_sdwan_peer peers[FP_SDWAN_MAX_PEERS];
     unsigned peer_count;
@@ -35,6 +39,14 @@ typedef struct {
 int fp_sdwan_parse(fp_sdwan *state, json_object *config);
 int fp_sdwan_owner(const fp_sdwan *state, uint32_t address);
 int fp_sdwan_ipv4(const uint8_t *packet, size_t length, uint32_t *source, uint32_t *destination);
+
+static inline int fp_sdwan_active(const fp_sdwan *state) {
+#ifdef _WIN32
+    return state && state->windows;
+#else
+    return state && state->fd >= 0;
+#endif
+}
 
 const char *fp_sdwan_check(void);
 const char *fp_sdwan_start(fp_sdwan *state);

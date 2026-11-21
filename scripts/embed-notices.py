@@ -6,6 +6,7 @@ from pathlib import Path
 
 p = argparse.ArgumentParser()
 p.add_argument('--prefix', default='')
+p.add_argument('--wintun-license', type=Path)
 p.add_argument('--output', required=True)
 args = p.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -15,6 +16,8 @@ if args.prefix:
     for name, item in json.loads((root/'deps.lock.json').read_text()).items():
         file = item.get('license', 'LICENSE.txt' if name == 'openssl' else 'COPYING')
         files.append((name + ' ' + item['version'], sources/(name+'-'+item['version'])/file))
+if args.wintun_license:
+    files.append(('Wintun prebuilt binaries license', args.wintun_license))
 data = b''.join(('\n===== '+name+' =====\n').encode() + path.read_bytes() + b'\n' for name, path in files)
 Path(args.output).write_text('static const unsigned char fastp2p_notices[] = {\n' +
     '\n'.join(','.join(str(b) for b in data[i:i+32])+',' for i in range(0,len(data),32)) + '\n};\n', encoding='utf-8')

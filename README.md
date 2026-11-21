@@ -112,6 +112,18 @@ VPS B 的配置片段
 
 TUN 支持单播 IPv4，只安装配置中的对端地址及子网路由。已存在的同前缀路由会使启动报错，停止客户端会释放 TUN 及其路由。IPv6 直连需让对端访问节点的 UDP 业务端口；若使用中继，中继节点也须运行支持 SD-WAN 的客户端。
 
+### Windows SD-WAN
+
+Windows x86_64 客户端随单文件 EXE 打包官方签名的 Wintun。安装为 Windows 服务后，可在网关控制台将设备加入 SD-WAN 并分配虚拟 IPv4。服务为对端虚拟地址和共享子网安装路由，停止组网或服务时清理对应的网卡和路由。在管理员 PowerShell 中可检查依赖和已配置的虚拟网卡。
+
+```powershell
+& "$env:ProgramFiles\fastp2p\fastp2p.exe" --check-sdwan
+Get-NetIPAddress -InterfaceAlias fastp2p0 -AddressFamily IPv4
+Get-NetRoute -InterfaceAlias fastp2p0 -AddressFamily IPv4
+```
+
+从 Windows 分享本机子网时，还需要在相关 LAN 接口启用 IPv4 转发，允许防火墙转发，并在子网网关配置回程路由。
+
 ### Android SD-WAN
 
 从 FastP2P 通知打开「SD-WAN」，粘贴 `sdwan` 的 JSON 对象。保存配置时应用会先尝试通过 `su` 建立 TUN。系统缺少 Root 授权或无法建立 Root TUN 时，在通知中选择「授权 VPN」，按 Android 提示确认即可。本机可访问配置的虚拟地址和对端子网。在 Android 上向其他节点发布手机所在子网需要 Root，并需另外配置 IPv4 转发、防火墙和回程路由。

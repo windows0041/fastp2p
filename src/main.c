@@ -80,7 +80,7 @@ static void usage(void) {
          "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
-         "fastp2p --check-sdwan (checks Linux TUN, iproute2 and CAP_NET_ADMIN)\n"
+         "fastp2p --check-sdwan (checks Linux TUN or Windows Wintun dependencies)\n"
          "fastp2p stop [--config FILE]\n"
          "fastp2p --config FILE [--serverhost HOST] [--node NAME] [--cacert FILE]\n"
          "          [--port WSS_PORT] [--publicipport PORT] [--run-seconds N]\n"

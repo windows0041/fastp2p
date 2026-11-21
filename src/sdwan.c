@@ -283,9 +283,9 @@ int fp_sdwan_read(fp_sdwan *state, uint8_t packet[FP_SDWAN_MTU]) {
 void fp_sdwan_write(fp_sdwan *state, const uint8_t *packet, size_t length) {
     (void)write(state->fd, packet, length);
 }
-#else
+#elif !defined(_WIN32)
 const char *fp_sdwan_check(void) {
-    return "SD-WAN TUN is supported on Linux only";
+    return "SD-WAN TUN is unavailable on this platform";
 }
 const char *fp_sdwan_start(fp_sdwan *state) {
     (void)state;

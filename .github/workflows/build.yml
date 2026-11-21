@@ -264,6 +264,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-service-windows.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/windows/test-sdwan-windows.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-wire.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/windows/test-secure.exe
