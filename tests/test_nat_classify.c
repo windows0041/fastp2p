@@ -768,6 +768,30 @@ int main(void) {
     udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();
     public_round_budget();
+    /* Built-in probe defaults. Two destinations each, because the UDP filter test
+     * needs a second *address* to answer and the TCP mapping test cannot classify a
+     * destination-dependent mapping from the gateway's single probe address. */
+    {
+        fastp2p_client probes = {0};
+        assert(fp_client_tcp_nat_config(&probes, NULL) == FASTP2P_OK);
+        assert(probes.tcp_nat.server_count == 2);
+        assert(!strcmp(probes.tcp_nat.servers[0].host, "stun.fastp2p.top"));
+        assert(probes.tcp_nat.servers[0].port == 3478);
+        assert(!strcmp(probes.tcp_nat.servers[1].host, "stun.nextcloud.com"));
+        assert(probes.tcp_nat.servers[1].port == 443);
+        assert(fp_client_stun_config(&probes, NULL) == FASTP2P_OK);
+        assert(probes.stun_count == 2);
+        assert(!strcmp(probes.stun_host[0], "stun.miwifi.com") && probes.stun_port[0] == 3478);
+        assert(!strcmp(probes.stun_host[1], "stun.fastp2p.top") && probes.stun_port[1] == 3478);
+        /* An explicit empty array still opts out of leaving the host. */
+        json_object *none = json_object_new_array();
+        assert(none);
+        assert(fp_client_tcp_nat_config(&probes, none) == FASTP2P_OK);
+        assert(probes.tcp_nat.server_count == 0);
+        assert(fp_client_stun_config(&probes, none) == FASTP2P_OK);
+        assert(probes.stun_count == 0);
+        json_object_put(none);
+    }
     /* Dense start: the first half second decides a cone-to-cone punch. */
     assert(punch_interval(0) == 50 * MS);
     assert(punch_interval(499 * MS) == 50 * MS);

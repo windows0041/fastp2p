@@ -885,8 +885,38 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
     return transport == FASTP2P_TRANSPORT_TCP ? c->tcp_nat.family[OP_FAM_V4].type
                                               : (uint64_t)c->nat[OP_FAM_V4].type;
 }
+/* Built-in probe servers: every node measures its NAT the same way without any
+ * per-machine configuration. Each is still overridable, and `[]` / "" disables the
+ * corresponding probe for an operator who does not want it to leave the host.
+ *
+ * The UDP entry pairs a nearby server with the project's own: the filter verdict
+ * needs an answer from a *different address*, so one unreachable probe would leave
+ * the level unmeasured rather than merely slow. */
+#define FP_DEFAULT_STUN_SERVERS "stun.miwifi.com:3478"
+#define FP_DEFAULT_STUN_SERVERS_ALT "stun.fastp2p.top:3478"
+/* TCP filtering needs a callback probe server; the project's own host, dedicated
+ * port. It answers a plain-text "mapped <ip> <port>" line, not STUN. */
+#define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
+/* TCP mapping needs two destinations on *different addresses*: the gateway's own
+ * probe ports are one address, so a mapping that depends on the destination could
+ * otherwise never be told apart from a stable one, and the port prediction that
+ * symmetric-to-symmetric punching relies on would never enable. */
+#define FP_DEFAULT_TCP_MAPPING_SERVERS "stun.fastp2p.top:3478"
+#define FP_DEFAULT_TCP_MAPPING_SERVERS_ALT "stun.nextcloud.com:443"
+
 int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
-    return fp_tcp_nat_configure(&c->tcp_nat, servers) ? FASTP2P_EINVAL : FASTP2P_OK;
+    if (servers)
+        return fp_tcp_nat_configure(&c->tcp_nat, servers) ? FASTP2P_EINVAL : FASTP2P_OK;
+    /* No key at all falls back to the two built-in destinations. An empty array is
+     * an explicit opt-out, so a hermetic deployment still gets no external traffic. */
+    json_object *fallback = json_object_new_array();
+    if (!fallback)
+        return FASTP2P_EIO;
+    json_object_array_add(fallback, json_object_new_string(FP_DEFAULT_TCP_MAPPING_SERVERS));
+    json_object_array_add(fallback, json_object_new_string(FP_DEFAULT_TCP_MAPPING_SERVERS_ALT));
+    int configured = fp_tcp_nat_configure(&c->tcp_nat, fallback);
+    json_object_put(fallback);
+    return configured ? FASTP2P_EINVAL : FASTP2P_OK;
 }
 /* Two cone NATs open their filters on the first packet either side sends, so the
  * first moments decide the outcome: send densely for half a second, then fall
@@ -5217,12 +5247,7 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
  * then the same request with CHANGE-REQUEST asking for another port, then for
  * another address. A reply that arrives from a *different* source than the one
  * we addressed is the evidence the NAT's filter let a stranger through. */
-/* Built-in probe servers: every node measures its NAT the same way without any
- * per-machine configuration. Both are still overridable, and `[]` / "" disables
- * the corresponding probe for an operator who does not want it to leave the host. */
-#define FP_DEFAULT_STUN_SERVERS "stun.fastp2p.top:3478"
-/* TCP filtering needs a callback probe server; same host, dedicated port. */
-#define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
+/* Built-in probe servers are defined with fp_client_tcp_nat_config above. */
 
 int fp_client_tcp_level_config(fastp2p_client *c, json_object *probe) {
     if (!c)
@@ -5284,13 +5309,14 @@ static int stun_entry(fastp2p_client *c, const char *text, int count) {
 }int fp_client_stun_config(fastp2p_client *c, json_object *servers) {
     if (!c)
         return FASTP2P_OK;
-    /* No key at all falls back to the built-in server, so a node measures its NAT
+    /* No key at all falls back to the built-in servers, so a node measures its NAT
      * without any per-machine configuration. An empty array is an explicit opt-out
      * for operators who do not want the client to contact anything. */
     if (!servers) {
-        if (stun_entry(c, FP_DEFAULT_STUN_SERVERS, 0))
+        if (stun_entry(c, FP_DEFAULT_STUN_SERVERS, 0) ||
+            stun_entry(c, FP_DEFAULT_STUN_SERVERS_ALT, 1))
             return FASTP2P_EINVAL;
-        c->stun_count = 1;
+        c->stun_count = 2;
         return FASTP2P_OK;
     }
     if (!json_object_is_type(servers, json_type_array) ||

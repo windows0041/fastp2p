@@ -167,7 +167,7 @@ try:
             directory.mkdir()
             config = {'network': {
                 'Node': name, 'Token': token, 'ServerHost': '127.0.0.1', 'ServerPort': 27183,
-                'TCPNatProbe': '127.0.0.1:%d' % server.port, 'UDPSTUNServers': []},
+                'TCPNatProbe': '127.0.0.1:%d' % server.port, 'UDPSTUNServers': [], 'TCPSTUNServers': []},
                 'CACertFile': str(certs / 'ca.crt'), 'apps': []}
             path = directory / 'config.json'
             path.write_text(json.dumps(config))

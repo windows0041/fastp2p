@@ -198,7 +198,7 @@ try:
             directory.mkdir(mode=0o700)
             cfg = {'product': 'fastp2p', 'network': {'Node': name, 'Token': install_token, 'ServerHost': host,
                                'ServerPort': 27183, 'ShareBandwidth': 0,
-                               'UDPSTUNServers': [], 'TCPNatProbe': ''},
+                               'UDPSTUNServers': [], 'TCPSTUNServers': [], 'TCPNatProbe': ''},
                    'CACertFile': str(certs / 'ca.crt'), 'LogLevel': 0,
                    'apps': list(apps), 'socks5': list(socks5)}
             if public_port:
