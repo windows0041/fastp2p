@@ -18,7 +18,11 @@ import time
 from certificates import create_certificates
 
 p=argparse.ArgumentParser();p.add_argument('--client',required=True);p.add_argument('--gateway',required=True)
-p.add_argument('--output',default='build/enrollment-result.json');args=p.parse_args()
+p.add_argument('--output',default='build/enrollment-result.json')
+p.add_argument('--profile-directory', type=Path, help='Empty directory for exercising a specific filesystem path')
+args=p.parse_args()
+if args.profile_directory is not None:
+    assert args.profile_directory.is_absolute() and not any(args.profile_directory.iterdir())
 result={};gateway=None
 with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
     root=Path(temporary).resolve();assert root.parent==Path(tempfile.gettempdir()).resolve()
@@ -74,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
                 assert struct.unpack_from('<HH',frame(),4)==(6,7)
                 stream.close()
             result['portable_fixture_accepts_127_byte_extended_frame']=True
-        profile=root/'client.profile';token_file=root/'install.token';token_file.write_text(token)
+        profile=(args.profile_directory or root)/'client.profile';token_file=root/'install.token';token_file.write_text(token)
         def install(expected=0):
             completed=subprocess.run([str(Path(args.client).resolve()),'install','--token-file',str(token_file),
                 '--config',str(profile),'--no-service'],env=client_environment,cwd=root,capture_output=True,timeout=40)
@@ -110,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-enrollment-') as temporary:
                                         '--run-seconds', '3'], env=named_environment, capture_output=True, timeout=20)
             assert completed.returncode == 0 and b'gateway authenticated' in completed.stdout
             result['filename_token_enrolls_without_token_arguments'] = True
-        trust=next(root.glob(profile.name+'.ca.*.pem'))
+        trust=next(profile.parent.glob(profile.name+'.ca.*.pem'))
         trust_stat=trust.stat()
         def same_trust_file():
             current=trust.stat()

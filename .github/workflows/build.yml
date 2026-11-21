@@ -72,6 +72,13 @@ jobs:
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
           ctest --test-dir build --output-on-failure
           dist/${{ matrix.target }}/bin/fastp2p --version
+      - name: Enroll a profile through the macOS /etc system alias
+        run: |
+          export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
+          config_dir=$(sudo mktemp -d /etc/fastp2p-ci.XXXXXXXX)
+          trap 'sudo rm -rf -- "$config_dir"' EXIT
+          sudo chown "$(id -u)" "$config_dir"
+          python3 tests/enrollment_integration.py --client build/fastp2p --gateway tests/gateway_fixture.py --profile-directory "$config_dir"
       - uses: actions/upload-artifact@v4
         with:
           name: fastp2p-${{ matrix.target }}

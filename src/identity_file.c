@@ -35,7 +35,24 @@ static int directory(const char *path) {
     struct stat status;
     if (mkdir(path, 0700) && errno != EEXIST)
         return -1;
-    return !lstat(path, &status) && S_ISDIR(status.st_mode) ? 0 : -1;
+    if (lstat(path, &status))
+        return -1;
+#ifdef __APPLE__
+    /* Darwin exposes /etc as a system-owned link. Keep all other parent
+     * symlinks disallowed, and only accept the standard target for /etc. */
+    if (S_ISLNK(status.st_mode) && !strcmp(path, "/etc") && status.st_uid == 0) {
+        char target[32];
+        ssize_t size = readlink(path, target, sizeof(target) - 1);
+        if (size < 0 || (size_t)size >= sizeof(target) - 1)
+            return -1;
+        target[size] = 0;
+        if (strcmp(target, "private/etc") && strcmp(target, "/private/etc"))
+            return -1;
+        return !lstat("/private/etc", &status) && S_ISDIR(status.st_mode) &&
+               !status.st_uid && !(status.st_mode & 0022) ? 0 : -1;
+    }
+#endif
+    return S_ISDIR(status.st_mode) ? 0 : -1;
 #endif
 }
 static int open_file(const char *path, int create) {
