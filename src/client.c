@@ -59,7 +59,10 @@
  * to, but not equal to, the one reported for a different destination. */
 #define TCP_PUNCH_SCAN 0
 /* How often an active tunnel proves it is still there. */
-#define TCP_KEEPALIVE_MS 5000u
+#define TCP_KEEPALIVE_MS 3000u
+/* Rebuild an idle tunnel before the carrier mapping it rides on ages out. */
+#define TCP_REFRESH_AFTER_NS (240 * NS)
+#define TCP_REFRESH_IDLE_NS (20 * NS)
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -228,7 +231,7 @@ typedef struct {
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
-    uint64_t last_session_push, silent_logged;
+    uint64_t last_session_push, silent_logged, last_payload;
     /* Peer's predicted mapping window: base port, direction and width. A
      * symmetric peer changes port per destination, so the peer tells us
      * where its next mapping is likely to land and we spray that range.
@@ -2740,6 +2743,7 @@ static int overlay_data(fastp2p_client *c, int oi, const uint8_t *data, size_t l
     op_put64(payload, o->id);
     memcpy(payload + 8, data, len);
     o->activity = mono();
+    c->tunnels[o->tunnel_index].last_payload = mono();
     return tseal(c, &c->tunnels[o->tunnel_index], TUN_DATA, payload, len + 8);
 }
 static void request_overlay(fastp2p_client *c, int oi) {
@@ -3780,6 +3784,9 @@ static int topen(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, s
     int rv = fp_open(&t->crypto, sub, 0, data, len, out, capacity, written);
     if (rv == -1)
         return 1;
+    /* Sealed frames only: a keepalive is plaintext, so this timestamp really means
+     * the rule was carrying traffic, which is what decides an idle re-punch. */
+    t->last_payload = mono();
     if (rv) {
         if (getenv("FP_DEBUG_KEYS"))
             fprintf(stderr, "auth fail ti=%d sub=%u len=%zu rxmax=%llu\n", ti, sub, len,
@@ -4553,6 +4560,17 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     if (t->state == T_ACTIVE) {
         if (now >= t->last_rx && now - t->last_rx > 30 * NS) {
             close_tunnel(c, ti, "peer heartbeat timed out");
+            return;
+        }
+        /* Rebuild an idle tunnel before the mapping under it ages out. Both carrier
+         * NATs here drop a flow after a few minutes even while keepalives cross it,
+         * and the rule then pays for the failure with a request that times out.
+         * Doing it while nothing is in flight costs the user nothing. */
+        if (t->relay_link < 0 && !t->relay_wait && t->active_at && now >= t->active_at &&
+            now - t->active_at >= (uint64_t)TCP_REFRESH_AFTER_NS &&
+            (!t->last_payload ||
+             (now >= t->last_payload && now - t->last_payload >= (uint64_t)TCP_REFRESH_IDLE_NS))) {
+            close_tunnel(c, ti, "re-punching before the carrier mapping ages out");
             return;
         }
         /* Five seconds, not ten: a punched socket is only kept alive by traffic,
