@@ -58,6 +58,8 @@
  * the mapping for a new destination out of a pool, so the reachable port is close
  * to, but not equal to, the one reported for a different destination. */
 #define TCP_PUNCH_SCAN 0
+/* How often an active tunnel proves it is still there. */
+#define TCP_KEEPALIVE_MS 5000u
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -226,7 +228,7 @@ typedef struct {
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
-    uint64_t last_session_push;
+    uint64_t last_session_push, silent_logged;
     /* Peer's predicted mapping window: base port, direction and width. A
      * symmetric peer changes port per destination, so the peer tells us
      * where its next mapping is likely to land and we spray that range.
@@ -4553,9 +4555,22 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             close_tunnel(c, ti, "peer heartbeat timed out");
             return;
         }
-        if (now >= t->last_hb && now - t->last_hb >= 10 * NS) {
+        /* Five seconds, not ten: a punched socket is only kept alive by traffic,
+         * and both carrier NATs drop a silent TCP mapping well before the
+         * heartbeat timeout would notice. The link then looks established while
+         * nothing crosses it, which is what a rule hitting its deadline after an
+         * idle period is really seeing. */
+        if (now >= t->last_hb && now - t->last_hb >= TCP_KEEPALIVE_MS * MS) {
             tframe(t, TUN_KEEPALIVE, NULL, 0);
             t->last_hb = now;
+            if (now >= t->last_rx && now - t->last_rx >= 15 * NS &&
+                (!t->silent_logged || now - t->silent_logged >= 15 * NS)) {
+                char note[96];
+                snprintf(note, sizeof(note), "peer silent for %llus; keepalive sent",
+                         (unsigned long long)((now - t->last_rx) / NS));
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                t->silent_logged = now;
+            }
         }
         /* The first session push can land while the peer is still finishing its own
          * handshake, and a peer that drops it never becomes ready: the rule then
