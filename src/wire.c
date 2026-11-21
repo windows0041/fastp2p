@@ -172,6 +172,14 @@ uint64_t op_integer(json_object *o, const char *name) {
     json_object *v = op_get(o, name);
     return v && json_object_is_type(v, json_type_int) ? json_object_get_uint64(v) : 0;
 }
+int op_flag(json_object *o, const char *name) {
+    json_object *v = op_get(o, name);
+    if (!v)
+        return 0;
+    if (json_object_is_type(v, json_type_boolean))
+        return json_object_get_boolean(v) ? 1 : 0;
+    return json_object_is_type(v, json_type_int) ? json_object_get_uint64(v) != 0 : 0;
+}
 void op_js(json_object *o, const char *name, const char *s) {
     json_object_object_add(o, name, json_object_new_string(s ? s : ""));
 }

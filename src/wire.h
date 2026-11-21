@@ -27,6 +27,9 @@ json_object *op_json(const void *data, size_t len);
 json_object *op_get(json_object *obj, const char *name);
 const char *op_string(json_object *obj, const char *name);
 uint64_t op_integer(json_object *obj, const char *name);
+/* A console switch is a JSON boolean, and json-c reports a boolean as 0 through
+ * the integer accessor, so a switch the operator turned on read as off. */
+int op_flag(json_object *obj, const char *name);
 void op_js(json_object *obj, const char *name, const char *value);
 void op_ju(json_object *obj, const char *name, uint64_t value);
 #endif

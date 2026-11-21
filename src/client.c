@@ -226,6 +226,7 @@ typedef struct {
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
+    uint64_t last_session_push;
     /* Peer's predicted mapping window: base port, direction and width. A
      * symmetric peer changes port per destination, so the peer tells us
      * where its next mapping is likely to land and we spray that range.
@@ -2641,6 +2642,7 @@ static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
     t->last_rx = t->last_hb = t->active_at = mono();
+    t->last_session_push = mono();
     if (t->listen_fd >= 0)
         op_close(t->listen_fd);
     if (t->alternate_fd >= 0)
@@ -3121,7 +3123,7 @@ static void apply_rule(fastp2p_client *c, json_object *j) {
                     const char *relay = op_string(j, "relayNode");
                     /* Accept both spellings: the console sends NoRelay, while a rule
                      * stored without a descriptor keeps the key as written by hand. */
-                    int no_relay = op_integer(j, "NoRelay") != 0 || op_integer(j, "noRelay") != 0;
+                    int no_relay = op_flag(j, "NoRelay") || op_flag(j, "noRelay");
                     for (int i = 0; i < NA; ++i)
                         if (c->apps[i].used && c->apps[i].id == id) {
                             if (*relay && valid_node(relay))
@@ -4508,6 +4510,25 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (now >= t->last_hb && now - t->last_hb >= 10 * NS) {
             tframe(t, TUN_KEEPALIVE, NULL, 0);
             t->last_hb = now;
+        }
+        /* The first session push can land while the peer is still finishing its own
+         * handshake, and a peer that drops it never becomes ready: the rule then
+         * gives up at its deadline and abandons a tunnel that is already carrying
+         * traffic, which is why a working link kept disappearing after ~20 s. Push
+         * again until the rule that owns this tunnel reports the session; the
+         * session and secret are the same values, so a peer that already has them
+         * simply re-keys to the same state. */
+        if (t->session_owner && t->relay_link < 0 &&
+            now >= t->last_session_push && now - t->last_session_push >= 2 * NS) {
+            int pending = 0;
+            for (int i = 0; i < NA; ++i)
+                if (c->apps[i].used && c->apps[i].local && c->apps[i].tunnel_index == ti &&
+                    !c->apps[i].synced)
+                    pending = 1;
+            if (pending) {
+                push_session(c, t, NULL);
+                t->last_session_push = now;
+            }
         }
         /* A link that stays up for a minute has proven the path: clear the
          * failure counters so a later drop retries the direct punch first. */
