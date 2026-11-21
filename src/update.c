@@ -63,6 +63,10 @@ static void set_error(char *error, size_t length, const char *text) {
     if (error && length)
         snprintf(error, length, "%s", text);
 }
+static void update_error(char *error, size_t length, const char *action, int code) {
+    if (error && length)
+        snprintf(error, length, "%s: %s", action, strerror(code));
+}
 static void update_hex(const unsigned char *digest, unsigned length, char *out) {
     static const char digits[] = "0123456789abcdef";
     for (unsigned i = 0; i < length; ++i) {
@@ -109,7 +113,7 @@ int fp_update_download(const char *url, const char *ca, const char *ca_pem,
     }
     FILE *file = fopen(dest, "wb");
     if (!file) {
-        set_error(error, error_length, "cannot create the staging file");
+        update_error(error, error_length, "cannot create the staging file", errno);
         return -1;
     }
     EVP_MD_CTX *digest = EVP_MD_CTX_new();
@@ -468,12 +472,6 @@ int fp_update_swap(const char *staged, const char *target, const char *service) 
         return -1;
     return rename(staged, target) ? -1 : 0;
 }
-static void update_error(char *error, size_t length, const char *action, int code) {
-    char detail[160];
-    snprintf(detail, sizeof(detail), "%s: %s", action, strerror(code));
-    set_error(error, length, detail);
-}
-
 static struct {
     char target[4096];
     char rollback[4240];

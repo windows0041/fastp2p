@@ -15,7 +15,7 @@ final class Bootstrap {
     private Bootstrap(String config, String token, String ca, String fingerprint) {
         this.config = config; this.token = token; this.ca = ca; this.fingerprint = fingerprint;
     }
-    private static String digest(String value) throws Exception {
+    static String digest(String value) throws Exception {
         byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
         StringBuilder text = new StringBuilder();
         for (byte b : hash) text.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));

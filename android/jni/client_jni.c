@@ -10,6 +10,7 @@ typedef struct {
     JavaVM *vm;
     jobject listener;
     jmethodID callback;
+    jmethodID config_callback;
     fastp2p_client *client;
     int callback_failed;
     int restart_requested;
@@ -20,6 +21,27 @@ enum { STEP_RESTART_REQUESTED = 1 };
 static void request_restart(void *user) {
     binding *b = user;
     b->restart_requested = 1;
+}
+
+static int receive_config(const char *fields, uint64_t revision, void *user) {
+    binding *b = user;
+    JNIEnv *env = NULL;
+    size_t size = strlen(fields);
+    if (size > 65536 || (*b->vm)->GetEnv(b->vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK)
+        return FASTP2P_EINVAL;
+    jbyteArray json = (*env)->NewByteArray(env, (jsize)size);
+    if (json)
+        (*env)->SetByteArrayRegion(env, json, 0, (jsize)size, (const jbyte *)fields);
+    int result = FASTP2P_EIO;
+    if (json && !(*env)->ExceptionCheck(env))
+        result = (*env)->CallIntMethod(env, b->listener, b->config_callback, json, (jlong)revision);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        result = FASTP2P_EIO;
+    }
+    if (json)
+        (*env)->DeleteLocalRef(env, json);
+    return result;
 }
 
 static void notify(fastp2p_client *client, const fastp2p_event *event, void *user) {
@@ -111,6 +133,19 @@ JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_attachSdwanTun(
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
     return b ? fastp2p_client_attach_sdwan_tun(b->client, fd) : FASTP2P_EINVAL;
+}
+
+JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_enableConfigPush(
+    JNIEnv *env, jclass cls, jlong handle) {
+    (void)cls;
+    binding *b = (binding *)(intptr_t)handle;
+    if (!b)
+        return FASTP2P_EINVAL;
+    jclass listener = (*env)->GetObjectClass(env, b->listener);
+    b->config_callback = (*env)->GetMethodID(env, listener, "onGatewayConfig", "([BJ)I");
+    (*env)->DeleteLocalRef(env, listener);
+    return b->config_callback ? fastp2p_client_set_config_handler(b->client, receive_config, b)
+                              : FASTP2P_EINVAL;
 }
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
                                                                      jlong handle) {

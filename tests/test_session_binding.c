@@ -253,7 +253,39 @@ static void failed_relay_can_be_reselected(void) {
     dispose(c);
 }
 
+static void expired_nat_probes_release_sockets(void) {
+    fastp2p_client *c = fixture();
+    c->families_wanted = FAM_V4 | FAM_V6;
+    uint64_t now = mono();
+    for (int advisory_first = 0; advisory_first < 2; ++advisory_first) {
+        int index = new_tunnel(c, "sender-node", UINT64_C(41000) + advisory_first,
+                               FASTP2P_TRANSPORT_QUIC, 0);
+        assert(index >= 0);
+        tunnel *t = &c->tunnels[index];
+        op_socket primary = socket_bound(1, "127.0.0.1", 0, BIND_DEFAULT);
+        op_socket advisory = socket_bound(1, "127.0.0.1", 0, BIND_DEFAULT);
+        assert(primary >= 0 && advisory >= 0);
+        t->state = T_PROBE;
+        t->deadline = advisory_first ? now + NS : now - 1;
+        t->probes[OP_FAM_V4] = (nat_probe){.fd = primary, .state = PROBE_UDP};
+        t->probes[OP_FAM_V6] = (nat_probe){.fd = advisory, .state = PROBE_UDP, .deadline = now - 1};
+        op_addr bound;
+        if (advisory_first) {
+            assert(probe_round(c, index, now) == 0);
+            assert(op_addr_socketname(advisory, &bound));
+            assert(!op_addr_socketname(primary, &bound));
+            t->deadline = now - 1;
+        }
+        assert(probe_round(c, index, now) == -1);
+        assert(op_addr_socketname(primary, &bound));
+        assert(op_addr_socketname(advisory, &bound));
+    }
+    dispose(c);
+}
+
 int main(void) {
+    assert(!op_platform_init());
+    expired_nat_probes_release_sockets();
     relay_cannot_steal_direct_rule();
     relay_endpoint_shares_only_with_the_logical_peer();
     relay_requests_are_shared_and_expire();

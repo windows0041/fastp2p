@@ -251,7 +251,7 @@ static int create_json(const char *text, const char *token_text, const char *ca,
         rv = fastp2p_client_add_socks5(*out, &proxy, NULL);
     }
     json_object *sdwan;
-    if (!rv && json_object_object_get_ex(root, "sdwan", &sdwan))
+    if (!rv && json_object_object_get_ex(root, "sdwan", &sdwan) && sdwan)
         rv = fp_client_sdwan_config(*out, sdwan);
     json_object_put(root);
     if (rv && *out) {

@@ -3,10 +3,12 @@
 
 import argparse
 from contextlib import ExitStack
+import http.client
 import json
 import os
 from pathlib import Path
 import secrets
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -53,6 +55,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--client', required=True, type=lambda p: Path(p).resolve())
     parser.add_argument('--gateway', required=True, type=lambda p: Path(p).resolve())
+    parser.add_argument('--managed', action='store_true', help='Apply and revoke topology through the gateway')
     args = parser.parse_args()
     for namespace in ('mnt', 'net'):
         if Path('/proc/self/ns/' + namespace).readlink() == Path('/proc/1/ns/' + namespace).readlink():
@@ -116,35 +119,82 @@ def main():
             return process
 
         start([str(args.gateway), '--bind', '127.0.0.1', '--bind6', gateway_ip,
-               '--apibind', '127.0.0.1', '--database', str(root / 'nodes.sqlite3'),
+               '--apibind', '127.0.0.1', '--apibind6', gateway_ip, '--database', str(root / 'nodes.sqlite3'),
                '--cert', str(certs / 'server.crt'), '--key', str(certs / 'server.key')], 'gateway', environment)
         client_env = {key: value for key, value in environment.items()
                       if key not in ('FASTP2P_USER', 'FASTP2P_PASSWORD', 'FASTP2P_TOKEN')}
         lans = ('192.168.50', '192.168.15')
         nodes = ('sdwan-vps-a', 'sdwan-vps-b')
         clients = []
+        jwt = None
+        tls = ssl.create_default_context(cafile=str(certs / 'ca.crt'))
+
+        def api(path, body=None):
+            headers = {'Content-Type': 'application/json'}
+            if jwt:
+                headers['Authorization'] = 'Bearer ' + jwt
+            connection = http.client.HTTPSConnection(gateway_ip, 10008, context=tls, timeout=3)
+            try:
+                connection.request('POST' if body is not None else 'GET', path,
+                                   json.dumps(body) if body is not None else None, headers)
+                reply = connection.getresponse()
+                return reply.status, json.loads(reply.read())
+            finally:
+                connection.close()
+
+        def login():
+            nonlocal jwt
+            try:
+                status, result = api('/api/v1/user/login', {'user': environment['FASTP2P_USER'],
+                                     'password': environment['FASTP2P_PASSWORD']})
+            except OSError:
+                return False
+            if status == 200:
+                jwt = result['token']
+            return bool(jwt)
+
         try:
             for i, name in enumerate(names):
                 other = 1 - i
-                profile = root / (name + '.json')
-                profile.write_text(json.dumps({
+                config_dir = root / ('config-' + name)
+                config_dir.mkdir(mode=0o700)
+                os.chown(config_dir, 65534, 65534)
+                profile = config_dir / 'fastp2p.conf'
+                settings = {
                     'network': {'Node': nodes[i], 'ServerHost': gateway_ip, 'ServerPort': 27183,
                                 'PublicIPPort': 6221, 'Token': environment['FASTP2P_TOKEN']},
-                    'CACertFile': str(certs / 'ca.crt'),
-                    'sdwan': {'Address': f'10.3.2.{i + 1}', 'LocalRoutes': [lans[i] + '.0/24'],
-                              'Peers': [{'Node': nodes[other], 'Address': f'10.3.2.{other + 1}',
-                                         'Routes': [lans[other] + '.0/24']}]}
-                }))
+                    'CACertFile': str(certs / 'ca.crt')
+                }
+                if not args.managed:
+                    settings['sdwan'] = {'Address': f'10.3.2.{i + 1}', 'LocalRoutes': [lans[i] + '.0/24'],
+                                         'Peers': [{'Node': nodes[other], 'Address': f'10.3.2.{other + 1}',
+                                                    'Routes': [lans[other] + '.0/24']}]}
+                profile.write_text(json.dumps(settings))
                 os.chown(profile, 65534, 65534)
                 profile.chmod(0o600)
                 clients.append(start(ns(name, *unprivileged, *net_admin, str(args.client), 'run',
                                         '--config', str(profile)), name, client_env))
+
+            if args.managed:
+                wait_for(login, 'Could not sign in to the isolated SD-WAN gateway')
+                wait_for(lambda: {n['name'] for n in api('/api/v1/nodes')[1]['nodes']} == set(nodes),
+                         'The SD-WAN members did not register')
+                members = [{'node': node, 'address': f'10.3.2.{i + 1}', 'routes': [lans[i] + '.0/24']}
+                           for i, node in enumerate(nodes)]
+                subnet = '10.3.2.0/24'
+                duplicate = [members[0], {**members[1], 'address': members[0]['address']}]
+                assert api('/api/v1/sdwan', {'subnet': subnet, 'members': duplicate})[0] == 400
+                assert api('/api/v1/sdwan')[1]['members'] == []
+                assert api('/api/v1/sdwan', {'subnet': subnet, 'members': members})[0] == 200
 
             def virtual_ping():
                 assert all(p.poll() is None for p in processes), 'A test daemon exited'
                 return ping(names[0], '10.3.2.2') and ping(names[1], '10.3.2.1')
 
             wait_for(virtual_ping, 'The IPv4 TUN peers could not reach each other over IPv6')
+            if args.managed:
+                wait_for(lambda: all(n['state'] == 'applied' for n in api('/api/v1/sdwan')[1]['members']),
+                         'The gateway did not receive SD-WAN application acknowledgements')
             for name in names:
                 log = (root / (name + '.log')).read_text()
                 assert 'resolved=+IPv6 wanted=+IPv6' in log
@@ -191,6 +241,13 @@ with socket.create_connection((sys.argv[1], 23456), timeout=6) as stream:
                      'TCP fixture did not start', timeout=5)
             command(*ns(lan_names[0], sys.executable, '-c', request, target), timeout=10)
             print('64 KiB of TCP payload forwarded across the remote subnet')
+
+            if args.managed:
+                assert api('/api/v1/sdwan', {'subnet': subnet, 'members': []})[0] == 200
+                wait_for(lambda: all('fastp2p0' not in output(*ns(n, 'ip', 'link', 'show')) for n in names),
+                         'Revoking the network did not remove its TUN devices')
+                assert all(p.poll() is None for p in clients)
+                print('Gateway topology persisted, acknowledged, and removed while both clients stayed online')
 
             for name, process in zip(names, clients):
                 stop(process)

@@ -34,6 +34,59 @@ public final class FastP2PService extends VpnService {
     private Thread worker;
     private volatile boolean vpnPending;
     private volatile String sdwanStatus = "";
+    // Owned by the native client's step thread.
+    private static final String[] MANAGED_FIELDS = {"apps", "socks5", "sdwan"};
+    private JSONObject configurationBase, managedFields;
+    private JSONObject effectiveManaged;
+    private String configurationToken, configurationCa, configurationSource;
+    private long managedRevision, managedReloadAt;
+    private boolean managedReady, managedRejected;
+
+    private static JSONObject applyManaged(JSONObject base, JSONObject managed) throws Exception {
+        JSONObject config = new JSONObject(base.toString());
+        for (String key : MANAGED_FIELDS) {
+            if (!managed.has(key)) continue;
+            Object value = managed.get(key);
+            if (key.equals("sdwan") && value == JSONObject.NULL) config.remove(key);
+            else config.put(key, value);
+        }
+        return config;
+    }
+
+    public int onGatewayConfig(byte[] bytes, long revision) {
+        if (revision <= 0 || configurationBase == null) return -1;
+        if (managedReloadAt != 0) return 1;
+        try {
+            JSONObject patch = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+            JSONObject desired = new JSONObject(managedFields.toString());
+            for (String key : MANAGED_FIELDS) {
+                if (patch.has(key)) desired.put(key, patch.get(key));
+            }
+            if (desired.toString().equals(managedFields.toString()) && revision == managedRevision)
+                return managedRejected ? -1 : managedReady ? 0 : 1;
+            JSONObject candidate = applyManaged(configurationBase, desired);
+            long test = NativeClient.create(candidate.toString().getBytes(StandardCharsets.UTF_8),
+                    configurationToken, configurationCa, this);
+            if (test == 0) return -1;
+            NativeClient.destroy(test);
+            SecretStore.saveManaged(this, new JSONObject().put("source", configurationSource)
+                    .put("revision", revision).put("fields", desired)
+                    .put("fallback", effectiveManaged).toString());
+            managedReloadAt = SystemClock.elapsedRealtime() + 200;
+            return 1;
+        } catch (Exception error) {
+            android.util.Log.w("fastp2p", "could not save gateway configuration");
+            return -1;
+        }
+    }
+
+    private boolean rejectManaged(JSONObject record) throws Exception {
+        if (managedRejected || managedRevision == 0 || !record.has("fallback"))
+            return false;
+        record.put("rejected", true);
+        SecretStore.saveManaged(this, record.toString());
+        return true;
+    }
     private Notification notification(boolean ongoing) {
         Intent open = new Intent(this, InstallActivity.class);
         Intent stop = new Intent(this, FastP2PService.class).setAction(STOP);
@@ -126,16 +179,36 @@ public final class FastP2PService extends VpnService {
                 String config = pending == null ? SecretStore.config(this) : pending.config;
                 String token = pending == null ? SecretStore.token(this) : pending.token;
                 String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
-                // Keep the APK staging directory out of the stored enrolment profile.
-                JSONObject nativeConfig = new JSONObject(config).put("UpdateDir", getCacheDir().getAbsolutePath());
-                ca = nativeConfig.has("CACertBuiltin") ? null : TrustStore.resolve(this, ca);
-                JSONObject sdwan = new JSONObject(SecretStore.sdwan(this));
-                if (sdwan.length() > 0) nativeConfig.put("sdwan", sdwan);
+                JSONObject enrollmentConfig = new JSONObject(config);
+                configurationBase = new JSONObject(config);
+                ca = configurationBase.has("CACertBuiltin") ? null : TrustStore.resolve(this, ca);
+                JSONObject localSdwan = new JSONObject(SecretStore.sdwan(this));
+                if (localSdwan.length() > 0) configurationBase.put("sdwan", localSdwan);
+                configurationToken = token;
+                configurationCa = ca;
+                String gatewayIdentity = pending == null
+                        ? SecretStore.preferences(this).getString("gatewayIdentity", "") : pending.fingerprint;
+                configurationSource = Bootstrap.digest(gatewayIdentity + "\n" + token);
+                JSONObject saved = new JSONObject(SecretStore.managed(this));
+                managedFields = configurationSource.equals(saved.optString("source"))
+                        ? saved.optJSONObject("fields") : null;
+                managedRevision = managedFields == null ? 0 : saved.optLong("revision");
+                if (managedFields == null) managedFields = new JSONObject();
+                managedRejected = managedRevision != 0 && saved.optBoolean("rejected");
+                effectiveManaged = managedRejected ? saved.getJSONObject("fallback") : managedFields;
+                managedReloadAt = 0;
+                managedReady = false;
+                JSONObject nativeConfig = applyManaged(configurationBase, effectiveManaged)
+                        .put("UpdateDir", getCacheDir().getAbsolutePath());
+                JSONObject sdwan = nativeConfig.optJSONObject("sdwan");
                 handle = NativeClient.create(nativeConfig.toString().getBytes(StandardCharsets.UTF_8), token, ca, this);
+                if (handle == 0 && rejectManaged(saved)) { restart = true; continue; }
                 if (handle == 0) throw new IllegalArgumentException("接入配置无效");
                 vpnPending = false;
                 sdwanStatus = "";
-                if (sdwan.length() > 0) {
+                boolean exportingSubnet = sdwan != null && sdwan.optJSONArray("LocalRoutes") != null
+                        && sdwan.optJSONArray("LocalRoutes").length() > 0;
+                if (sdwan != null && sdwan.length() > 0) {
                     SdwanTun.Plan plan = new SdwanTun.Plan(sdwan);
                     tun = SdwanTun.tryRoot(this, plan);
                     if (tun == null && !stopping.get()) {
@@ -148,35 +221,51 @@ public final class FastP2PService extends VpnService {
                             }
                         }
                     }
-                    if (tun == null || (!tun.root && sdwan.has("LocalRoutes"))) {
+                    if (tun == null || (!tun.root && exportingSubnet)) {
                         NativeClient.destroy(handle);
                         handle = 0;
                         if (tun == null) nativeConfig.remove("sdwan");
-                        else sdwan.remove("LocalRoutes");
+                        else {
+                            JSONObject vpnConfig = new JSONObject(sdwan.toString());
+                            vpnConfig.remove("LocalRoutes");
+                            nativeConfig.put("sdwan", vpnConfig);
+                        }
                         handle = NativeClient.create(nativeConfig.toString().getBytes(StandardCharsets.UTF_8), token, ca, this);
                         if (handle == 0) throw new IllegalArgumentException("接入配置无效");
                     }
-                    if (tun != null && NativeClient.attachSdwanTun(handle, tun.device.getFd()) != 0)
-                        throw new IllegalStateException("无法连接 SD-WAN 网卡");
-                    sdwanStatus = tun != null ? (tun.root ? "SD-WAN Root" : "SD-WAN 系统 VPN")
+                    sdwanStatus = tun != null ? (tun.root ? "SD-WAN Root" : exportingSubnet
+                            ? "SD-WAN 系统 VPN，发布子网需要 Root" : "SD-WAN 系统 VPN")
                             : vpnPending ? "SD-WAN 等待 VPN 授权" : "SD-WAN 网卡不可用";
                 }
                 if (stopping.get()) break;
-                if (NativeClient.start(handle) != 0) throw new IllegalStateException();
-                JSONObject network = nativeConfig.getJSONObject("network");
+                managedReady = !effectiveManaged.has("sdwan") || sdwan == null ||
+                        (tun != null && (!exportingSubnet || tun.root));
+                if (NativeClient.enableConfigPush(handle) != 0) throw new IllegalStateException();
+                if ((tun != null && NativeClient.attachSdwanTun(handle, tun.device.getFd()) != 0) ||
+                        NativeClient.start(handle) != 0) {
+                    if (!rejectManaged(saved)) throw new IllegalStateException();
+                    NativeClient.destroy(handle);
+                    handle = 0;
+                    if (tun != null) { tun.close(); tun = null; }
+                    restart = true;
+                    continue;
+                }
+                JSONObject network = enrollmentConfig.getJSONObject("network");
                 int portToSave = network.optInt("PublicIPPort") == 0 ? NativeClient.publicPort(handle) : 0;
                 long deadline = SystemClock.elapsedRealtime() + 30000;
                 while (!stopping.get()) {
-                    if (reconfigure.getAndSet(false)) { restart = true; break; }
+                    if (reconfigure.getAndSet(false) ||
+                            (managedReloadAt != 0 && SystemClock.elapsedRealtime() >= managedReloadAt)) {
+                        restart = true;
+                        break;
+                    }
                     int step = NativeClient.step(handle);
                     restart = step == NativeClient.STEP_RESTART_REQUESTED;
                     if (step != 0 && !restart) throw new IllegalStateException();
                     if (state == 2 && (pending != null || portToSave != 0)) {
                         if (portToSave != 0) network.put("PublicIPPort", portToSave);
-                        nativeConfig.remove("UpdateDir");
-                        nativeConfig.remove("sdwan");
-                        if (pending != null) { pending.commit(this, nativeConfig.toString()); pending = null; }
-                        else SecretStore.saveConfig(this, nativeConfig.toString());
+                        if (pending != null) { pending.commit(this, enrollmentConfig.toString()); pending = null; }
+                        else SecretStore.saveConfig(this, enrollmentConfig.toString());
                         portToSave = 0;
                     } else if (pending != null && SystemClock.elapsedRealtime() > deadline)
                         throw new IllegalArgumentException("无法校验网关证书或安装 Token");
@@ -190,6 +279,9 @@ public final class FastP2PService extends VpnService {
             failure = error instanceof IllegalArgumentException ? error.getMessage() : "连接或配置保存失败";
             android.util.Log.w("fastp2p", "client stopped: " + failure, error);
         } finally {
+            configurationBase = null;
+            configurationToken = null;
+            configurationCa = null;
             if (handle != 0) NativeClient.destroy(handle);
             if (tun != null) tun.close();
             final String finalStatus = failure == null ? "已停止" : failure;

@@ -1128,6 +1128,15 @@ static void close_udp_candidates(tunnel *t) {
             op_close(t->udp_candidates[i]);
     t->udp_candidate_count = 0;
 }
+/* t->fd owns the active punch socket after a probe socket is adopted. */
+static void probe_socket_close(tunnel *t) {
+    for (int index = 0; index < OP_FAM_COUNT; ++index) {
+        op_socket fd = t->probes[index].fd;
+        if (fd >= 0 && fd != t->fd)
+            op_close(fd);
+        t->probes[index].fd = -1;
+    }
+}
 static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tunnel *t = &c->tunnels[index];
     if (!t->state)
@@ -1194,6 +1203,7 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
         release_relay(c, index);
     if (t->quic)
         opq_free(t->quic);
+    probe_socket_close(t);
     if (t->fd >= 0)
         op_close(t->fd);
     if (t->listen_fd >= 0)
@@ -1326,15 +1336,6 @@ static int udp_packet(op_socket fd, const op_addr *peer, uint16_t main, uint16_t
 static int gateway_has(const fastp2p_client *c, int index) {
     return c->gateway_families & family_bit(index) ? 1 : 0;
 }
-/* Close a probe socket without disturbing whichever socket the tunnel is
- * currently punching with (t->fd owns the active family's socket). */
-static void probe_socket_close(tunnel *t) {
-    for (int index = 0; index < OP_FAM_COUNT; ++index)
-        if (t->probes[index].fd >= 0) {
-            op_close(t->probes[index].fd);
-            t->probes[index].fd = -1;
-        }
-}
 static int probe_running(const tunnel *t) {
     for (int index = 0; index < OP_FAM_COUNT; ++index)
         if (t->probes[index].state && t->probes[index].state != PROBE_DONE)
@@ -1435,9 +1436,8 @@ static int tunnel_learn_peer(tunnel *t, const char *text, uint64_t port) {
 }
 static int start_probe(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
+    probe_socket_close(t);
     for (int i = 0; i < OP_FAM_COUNT; ++i) {
-        if (t->probes[i].fd >= 0 && t->probes[i].fd != t->fd)
-            op_close(t->probes[i].fd);
         t->probes[i] = (nat_probe){.fd = -1};
         t->mapped_ports[i] = 0;
         t->mapped_text[i][0] = 0;
@@ -1588,6 +1588,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                 close_tunnel(c, index, "peer NAT mapping discovery timed out");
                 return -1;
             }
+            op_close(p->fd);
+            p->fd = -1;
             p->state = PROBE_FREE; /* advisory only: drop it and keep going */
             continue;
         }
@@ -4748,6 +4750,9 @@ static void report_client(fastp2p_client *c) {
     op_ju(j, "publicUDP", has_udp_listener(c));
     report_port_mapping(c, j);
     op_ju(j, "configPush", c->config_handler != NULL);
+#ifdef __linux__
+    op_ju(j, "sdwanPush", c->config_handler != NULL);
+#endif
     op_ju(j, "restart", c->restart_handler != NULL);
     op_ju(j, "udpNatType", (uint64_t)c->nat[OP_FAM_V4].type);
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);

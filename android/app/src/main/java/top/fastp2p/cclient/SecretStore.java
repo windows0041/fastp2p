@@ -53,6 +53,12 @@ final class SecretStore {
     static String sdwan(Context c) throws Exception {
         return readJson(c, "sdwan");
     }
+    static void saveManaged(Context c, String config) throws Exception {
+        saveJson(c, "managedConfig", config);
+    }
+    static String managed(Context c) throws Exception {
+        return readJson(c, "managedConfig");
+    }
     private static void saveJson(Context c, String name, String config) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
