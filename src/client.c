@@ -3818,15 +3818,25 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
     tunnel *t = &c->tunnels[ti];
     t->last_rx = mono();
     if (t->state == T_HANDSHAKE || t->state == T_QUIC) {
-        if (t->server && sub == TUN_HELLO && len == 8 && op_u64(data) == t->id) {
+        /* A hello means the peer's socket is live in both directions, whichever side
+         * we were told we are: during a punch both ends dial, so both can be the one
+         * that receives it. Requiring the server role here left the two ends each
+         * waiting for the other's acknowledgement and tearing the tunnel down with
+         * "invalid tunnel handshake". */
+        if (sub == TUN_HELLO && len == 8 && op_u64(data) == t->id) {
             tframe(t, TUN_HELLO_ACK, data, len);
             if (t->udp_direct_port)
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP peer listener accepted connection");
             tunnel_active(c, ti);
-        } else if (!t->server && sub == TUN_HELLO_ACK && len == 8 && op_u64(data) == t->id) {
+        } else if (sub == TUN_HELLO_ACK && len == 8 && op_u64(data) == t->id) {
             if (t->udp_direct_port)
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP peer listener connected");
             tunnel_active(c, ti);
+        } else if (sub == 4 && len == 8 && op_u64(data) == t->id) {
+            /* An older build confirmed a completed dial with this frame. It names
+             * this tunnel and nothing else, so it can arrive just after the socket
+             * is adopted; ignoring it keeps a mixed-version pair from tearing the
+             * tunnel down over a frame that carries no state this side still needs. */
         } else
             close_tunnel(c, ti, "invalid tunnel handshake");
         return;
@@ -3868,6 +3878,12 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
         return;
     }
     if (sub == TUN_KEEPALIVE_ACK)
+        return;
+    /* A plaintext hello or acknowledgement can land after this side is already
+     * active: during a punch both ends answer the peer's hello, so the second
+     * answer arrives once the tunnel is up. It carries only the tunnel id and is
+     * never sealed, so opening it as data would fail the session. */
+    if ((sub == TUN_HELLO || sub == TUN_HELLO_ACK) && len == 8 && op_u64(data) == t->id)
         return;
     /* Acting as a relay hop: pass application frames through untouched. */
     if (t->relay_link >= 0 && t->relay_ready) {
@@ -4430,14 +4446,11 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                     op_close(t->listen_fd);
                 t->listen_fd = -1;
             }
-            /* This socket completed a dial, so it is live in both directions: say so,
-             * with the hello a peer adopts on and with the 4/2 it may be waiting for
-             * instead. Both carry the tunnel id, and a peer that already adopted on
-             * the hello simply ignores the trailing frame. */
+            /* This socket completed a dial, so it is live in both directions: say so
+             * with the hello, which is what a peer adopts a parked socket on. */
             uint8_t id[8];
             op_put64(id, t->id);
-            tframe(t, 2, id, 8);
-            tframe(t, 4, id, 8);
+            tframe(t, TUN_HELLO, id, sizeof(id));
         }
     }
     accept_punch(c, ti);
