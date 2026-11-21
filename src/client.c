@@ -4886,14 +4886,24 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             }
         }
         /* A link that never finishes its session is not usable: retire it so the
-         * retry ladder can move on (and eventually escalate to a relay). */
+         * retry ladder can move on (and eventually escalate to a relay). A link
+         * whose transport is already active is a different case: the punched
+         * socket is carrying the peer's traffic, and dropping it at this deadline
+         * is what the peer sees as a heartbeat timeout. Give the session exchange
+         * more time instead, and let the tunnel's own heartbeat decide when it is
+         * really gone. */
         if (a->tunnel_index >= 0 && !a->synced && a->link_deadline && now > a->link_deadline) {
-            int dead = a->tunnel_index;
-            a->link_deadline = 0;
-            a->tunnel_index = -1;
-            a->retry = now;
-            if (c->tunnels[dead].state)
-                close_tunnel(c, dead, "link did not become ready");
+            int index = a->tunnel_index;
+            if (c->tunnels[index].state == T_ACTIVE) {
+                a->link_deadline = now + 20 * NS;
+                bind_pending_key(c, index);
+            } else {
+                a->link_deadline = 0;
+                a->tunnel_index = -1;
+                a->retry = now;
+                if (c->tunnels[index].state)
+                    close_tunnel(c, index, "link did not become ready");
+            }
         }
         if (a->tunnel_index < 0 && now >= a->retry && c->state == FASTP2P_ONLINE) {
             int ti = active_tunnel(c, a->peer, a->transport);
