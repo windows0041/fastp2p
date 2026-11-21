@@ -60,9 +60,6 @@
 #define TCP_PUNCH_SCAN 0
 /* How often an active tunnel proves it is still there. */
 #define TCP_KEEPALIVE_MS 3000u
-/* Rebuild an idle tunnel before the carrier mapping it rides on ages out. */
-#define TCP_REFRESH_AFTER_NS (240 * NS)
-#define TCP_REFRESH_IDLE_NS (20 * NS)
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
@@ -231,7 +228,7 @@ typedef struct {
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
-    uint64_t last_session_push, silent_logged, last_payload;
+    uint64_t last_session_push, silent_logged, last_payload, active_since;
     /* Peer's predicted mapping window: base port, direction and width. A
      * symmetric peer changes port per destination, so the peer tells us
      * where its next mapping is likely to land and we spray that range.
@@ -2693,6 +2690,9 @@ static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
     t->last_rx = t->last_hb = t->active_at = mono();
+    /* Never cleared: active_at is reset once the link proves stable, and the
+     * idle refresh needs the tunnel's real age. */
+    t->active_since = mono();
     t->last_session_push = mono();
     if (t->listen_fd >= 0)
         op_close(t->listen_fd);
@@ -4562,18 +4562,8 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             close_tunnel(c, ti, "peer heartbeat timed out");
             return;
         }
-        /* Rebuild an idle tunnel before the mapping under it ages out. Both carrier
-         * NATs here drop a flow after a few minutes even while keepalives cross it,
-         * and the rule then pays for the failure with a request that times out.
-         * Doing it while nothing is in flight costs the user nothing. */
-        if (t->relay_link < 0 && !t->relay_wait && t->active_at && now >= t->active_at &&
-            now - t->active_at >= (uint64_t)TCP_REFRESH_AFTER_NS &&
-            (!t->last_payload ||
-             (now >= t->last_payload && now - t->last_payload >= (uint64_t)TCP_REFRESH_IDLE_NS))) {
-            close_tunnel(c, ti, "re-punching before the carrier mapping ages out");
-            return;
-        }
-        /* Five seconds, not ten: a punched socket is only kept alive by traffic,
+
+        /* Three seconds, not ten: a punched socket is only kept alive by traffic,
          * and both carrier NATs drop a silent TCP mapping well before the
          * heartbeat timeout would notice. The link then looks established while
          * nothing crosses it, which is what a rule hitting its deadline after an
