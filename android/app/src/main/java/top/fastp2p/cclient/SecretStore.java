@@ -42,18 +42,30 @@ final class SecretStore {
         return new String(cipher.doFinal(Base64.decode(p.getString("secret", ""), Base64.NO_WRAP)), StandardCharsets.US_ASCII);
     }
     static void saveConfig(Context c, String config) throws Exception {
+        saveJson(c, "config", config);
+    }
+    static String config(Context c) throws Exception {
+        return readJson(c, "config");
+    }
+    static void saveSdwan(Context c, String config) throws Exception {
+        saveJson(c, "sdwan", config);
+    }
+    static String sdwan(Context c) throws Exception {
+        return readJson(c, "sdwan");
+    }
+    private static void saveJson(Context c, String name, String config) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
         byte[] ciphertext = cipher.doFinal(config.getBytes(StandardCharsets.UTF_8));
-        if (!preferences(c).edit().putString("configSecret", Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-                .putString("configIV", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)).remove("config").commit())
+        if (!preferences(c).edit().putString(name + "Secret", Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+                .putString(name + "IV", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)).remove(name).commit())
             throw new IllegalStateException("无法保存配置");
     }
-    static String config(Context c) throws Exception {
+    private static String readJson(Context c, String name) throws Exception {
         SharedPreferences p = preferences(c);
-        if (!p.contains("configSecret")) return p.getString("config", "{}");
+        if (!p.contains(name + "Secret")) return p.getString(name, "{}");
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(p.getString("configIV", ""), Base64.NO_WRAP)));
-        return new String(cipher.doFinal(Base64.decode(p.getString("configSecret", ""), Base64.NO_WRAP)), StandardCharsets.UTF_8);
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(p.getString(name + "IV", ""), Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(p.getString(name + "Secret", ""), Base64.NO_WRAP)), StandardCharsets.UTF_8);
     }
 }

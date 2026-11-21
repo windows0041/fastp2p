@@ -118,6 +118,7 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 }
 #else
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <pwd.h>
 #include <grp.h>
@@ -128,13 +129,35 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#if defined(__linux__)
+static int root_owned_profile(const char *profile) {
+    struct stat metadata;
+    if (lstat(profile, &metadata) || !S_ISREG(metadata.st_mode) || metadata.st_uid ||
+        metadata.st_nlink != 1 || (metadata.st_mode & 0077))
+        return 0;
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s", profile) >= (int)sizeof(path))
+        return 0;
+    char *slash;
+    while ((slash = strrchr(path, '/')) && slash != path) {
+        *slash = 0;
+        if (lstat(path, &metadata) || !S_ISDIR(metadata.st_mode) || metadata.st_uid ||
+            (metadata.st_mode & 0022))
+            return 0;
+    }
+    return 1;
+}
+#endif
 int fastp2p_runtime_prepare(const char *profile) {
 #if defined(__linux__)
-    /* Managed configuration is writable by the service for gateway updates.
-     * An interactive root CLI must run it with the same unprivileged identity. */
-    if (!geteuid() && fastp2p_linux_managed_profile(profile)) {
+    /* An online binary update can arrive before the service is reinstalled.
+     * Preserve the old account for its profile and never run that profile as root. */
+    if (!geteuid() && fastp2p_linux_managed_profile(profile) && !root_owned_profile(profile)) {
         struct passwd *account=getpwnam("fastp2p");
-        if (!account || !account->pw_uid || setgroups(0,NULL) ||
+        struct stat metadata;
+        if (!account || !account->pw_uid || lstat(profile, &metadata) ||
+            !S_ISREG(metadata.st_mode) || metadata.st_uid != account->pw_uid ||
+            setgroups(0,NULL) ||
             setgid(account->pw_gid) || setuid(account->pw_uid)) return -1;
     }
 #else
@@ -161,8 +184,25 @@ static int execute(char *const arguments[], int quiet) {
     }
     int status;
     while (waitpid(child, &status, 0) < 0) if (errno != EINTR) return -1;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+#if defined(__linux__)
+static int openwrt_service(const char *action) {
+    const char *script = "/etc/init.d/fastp2p";
+    struct stat metadata;
+    if (lstat(script, &metadata))
+        return errno == ENOENT ? 0 : -1;
+    if (geteuid() || !S_ISREG(metadata.st_mode) || metadata.st_uid || (metadata.st_mode & 0022))
+        return -1;
+    if (!strcmp(action, "stop")) {
+        char *const status[] = {(char *)script, "status", NULL};
+        if (execute(status, 1) == 3)
+            return 0;
+    }
+    char *const command[] = {(char *)script, (char *)action, NULL};
+    return execute(command, 0);
+}
+#endif
 int fastp2p_stop_installed(const char *profile) {
     (void)profile;
 #ifdef __APPLE__
@@ -179,6 +219,10 @@ int fastp2p_stop_installed(const char *profile) {
     char *const stop[] = {"/bin/launchctl", "bootout", service, NULL};
     return execute(stop, 0);
 #else
+#if defined(__linux__)
+    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK))
+        return openwrt_service("stop");
+#endif
     char *const stop[] = {"/usr/local/fastp2p/fastp2p-service", "stop", NULL}; return execute(stop, 0);
 #endif
 }
@@ -199,7 +243,139 @@ static int linux_controller_ready(void) {
            script.st_uid == 0 && !(script.st_mode & 0022) &&
            !access("/usr/local/fastp2p/fastp2p-service", X_OK);
 }
+
+static int unlink_managed(const char *path) {
+    return unlink(path) && errno != ENOENT ? -1 : 0;
+}
+
+static int remove_backup_at(int parent, const char *name, dev_t device, unsigned depth) {
+    struct stat st;
+    if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW))
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return unlinkat(parent, name, 0);
+    if (!depth || st.st_uid || st.st_dev != device)
+        return -1;
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    DIR *directory = fdopendir(fd);
+    if (!directory) {
+        close(fd);
+        return -1;
+    }
+    int failed = 0;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            failed |= errno != 0;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
+            failed |= remove_backup_at(fd, entry->d_name, device, depth - 1) != 0;
+    }
+    closedir(directory);
+    return failed || unlinkat(parent, name, AT_REMOVEDIR) ? -1 : 0;
+}
+
+static int remove_openwrt_config(void) {
+    struct stat st;
+    const char *parent = "/etc/fastp2p-client";
+    const char *state = "/etc/fastp2p-client/config";
+    if (lstat(parent, &st))
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode) || st.st_uid || (st.st_mode & 0022))
+        return -1;
+    int fd = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    DIR *directory = fdopendir(fd);
+    if (!directory) {
+        close(fd);
+        return -1;
+    }
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (!entry) {
+            failed |= errno != 0;
+            break;
+        }
+        const char *name = entry->d_name;
+        const char ca[] = "fastp2p.conf.ca.";
+        size_t length = sizeof(ca) - 1;
+        int certificate = strlen(name) == length + 68 && !strncmp(name, ca, length) &&
+            strspn(name + length, "0123456789abcdef") == 64 && !strcmp(name + length + 64, ".pem");
+        if (certificate || !strcmp(name, "fastp2p.conf") || !strcmp(name, "fastp2p.conf.previous") ||
+            !strcmp(name, "fastp2p.conf.identity"))
+            failed |= unlinkat(fd, name, 0) && errno != ENOENT;
+    }
+    closedir(directory);
+    rmdir(state);
+    rmdir(parent);
+    return failed ? -1 : 0;
+}
+
+static int openwrt_uninstall(int keep_config) {
+    if (openwrt_service("stop") || openwrt_service("disable") ||
+        unlink_managed("/etc/init.d/fastp2p"))
+        return -1;
+    if (keep_config) {
+        puts("fastp2p service removed; configuration retained.");
+        return 0;
+    }
+    if (remove_openwrt_config())
+        return -1;
+
+    struct stat st;
+    const char *prefix = "/usr/local/fastp2p";
+    if (!lstat(prefix, &st)) {
+        if (!S_ISDIR(st.st_mode) || st.st_uid || (st.st_mode & 0022))
+            return -1;
+        int directory = open(prefix, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (directory < 0)
+            return -1;
+        int removed = remove_backup_at(directory, ".backups", st.st_dev, 4);
+        close(directory);
+        if (removed || unlink_managed("/usr/local/fastp2p/fastp2p-service") ||
+            unlink_managed("/usr/local/fastp2p/init"))
+            return -1;
+        /* A legacy bin directory may belong to the previous service account. */
+        if (!lstat("/usr/local/fastp2p/bin", &st)) {
+            if (!S_ISDIR(st.st_mode) || unlink_managed("/usr/local/fastp2p/bin/fastp2p.old") ||
+                unlink_managed("/usr/local/fastp2p/bin/fastp2p"))
+                return -1;
+            rmdir("/usr/local/fastp2p/bin");
+        } else if (errno != ENOENT) {
+            return -1;
+        }
+        rmdir(prefix);
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    if (unlink_managed("/usr/local/bin/fastp2p"))
+        return -1;
+    puts("fastp2p service and client configuration removed.");
+    return 0;
+}
+
 int fastp2p_linux_uninstall(int keep_config) {
+    if (geteuid())
+        return -1;
+    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK)) {
+        const char *lock = "/var/run/fastp2p-install.lock";
+        if (mkdir(lock, 0700)) {
+            perror("Cannot lock the OpenWrt FastP2P installation");
+            return -1;
+        }
+        int result = openwrt_uninstall(keep_config);
+        if (result)
+            fputs("OpenWrt FastP2P uninstall did not complete. Check service and file permissions.\n", stderr);
+        return rmdir(lock) ? -1 : result;
+    }
     if (!linux_controller_ready()) {
         fputs("Use the Linux installer script from the gateway to manage this installation.\n", stderr);
         return -1;

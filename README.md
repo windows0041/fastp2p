@@ -25,11 +25,11 @@ fastp2p --licenses
 
 在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/bin/fastp2p`。OpenWrt 和 ImmortalWrt 将配置存放在 `/etc/fastp2p-client/config/fastp2p.conf`，其他 Linux 系统使用 `/var/lib/fastp2p/config/fastp2p.conf`。手动下载脚本时请保留文件名中的 Token。
 
-该脚本要求客户端 2.0.4 或更新版本：先在私有临时目录验证接入和合并配置，通过后才停止旧服务。替换后以服务账号加载完整配置、验证监听端口及网关认证，并检查系统服务持续运行，再提交安装；失败时恢复旧文件、目录权限及原有开机启动状态。旧客户端持有的数据父目录会安全迁移为 root 持有，配置子目录仍由客户端账号持有。同目录的其他文件（例如停用网关的数据库）保持内容与文件所有者不变。若旧网关仍在使用该目录，请先迁移网关，安装器会在卸载客户端前报错。
+脚本先在私有临时目录验证接入和合并配置，通过后才停止旧服务。安装后的服务默认以 root 运行，配置及包含凭据的目录由 root 私有。安装器验证监听端口、网关认证和服务运行状态，失败时恢复旧文件、目录权限和开机启动状态。在旧版安装上重新运行新版安装命令即可迁移服务权限并保留节点身份。若旧网关仍在共享客户端的数据目录，请先迁移网关。
 
 安装成功后清理安装器管理的旧程序：Linux 删除历次 `.backups` 中的程序副本和旧路径的可执行文件，保留配置、证书和诊断日志；失败时先恢复旧程序，保留故障备份。客户端 2.0.5 起，Linux/macOS 远程升级在新程序认证上线并稳定运行 5 秒后删除 `.old`；Windows 升级辅助程序在新服务启动成功后清理旧 EXE，运行中的辅助 EXE 由新客户端在文件释放后清理。Windows 服务安装还会清理旧用户目录中的程序，保留该目录的配置。清理只匹配已知程序文件，跳过仍在工作的下载进程及目录、符号链接，不扫描下载目录中的用户安装包。Android 的旧应用由系统替换，安装成功回调清理缓存 APK。
 
-安装和保活逻辑由 `scripts/linux-installer.sh` 和 `scripts/fastp2p-service.sh` 提供。脚本根据系统选择 systemd、procd 或 OpenRC，并使用独立服务账号。当前官方 Release 提供 x86_64、aarch64、armv7（硬浮点）、riscv64 和 mips64el（64 位小端用户空间）。安装脚本以网关提供的包为准，缺包时会列出可用架构并退出，旧服务保持运行。容器可直接运行对应架构的原始可执行文件。
+安装脚本根据系统选择 systemd、procd 或 OpenRC。OpenWrt 和 ImmortalWrt 由 procd 保活，安装阶段使用的 `fastp2p-service` 脚本会在安装完成后移除。当前官方 Release 提供 x86_64、aarch64、armv7（硬浮点）、riscv64 和 mips64el（64 位小端用户空间）。安装脚本以网关提供的包为准，缺包时会列出可用架构并退出，旧服务保持运行。容器可直接运行对应架构的原始可执行文件。
 
 在网关控制台点击「下载 Linux 通用安装脚本」。保留下载文件名，将下面引号内的示例替换为实际文件名执行；架构和 Token 会自动读取，无需额外输入。脚本固定下载时各架构的最新版；若旧包已清理，请重新下载脚本：
 
@@ -46,6 +46,8 @@ sudo journalctl -u fastp2p-client -n 50 --no-pager
 
 Alpine/OpenRC 用 `rc-service fastp2p status`，OpenWrt 用 `/etc/init.d/fastp2p status`。安装完成后程序在后台运行，不需要保持安装终端在线。
 
+OpenWrt 从 root 终端运行 `fastp2p stop` 停止服务，使用 `fastp2p uninstall` 卸载客户端并删除配置。使用 `fastp2p uninstall --keep-config` 可移除开机服务并保留程序、配置和节点身份，方便重新安装。
+
 macOS 在网关控制台的「安装客户端 → Mac」下载通用安装脚本。保留文件名，在终端执行 `sh ./fastp2p-macos-<16位数字>.sh`，无需 sudo。脚本支持 macOS 13 及以上，自动下载 Apple Silicon 或 Intel 版本，保留原节点身份和配置。安装后 LaunchAgent 随当前用户登录启动。
 
 Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p/config/fastp2p.conf`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%/fastp2p/config/fastp2p.conf`，使用当前用户 DPAPI。旧 `client.dat` 会迁移，备份保存在新配置目录。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
@@ -55,6 +57,60 @@ Windows 开机服务和 `run --background` 不创建终端窗口；后台日志�
 高级调试使用 `--config FILE`，参考 `config.example.json`、`config.socks5.example.json`。重复安装保留原有转发和 SOCKS5 规则；Web 新增规则保存在网关数据库，节点重连后恢复。
 
 局域网设备可以使用入口节点的转发端口。编辑网关转发规则，把「监听地址」设置为入口节点的局域网 IP，留空时默认为 `127.0.0.1`。例如，入口监听 `192.168.50.1:2222`，出口选择 `newcounas`，目标可填写其所在局域网内的 `192.168.15.1:22`。同一局域网内的电脑连接入口即可使用目标服务。目标地址由出口节点访问，入口的访问范围由入口节点防火墙控制。
+
+### Linux SD-WAN
+
+SD-WAN 使用 Linux TUN 接口 `fastp2p0`，在 FastP2P 的 QUIC 隧道里传输 IPv4。两端有到网关及对端的 IPv6 路径即可建立 IPv4 网络。默认虚拟网段为 `10.3.2.0/24`，每个节点手动分配一个唯一虚拟地址。两端使用同一 FastP2P 账号下的节点名，并在各自客户端配置中列出对端。
+
+**依赖**
+
+- Linux 内核 TUN 驱动和可打开的 `/dev/net/tun`。容器或受限 VPS 需要宿主机提供该设备并允许 `CAP_NET_ADMIN`。
+- `iproute2`（`ip` 命令）。Debian 和 Ubuntu 可用 `apt install iproute2` 安装，OpenWrt 可安装 `ip-full` 和 `kmod-tun`。
+- 创建 TUN 和安装路由需要 `CAP_NET_ADMIN`。安装后的 Linux 服务以 root 运行。在容器里仍需由宿主机授予该能力。
+
+使用包含 SD-WAN 的 Linux 安装包时，在安装脚本的执行命令中启用检查。把 `YOUR_TOKEN` 换成控制台提供的接入 Token。
+
+```sh
+curl -fsSL https://fastp2p.top:10008/linux/install | sudo env FASTP2P_SDWAN=1 sh -s -- --token YOUR_TOKEN
+```
+
+脚本会检查依赖和 TUN 创建权限，缺失时提示并退出。现有安装可用 `sudo fastp2p --check-sdwan` 手动检查。普通安装无需这些依赖。
+
+**两台 VPS**
+
+在各自 `fastp2p.conf` 根对象加入 `sdwan` 字段，保留已有 `network` 等配置。可运行 `fastp2p --service-profile` 查看托管配置路径。以下两个片段分别定义 A、B 的虚拟地址，并互相导出一个 IPv4 子网。仅需虚拟 IP 互通时可以省略 `LocalRoutes` 和 `Routes`。
+
+VPS A 的配置片段
+
+```json
+"sdwan": {
+  "Address": "10.3.2.1",
+  "LocalRoutes": ["192.168.50.0/24"],
+  "Peers": [{"Node": "sdwan-vps-b", "Address": "10.3.2.2", "Routes": ["192.168.15.0/24"]}]
+}
+```
+
+VPS B 的配置片段
+
+```json
+"sdwan": {
+  "Address": "10.3.2.2",
+  "LocalRoutes": ["192.168.15.0/24"],
+  "Peers": [{"Node": "sdwan-vps-a", "Address": "10.3.2.1", "Routes": ["192.168.50.0/24"]}]
+}
+```
+
+把 `Node` 换成控制台显示的实际节点名，修改后运行 `sudo systemctl restart fastp2p-client`。从 A 测试 `ping -4 10.3.2.2`，并用 `ip -4 route show dev fastp2p0` 查看已添加的路由。两端也可用同一个 `Subnet` 字段覆盖默认虚拟网段。
+
+**子网路由**
+
+`LocalRoutes` 声明本机负责转发的子网，必须从本机可达。`Peers[].Routes` 把对端负责的子网安装为经 TUN 到达的路由。按最长前缀选路。转发到子网里的其他设备时，需要在对应 VPS 开启 `net.ipv4.ip_forward=1`，允许防火墙在本地接口与 `fastp2p0` 之间转发，并在目标网段的网关上设置回程路由。子网互访时，两侧都需有回程路由。FastP2P 保留原始 IPv4 源地址，网段中其他设备可通过网关回程。
+
+TUN 支持单播 IPv4，只安装配置中的对端地址及子网路由。已存在的同前缀路由会使启动报错，停止客户端会释放 TUN 及其路由。IPv6 直连需让对端访问节点的 UDP 业务端口；若使用中继，中继节点也须运行支持 SD-WAN 的客户端。
+
+### Android SD-WAN
+
+从 FastP2P 通知打开「SD-WAN」，粘贴 `sdwan` 的 JSON 对象。保存配置时应用会先尝试通过 `su` 建立 TUN。系统缺少 Root 授权或无法建立 Root TUN 时，在通知中选择「授权 VPN」，按 Android 提示确认即可。本机可访问配置的虚拟地址和对端子网。在 Android 上向其他节点发布手机所在子网需要 Root，并需另外配置 IPv4 转发、防火墙和回程路由。
 
 SOCKS5 的 CONNECT 和 UDP ASSOCIATE 支持 IPv4、IPv6 以及由出口节点解析的域名。双栈节点优先直连 IPv6，失败时会重新协商 IPv4 直连。
 
@@ -94,7 +150,7 @@ Windows 使用 MinGW，macOS 原生构建，Android 使用 NDK 和 Java/JNI 系�
 
 可选的 `tls_alias` 包含 `host` 和 `ca`。客户端匹配内置网关且使用默认信任时，通过这个名称建立并验证 HTTPS/WSS 连接，也会在节点间的 QUIC ClientHello 发送该名称。官方网关的客户端 TLS 名称为 `speedtest.fastp2p.top`，控制台入口为 `fastp2p.top`。
 
-Linux 的 config 目录由独立 fastp2p 服务账号持有（0700），fastp2p.conf 为 0600，支持网关下发时原子替换。父目录与服务控制脚本仍由 root 持有；安装器执行特权文件操作时临时锁定配置目录。直接以 root 运行默认配置的 CLI 也会降为服务账号。重复接入不会重写相同的 CA 文件。
+Linux 托管服务的 `config` 目录由 root 持有（0700），`fastp2p.conf` 为 0600，支持网关下发配置时原子替换。旧版服务仅更新二进制时继续使用原有服务账号。重新运行新版安装命令会迁移配置和服务权限。
 
 启动先读取 fastp2p.conf（Linux 内容沿用 JSON；Windows 文件由 DPAPI 加密）。网关控制台不再接受手动字段下发：操作员只需维护转发与 SOCKS5 规则，网关把规则渲染成 `apps`/`socks5` 期望字段并在改动、停用、删除时同步给在线节点（离线节点上线后自动应用）。客户端收到期望字段后按键递归合并（对象逐层合并，数组/标量/null 按整字段替换，未下发的键保留），先验证候选配置，再私密保存、自动重载并重连；端口冲突、启动失败或 25 秒内无法通过网关认证时恢复旧配置。失败版本会被记住，规则改动后重新下发可重试。保留的 .previous 是上次配置备份，_fastp2pManaged 为内部状态，不能远程编辑。
 

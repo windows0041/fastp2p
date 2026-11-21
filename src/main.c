@@ -5,6 +5,7 @@
 #include "notices.h"
 #include "update.h"
 #include "platform.h"
+#include "sdwan.h"
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -79,6 +80,7 @@ static void usage(void) {
          "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
+         "fastp2p --check-sdwan (checks Linux TUN, iproute2 and CAP_NET_ADMIN)\n"
          "fastp2p stop [--config FILE]\n"
          "fastp2p --config FILE [--serverhost HOST] [--node NAME] [--cacert FILE]\n"
          "          [--port WSS_PORT] [--publicipport PORT] [--run-seconds N]\n"
@@ -90,6 +92,21 @@ static int client_main(int argc, char **argv) {
     optind = 1;
     was_online = 0;
     if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("2");return 0;}
+#ifdef __linux__
+    if (argc == 2 && !strcmp(argv[1], "--root-service-abi")) {
+        puts("1");
+        return 0;
+    }
+#endif
+    if (argc == 2 && !strcmp(argv[1], "--check-sdwan")) {
+        const char *error = fp_sdwan_check();
+        if (error) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+        puts("SD-WAN dependencies verified");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--service-profile")) {
         char profile[4096];
         if (fastp2p_service_profile(profile)) return 1;

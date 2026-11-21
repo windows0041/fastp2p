@@ -48,6 +48,9 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     etc = root / 'etc'; etc.mkdir()
     for name in ('passwd', 'group', 'nsswitch.conf', 'hosts', 'resolv.conf', 'ld.so.cache'):
         if (Path('/etc') / name).is_file(): shutil.copyfile(Path('/etc') / name, etc / name)
+    # All test services live on loopback. Avoid public DNS timeouts for the
+    # client's default NAT probes inside the private network namespace.
+    with (etc / 'hosts').open('a') as f: f.write('\n127.0.0.1 stun.fastp2p.top\n')
     # A private non-root account, without touching the host passwd/group files.
     for name in ('passwd', 'group'):
         path = etc / name
@@ -75,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
         command('mount', '--bind', str(original_local/'lib'), '/usr/local/lib')
         command('mount', '-o', 'remount,bind,ro', '/usr/local/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/run')
-    command('mount', '-t', 'tmpfs', 'tmpfs', '/var/lib')
+    command('mount', '-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', '/var/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/sbin')
     tools = root / 'tools'; tools.mkdir()
     events = root / 'events'
@@ -179,10 +182,8 @@ esac
             assert db.execute('SELECT expires_at FROM package_leases WHERE platform="linux"').fetchone()[0] > time.time()
         named = root/('fastp2p-'+key); named.write_bytes(installer)
         def run(path=named, expected=0, shell='sh'):
-            # The real managed-profile probe drops UID/GID. Some container
-            # kernels prevent LeakSanitizer from attaching to that process on
-            # exit. ASan/UBSan remain active; standalone client/protocol tests
-            # and the gateway retain their normal leak checks.
+            # Legacy-profile migration can drop UID/GID, which prevents
+            # LeakSanitizer from attaching on some container kernels.
             installer_env=dict(environment)
             prior=installer_env.get('ASAN_OPTIONS','')
             installer_env['ASAN_OPTIONS']=(prior+':' if prior else '')+'detect_leaks=0'
@@ -198,6 +199,8 @@ esac
         linux_profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
         openwrt_profile = Path('/etc/fastp2p-client/config/fastp2p.conf')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
+        def installed_controller():
+            return controller.read_bytes() if controller.exists() else None
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
         minimal = root/'procd-tools'
         minimal.mkdir()
@@ -244,7 +247,7 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
                     assert subprocess.check_output([str(client),'--service-profile'],text=True).strip() == str(openwrt_profile)
                     binary=Path('/usr/local/fastp2p/bin/fastp2p')
                     cli=Path('/usr/local/bin/fastp2p')
-                    assert binary.samefile(cli) and not cli.is_symlink() and cli.stat().st_uid==0
+                    assert binary.samefile(cli) and cli.is_symlink() and cli.lstat().st_uid==0
                     assert not (stale/'incoming').exists()
                     assert (stale/'startup-check.log').read_text()=='keep diagnostics'
                     events.write_text('')
@@ -265,7 +268,11 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             profile.write_text(json.dumps(first)); before = profile.read_bytes()
             binary = Path('/usr/local/fastp2p/bin/fastp2p')
             assert binary.read_bytes() == payload and Path('/usr/local/bin/fastp2p').read_bytes() == payload
-            assert controller.stat().st_uid == 0 and not controller.stat().st_mode & 0o022
+            if manager == 'procd':
+                assert not controller.exists()
+                executable(controller, 'exit 88\n')
+            else:
+                assert controller.stat().st_uid == 0 and not controller.stat().st_mode & 0o022
             assert Path('/usr/local/fastp2p').stat().st_uid == 0
             backups=Path('/usr/local/fastp2p/.backups')
             assert not any(backups.glob('*/incoming'))
@@ -278,16 +285,19 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             outside=root/('outside-'+manager);outside.mkdir();(outside/'runtime').write_text('do-not-follow')
             (backups/'20200102T000000.43').symlink_to(outside,target_is_directory=True)
             unknown=backups/'user-data';unknown.mkdir();(unknown/'runtime').write_text('not-an-installer-backup')
-            assert binary.parent.stat().st_uid != 0 and profile.stat().st_mode & 0o007 == 0
+            assert binary.parent.stat().st_uid == 0 and profile.stat().st_uid == 0
+            assert profile.stat().st_mode & 0o777 == 0o600
             if manager.startswith('systemd'):
                 unit = Path('/etc/systemd/system/fastp2p-client.service').read_text()
                 assert ('ProtectSystem=full' if manager == 'systemd219' else 'ProtectSystem=strict') in unit
                 assert 'Restart=always' in unit and str(binary) in unit
+                assert 'User=root' in unit and 'Group=root' in unit
                 dropin = Path('/etc/systemd/system/fastp2p-client.service.d'); dropin.mkdir()
                 (dropin/'20-remote-upgrade.conf').write_text('[Service]\nExecStart=/old/client\n')
             else:
                 unit = Path('/etc/init.d/fastp2p').read_text()
                 assert ('respawn 3600 3 0' if manager == 'procd' else 'supervisor="supervise-daemon"') in unit
+                assert ('procd_set_param user root' if manager == 'procd' else 'command_user="root:root"') in unit
                 assert str(profile) in unit
             legacy=Path('/var/lib/fastp2p-client'); legacy.mkdir(exist_ok=True)
             (legacy/'fastp2p').write_bytes(payload)
@@ -325,7 +335,8 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert (outside/'runtime').read_text()=='do-not-follow'
             assert (unknown/'runtime').read_text()=='not-an-installer-backup'
             assert not legacy.exists() and not old_profile.exists()
-            assert profile.parent.stat().st_uid != 0
+            assert profile.parent.stat().st_uid == 0
+            if manager == 'procd': assert not controller.exists()
             assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
             assert gateway_db.parent.stat().st_uid == 0 and not gateway_db.parent.stat().st_mode & 0o022
             saved = json.loads(profile.read_text())
@@ -350,10 +361,10 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
                     alias.unlink()
                 # The fallback must also preserve special mode bits on rollback.
                 profile.parent.chmod(0o2700)
-            old_controller = controller.read_bytes(); events.write_text(''); (root/'fail-start').touch()
+            old_controller = installed_controller(); events.write_text(''); (root/'fail-start').touch()
             run(expected=1)
             assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
-            assert controller.read_bytes() == old_controller and 'start' in events.read_text()
+            assert installed_controller() == old_controller and 'start' in events.read_text()
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             if manager == 'procd':
                 assert profile.parent.stat().st_mode & 0o7777 == 0o2700
@@ -362,7 +373,7 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             # Detect the failed native status and restore both runtime and boot links.
             events.write_text(''); (root/'fail-after-start').touch(); run(expected=1)
             assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
-            assert controller.read_bytes() == old_controller
+            assert installed_controller() == old_controller
             assert (root/'client-running').exists() and (root/'client-enabled').exists()
             # Preserve an explicitly disabled old service's boot state too.
             (root/'client-enabled').unlink(); events.write_text(''); (root/'fail-start').touch()
@@ -381,7 +392,7 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
                 profile.write_text(json.dumps(blocked)); blocked_bytes=profile.read_bytes(); events.write_text('')
                 run(expected=1)
                 assert profile.read_bytes()==blocked_bytes and binary.read_bytes()==payload+b'old-marker'
-                assert controller.read_bytes()==old_controller
+                assert installed_controller()==old_controller
                 assert (root/'client-running').exists() and (root/'client-enabled').exists()
                 assert sum(line.endswith(' start') for line in events.read_text().splitlines())==1
                 check_log=max(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'),key=lambda p:p.stat().st_mtime_ns)
@@ -400,6 +411,32 @@ exec "$FIXTURE/tools/service-fixture" procd "$2"
             assert profile.read_text() == '{broken' and events.read_text() == ''
             profile.write_bytes(before)
             results[manager+'_install_reinstall_preserve_config_and_rollback'] = True
+            if manager == 'procd':
+                run()
+                cli = Path('/usr/local/bin/fastp2p')
+                service = Path('/etc/init.d/fastp2p')
+                def native(*args):
+                    return subprocess.run([str(cli), *args], env=environment, capture_output=True, timeout=15)
+
+                lock = Path('/var/run/fastp2p-install.lock')
+                lock.mkdir()
+                try:
+                    assert native('uninstall').returncode != 0 and service.exists()
+                finally:
+                    lock.rmdir()
+                assert native('stop').returncode == 0 and not (root/'client-running').exists()
+                before = profile.read_bytes()
+                ca_file = Path(json.loads(before)['CACertFile'])
+                assert native('uninstall', '--keep-config').returncode == 0
+                assert profile.read_bytes() == before and ca_file.exists() and cli.exists() and not service.exists()
+                assert not (root/'client-enabled').exists()
+                run()
+                assert json.loads(profile.read_bytes())['network']['DeviceID'] == identity
+                assert native('uninstall').returncode == 0
+                assert not any(path.exists() for path in (cli, binary, service, profile, ca_file, backups, controller))
+                assert gateway_db.read_bytes() == b'gateway-fixture'
+                assert (outside/'runtime').read_text() == 'do-not-follow'
+                results['openwrt_native_stop_and_uninstall_with_optional_config_retention'] = True
         # Exercise the real downloader against all manifest platforms, without
         # executing wrong-architecture images. Corrupt the fetched byte count
         # deliberately and verify every failure precedes any service change.

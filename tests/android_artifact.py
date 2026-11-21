@@ -33,7 +33,7 @@ with zipfile.ZipFile(args.apk) as apk, tempfile.TemporaryDirectory(prefix='fastp
         block_signed=b'APK Sig Block 42' in raw.read()
     assert jar_signed or block_signed, 'APK carries no signature'
     for abi,machine in [('arm64-v8a',183),('x86_64',62)]:
-        for library in ['libfastp2p.so','libfastp2p_jni.so']:
+        for library in ['libfastp2p.so','libfastp2p_jni.so','libfastp2p_tun_helper.so']:
             data=apk.read('lib/'+abi+'/'+library)
             assert data[:6]==b'\x7fELF\x02\x01' and struct.unpack_from('<H',data,18)[0]==machine,abi
             offset=struct.unpack_from('<Q',data,32)[0]

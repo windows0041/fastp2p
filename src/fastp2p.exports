@@ -8,6 +8,7 @@ _fastp2p_client_set_identity
 _fastp2p_client_device_id
 _fastp2p_client_node
 _fastp2p_client_public_port
+_fastp2p_client_attach_sdwan_tun
 _fastp2p_client_add_forward
 _fastp2p_client_add_socks5
 _fastp2p_client_start

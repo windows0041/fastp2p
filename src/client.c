@@ -8,6 +8,7 @@
 #include "stun.h"
 #include "tcp_level.h"
 #include "secure.h"
+#include "sdwan.h"
 #include "tcp_nat.h"
 #include <ctype.h>
 #include <errno.h>
@@ -76,7 +77,8 @@ enum {
     TUN_DATA = 9,
     TUN_RELAY_JOIN = 10,
     TUN_RELAY_READY = 11,
-    TUN_CERT_BIND = 12
+    TUN_CERT_BIND = 12,
+    TUN_SDWAN_IPV4 = 13
 };
 /* Control-plane push sub-codes between two clients. */
 enum {
@@ -247,7 +249,7 @@ typedef struct {
     int cert_sent, cert_checked;
 } tunnel;
 typedef struct {
-    int used, local, udp, transport, tunnel_index, synced, socks;
+    int used, local, udp, transport, tunnel_index, synced, socks, sdwan;
     op_socket fd;
     uint64_t id, retry, ready_at;
     char name[64], peer[32], destination[256], bind_ip[OP_ADDR_TEXT];
@@ -381,6 +383,7 @@ struct fastp2p_client {
     void *restart_user;
     int validate_only;
     void *user;
+    fp_sdwan *sdwan;
     tunnel tunnels[NT];
     app apps[NA];
     overlay overlays[NO];
@@ -2286,8 +2289,10 @@ static void session_ready(fastp2p_client *c, int index) {
             /* attempts is deliberately not reset here: a tunnel that completes
              * the key exchange and then dies must not restart the direct-punch
              * ladder, or a pair that cannot punch never reaches the relay. */
-            emit(c, FASTP2P_EVENT_FORWARD, c->apps[i].id, 0,
-                 relayed ? "forward attached to relay" : "forward attached to tunnel");
+            const char *message = a->sdwan
+                ? (relayed ? "SD-WAN peer attached to relay" : "SD-WAN peer attached to direct tunnel")
+                : (relayed ? "forward attached to relay" : "forward attached to tunnel");
+            emit(c, FASTP2P_EVENT_FORWARD, a->id, 0, message);
         }
     }
 }
@@ -2818,7 +2823,7 @@ static void report_apps(fastp2p_client *c) {
     json_object *root = json_object_new_object(), *list = json_object_new_array();
     for (int i = 0; i < NA; ++i) {
         app *a = &c->apps[i];
-        if (!a->used || !a->local)
+        if (!a->used || !a->local || a->sdwan)
             continue;
         json_object *j = json_object_new_object();
         op_js(j, "appName", a->name);
@@ -3354,7 +3359,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
          * first, then rebuild exactly the enabled set it persisted. */
         json_object *rules = op_get(j, "Rules");
         for (int i = 0; i < NA; ++i)
-            if (c->apps[i].used && c->apps[i].local)
+            if (c->apps[i].used && c->apps[i].local && !c->apps[i].sdwan)
                 remove_rule(c, i);
         if (rules && json_object_is_type(rules, json_type_array))
             for (size_t k = 0; k < json_object_array_length(rules); ++k) {
@@ -3613,7 +3618,8 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
         return;
     /* Acting as a relay hop: pass application frames through untouched. */
     if (t->relay_link >= 0 && t->relay_ready) {
-        if (sub != TUN_OPEN && sub != TUN_OPEN_ACK && sub != TUN_CLOSE && sub != TUN_DATA)
+        if (sub != TUN_OPEN && sub != TUN_OPEN_ACK && sub != TUN_CLOSE &&
+            sub != TUN_DATA && sub != TUN_SDWAN_IPV4)
             return;
         relay_link *r = &c->relays[t->relay_link];
         int other = r->ta == ti ? r->tb : r->ta;
@@ -3622,11 +3628,24 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
             close_tunnel(c, ti, "relay forwarding failed");
         return;
     }
+    if (sub == TUN_SDWAN_IPV4 && (!c->sdwan || c->sdwan->fd < 0 || !tunnel_ready(t)))
+        return;
     uint8_t plain[4096 + 256];
     size_t n = 0;
     int rv = topen(c, ti, sub, data, len, plain, sizeof(plain), &n);
     if (rv)
         return;
+    if (sub == TUN_SDWAN_IPV4) {
+        uint32_t source, destination;
+        if (fp_sdwan_ipv4(plain, n, &source, &destination) ||
+            fp_sdwan_owner(c->sdwan, destination) != FP_SDWAN_LOCAL)
+            return;
+        int owner = fp_sdwan_owner(c->sdwan, source);
+        const char *peer = t->relay_wait ? t->relay_peer : t->peer;
+        if (owner >= 0 && !strcmp(peer, c->apps[c->sdwan->peers[owner].app_index].peer))
+            fp_sdwan_write(c->sdwan, plain, n);
+        return;
+    }
     if (sub == TUN_DATA) {
         if (n < 8)
             return;
@@ -4631,7 +4650,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
         if (a->tunnel_index < 0 || !a->synced ||
             !tunnel_ready(&c->tunnels[a->tunnel_index]) || now < a->ready_at)
             continue;
-        if (a->socks)
+        if (a->socks || a->sdwan)
             continue;
         if (!a->udp) {
             for (int k = 0; k < 4; ++k) {
@@ -5720,6 +5739,73 @@ int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64
         *id = aid;
     return FASTP2P_OK;
 }
+int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
+#if defined(__linux__)
+    fp_sdwan *state = malloc(sizeof(*state));
+    if (!state)
+        return FASTP2P_EIO;
+    if (fp_sdwan_parse(state, config)) {
+        free(state);
+        return FASTP2P_EINVAL;
+    }
+    unsigned available = 0;
+    for (int i = 0; i < NA; ++i)
+        available += !c->apps[i].used;
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        const char *peer = state->peers[i].node;
+        if (i >= available || !valid_node(peer) || !strcmp(c->node, peer)) {
+            free(state);
+            return FASTP2P_EINVAL;
+        }
+    }
+    int slot = 0;
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        while (c->apps[slot].used)
+            ++slot;
+        fp_sdwan_peer *peer = &state->peers[i];
+        peer->app_index = slot;
+        app *a = &c->apps[slot++];
+        *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
+                   .transport = FASTP2P_TRANSPORT_QUIC, .id = random_id()};
+        strcpy(a->peer, peer->node);
+    }
+    c->sdwan = state;
+    return FASTP2P_OK;
+#else
+    (void)c;
+    (void)config;
+    return FASTP2P_EINVAL;
+#endif
+}
+
+int fastp2p_client_attach_sdwan_tun(fastp2p_client *c, int fd) {
+    if (!c || c->in_callback || c->running)
+        return FASTP2P_ESTATE;
+    return fp_sdwan_attach(c->sdwan, fd) ? FASTP2P_EINVAL : FASTP2P_OK;
+}
+
+static void tick_sdwan(fastp2p_client *c) {
+    fp_sdwan *state = c->sdwan;
+    if (!state || state->fd < 0)
+        return;
+    for (int i = 0; i < 32; ++i) {
+        uint8_t packet[FP_SDWAN_MTU];
+        int length = fp_sdwan_read(state, packet);
+        if (length <= 0)
+            break;
+        uint32_t source, destination;
+        if (fp_sdwan_ipv4(packet, (size_t)length, &source, &destination) ||
+            fp_sdwan_owner(state, source) != FP_SDWAN_LOCAL)
+            continue;
+        int owner = fp_sdwan_owner(state, destination);
+        if (owner < 0)
+            continue;
+        app *a = &c->apps[state->peers[owner].app_index];
+        if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
+            (void)tseal(c, &c->tunnels[a->tunnel_index], TUN_SDWAN_IPV4, packet, (size_t)length);
+    }
+}
+
 int fastp2p_client_start(fastp2p_client *c) {
     if (!c || c->in_callback || c->running || c->multi)
         return FASTP2P_ESTATE;
@@ -5748,7 +5834,7 @@ int fastp2p_client_start(fastp2p_client *c) {
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     for (int i = 0; i < NA; ++i)
-        if (c->apps[i].used && c->apps[i].local && c->apps[i].fd < 0) {
+        if (c->apps[i].used && c->apps[i].local && !c->apps[i].sdwan && c->apps[i].fd < 0) {
             app *a = &c->apps[i];
             a->fd = socket_bound(a->udp, a->bind_ip, a->port, 0);
             if (a->fd < 0 || (!a->udp && op_listen(a->fd, 64))) {
@@ -5777,6 +5863,15 @@ int fastp2p_client_start(fastp2p_client *c) {
     if (!c->multi) {
         fastp2p_client_stop(c);
         return FASTP2P_EIO;
+    }
+    if (c->sdwan) {
+        const char *error = fp_sdwan_start(c->sdwan);
+        if (error) {
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+            fastp2p_client_stop(c);
+            return FASTP2P_EIO;
+        }
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "SD-WAN TUN interface ready");
     }
     c->running = 1;
     if (c->auto_port_mapping && !c->validate_only)
@@ -5900,22 +5995,25 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
         tick_tunnel(c, i, now);
     tick_relays(c, now);
     tick_apps(c, now);
+    tick_sdwan(c);
     tick_socks(c, now);
     tick_overlays(c, now);
     if (wait_ms > 10)
         wait_ms = 10;
     if (wait_ms) {
-        struct curl_waitfd extra = {0};
+        struct curl_waitfd extra[2] = {{0}};
         unsigned count = 0;
         if (c->ws_connected) {
-            extra.fd = c->ws_socket;
-            extra.events = CURL_WAIT_POLLIN;
+            extra[count].fd = c->ws_socket;
+            extra[count].events = CURL_WAIT_POLLIN;
             if (op_buffer_size(&c->ws_tx))
-                extra.events |= CURL_WAIT_POLLOUT;
-            count = 1;
+                extra[count].events |= CURL_WAIT_POLLOUT;
+            ++count;
         }
+        if (c->sdwan && c->sdwan->fd >= 0)
+            extra[count++] = (struct curl_waitfd){.fd = (curl_socket_t)c->sdwan->fd, .events = CURL_WAIT_POLLIN};
         int events;
-        curl_multi_poll(c->multi, &extra, count, (int)wait_ms, &events);
+        curl_multi_poll(c->multi, extra, count, (int)wait_ms, &events);
         service_gateway(c);
     }
     c->stepping = 0;
@@ -5932,6 +6030,8 @@ int fastp2p_client_stop(fastp2p_client *c) {
     }
     c->stopping = 1;
     c->running = 0;
+    if (c->sdwan)
+        fp_sdwan_stop(c->sdwan);
     fp_port_mapping_stop(c->port_mapping);
     c->port_mapping = NULL;
     c->mapped_listener = (fp_mapped_ports){0};
@@ -5985,6 +6085,7 @@ void fastp2p_client_destroy(fastp2p_client *c) {
     for (int i = 0; i < NA; ++i)
         if (c->apps[i].used && c->apps[i].local && c->apps[i].fd >= 0)
             op_close(c->apps[i].fd);
+    free(c->sdwan);
     OPENSSL_cleanse(c, sizeof(*c));
     free(c);
 }

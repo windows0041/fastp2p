@@ -1,5 +1,5 @@
 #!/bin/sh
-# OS integration is deliberately kept outside the C P2P program.
+# Stage and verify Linux service installations and rollbacks.
 set -eu
 umask 077
 prefix=/usr/local/fastp2p
@@ -19,6 +19,12 @@ detect_init() {
     fi
 }
 manager=$(detect_init)
+sdwan=${FASTP2P_SDWAN:-0}
+case "$sdwan" in 0|1) ;; *) fail 'FASTP2P_SDWAN 只能为 0 或 1。' ;; esac
+sdwan_requirements() {
+    command -v ip >/dev/null 2>&1 || fail 'SD-WAN 需要 iproute2（ip 命令），请先自行安装。'
+    [ -c /dev/net/tun ] || fail 'SD-WAN 需要 Linux TUN 驱动和 /dev/net/tun，请在宿主机或 VPS 上开启。'
+}
 parent=/var/lib/fastp2p
 if [ "$manager" = procd ]; then parent=/etc/fastp2p-client; fi
 state=$parent/config
@@ -30,7 +36,8 @@ phase=
 discard_install_stage() {
     if [ -n "$install_backup" ]; then
         rm -f -- "$install_backup/incoming" "$install_backup/runtime.new" \
-            "$install_backup/cli.new" "$install_backup/controller.new"
+            "$install_backup/cli.new" "$install_backup/controller.new" \
+            "$install_backup/identity.new" "$install_backup/ca.new"
     fi
 }
 finish() {
@@ -60,26 +67,6 @@ case "${1:-}" in
         locked=true
         printf '%s\n' "$$" > /var/run/fastp2p-service.lock/pid ;;
 esac
-account_ready() {
-    if id fastp2p >/dev/null 2>&1; then
-        [ "$(id -u fastp2p)" -ne 0 ] || fail 'fastp2p 用户不能使用 UID 0。'
-        return
-    fi
-    if command -v useradd >/dev/null 2>&1; then
-        useradd --system --user-group --home-dir "$state" --shell /bin/false fastp2p
-    elif [ "$manager" = procd ] && [ -f /lib/functions.sh ]; then
-        # OpenWrt's own locked passwd/group helpers also work without adduser.
-        ( set +u; . /lib/functions.sh
-          gid=$(group_add_next fastp2p)
-          user_add fastp2p '' "$gid" fastp2p "$state" /bin/false )
-    elif command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
-        addgroup -S fastp2p
-        adduser -S -D -H -h "$state" -s /bin/false -G fastp2p fastp2p
-    else
-        fail '缺少系统用户管理工具，请安装 shadow/useradd 或 BusyBox adduser 后重试。'
-    fi
-    id fastp2p >/dev/null 2>&1 || fail '无法创建 fastp2p 服务用户。'
-}
 start_service() {
     case "$manager" in
         systemd) systemctl start "$service.service" ;;
@@ -150,7 +137,6 @@ remove_service() {
     esac
 }
 write_service() {
-    group=$(id -gn fastp2p)
     case "$manager" in
         systemd)
             protection=full
@@ -164,8 +150,8 @@ After=network-online.target
 Wants=network-online.target
 StartLimitInterval=0
 [Service]
-User=fastp2p
-Group=$group
+User=root
+Group=root
 ExecStart=$binary run --config $profile
 Restart=always
 RestartSec=3
@@ -191,7 +177,7 @@ USE_PROCD=1
 start_service() {
     procd_open_instance
     procd_set_param command "$binary" run --config "$profile"
-    procd_set_param user fastp2p
+    procd_set_param user root
     procd_set_param no_new_privs 1
     procd_set_param respawn 3600 3 0
     procd_set_param stdout 1
@@ -209,7 +195,7 @@ description="fastp2p client"
 supervisor="supervise-daemon"
 command="$binary"
 command_args="run --config $profile"
-command_user="fastp2p:$group"
+command_user="root:root"
 pidfile="/run/fastp2p.pid"
 respawn_delay=3
 respawn_max=0
@@ -298,8 +284,13 @@ install_service() {
     done
     [ -f "$source_binary" ] || fail '找不到已校验的客户端程序。'
     [ -f "$source_profile" ] && [ ! -L "$source_profile" ] || fail '找不到已校验的客户端配置。'
+    [ "$("$source_binary" --root-service-abi 2>/dev/null || true)" = 1 ] ||
+        fail '网关缓存的客户端版本不支持 root 服务，请同步新版客户端后重新获取安装命令。'
+    if [ "$sdwan" -eq 1 ]; then
+        sdwan_requirements
+        "$source_binary" --check-sdwan || fail 'SD-WAN 环境检查失败，请检查 TUN、权限和客户端版本。'
+    fi
     [ ! -L "$state" ] && [ ! -L "$profile" ] || fail '配置路径不能是符号链接。'
-    account_ready
     [ ! -L "$parent" ] || fail '数据目录不能是符号链接。'
     parent_metadata=
     config_metadata=
@@ -308,7 +299,8 @@ install_service() {
         details=$(file_metadata "$parent") || fail '无法读取数据目录的权限。'
         parent_metadata=${details%:*}
         parent_uid=${parent_metadata%%:*}
-        [ "$parent_uid" -eq 0 ] || [ "$parent_uid" -eq "$(id -u fastp2p)" ] || fail '数据目录属于其他用户，未卸载原服务。'
+        legacy_uid=$(id -u fastp2p 2>/dev/null || true)
+        [ "$parent_uid" -eq 0 ] || [ "$parent_uid" = "$legacy_uid" ] || fail '数据目录属于其他用户，未卸载原服务。'
         if [ "$parent_uid" -ne 0 ]; then
             # An old co-located gateway may still need to write this directory.
             # Never take it away from a running gateway during client migration.
@@ -330,6 +322,13 @@ install_service() {
         config_metadata=${details%:*}
     fi
     [ ! -L "$prefix" ] || fail '安装目录不能是符号链接。'
+    bin_metadata=
+    [ ! -L "$prefix/bin" ] || fail '程序目录不能是符号链接。'
+    if [ -e "$prefix/bin" ]; then
+        [ -d "$prefix/bin" ] || fail '程序路径不是目录。'
+        details=$(file_metadata "$prefix/bin") || fail '无法读取程序目录的权限。'
+        bin_metadata=${details%:*}
+    fi
     mkdir -p "$prefix"
     chown 0:0 "$prefix"; chmod 755 "$prefix"
     [ ! -L "$prefix/.backups" ] || fail '备份目录不能是符号链接。'
@@ -340,16 +339,17 @@ install_service() {
     backup=$prefix/.backups/$(date +%Y%m%dT%H%M%S).$$
     mkdir "$backup"; chmod 700 "$backup"
     install_backup=$backup
-    # Both destinations use the same root-owned image on a single filesystem.
-    # A hard link keeps the CLI pinned even after the service swaps its path.
+    # Stage one executable inode. The CLI symlink follows later image swaps.
     if ! cp "$source_binary" "$backup/incoming"; then
         bytes=$(wc -c < "$source_binary")
         fail "无法暂存客户端（需 $bytes 字节），请检查 /usr/local 的磁盘空间。原服务尚未停止。"
     fi
     chmod 755 "$backup/incoming"
     save_program "$backup/incoming" "$backup/runtime.new"
-    save_program "$backup/incoming" "$backup/cli.new"
-    cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"
+    ln -s "$binary" "$backup/cli.new"
+    if [ "$manager" != procd ]; then
+        cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"
+    fi
     cp "$source_profile" "$backup/desired-config"; chmod 600 "$backup/desired-config"
     save_program "$binary" "$backup/runtime"
     save_program /usr/local/bin/fastp2p "$backup/cli"
@@ -372,6 +372,7 @@ install_service() {
     if $old_service && service_enabled >/dev/null 2>&1; then old_enabled=true; fi
     config_changed=false
     parent_changed=false
+    bin_changed=false
     restore_metadata() {
         target=$1; metadata=$2
         if [ -n "$metadata" ]; then
@@ -406,6 +407,7 @@ install_service() {
             restore_metadata "$state" "$config_metadata"
             restore_metadata "$parent" "$parent_metadata"
         fi
+        if $bin_changed; then restore_metadata "$prefix/bin" "$bin_metadata"; fi
         if $old_enabled; then enable_service >/dev/null 2>&1 || true; fi
         if $old_service; then start_service >/dev/null 2>&1 || true; fi
     }
@@ -414,11 +416,9 @@ install_service() {
     printf '服务管理方式：%s；正在探测并卸载旧服务，保留配置。\n' "$manager"
     remove_service
     phase=准备安装与配置目录
-    group=$(id -gn fastp2p)
     [ ! -L "$prefix/bin" ] && [ ! -L "$parent" ] && [ ! -L "$state" ] || return 1
     mkdir -p "$prefix/bin" "$parent" /usr/local/bin
-    # Stop StateDirectory users before changing ownership: systemd may chown it
-    # again on restart. Only the config child is writable by the new client.
+    # Stop the legacy service before taking over its writable directories.
     parent_changed=true
     chown -h 0:0 "$parent"; chmod 711 "$parent"
     mkdir -p "$state"
@@ -434,25 +434,38 @@ install_service() {
     done
     config_changed=true
     phase=更新程序文件
-    chown "fastp2p:$group" "$prefix/bin"; chmod 700 "$prefix/bin"
+    bin_changed=true
+    chown -h 0:0 "$prefix/bin"; chmod 755 "$prefix/bin"
     mv -fT "$backup/runtime.new" "$binary"
     mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
-    mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
+    if [ "$manager" = procd ]; then
+        rm -f -- "$prefix/fastp2p-service"
+    else
+        mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
+    fi
     phase=写入配置及证书
-    "$backup/incoming" --relocate-profile "$backup/desired-config" "$profile"
-    chown "fastp2p:$group" "$profile"; chmod 600 "$profile"
     for ca in "$state"/fastp2p.conf.ca.*.pem; do
         [ -f "$ca" ] || continue
         is_single_link_file "$ca" || fail '无法确认证书是单链接普通文件。'
-        chown "0:$group" "$ca"; chmod 640 "$ca"
+        cp "$ca" "$backup/ca.new"; chmod 600 "$backup/ca.new"
+        mv -fT "$backup/ca.new" "$ca"
     done
-    chown "fastp2p:$group" "$state"; chmod 700 "$state"
+    "$backup/incoming" --relocate-profile "$backup/desired-config" "$profile"
+    chown 0:0 "$profile"; chmod 600 "$profile"
+    # Give ancillary configuration new inodes so open descriptors held by the
+    # legacy service account cannot alter the files used by the root service.
+    for file in "$profile.identity" "$profile.previous"; do
+        saved=$backup/config/${file##*/}
+        [ -f "$saved" ] || continue
+        cp "$saved" "$backup/identity.new"
+        chmod 600 "$backup/identity.new"
+        mv -fT "$backup/identity.new" "$file"
+    done
     # Pure schema checks cannot detect occupied ports or account permissions.
-    # Probe the full runtime as the service account before committing the upgrade.
+    # Probe the full runtime with its installed permissions before committing.
     phase=客户端启动检查
-    if ! "$backup/incoming" run --config "$profile" --verify-start > "$backup/startup-check.log" 2>&1; then
+    "$backup/incoming" run --config "$profile" --verify-start > "$backup/startup-check.log" 2>&1 ||
         fail "客户端启动检查失败，正在恢复旧服务。诊断日志：$backup/startup-check.log"
-    fi
     phase=注册开机启动服务
     write_service
     phase=启动客户端服务
@@ -463,7 +476,11 @@ install_service() {
         sleep 1
         service_running >/dev/null 2>&1 || fail '客户端服务未持续运行，正在恢复旧服务。'
     done
-    printf '%s\n' "$manager" > "$prefix/init"
+    if [ "$manager" = procd ]; then
+        rm -f -- "$prefix/init"
+    else
+        printf '%s\n' "$manager" > "$prefix/init"
+    fi
     transaction=false
     prune_program_backups incoming runtime cli controller legacy-runtime legacy-runtime.old \
         runtime.restore cli.restore controller.restore runtime.new cli.new controller.new
@@ -475,6 +492,10 @@ install_service() {
 }
 case "${1:-}" in
     check)
+        if [ "$sdwan" -eq 1 ]; then
+            sdwan_requirements
+            printf '%s\n' '已检查 ip 和 /dev/net/tun。转发其他设备的子网流量时，请启用 IPv4 转发并配置回程路由。'
+        fi
         mv --help 2>&1 | grep -q -- '-T' || fail '需要支持 -T 的 mv（GNU coreutils 或 BusyBox）。'
         file_metadata / >/dev/null || fail '无法读取文件权限，请检查 stat 或 ls -ldn。'
         if [ "$manager" = procd ]; then

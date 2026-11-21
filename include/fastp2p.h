@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define FASTP2P_ABI_VERSION 1u
-#define FASTP2P_VERSION "2.0.34"
+#define FASTP2P_VERSION "2.0.35"
 #if defined(_WIN32) && !defined(FASTP2P_STATIC)
 #if defined(FASTP2P_BUILDING_LIBRARY)
 #define FASTP2P_API __declspec(dllexport)
@@ -80,6 +80,8 @@ FASTP2P_API const char *fastp2p_client_device_id(const fastp2p_client *);
 FASTP2P_API const char *fastp2p_client_node(const fastp2p_client *);
 /* Bound peer port, or zero when the client is stopped. */
 FASTP2P_API uint16_t fastp2p_client_public_port(const fastp2p_client *);
+/* Attach an Android SD-WAN TUN before start. The client duplicates the fd. */
+FASTP2P_API int fastp2p_client_attach_sdwan_tun(fastp2p_client *, int fd);
 typedef struct {
     size_t struct_size;
     const char *name;

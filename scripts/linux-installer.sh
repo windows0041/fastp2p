@@ -4,6 +4,8 @@
 set -eu
 umask 077
 fail() { printf '%s\n' "fastp2p: $*" >&2; exit 1; }
+sdwan=${FASTP2P_SDWAN:-0}
+case "$sdwan" in 0|1) ;; *) fail 'FASTP2P_SDWAN 只能为 0 或 1。' ;; esac
 [ "$#" -eq 0 ] || fail '请直接运行 sh 或 bash 加下载文件名，无需传入 Token。'
 case "$0" in /*) self=$0 ;; *) self=$PWD/$0 ;; esac
 name=${0##*/}
@@ -15,7 +17,7 @@ if [ -z "$token" ]; then
 fi
 if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || fail '需要 root 权限，请以 root 执行此脚本。'
-    exec sudo -- sh "$self"
+    exec sudo -- env FASTP2P_SDWAN="$sdwan" sh "$self"
 fi
 for tool in awk uname sha256sum mktemp chmod cp wc; do
     command -v "$tool" >/dev/null 2>&1 || fail "缺少必要命令：$tool"

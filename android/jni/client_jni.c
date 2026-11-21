@@ -104,6 +104,14 @@ JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_start(JNIEnv *env, 
     binding *b = (binding *)(intptr_t)handle;
     return b ? fastp2p_client_start(b->client) : FASTP2P_EINVAL;
 }
+
+JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_attachSdwanTun(
+    JNIEnv *env, jclass cls, jlong handle, jint fd) {
+    (void)env;
+    (void)cls;
+    binding *b = (binding *)(intptr_t)handle;
+    return b ? fastp2p_client_attach_sdwan_tun(b->client, fd) : FASTP2P_EINVAL;
+}
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_step(JNIEnv *env, jclass cls,
                                                                      jlong handle) {
     (void)env;

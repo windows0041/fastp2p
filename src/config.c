@@ -250,6 +250,9 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                                           op_integer(p,"noRelay") != 0) ? 1 : 0};
         rv = fastp2p_client_add_socks5(*out, &proxy, NULL);
     }
+    json_object *sdwan;
+    if (!rv && json_object_object_get_ex(root, "sdwan", &sdwan))
+        rv = fp_client_sdwan_config(*out, sdwan);
     json_object_put(root);
     if (rv && *out) {
         fastp2p_client_destroy(*out);

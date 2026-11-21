@@ -10,6 +10,7 @@ EXPORTS
     fastp2p_client_device_id
     fastp2p_client_node
     fastp2p_client_public_port
+    fastp2p_client_attach_sdwan_tun
     fastp2p_client_add_forward
     fastp2p_client_add_socks5
     fastp2p_client_start
