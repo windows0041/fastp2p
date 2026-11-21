@@ -213,7 +213,7 @@ static int client_main(int argc, char **argv) {
         run_seconds = 25;
     }
     if (fastp2p_runtime_prepare(config_file)) {
-        fputs("Cannot use the managed service account.\n", stderr); return 1;
+        fputs("The system profile requires root and a private, root-owned configuration file.\n", stderr); return 1;
     }
     json_object *root = config_file ? fastp2p_profile_read(config_file) : json_object_new_object();
     if (errno == ERANGE || !root || !json_object_is_type(root, json_type_object)) {
@@ -287,6 +287,7 @@ static int client_main(int argc, char **argv) {
     }
     signal(SIGINT, signal_stop);
     if (fastp2p_runtime_begin(config_file, background)) {
+        fputs("Cannot open the FastP2P runtime log or start another service instance.\n", stderr);
         fastp2p_client_destroy(client); json_object_put(root); return 1;
     }
     signal(SIGTERM, signal_stop);

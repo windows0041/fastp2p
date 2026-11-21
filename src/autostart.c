@@ -34,9 +34,15 @@ int fastp2p_runtime_begin(const char *profile, int background) {
     /* A service STOP may arrive before this event exists. Keep the in-process
      * request; configuration reloads must not clear a real SCM shutdown either. */
     if (background) {
-        char log[4096];
-        if (snprintf(log, sizeof(log), "%s.log", profile) >= (int)sizeof(log)) return -1;
-        WCHAR path[4096]; if (wide(log, path)) return -1;
+        WCHAR path[4096];
+        char machine[4096];
+        if (!fastp2p_service_profile(machine) && !strcmp(profile, machine)) {
+            if (fastp2p_windows_log(path)) return -1;
+        } else {
+            char log[4096];
+            if (snprintf(log, sizeof(log), "%s.log", profile) >= (int)sizeof(log) || wide(log, path))
+                return -1;
+        }
         if (!_wfreopen(path, L"ab", stdout) || !_wfreopen(path, L"ab", stderr)) return -1;
     }
     return 0;
@@ -120,22 +126,20 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <pwd.h>
-#include <grp.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
-#if defined(__linux__)
 static int root_owned_profile(const char *profile) {
     struct stat metadata;
     if (lstat(profile, &metadata) || !S_ISREG(metadata.st_mode) || metadata.st_uid ||
         metadata.st_nlink != 1 || (metadata.st_mode & 0077))
         return 0;
     char path[4096];
+#ifdef __APPLE__
+    /* /etc is Apple's system symlink to /private/etc. */
+    profile = "/private" FASTP2P_SYSTEM_PROFILE;
+#endif
     if (snprintf(path, sizeof(path), "%s", profile) >= (int)sizeof(path))
         return 0;
     char *slash;
@@ -147,25 +151,46 @@ static int root_owned_profile(const char *profile) {
     }
     return 1;
 }
-#endif
 int fastp2p_runtime_prepare(const char *profile) {
-#if defined(__linux__)
-    /* An online binary update can arrive before the service is reinstalled.
-     * Preserve the old account for its profile and never run that profile as root. */
-    if (!geteuid() && fastp2p_linux_managed_profile(profile) && !root_owned_profile(profile)) {
-        struct passwd *account=getpwnam("fastp2p");
-        struct stat metadata;
-        if (!account || !account->pw_uid || lstat(profile, &metadata) ||
-            !S_ISREG(metadata.st_mode) || metadata.st_uid != account->pw_uid ||
-            setgroups(0,NULL) ||
-            setgid(account->pw_gid) || setuid(account->pw_uid)) return -1;
-    }
-#else
-    (void)profile;
-#endif
-    return 0;
+    return profile && !strcmp(profile, FASTP2P_SYSTEM_PROFILE) &&
+           (geteuid() || !root_owned_profile(profile)) ? -1 : 0;
 }
-int fastp2p_runtime_begin(const char *profile, int background) { (void)profile; (void)background; return 0; }
+
+static int open_log_directory(void) {
+    int fd = open(FASTP2P_LOG_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat metadata;
+    if (fd >= 0 && (fstat(fd, &metadata) || metadata.st_uid || (metadata.st_mode & 0077))) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int fastp2p_runtime_begin(const char *profile, int background) {
+    if (!background || !profile || strcmp(profile, FASTP2P_SYSTEM_PROFILE))
+        return 0;
+    if (mkdir(FASTP2P_LOG_DIR, 0700) && errno != EEXIST)
+        return -1;
+    int directory = open_log_directory();
+    if (directory < 0)
+        return -1;
+    int log = openat(directory, "fastp2p.log",
+                     O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+    close(directory);
+    if (log < 0)
+        return -1;
+    struct stat metadata;
+    int failed = fstat(log, &metadata) || !S_ISREG(metadata.st_mode) ||
+                 metadata.st_uid || metadata.st_nlink != 1 || (metadata.st_mode & 0077);
+    if (!failed) {
+        fflush(stdout);
+        fflush(stderr);
+        failed = dup2(log, STDOUT_FILENO) < 0 || dup2(log, STDERR_FILENO) < 0;
+    }
+    if (log != STDOUT_FILENO && log != STDERR_FILENO)
+        close(log);
+    return failed ? -1 : 0;
+}
 int fastp2p_runtime_stopping(void) { return 0; }
 void fastp2p_runtime_request_stop(void) {}
 void fastp2p_runtime_end(void) {}
@@ -206,17 +231,10 @@ static int openwrt_service(const char *action) {
 int fastp2p_stop_installed(const char *profile) {
     (void)profile;
 #ifdef __APPLE__
-    char domain[64], service[80];
-    snprintf(domain, sizeof(domain), "gui/%lu", (unsigned long)getuid());
-    snprintf(service, sizeof(service), "%s/top.fastp2p", domain);
-    char *const check[] = {"/bin/launchctl", "print", service, NULL};
-    if (execute(check, 1)) {
-        char *const session[] = {"/bin/launchctl", "print", domain, NULL};
-        if (!execute(session, 1)) return 0;
-        fputs("Cannot access the macOS graphical login session for fastp2p.\n", stderr);
-        return -1;
-    }
-    char *const stop[] = {"/bin/launchctl", "bootout", service, NULL};
+    if (geteuid()) return -1;
+    char *const check[] = {"/bin/launchctl", "print", "system/top.fastp2p", NULL};
+    if (execute(check, 1)) return 0;
+    char *const stop[] = {"/bin/launchctl", "bootout", "system/top.fastp2p", NULL};
     return execute(stop, 0);
 #else
 #if defined(__linux__)
@@ -227,43 +245,26 @@ int fastp2p_stop_installed(const char *profile) {
 #endif
 }
 int fastp2p_remove_autostart(const char *profile) {
-#ifdef __APPLE__
     return fastp2p_stop_installed(profile);
-#else
-    if (geteuid() || !fastp2p_linux_managed_profile(profile)) return -1;
-    return fastp2p_linux_uninstall(1);
-#endif
-}
-#if defined(__linux__)
-static int linux_controller_ready(void) {
-    struct stat directory, script;
-    return !lstat("/usr/local/fastp2p", &directory) && S_ISDIR(directory.st_mode) &&
-           directory.st_uid == 0 && !(directory.st_mode & 0022) &&
-           !lstat("/usr/local/fastp2p/fastp2p-service", &script) && S_ISREG(script.st_mode) &&
-           script.st_uid == 0 && !(script.st_mode & 0022) &&
-           !access("/usr/local/fastp2p/fastp2p-service", X_OK);
 }
 
 static int unlink_managed(const char *path) {
     return unlink(path) && errno != ENOENT ? -1 : 0;
 }
 
-static int remove_backup_at(int parent, const char *name, dev_t device, unsigned depth) {
+static int protected_directory(const char *path) {
     struct stat st;
-    if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW))
+    if (lstat(path, &st))
         return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode))
-        return unlinkat(parent, name, 0);
-    if (!depth || st.st_uid || st.st_dev != device)
-        return -1;
-    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    DIR *directory = fdopendir(fd);
-    if (!directory) {
-        close(fd);
-        return -1;
-    }
+    return S_ISDIR(st.st_mode) && !st.st_uid && !(st.st_mode & 0022) ? 1 : -1;
+}
+
+static int remove_profile(void) {
+    const char *directory_path = "/etc/fastp2p";
+    int exists = protected_directory(directory_path);
+    if (exists <= 0) return exists;
+    DIR *directory = opendir(directory_path);
+    if (!directory) return -1;
     int failed = 0;
     struct dirent *entry;
     for (;;) {
@@ -273,185 +274,82 @@ static int remove_backup_at(int parent, const char *name, dev_t device, unsigned
             failed |= errno != 0;
             break;
         }
-        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
-            failed |= remove_backup_at(fd, entry->d_name, device, depth - 1) != 0;
-    }
-    closedir(directory);
-    return failed || unlinkat(parent, name, AT_REMOVEDIR) ? -1 : 0;
-}
-
-static int remove_openwrt_config(void) {
-    struct stat st;
-    const char *parent = "/etc/fastp2p-client";
-    const char *state = "/etc/fastp2p-client/config";
-    if (lstat(parent, &st))
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode) || st.st_uid || (st.st_mode & 0022))
-        return -1;
-    int fd = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT ? 0 : -1;
-    DIR *directory = fdopendir(fd);
-    if (!directory) {
-        close(fd);
-        return -1;
-    }
-    int failed = 0;
-    for (;;) {
-        errno = 0;
-        struct dirent *entry = readdir(directory);
-        if (!entry) {
-            failed |= errno != 0;
-            break;
-        }
         const char *name = entry->d_name;
-        const char ca[] = "fastp2p.conf.ca.";
-        size_t length = sizeof(ca) - 1;
-        int certificate = strlen(name) == length + 68 && !strncmp(name, ca, length) &&
+        const char prefix[] = "config.conf.ca.";
+        size_t length = sizeof(prefix) - 1;
+        int certificate = strlen(name) == length + 68 && !strncmp(name, prefix, length) &&
             strspn(name + length, "0123456789abcdef") == 64 && !strcmp(name + length + 64, ".pem");
-        if (certificate || !strcmp(name, "fastp2p.conf") || !strcmp(name, "fastp2p.conf.previous") ||
-            !strcmp(name, "fastp2p.conf.identity"))
-            failed |= unlinkat(fd, name, 0) && errno != ENOENT;
+        if (certificate || !strcmp(name, "config.conf") || !strcmp(name, "config.conf.previous") ||
+            !strcmp(name, "config.conf.identity"))
+            failed |= unlinkat(dirfd(directory), name, 0) && errno != ENOENT;
     }
     closedir(directory);
-    rmdir(state);
-    rmdir(parent);
+    (void)rmdir(directory_path);
     return failed ? -1 : 0;
 }
 
-static int openwrt_uninstall(int keep_config) {
-    if (openwrt_service("stop") || openwrt_service("disable") ||
-        unlink_managed("/etc/init.d/fastp2p"))
+static int delete_installation(int keep_config) {
+    if (protected_directory(FASTP2P_SYSTEM_DIR) < 0 ||
+        protected_directory(FASTP2P_SYSTEM_DIR "/bin") < 0)
         return -1;
-    if (keep_config) {
-        puts("fastp2p service removed; configuration retained.");
-        return 0;
+    if (!keep_config && remove_profile())
+        return -1;
+    int log = open_log_directory();
+    if (log >= 0) {
+        (void)unlinkat(log, "fastp2p.log", 0);
+        close(log);
+        (void)rmdir(FASTP2P_LOG_DIR);
     }
-    if (remove_openwrt_config())
+    if (unlink_managed(FASTP2P_SYSTEM_DIR "/bin/fastp2p.old") ||
+        unlink_managed(FASTP2P_SYSTEM_DIR "/bin/fastp2p"))
         return -1;
-
-    struct stat st;
-    const char *prefix = "/usr/local/fastp2p";
-    if (!lstat(prefix, &st)) {
-        if (!S_ISDIR(st.st_mode) || st.st_uid || (st.st_mode & 0022))
+#ifdef __linux__
+    char target[4096];
+    ssize_t used = readlink("/usr/local/bin/fastp2p", target, sizeof(target) - 1);
+    if (used >= 0) {
+        target[used] = 0;
+        if (!strcmp(target, FASTP2P_SYSTEM_DIR "/bin/fastp2p") &&
+            unlink_managed("/usr/local/bin/fastp2p"))
             return -1;
-        int directory = open(prefix, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (directory < 0)
-            return -1;
-        int removed = remove_backup_at(directory, ".backups", st.st_dev, 4);
-        close(directory);
-        if (removed || unlink_managed("/usr/local/fastp2p/fastp2p-service") ||
-            unlink_managed("/usr/local/fastp2p/init"))
-            return -1;
-        /* A legacy bin directory may belong to the previous service account. */
-        if (!lstat("/usr/local/fastp2p/bin", &st)) {
-            if (!S_ISDIR(st.st_mode) || unlink_managed("/usr/local/fastp2p/bin/fastp2p.old") ||
-                unlink_managed("/usr/local/fastp2p/bin/fastp2p"))
-                return -1;
-            rmdir("/usr/local/fastp2p/bin");
-        } else if (errno != ENOENT) {
-            return -1;
-        }
-        rmdir(prefix);
-    } else if (errno != ENOENT) {
-        return -1;
     }
-    if (unlink_managed("/usr/local/bin/fastp2p"))
-        return -1;
-    puts("fastp2p service and client configuration removed.");
+#endif
+    (void)rmdir(FASTP2P_SYSTEM_DIR "/bin");
+    (void)rmdir(FASTP2P_SYSTEM_DIR);
+    puts(keep_config ? "fastp2p removed; configuration retained." :
+                       "fastp2p service and client configuration removed.");
     return 0;
 }
 
-int fastp2p_linux_uninstall(int keep_config) {
-    if (geteuid())
-        return -1;
+int fastp2p_posix_uninstall(int keep_config) {
+    if (geteuid()) return -1;
+#ifdef __APPLE__
+    const char *lock = "/var/run/fastp2p-macos-install.lock";
+    if (mkdir(lock, 0700)) return -1;
+    int result = fastp2p_stop_installed(NULL) ||
+                 unlink_managed("/Library/LaunchDaemons/top.fastp2p.plist") ||
+                 delete_installation(keep_config);
+    return rmdir(lock) ? -1 : result;
+#else
     if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK)) {
         const char *lock = "/var/run/fastp2p-install.lock";
-        if (mkdir(lock, 0700)) {
-            perror("Cannot lock the OpenWrt FastP2P installation");
-            return -1;
-        }
-        int result = openwrt_uninstall(keep_config);
-        if (result)
-            fputs("OpenWrt FastP2P uninstall did not complete. Check service and file permissions.\n", stderr);
+        if (mkdir(lock, 0700)) return -1;
+        int result = openwrt_service("stop") || openwrt_service("disable") ||
+                     unlink_managed("/etc/init.d/fastp2p") || delete_installation(keep_config);
         return rmdir(lock) ? -1 : result;
     }
-    if (!linux_controller_ready()) {
-        fputs("Use the Linux installer script from the gateway to manage this installation.\n", stderr);
+    const char *controller = FASTP2P_SYSTEM_DIR "/fastp2p-service";
+    struct stat script;
+    if (protected_directory(FASTP2P_SYSTEM_DIR) != 1 || lstat(controller, &script) ||
+        !S_ISREG(script.st_mode) || script.st_uid || (script.st_mode & 0022))
         return -1;
-    }
-    char *const command[] = {"/usr/local/fastp2p/fastp2p-service", "uninstall",
-                             keep_config ? "--keep-config" : NULL, NULL};
+    char *const command[] = {(char *)controller, "uninstall", keep_config ? "--keep-config" : NULL, NULL};
     return execute(command, 0);
+#endif
 }
-#endif
-#ifdef __APPLE__
-static int copy_binary(const char *target) {
-    char source[4096];
-#ifdef __APPLE__
-    uint32_t capacity = sizeof(source);
-    if (_NSGetExecutablePath(source, &capacity)) return -1;
-#else
-    ssize_t length = readlink("/proc/self/exe", source, sizeof(source) - 1);
-    if (length <= 0) return -1;
-    source[length] = 0;
-#endif
-    struct stat a, b;
-    if (stat(source, &a)) return -1;
-    if (!stat(target, &b) && a.st_dev == b.st_dev && a.st_ino == b.st_ino) return 0;
-    if (fastp2p_private_parents(target)) return -1;
-    char temporary[4096];
-    if (snprintf(temporary, sizeof(temporary), "%s.new.%lu", target, (unsigned long)getpid()) >= (int)sizeof(temporary)) return -1;
-    int input = open(source, O_RDONLY | O_CLOEXEC), output = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0755);
-    if (input < 0 || output < 0) { if (input >= 0) close(input); if (output >= 0) close(output); return -1; }
-    char buffer[65536]; ssize_t length_read; int ok = 1;
-    while ((length_read = read(input, buffer, sizeof(buffer))) > 0) {
-        size_t used = 0;
-        while (used < (size_t)length_read) {
-            ssize_t count = write(output, buffer + used, (size_t)length_read - used);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) { ok = 0; break; }
-            used += (size_t)count;
-        }
-        if (!ok) break;
-    }
-    if (length_read < 0 || fsync(output) || fchmod(output, 0755)) ok = 0;
-    close(input); if (close(output)) ok = 0;
-    if (ok && rename(temporary, target)) ok = 0;
-    if (!ok) unlink(temporary);
-    return ok ? 0 : -1;
-}
-#endif
+
 int fastp2p_enable_autostart(const char *profile, const char *ca) {
-#ifdef __APPLE__
-    (void)profile; (void)ca;
-    /* The same executable/profile runs under launchd; installation stays per-user. */
-    const char *home = getenv("HOME");
-    if (!home || strchr(home, '<') || strchr(home, '&') || strchr(profile, '<') || strchr(profile, '&')) return -1;
-    char target[4096], plist[4096], domain[64], text[12000];
-    if (snprintf(target, sizeof(target), "%s/Library/Application Support/fastp2p/fastp2p", home) >= (int)sizeof(target) ||
-        snprintf(plist, sizeof(plist), "%s/Library/LaunchAgents/top.fastp2p.plist", home) >= (int)sizeof(plist) || copy_binary(target)) return -1;
-    int size = snprintf(text, sizeof(text), "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>top.fastp2p</string><key>ProgramArguments</key><array><string>%s</string><string>run</string><string>--config</string><string>%s</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>", target, profile);
-    if (size < 0 || size >= (int)sizeof(text) || fastp2p_private_parents(plist)) return -1;
-    FILE *file = fopen(plist, "wb");
-    if (!file) return -1;
-    int ok = fwrite(text, 1, (size_t)size, file) == (size_t)size;
-    if (fclose(file)) ok = 0;
-    if (!ok) return -1;
-    snprintf(domain, sizeof(domain), "gui/%lu", (unsigned long)getuid());
-    char *const load[] = {"/bin/launchctl", "bootstrap", domain, plist, NULL};
-    return execute(load, 0);
-#else
+    (void)profile;
     (void)ca;
-    char expected[4096];
-    if (geteuid() || fastp2p_service_profile(expected) || strcmp(profile, expected) || !linux_controller_ready()) {
-        fputs("Install the Linux service using the script downloaded from the gateway.\n", stderr);
-        return -1;
-    }
-    char source[80]; snprintf(source, sizeof(source), "/proc/%lu/exe", (unsigned long)getpid());
-    char *const install[] = {"/usr/local/fastp2p/fastp2p-service", "install", "--binary", source,
-                             "--config", (char *)profile, NULL};
-    return execute(install, 0);
-#endif
+    return -1;
 }
 #endif

@@ -99,11 +99,6 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
     snprintf(sync_state.path,sizeof(sync_state.path),"%s",path);
     snprintf(sync_state.previous,sizeof(sync_state.previous),"%s.previous",path);
     char machine[4096];sync_state.machine=fastp2p_service_supported()&&!fastp2p_service_profile(machine)&&!strcmp(machine,path);
-#ifdef _WIN32
-    const char *program_data=getenv("ProgramData");
-    if(program_data&&snprintf(machine,sizeof(machine),"%s/fastp2p/client.dat",program_data)<(int)sizeof(machine)&&!strcmp(machine,path))
-        sync_state.machine=1; /* in-place upgrade before the installer migrates it */
-#endif
     if(sync_state.active)json_object_put(sync_state.active);
     sync_state.active=json_object_get(active);sync_state.online=0;sync_state.reload=0;
     json_object *meta=get(active,META);
@@ -113,8 +108,6 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
         snprintf(sync_state.digest,sizeof(sync_state.digest),"%s",string(meta,"digest"));
         sync_state.deadline=op_monotonic_ns()+UINT64_C(25000000000);
     }
-    /* Old Linux units keep /etc read-only. Preserve their legacy rule protocol
-     * until the installer migrates them to the writable config directory. */
     return client&&fastp2p_profile_writable(path)?fastp2p_client_set_config_handler(client,receive,NULL):0;
 }
 void fp_config_sync_online(uint16_t public_port) {

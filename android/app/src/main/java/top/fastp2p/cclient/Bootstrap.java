@@ -2,9 +2,7 @@ package top.fastp2p.cclient;
 
 import android.content.Context;
 import android.content.SharedPreferences;
-import java.io.File;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.UUID;
 import org.json.JSONObject;
@@ -41,13 +39,7 @@ final class Bootstrap {
             throw new IllegalArgumentException("安装 Token 无效");
         String fingerprint = digest(host + "\n" + port + "\n" + pem);
         SharedPreferences preferences = SecretStore.preferences(context);
-        String accepted = preferences.getString("gatewayIdentity", "");
-        if (accepted.isEmpty() && preferences.contains("enrollment")) {
-            JSONObject previous = new JSONObject(SecretStore.config(context)).getJSONObject("network");
-            File previousCA = new File(preferences.getString("ca", ""));
-            String previousPEM = previousCA.isFile() ? new String(Files.readAllBytes(previousCA.toPath()), StandardCharsets.US_ASCII) : "";
-            accepted = digest(previous.getString("ServerHost") + "\n" + previous.optInt("ServerPort", 27183) + "\n" + previousPEM);
-        }
+        String accepted = SecretStore.gatewayIdentity(context);
         // Migration can only select the immutable preset in this signed APK.
         // Its TLS identity and Token must still verify before commit().
         if (!accepted.isEmpty() && !accepted.equals(fingerprint) && !migrate)
@@ -58,7 +50,7 @@ final class Bootstrap {
             if (!preferences.edit().putString("deviceID", identity).commit()) throw new IllegalStateException();
         }
         String ca = pem.isEmpty() ? TrustStore.resolve(context, "") : "";
-        JSONObject root = preferences.contains("enrollment") ? new JSONObject(SecretStore.config(context)) : new JSONObject();
+        JSONObject root = !accepted.isEmpty() ? new JSONObject(SecretStore.config(context)) : new JSONObject();
         JSONObject network = new JSONObject().put("AutoNode", true).put("DeviceID", identity)
                 .put("ServerHost", host).put("ServerPort", port).put("Token", 0);
         JSONObject previousNetwork = root.optJSONObject("network");
@@ -71,10 +63,8 @@ final class Bootstrap {
         return new Bootstrap(root.toString(), key, ca, fingerprint);
     }
     void commit(Context context, String verifiedConfig) throws Exception {
-        SecretStore.saveToken(context, token);
-        SecretStore.saveConfig(context, verifiedConfig);
-        if (!SecretStore.preferences(context).edit().putString("ca", ca)
-                .putString("enrollment", fingerprint).putString("gatewayIdentity", fingerprint).putBoolean("enabled", true).commit())
-            throw new IllegalStateException("无法保存接入配置");
+        SecretStore.saveEnrollment(context, token, verifiedConfig, ca, fingerprint);
+        if (!SecretStore.preferences(context).edit().putBoolean("enabled", true).commit())
+            throw new IllegalStateException("无法保存启动状态");
     }
 }

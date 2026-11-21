@@ -23,7 +23,7 @@ fastp2p --licenses
 
 安装 Token 为 16 位数字，网关地址、端口和公开 CA 已预置于专用客户端包。安装先完成 TLS 主机名校验及网关认证，成功后原子保存配置。错误凭据不会替换旧配置。支持 `--token`、`FASTP2P_INSTALL_TOKEN`、`--node`、`--config`、`--no-service`。
 
-在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/bin/fastp2p`。OpenWrt 和 ImmortalWrt 将配置存放在 `/etc/fastp2p-client/config/fastp2p.conf`，其他 Linux 系统使用 `/var/lib/fastp2p/config/fastp2p.conf`。手动下载脚本时请保留文件名中的 Token。
+在网关控制台选择 Linux 并复制安装命令。脚本会识别 CPU，从网关通过 HTTPS 下载程序，并校验长度、SHA-256 和版本。下载程序需要 curl 或支持 TLS 的 GNU wget。程序安装到 `/usr/local/fastp2p/bin/fastp2p`。各 Linux 发行版统一使用 `/etc/fastp2p/config.conf`，日志写入 `/tmp/fastp2p/fastp2p.log`。手动下载脚本时请保留文件名中的 Token。
 
 脚本先在私有临时目录验证接入和合并配置，通过后才停止旧服务。安装后的服务默认以 root 运行，配置及包含凭据的目录由 root 私有。安装器验证监听端口、网关认证和服务运行状态，失败时恢复旧文件、目录权限和开机启动状态。在旧版安装上重新运行新版安装命令即可迁移服务权限并保留节点身份。若旧网关仍在共享客户端的数据目录，请先迁移网关。
 
@@ -46,11 +46,15 @@ sudo journalctl -u fastp2p-client -n 50 --no-pager
 
 Alpine/OpenRC 用 `rc-service fastp2p status`，OpenWrt 用 `/etc/init.d/fastp2p status`。安装完成后程序在后台运行，不需要保持安装终端在线。
 
-OpenWrt 从 root 终端运行 `fastp2p stop` 停止服务，使用 `fastp2p uninstall` 卸载客户端并删除配置。使用 `fastp2p uninstall --keep-config` 可移除开机服务并保留程序、配置和节点身份，方便重新安装。
+在 Linux 和 macOS 用 root 运行 `/usr/local/fastp2p/bin/fastp2p stop` 可停止服务，运行 `/usr/local/fastp2p/bin/fastp2p uninstall` 可卸载。加 `--keep-config` 可保留当前布局中的配置和节点身份。
 
-macOS 在网关控制台的「安装客户端 → Mac」下载通用安装脚本。保留文件名，在终端执行 `sh ./fastp2p-macos-<16位数字>.sh`，无需 sudo。脚本支持 macOS 13 及以上，自动下载 Apple Silicon 或 Intel 版本，保留原节点身份和配置。安装后 LaunchAgent 随当前用户登录启动。
+macOS 在网关控制台的「安装客户端 → Mac」下载通用安装脚本。保留文件名，在终端执行 `sh ./fastp2p-macos-<16位数字>.sh` 并按提示输入管理员密码。脚本支持 macOS 13 及以上，自动下载 Apple Silicon 或 Intel 版本。程序、配置和日志与 Linux 使用相同路径，LaunchDaemon 随系统开机启动。
 
-Windows 双击带 Token 文件名的 EXE，经 UAC 授权后卸载旧服务并安装到 `%ProgramFiles%/fastp2p`，机器级 DPAPI 加密配置在 `%ProgramData%/fastp2p/config/fastp2p.conf`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%/fastp2p/config/fastp2p.conf`，使用当前用户 DPAPI。旧 `client.dat` 会迁移，备份保存在新配置目录。macOS 安装为当前用户的 LaunchAgent，最低 macOS 13。高级调试使用 `fastp2p install --token-file token.txt --no-service` 后手动运行。
+Windows 双击带 Token 文件名的 EXE，经 UAC 授权后安装到 `%ProgramFiles%\fastp2p`。服务配置使用机器级 DPAPI 加密，位于 `%ProgramData%\fastp2p\config.conf`，运行和安装日志位于 `%SystemRoot%\Temp\fastp2p\fastp2p.log`。高级 CLI 的当前用户配置在 `%LOCALAPPDATA%\fastp2p\config.conf`，使用当前用户 DPAPI。
+
+Android 由系统安装 APK。接入密钥和客户端配置加密存放在应用私有目录的 `files/fastp2p/config.conf`，运行日志位于 `cache/fastp2p/fastp2p.log`。
+
+从旧目录切换到这套布局时，请先用旧版卸载客户端，再从网关安装新版并重新接入。 旧版 macOS 使用登录启动项，先用 `launchctl bootout "gui/$(id -u)/top.fastp2p"` 停止服务，再移除 `~/Library/LaunchAgents/top.fastp2p.plist`。
 
 Windows 开机服务和 `run --background` 不创建终端窗口；后台日志写入配置文件同目录的 `fastp2p.conf.log`。手动从终端运行前台命令时连接现有终端，管道和文件重定向继续可用。只有双击安装并完成 UAC 授权后，才创建安装进度终端和结果提示。服务崩溃或启动时 DNS/网络暂不可用导致退出时，Windows 服务管理器会按恢复策略重启客户端。
 
@@ -78,7 +82,7 @@ curl -fsSL https://fastp2p.top:10008/linux/install | sudo env FASTP2P_SDWAN=1 sh
 
 **两台 VPS**
 
-在各自 `fastp2p.conf` 根对象加入 `sdwan` 字段，保留已有 `network` 等配置。可运行 `fastp2p --service-profile` 查看托管配置路径。以下两个片段分别定义 A、B 的虚拟地址，并互相导出一个 IPv4 子网。仅需虚拟 IP 互通时可以省略 `LocalRoutes` 和 `Routes`。
+在各自 `config.conf` 根对象加入 `sdwan` 字段，保留已有 `network` 等配置。可运行 `fastp2p --service-profile` 查看托管配置路径。以下两个片段分别定义 A、B 的虚拟地址，并互相导出一个 IPv4 子网。仅需虚拟 IP 互通时可以省略 `LocalRoutes` 和 `Routes`。
 
 VPS A 的配置片段
 

@@ -84,7 +84,7 @@ Android 还额外要求 APK 的 `versionCode` **严格大于**已安装版本：
 本次构建（Windows 双击安装包、Android 安装 APK、Linux 执行控制台下载的脚本）。
 完成这一次之后，后续版本都可以从控制台远程下发。
 
-旧 Linux 服务使用安装脚本迁移到 `/usr/local/fastp2p`，配置和证书迁到 `/var/lib/fastp2p/config/fastp2p.conf`，自动移除旧 `20-remote-upgrade.conf` 路径覆盖，保留 DeviceID。成功后清理旧 `/var/lib/fastp2p-client` 中已备份的程序和 `/etc/fastp2p/client.json` 客户端文件，保留同目录的网关文件。新安装器的 root 控制脚本放在根用户持有的目录中，服务仅能写程序的 `bin` 和自身 config 目录，不接管同机网关的数据目录所有权；`/usr/local/bin/fastp2p` 是单独的 CLI 副本，更新后运行服务的版本以控制台上报为准。自定义服务单元需自行确认权限与更新路径。Windows 的远程替换由 fastp2p 系统服务执行。
+从旧安装布局切至 Linux、macOS、Windows 或 Android 的新布局时，先使用旧版卸载，再安装新版并重新接入。Linux 和 macOS 的程序位于 `/usr/local/fastp2p/bin/fastp2p`，配置位于 `/etc/fastp2p/config.conf`，日志位于 `/tmp/fastp2p/fastp2p.log`。后续原地升级使用当前服务的安装路径。Windows 的远程替换仍由系统服务执行。
 
 ## 回滚
 

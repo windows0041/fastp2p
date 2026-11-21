@@ -11,7 +11,7 @@ public final class BootReceiver extends BroadcastReceiver {
             RootUpdateInstaller.discardSnapshots(context);
         }
         if (SecretStore.preferences(context).getBoolean("enabled", false) &&
-                SecretStore.preferences(context).contains("enrollment")) {
+                SecretStore.enrolled(context)) {
             context.startForegroundService(new Intent(context, FastP2PService.class));
         }
     }

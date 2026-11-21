@@ -38,7 +38,7 @@ public final class InstallActivity extends Activity {
             finish();
             return;
         }
-        if (token == null && !SecretStore.preferences(this).contains("enrollment")) {
+        if (token == null && !SecretStore.enrolled(this)) {
             Toast.makeText(this, "请使用网关控制台提供的安装链接接入", Toast.LENGTH_LONG).show();
             finishEntry();
             return;

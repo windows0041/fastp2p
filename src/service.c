@@ -142,6 +142,10 @@ static int restrict_directory(const char *file) {
     *slash = 0;
     WCHAR wide_directory[4096];
     if (wide(directory, wide_directory)) return -1;
+    DWORD attributes = GetFileAttributesW(wide_directory);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return -1;
     EXPLICIT_ACCESSW entries[2] = {0};
     for (int i = 0; i < 2; ++i) {
         entries[i].grfAccessPermissions = GENERIC_ALL;
@@ -189,6 +193,33 @@ int fastp2p_service_prepare(const char *profile) {
     if (!profile || fastp2p_private_parents(profile))
         return -1;
     return restrict_directory(profile);
+}
+
+static int windows_temp_directory(wchar_t path[4096]) {
+    WCHAR root[4096];
+    UINT size = GetSystemWindowsDirectoryW(root, 4096);
+    if (!size || size >= 4096) return -1;
+    int length = swprintf(path, 4096, L"%ls\\Temp\\fastp2p", root);
+    return length > 0 && length < 4096 ? 0 : -1;
+}
+
+int fastp2p_windows_log(wchar_t path[4096]) {
+    WCHAR folder[4096];
+    char utf8[4096];
+    if (windows_temp_directory(folder)) return -1;
+    int length = swprintf(path, 4096, L"%ls\\fastp2p.log", folder);
+    if (length < 0 || length >= 4096 ||
+        !WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL) ||
+        fastp2p_service_prepare(utf8))
+        return -1;
+    HANDLE file = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE) return -1;
+    BY_HANDLE_FILE_INFORMATION info;
+    int trusted = GetFileInformationByHandle(file, &info) && info.nNumberOfLinks == 1 &&
+                  !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY));
+    CloseHandle(file);
+    return trusted ? 0 : -1;
 }
 
 int fastp2p_service_install(const char *profile, const char *ca) {
@@ -412,6 +443,15 @@ int fastp2p_service_purge(void) {
             do {
                 if (!wcscmp(entry.cFileName, L".") || !wcscmp(entry.cFileName, L".."))
                     continue;
+                const wchar_t *name = entry.cFileName;
+                const wchar_t certificate[] = L"config.conf.ca.";
+                size_t prefix = sizeof(certificate) / sizeof(*certificate) - 1;
+                int ca = wcslen(name) == prefix + 68 && !wcsncmp(name, certificate, prefix) &&
+                         wcsspn(name + prefix, L"0123456789abcdef") == 64 &&
+                         !wcscmp(name + prefix + 64, L".pem");
+                if (!ca && wcscmp(name, L"config.conf") && wcscmp(name, L"config.conf.previous") &&
+                    wcscmp(name, L"config.conf.identity"))
+                    continue;
                 WCHAR victim[4096];
                 if (snprintf(joined, sizeof(joined), "%s/%ls", directory, entry.cFileName) >=
                     (int)sizeof(joined))
@@ -427,6 +467,13 @@ int fastp2p_service_purge(void) {
     WCHAR wide_directory[4096];
     if (!wide(directory, wide_directory))
         RemoveDirectoryW(wide_directory);
+
+    WCHAR temp[4096], log[4096];
+    if (!windows_temp_directory(temp) && GetFileAttributesW(temp) != INVALID_FILE_ATTRIBUTES &&
+        !fastp2p_windows_log(log)) {
+        DeleteFileW(log);
+        RemoveDirectoryW(temp);
+    }
 
     const char *program_files = getenv("ProgramFiles");
     if (program_files && *program_files) {

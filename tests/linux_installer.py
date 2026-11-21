@@ -42,7 +42,7 @@ def command(*values):
 
 command('mount', '--make-rprivate', '/')
 command('ip', 'link', 'set', 'lo', 'up')
-with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary, ExitStack() as mounts:
+with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-', dir='/var/tmp') as temporary, ExitStack() as mounts:
     root = Path(temporary)
     root.chmod(0o700)
     etc = root / 'etc'; etc.mkdir()
@@ -70,13 +70,14 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-installer-test-') as temporary,
     # A read-only source is a second guard against deletion of host files.
     mounts.callback(command, 'umount', '-l', str(original_local))
     command('mount', '-o', 'remount,bind,ro', str(original_local))
-    command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/local')
+    command('mount', '-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', '/usr/local')
     # Official Python containers keep their stdlib here. Preserve it while
     # isolating product paths and /usr/local/bin from the host installation.
     if (original_local/'lib').is_dir():
         Path('/usr/local/lib').mkdir()
         command('mount', '--bind', str(original_local/'lib'), '/usr/local/lib')
         command('mount', '-o', 'remount,bind,ro', '/usr/local/lib')
+    command('mount', '-t', 'tmpfs', '-o', 'mode=1777', 'tmpfs', '/tmp')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/run')
     command('mount', '-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', '/var/lib')
     command('mount', '-t', 'tmpfs', 'tmpfs', '/usr/sbin')
@@ -182,261 +183,120 @@ esac
             assert db.execute('SELECT expires_at FROM package_leases WHERE platform="linux"').fetchone()[0] > time.time()
         named = root/('fastp2p-'+key); named.write_bytes(installer)
         def run(path=named, expected=0, shell='sh'):
-            # Legacy-profile migration can drop UID/GID, which prevents
-            # LeakSanitizer from attaching on some container kernels.
-            installer_env=dict(environment)
-            prior=installer_env.get('ASAN_OPTIONS','')
-            installer_env['ASAN_OPTIONS']=(prior+':' if prior else '')+'detect_leaks=0'
-            result = subprocess.run([shell, str(path)], env=installer_env, capture_output=True, timeout=50)
+            result = subprocess.run([shell, str(path)], env=environment, capture_output=True, timeout=50)
             if result.returncode != expected:
-                diagnostic=result.stderr.decode(errors='replace')
-                checks=list(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'))
-                if checks:diagnostic+='\n'+max(checks,key=lambda p:p.stat().st_mtime_ns).read_text(errors='replace')[-8000:]
-                raise AssertionError(diagnostic.replace(key,'[redacted]'))
+                diagnostic = (result.stdout + result.stderr).decode(errors='replace')
+                raise AssertionError(diagnostic.replace(key, '[redacted]'))
             assert key.encode() not in result.stdout+result.stderr
             assert b'Sanitizer' not in result.stderr and b'runtime error:' not in result.stderr
             return result
-        linux_profile = Path('/var/lib/fastp2p/config/fastp2p.conf')
-        openwrt_profile = Path('/etc/fastp2p-client/config/fastp2p.conf')
+        profile = Path('/etc/fastp2p/config.conf')
+        binary = Path('/usr/local/fastp2p/bin/fastp2p')
+        cli = Path('/usr/local/bin/fastp2p')
         controller = Path('/usr/local/fastp2p/fastp2p-service')
-        def installed_controller():
-            return controller.read_bytes() if controller.exists() else None
+        adjacent = Path('/etc/fastp2p/gateway.env')
+        adjacent.write_text('keep')
         results = {'gateway_filename_token_free_cache_raw_upgrade_and_download_lease': True}
         minimal = root/'procd-tools'
         minimal.mkdir()
         for name in ('sh','id','awk','uname','sha256sum','mktemp','chmod','cp','wc','rm','rmdir',
-                     'mkdir','mv','grep','curl','cat','ls','date','chown','sleep','touch','ln'):
+                     'mkdir','mv','grep','curl','cat','ls','sleep','touch','ln'):
             (minimal/name).symlink_to(shutil.which(name))
         native_path = environment['PATH']
+
+        def native(*args):
+            return subprocess.run([str(cli), *args], env=environment, capture_output=True, timeout=15)
+
         for manager in ('systemd', 'systemd219', 'procd', 'openrc'):
-            profile = openwrt_profile if manager == 'procd' else linux_profile
             environment['PATH'] = str(minimal) if manager == 'procd' else native_path
-            for name in ('client-running', 'client-enabled', 'fail-start', 'fail-after-start'):
-                (root/name).unlink(missing_ok=True)
-            for folder in ('/usr/local/fastp2p', '/etc/systemd/system', '/etc/init.d'):
-                shutil.rmtree(folder, ignore_errors=True); Path(folder).mkdir(parents=True)
-            for file in (linux_profile, openwrt_profile, Path('/etc/openwrt_release'), Path('/etc/rc.common'), Path('/sbin/openrc-run')):
-                file.unlink(missing_ok=True)
+            for file in ('/etc/openwrt_release', '/etc/rc.common', '/sbin/openrc-run'):
+                Path(file).unlink(missing_ok=True)
             shutil.rmtree('/run/systemd', ignore_errors=True)
             environment['FIXTURE_SYSTEMD'] = '219' if manager == 'systemd219' else '252'
-            if manager.startswith('systemd'): Path('/run/systemd/system').mkdir(parents=True)
-            elif manager == 'procd':
-                Path('/etc/openwrt_release').write_text("DISTRIB_ID='ImmortalWrt'\nDISTRIB_RELEASE='25.12.2'\n")
-                executable(Path('/etc/rc.common'), '''
-exec "$FIXTURE/tools/service-fixture" procd "$2"
-''')
-            else: executable(Path('/sbin/openrc-run'), 'exit 0\n')
-            events.write_text('')
-            if manager == 'procd':
-                # Limit the actual install filesystem to one binary plus metadata.
-                # Seed a failed transaction's staged image to exercise recovery.
-                Path('/usr/local/bin/fastp2p').unlink(missing_ok=True)
-                stats=os.statvfs('/usr/local')
-                original_size=stats.f_blocks*stats.f_frsize
-                command('mount','-o',f'remount,size={len(payload)+512*1024}','/usr/local')
-                try:
-                    stale=Path('/usr/local/fastp2p/.backups/20200103T000000.44')
-                    stale.mkdir(parents=True, mode=0o700)
-                    (stale/'incoming').write_bytes(payload)
-                    (stale/'startup-check.log').write_text('keep diagnostics')
-                    stats=os.statvfs('/usr/local')
-                    assert stats.f_bavail*stats.f_frsize < len(payload)
-                    starting = run(short_name)
-                    assert 'ImmortalWrt 25.12.2'.encode() in starting.stdout
-                    assert openwrt_profile.is_file() and not linux_profile.exists()
-                    assert subprocess.check_output([str(client),'--service-profile'],text=True).strip() == str(openwrt_profile)
-                    binary=Path('/usr/local/fastp2p/bin/fastp2p')
-                    cli=Path('/usr/local/bin/fastp2p')
-                    assert binary.samefile(cli) and cli.is_symlink() and cli.lstat().st_uid==0
-                    assert not (stale/'incoming').exists()
-                    assert (stale/'startup-check.log').read_text()=='keep diagnostics'
-                    events.write_text('')
-                    response=run(short_name,1)
-                    assert '原服务尚未停止'.encode() in response.stderr
-                    assert events.read_text()=='' and binary.read_bytes()==payload and binary.samefile(cli)
-                    assert not any(stale.parent.glob('*/incoming'))
-                    assert (root/'client-running').exists()
-                finally:
-                    command('mount','-o',f'remount,size={original_size}','/usr/local')
-                results['one_image_install_reclaims_failed_stage_and_preserves_service_on_enospc']=True
-            else:
-                run(shell='bash' if manager.startswith('systemd') else 'sh')
-            assert (root/'client-running').exists() and (root/'client-enabled').exists()
-            first = json.loads(profile.read_text()); identity = first['network']['DeviceID']
-            first['customSetting'] = {'preserve': True}; first['network']['UDPPort'] = 29887
-            first['network']['Node'] = 'ignored-stale-node'
-            profile.write_text(json.dumps(first)); before = profile.read_bytes()
-            binary = Path('/usr/local/fastp2p/bin/fastp2p')
-            assert binary.read_bytes() == payload and Path('/usr/local/bin/fastp2p').read_bytes() == payload
-            if manager == 'procd':
-                assert not controller.exists()
-                executable(controller, 'exit 88\n')
-            else:
-                assert controller.stat().st_uid == 0 and not controller.stat().st_mode & 0o022
-            assert Path('/usr/local/fastp2p').stat().st_uid == 0
-            backups=Path('/usr/local/fastp2p/.backups')
-            assert not any(backups.glob('*/incoming'))
-            historical=backups/'20200101T000000.42';historical.mkdir(mode=0o700)
-            for name in ('incoming','runtime','cli','controller','legacy-runtime','legacy-runtime.old'):
-                (historical/name).write_bytes(payload)
-            (historical/'desired-config').write_text('retain-private-config')
-            (historical/'startup-check.log').write_text('retain-diagnostics')
-            binary.with_name('fastp2p.old').write_bytes(payload)
-            outside=root/('outside-'+manager);outside.mkdir();(outside/'runtime').write_text('do-not-follow')
-            (backups/'20200102T000000.43').symlink_to(outside,target_is_directory=True)
-            unknown=backups/'user-data';unknown.mkdir();(unknown/'runtime').write_text('not-an-installer-backup')
-            assert binary.parent.stat().st_uid == 0 and profile.stat().st_uid == 0
-            assert profile.stat().st_mode & 0o777 == 0o600
             if manager.startswith('systemd'):
-                unit = Path('/etc/systemd/system/fastp2p-client.service').read_text()
-                assert ('ProtectSystem=full' if manager == 'systemd219' else 'ProtectSystem=strict') in unit
-                assert 'Restart=always' in unit and str(binary) in unit
-                assert 'User=root' in unit and 'Group=root' in unit
-                dropin = Path('/etc/systemd/system/fastp2p-client.service.d'); dropin.mkdir()
-                (dropin/'20-remote-upgrade.conf').write_text('[Service]\nExecStart=/old/client\n')
+                Path('/run/systemd/system').mkdir(parents=True)
+                unit = Path('/etc/systemd/system/fastp2p-client.service')
             else:
-                unit = Path('/etc/init.d/fastp2p').read_text()
-                assert ('respawn 3600 3 0' if manager == 'procd' else 'supervisor="supervise-daemon"') in unit
-                assert ('procd_set_param user root' if manager == 'procd' else 'command_user="root:root"') in unit
-                assert str(profile) in unit
-            legacy=Path('/var/lib/fastp2p-client'); legacy.mkdir(exist_ok=True)
-            (legacy/'fastp2p').write_bytes(payload)
-            old_profile=Path('/etc/fastp2p/client.json')
-            old_profile.write_bytes(profile.read_bytes()); profile.unlink()
-            gateway_db=profile.parent.parent/'nodes.sqlite3'; gateway_db.write_bytes(b'gateway-fixture')
-            os.chown(gateway_db, 32123, 32123)
-            os.chown(gateway_db.parent, 12345, 12345)
-            events.write_text(''); run(expected=1)
-            assert events.read_text() == '' and old_profile.read_bytes() == before
-            os.chown(gateway_db.parent, 32123, 32123); gateway_db.parent.chmod(0o700)
-            if manager.startswith('systemd'):
-                (root/'gateway-active').touch(); events.write_text(''); run(expected=1)
-                assert events.read_text() == '' and gateway_db.parent.stat().st_uid == 32123
-                (root/'gateway-active').unlink()
-            # A real legacy StateDirectory is service-owned. Both its metadata
-            # and its neighbouring gateway database must survive failed setup.
-            config_metadata = (profile.parent.stat().st_uid, profile.parent.stat().st_gid, profile.parent.stat().st_mode & 0o777)
-            events.write_text(''); (root/'fail-start').touch(); run(expected=1)
-            assert gateway_db.parent.stat().st_uid == 32123 and gateway_db.parent.stat().st_mode & 0o777 == 0o700
-            actual_metadata = (profile.parent.stat().st_uid, profile.parent.stat().st_gid, profile.parent.stat().st_mode & 0o777)
-            assert actual_metadata == config_metadata, (manager, actual_metadata, config_metadata)
-            assert old_profile.read_bytes() == before and not profile.exists()
-            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
-            assert (legacy/'fastp2p').read_bytes() == payload
-            assert (historical/'runtime').read_bytes()==payload and binary.with_name('fastp2p.old').exists()
-            assert (root/'client-running').exists() and (root/'client-enabled').exists()
-            if manager.startswith('systemd'): assert (dropin/'20-remote-upgrade.conf').exists()
-            run()
-            assert not binary.with_name('fastp2p.old').exists()
-            assert not any(historical.glob('runtime*')) and not (historical/'incoming').exists()
-            assert not any(p for p in backups.glob('*/incoming') if not p.parent.is_symlink())
-            assert (historical/'desired-config').read_text()=='retain-private-config'
-            assert (historical/'startup-check.log').read_text()=='retain-diagnostics'
-            assert (outside/'runtime').read_text()=='do-not-follow'
-            assert (unknown/'runtime').read_text()=='not-an-installer-backup'
-            assert not legacy.exists() and not old_profile.exists()
-            assert profile.parent.stat().st_uid == 0
-            if manager == 'procd': assert not controller.exists()
-            assert gateway_db.read_bytes() == b'gateway-fixture' and gateway_db.stat().st_uid == 32123
-            assert gateway_db.parent.stat().st_uid == 0 and not gateway_db.parent.stat().st_mode & 0o022
-            saved = json.loads(profile.read_text())
-            assert saved['network']['DeviceID'] == identity and saved['customSetting'] == first['customSetting']
-            assert saved['network']['AutoNode'] is True and 'Node' not in saved['network']
-            assert saved['network']['UDPPort'] == 29887
-            assert saved['CACertFile'].startswith(str(profile)+'.ca.') and Path(saved['CACertFile']).read_bytes() == (root/'tls/ca.crt').read_bytes()
-            assert 'stop' in events.read_text() and 'start' in events.read_text()
-            if manager.startswith('systemd'): assert not (dropin/'20-remote-upgrade.conf').exists()
-            # Real startup failure must roll back old image, controller and profile.
-            before = profile.read_bytes(); binary.write_bytes(payload+b'old-marker')
-            if manager == 'procd':
-                # The fallback must still reject multiply-linked config files.
-                alias = profile.with_name('test-config.hardlink')
-                os.link(profile, alias)
-                try:
-                    result = run(expected=1)
-                    assert '单链接普通文件'.encode() in result.stderr
-                    assert profile.stat().st_nlink == 2 and profile.read_bytes() == before
-                    assert (root/'client-running').exists() and (root/'client-enabled').exists()
-                finally:
-                    alias.unlink()
-                # The fallback must also preserve special mode bits on rollback.
-                profile.parent.chmod(0o2700)
-            old_controller = installed_controller(); events.write_text(''); (root/'fail-start').touch()
-            run(expected=1)
-            assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
-            assert installed_controller() == old_controller and 'start' in events.read_text()
-            assert (root/'client-running').exists() and (root/'client-enabled').exists()
-            if manager == 'procd':
-                assert profile.parent.stat().st_mode & 0o7777 == 0o2700
-                results['procd_without_stat_preserves_modes_and_rejects_hardlinks'] = True
-            # A successful start command does not guarantee a live service.
-            # Detect the failed native status and restore both runtime and boot links.
-            events.write_text(''); (root/'fail-after-start').touch(); run(expected=1)
-            assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
-            assert installed_controller() == old_controller
-            assert (root/'client-running').exists() and (root/'client-enabled').exists()
-            # Preserve an explicitly disabled old service's boot state too.
-            (root/'client-enabled').unlink(); events.write_text(''); (root/'fail-start').touch()
-            run(expected=1)
-            assert not (root/'client-enabled').exists() and (root/'client-running').exists()
-            assert profile.read_bytes() == before and binary.read_bytes() == payload+b'old-marker'
-            (root/'client-enabled').touch()
-            # The pre-commit runtime probe binds real forwarding ports. An
-            # unrelated listener must fail it before installing the new service.
-            with socket.socket() as occupied:
-                occupied.bind(('127.0.0.1',0)); occupied.listen()
-                blocked=json.loads(before)
-                blocked['apps']=[{'AppName':'installer-bind-check','Protocol':'tcp',
-                    'SrcPort':occupied.getsockname()[1],'PeerNode':'offline-peer-node',
-                    'DstHost':'127.0.0.1','DstPort':22,'UnderlayProtocol':'tcp'}]
-                profile.write_text(json.dumps(blocked)); blocked_bytes=profile.read_bytes(); events.write_text('')
-                run(expected=1)
-                assert profile.read_bytes()==blocked_bytes and binary.read_bytes()==payload+b'old-marker'
-                assert installed_controller()==old_controller
-                assert (root/'client-running').exists() and (root/'client-enabled').exists()
-                assert sum(line.endswith(' start') for line in events.read_text().splitlines())==1
-                check_log=max(Path('/usr/local/fastp2p/.backups').glob('*/startup-check.log'),key=lambda p:p.stat().st_mtime_ns)
-                assert check_log.stat().st_uid==0 and check_log.stat().st_mode&0o077==0
-                assert key.encode() not in check_log.read_bytes()
-            profile.write_bytes(before)
-            # Corrupt payload, missing/ambiguous filename token, bad key and an
-            # unreadable profile must not reach the service teardown.
-            for content, filename in ((installer.replace(hashlib.sha256(payload).hexdigest().encode(),b'0'*64), named.name),
-                                      (installer, 'fastp2p-missing'), (installer, named.name+'-'+key),
-                                      (installer, 'fastp2p-9999999999999998')):
-                bad = root/filename; bad.write_bytes(content); events.write_text('')
-                run(bad, 1); assert events.read_text() == '' and profile.read_bytes() == before
-            named.write_bytes(installer)
-            profile.write_text('{broken'); events.write_text(''); run(expected=1)
-            assert profile.read_text() == '{broken' and events.read_text() == ''
-            profile.write_bytes(before)
-            results[manager+'_install_reinstall_preserve_config_and_rollback'] = True
-            if manager == 'procd':
-                run()
-                cli = Path('/usr/local/bin/fastp2p')
-                service = Path('/etc/init.d/fastp2p')
-                def native(*args):
-                    return subprocess.run([str(cli), *args], env=environment, capture_output=True, timeout=15)
+                unit = Path('/etc/init.d/fastp2p')
+                if manager == 'procd':
+                    Path('/etc/openwrt_release').write_text("DISTRIB_ID='ImmortalWrt'\n")
+                    executable(Path('/etc/rc.common'), 'exec "$FIXTURE/tools/service-fixture" procd "$2"\n')
+                else:
+                    executable(Path('/sbin/openrc-run'), 'exit 0\n')
 
+            for failure in ('fail-start', 'fail-after-start'):
+                (root/failure).touch()
+                run(expected=1)
+                assert not any(path.exists() for path in (unit, profile, binary, cli, controller))
+                assert not any(profile.parent.glob('config.conf.ca.*.pem'))
+                assert not (root/'client-running').exists() and not (root/'client-enabled').exists()
+                assert adjacent.read_text() == 'keep'
+
+            if manager == 'procd':
+                stats = os.statvfs('/usr/local')
+                original_size = stats.f_blocks * stats.f_frsize
+                command('mount','-o',f'remount,size={len(payload)+512*1024}','/usr/local')
+            try:
+                run(short_name if manager == 'procd' else named)
+            finally:
+                if manager == 'procd':
+                    command('mount','-o',f'remount,size={original_size}','/usr/local')
+            assert (root/'client-running').exists() and (root/'client-enabled').exists()
+            assert binary.read_bytes() == payload and cli.is_symlink() and binary.samefile(cli)
+            assert profile.stat().st_uid == 0 and profile.stat().st_mode & 0o777 == 0o600
+            assert subprocess.check_output([str(client),'--service-profile'],text=True).strip() == str(profile)
+            config = json.loads(profile.read_text())
+            ca_file = Path(config['CACertFile'])
+            assert ca_file.parent == profile.parent and ca_file.name.startswith('config.conf.ca.')
+            assert ca_file.read_bytes() == (root/'tls/ca.crt').read_bytes()
+            text = unit.read_text()
+            assert str(profile) in text and '--background' in text
+            if manager.startswith('systemd'):
+                assert ('ProtectSystem=full' if manager == 'systemd219' else 'ProtectSystem=strict') in text
+                assert 'PrivateTmp' not in text and 'User=root' in text
+            elif manager == 'procd':
+                assert 'procd_set_param user root' in text and not controller.exists()
+            else:
+                assert 'command_user="root:root"' in text
+            if manager == 'systemd':
+                runtime_log = Path('/tmp/fastp2p/fastp2p.log')
+                linked = root/'do-not-write'
+                linked.write_text('keep')
+                runtime_log.parent.symlink_to(root)
+                call = ['run','--config',str(profile),'--background','--run-seconds','2']
+                assert native(*call).returncode != 0 and linked.read_text() == 'keep'
+                runtime_log.parent.unlink()
+                native_result = native(*call)
+                assert native_result.returncode == 0, native_result.stderr
+                assert b'gateway authenticated' in runtime_log.read_bytes()
+                assert runtime_log.stat().st_mode & 0o777 == 0o600
+                assert key.encode() not in runtime_log.read_bytes()
+                results['runtime_log_is_private_and_rejects_symlink'] = True
+            before = profile.read_bytes()
+            events.write_text('')
+            run(expected=1)
+            assert events.read_text() == '' and profile.read_bytes() == before
+            if manager == 'procd':
                 lock = Path('/var/run/fastp2p-install.lock')
                 lock.mkdir()
                 try:
-                    assert native('uninstall').returncode != 0 and service.exists()
+                    assert native('uninstall').returncode != 0 and unit.exists()
                 finally:
                     lock.rmdir()
                 assert native('stop').returncode == 0 and not (root/'client-running').exists()
-                before = profile.read_bytes()
-                ca_file = Path(json.loads(before)['CACertFile'])
-                assert native('uninstall', '--keep-config').returncode == 0
-                assert profile.read_bytes() == before and ca_file.exists() and cli.exists() and not service.exists()
-                assert not (root/'client-enabled').exists()
-                run()
-                assert json.loads(profile.read_bytes())['network']['DeviceID'] == identity
-                assert native('uninstall').returncode == 0
-                assert not any(path.exists() for path in (cli, binary, service, profile, ca_file, backups, controller))
-                assert gateway_db.read_bytes() == b'gateway-fixture'
-                assert (outside/'runtime').read_text() == 'do-not-follow'
-                results['openwrt_native_stop_and_uninstall_with_optional_config_retention'] = True
+
+            keep = manager == 'openrc'
+            removed = native('uninstall', '--keep-config') if keep else native('uninstall')
+            assert removed.returncode == 0, removed.stderr.decode(errors='replace')
+            assert not any(path.exists() for path in (cli, binary, unit, controller))
+            assert not (root/'client-enabled').exists() and not (root/'client-running').exists()
+            if keep:
+                assert profile.read_bytes() == before and ca_file.exists()
+            else:
+                assert not profile.exists() and not ca_file.exists()
+            assert adjacent.read_text() == 'keep'
+            results[manager+'_fresh_install_rollback_and_uninstall'] = True
+
         # Exercise the real downloader against all manifest platforms, without
         # executing wrong-architecture images. Corrupt the fetched byte count
         # deliberately and verify every failure precedes any service change.
@@ -539,14 +399,13 @@ with open(args[args.index('--output')+1],'ab') as output:output.write(b'corrupt'
         Path('/var/run/fastp2p-install.lock').mkdir(); events.write_text('')
         run(expected=1); assert events.read_text() == '' and profile.read_bytes() == before
         Path('/var/run/fastp2p-install.lock').rmdir()
-        # Full uninstall delegates to the external controller and must not erase
-        # gateway files that share /etc/fastp2p.
-        adjacent=Path('/etc/fastp2p/gateway.env'); adjacent.write_text('keep')
-        subprocess.run(['/usr/local/bin/fastp2p','uninstall'], env=environment, check=True, stdout=subprocess.DEVNULL)
+        run()
+        assert profile.read_bytes() == before
+        removed = native('uninstall')
+        assert removed.returncode == 0, removed.stderr.decode(errors='replace')
         assert not profile.exists() and not controller.exists() and adjacent.read_text() == 'keep'
-        assert not Path('/usr/local/bin/fastp2p').exists()
-        assert not (root/'client-enabled').exists() and not (root/'client-running').exists()
-        results['installer_lock_and_full_uninstall_preserve_adjacent_gateway_files'] = True
+        assert not cli.exists()
+        results['retained_config_reinstall_and_merged_gateway_directory'] = True
         print(json.dumps(results, indent=2))
     finally:
         proc.terminate(); proc.wait(timeout=10); logs.close()

@@ -75,7 +75,7 @@ public final class FastP2PService extends VpnService {
             managedReloadAt = SystemClock.elapsedRealtime() + 200;
             return 1;
         } catch (Exception error) {
-            android.util.Log.w("fastp2p", "could not save gateway configuration");
+            AppLog.warning(this, "could not save gateway configuration", null);
             return -1;
         }
     }
@@ -134,7 +134,7 @@ public final class FastP2PService extends VpnService {
             snapshot = RootUpdateInstaller.snapshot(this, path);
         } catch (IOException error) {
             UPDATE_IN_PROGRESS.set(false);
-            android.util.Log.w("fastp2p", "cannot prepare the silent update", error);
+            AppLog.warning(this, "cannot prepare the silent update", error);
             notifyUpdate(path);
             return;
         }
@@ -162,7 +162,7 @@ public final class FastP2PService extends VpnService {
         }
         final String enrollment = intent == null ? null : intent.getStringExtra("token");
         final boolean migrate = intent != null && intent.getBooleanExtra("migrate", false);
-        if (enrollment == null && !SecretStore.preferences(this).contains("enrollment")) { stopSelf(); return START_NOT_STICKY; }
+        if (enrollment == null && !SecretStore.enrolled(this)) { stopSelf(); return START_NOT_STICKY; }
         running = true; state = 1; status = "正在校验网关"; stopping.set(false); reconfigure.set(false);
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, notification(true), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         else startForeground(1, notification(true));
@@ -178,7 +178,7 @@ public final class FastP2PService extends VpnService {
                 restart = false;
                 String config = pending == null ? SecretStore.config(this) : pending.config;
                 String token = pending == null ? SecretStore.token(this) : pending.token;
-                String ca = pending == null ? SecretStore.preferences(this).getString("ca", "") : pending.ca;
+                String ca = pending == null ? SecretStore.ca(this) : pending.ca;
                 JSONObject enrollmentConfig = new JSONObject(config);
                 configurationBase = new JSONObject(config);
                 ca = configurationBase.has("CACertBuiltin") ? null : TrustStore.resolve(this, ca);
@@ -187,7 +187,7 @@ public final class FastP2PService extends VpnService {
                 configurationToken = token;
                 configurationCa = ca;
                 String gatewayIdentity = pending == null
-                        ? SecretStore.preferences(this).getString("gatewayIdentity", "") : pending.fingerprint;
+                        ? SecretStore.gatewayIdentity(this) : pending.fingerprint;
                 configurationSource = Bootstrap.digest(gatewayIdentity + "\n" + token);
                 JSONObject saved = new JSONObject(SecretStore.managed(this));
                 managedFields = configurationSource.equals(saved.optString("source"))
@@ -217,7 +217,7 @@ public final class FastP2PService extends VpnService {
                             try {
                                 tun = SdwanTun.vpn(this, new Builder(), plan);
                             } catch (Exception error) {
-                                android.util.Log.w("fastp2p", "VPN interface unavailable", error);
+                                AppLog.warning(this, "VPN interface unavailable", error);
                             }
                         }
                     }
@@ -277,7 +277,7 @@ public final class FastP2PService extends VpnService {
             } while (restart && !stopping.get());
         } catch (Exception error) {
             failure = error instanceof IllegalArgumentException ? error.getMessage() : "连接或配置保存失败";
-            android.util.Log.w("fastp2p", "client stopped: " + failure, error);
+            AppLog.warning(this, "client stopped: " + failure, error);
         } finally {
             configurationBase = null;
             configurationToken = null;
@@ -295,9 +295,7 @@ public final class FastP2PService extends VpnService {
         }
     }
     public void onNativeEvent(int type, int newState, int code, String id, String message) {
-        // The desktop client prints these events to stdout; on Android logcat is
-        // the only place they can be observed, so record every one of them.
-        android.util.Log.i("fastp2p", "event type=" + type + " state=" + newState + " code=" + code
+        AppLog.info(this, "event type=" + type + " state=" + newState + " code=" + code
                 + " id=" + id + " " + message);
         state = newState;
         status = newState == 2 ? "已连接" : newState == 3 ? "正在重连" : newState == 1 ? "正在连接" : "已停止";

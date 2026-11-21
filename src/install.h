@@ -1,14 +1,19 @@
 #ifndef FASTP2P_INSTALL_H
 #define FASTP2P_INSTALL_H
 #include <json-c/json.h>
+#include <stddef.h>
 int fastp2p_install_command(int argc, char **argv);
 int fastp2p_uninstall_command(int argc, char **argv);
 int fastp2p_default_profile(char out[4096]);
 /* Machine-wide profile, used when the client runs as a Windows service and the
  * per-user location is not readable by the account the service runs under. */
 int fastp2p_service_profile(char out[4096]);
-#if defined(__linux__)
-int fastp2p_linux_managed_profile(const char *path);
+#ifndef _WIN32
+#define FASTP2P_SYSTEM_DIR "/usr/local/fastp2p"
+#define FASTP2P_SYSTEM_PROFILE "/etc/fastp2p/config.conf"
+#define FASTP2P_LOG_DIR "/tmp/fastp2p"
+#define FASTP2P_LOG_FILE FASTP2P_LOG_DIR "/fastp2p.log"
+int fastp2p_posix_uninstall(int keep_config);
 #endif
 json_object *fastp2p_profile_read(const char *path);
 int fastp2p_profile_write(const char *path, const char *text);
@@ -35,7 +40,6 @@ void fastp2p_runtime_end(void);
 int fastp2p_enable_autostart(const char *profile, const char *ca);
 /* Stop and unregister this installation while retaining its private profile. */
 int fastp2p_remove_autostart(const char *profile);
-int fastp2p_linux_uninstall(int keep_config);
 int fastp2p_stop_installed(const char *profile);
 /* Windows service plumbing; the POSIX builds answer "unsupported". */
 int fastp2p_service_supported(void);
@@ -43,6 +47,9 @@ int fastp2p_service_dispatch(const char *profile, int argc, char **argv,
                              int (*loop)(int, char **));
 int fastp2p_service_installed(void);
 int fastp2p_service_prepare(const char *profile);
+#ifdef _WIN32
+int fastp2p_windows_log(wchar_t path[4096]);
+#endif
 int fastp2p_service_install(const char *profile, const char *ca);
 int fastp2p_service_remove(void);
 /* After the replacement service is healthy, remove only known old images. */

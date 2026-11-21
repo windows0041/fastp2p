@@ -60,8 +60,6 @@ chmod 700 "$work/fastp2p-service"
 # Validate the init implementation and account tools before touching the old app.
 "$work/fastp2p-service" check
 profile=$("$work/fastp2p-service" profile)
-state=${profile%/*}
-parent=${state%/*}
 mkdir -p /var/run
 mkdir /var/run/fastp2p-install.lock 2>/dev/null || fail '另一个安装尚未结束；若上次被强制终止，请检查 /var/run/fastp2p-install.lock。'
 locked=true
@@ -95,32 +93,20 @@ chmod 700 "$work/fastp2p"
 version=$("$work/fastp2p" --version) || fail "程序无法在 $cpu 上运行，原服务尚未卸载。"
 case "$version" in "fastp2p $expected_version ABI "*) ;; *) fail '安装包版本不符。' ;; esac
 [ "$("$work/fastp2p" --installer-abi 2>/dev/null)" = 2 ] || fail '安装需要 fastp2p 客户端 2.0.4 或更新版本。'
-if [ "$profile" = /etc/fastp2p-client/config/fastp2p.conf ] &&
-   [ "$("$work/fastp2p" --service-profile 2>/dev/null || true)" != "$profile" ]; then
-    fail '当前安装包不支持 OpenWrt 持久配置，请从控制台重新生成安装命令。'
+[ "$("$work/fastp2p" --service-profile)" = "$profile" ] ||
+    fail '安装包使用旧目录，请先同步新版客户端。'
+prepared=$profile
+if [ ! -e "$profile" ] && [ ! -L "$profile" ]; then
+    mkdir "$work/verified"
+    prepared=$work/verified/config.conf
+    printf '%s' "$token" > "$work/token"
+    printf '%s\n' '正在验证网关证书与接入密钥…'
+    "$work/fastp2p" install --token-file "$work/token" --config "$prepared" --no-service ||
+        fail '网关校验失败。'
+    rm -f "$work/token"
 fi
-[ ! -L "$parent" ] && [ ! -L "$state" ] || fail '配置目录不能是符号链接。'
-mkdir "$work/verified"
-prepared=$work/verified/fastp2p.conf
-if [ -f "$profile" ]; then
-    [ ! -L "$profile" ] || fail '配置不能是符号链接。'
-    cp -p "$profile" "$prepared"
-elif [ "$profile" = /etc/fastp2p-client/config/fastp2p.conf ] &&
-     [ -f /var/lib/fastp2p/config/fastp2p.conf ]; then
-    [ ! -L /var/lib/fastp2p/config/fastp2p.conf ] || fail '旧配置不能是符号链接。'
-    cp -p /var/lib/fastp2p/config/fastp2p.conf "$prepared"
-elif [ -f /etc/fastp2p/client.json ]; then
-    [ ! -L /etc/fastp2p/client.json ] || fail '旧配置不能是符号链接。'
-    cp -p /etc/fastp2p/client.json "$prepared"
-fi
-printf '%s' "$token" > "$work/token"
 unset token
-printf '%s\n' '正在校验网关证书、接入密钥并保留原节点身份…'
-if ! "$work/fastp2p" install --token-file "$work/token" --config "$prepared" --no-service; then
-    fail '网关校验未通过，原服务尚未卸载。'
-fi
-if ! "$work/fastp2p-service" install --binary "$work/fastp2p" --config "$profile" --profile-source "$prepared"; then
-    fail '安装未完成，原配置已保留。请查看以上错误后重试。'
-fi
+"$work/fastp2p-service" install "$work/fastp2p" "$prepared" ||
+    fail '安装未完成，请检查上方错误。'
 printf '%s\n' 'fastp2p 安装完成：/usr/local/fastp2p，服务已设置开机启动及异常重启。'
 exit 0

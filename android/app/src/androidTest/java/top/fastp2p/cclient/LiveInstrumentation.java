@@ -20,13 +20,13 @@ public final class LiveInstrumentation extends Instrumentation {
                 context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName));
             boolean migrate = "true".equals(arguments.getString("migrate", "false"));
             String oldIdentity = SecretStore.preferences(context).getString("deviceID", "");
-            String oldGateway = SecretStore.preferences(context).getString("gatewayIdentity", "");
+            String oldGateway = SecretStore.gatewayIdentity(context);
             Bootstrap bootstrap = Bootstrap.decode(context, token, migrate);
             if (migrate && !oldGateway.isEmpty() && !oldGateway.equals(bootstrap.fingerprint)) {
                 boolean refused = false;
                 try { Bootstrap.decode(context, token); } catch (IllegalArgumentException expected) { refused = true; }
                 require(refused);
-                require(SecretStore.preferences(context).getString("gatewayIdentity", "").equals(oldGateway));
+                require(SecretStore.gatewayIdentity(context).equals(oldGateway));
                 result.putBoolean("migration_requires_explicit_flag", true);
             }
             require(bootstrap.ca.isEmpty() == new JSONObject(bootstrap.config).has("CACertBuiltin"));
@@ -35,10 +35,10 @@ public final class LiveInstrumentation extends Instrumentation {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivitySync(start);
             long deadline = System.currentTimeMillis() + 40000;
-            while ((!SecretStore.preferences(context).contains("enrollment") || FastP2PService.state != 2) && System.currentTimeMillis() < deadline) Thread.sleep(100);
-            require(FastP2PService.running && FastP2PService.state == 2 && SecretStore.preferences(context).contains("enrollment"));
-            require(!SecretStore.token(context).isEmpty() && SecretStore.preferences(context).contains("configSecret"));
-            require(SecretStore.preferences(context).getString("gatewayIdentity", "").equals(bootstrap.fingerprint));
+            while ((!SecretStore.enrolled(context) || FastP2PService.state != 2) && System.currentTimeMillis() < deadline) Thread.sleep(100);
+            require(FastP2PService.running && FastP2PService.state == 2 && SecretStore.enrolled(context));
+            require(!SecretStore.token(context).isEmpty() && SecretStore.configFile(context).isFile());
+            require(SecretStore.gatewayIdentity(context).equals(bootstrap.fingerprint));
             if (!oldIdentity.isEmpty()) {
                 require(SecretStore.preferences(context).getString("deviceID", "").equals(oldIdentity));
                 result.putBoolean("existing_device_identity_preserved", true);

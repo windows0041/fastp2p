@@ -61,7 +61,7 @@ public final class SdwanActivity extends Activity {
     private void validate(JSONObject sdwan) throws Exception {
         JSONObject profile = new JSONObject(SecretStore.config(this)).put("sdwan", sdwan);
         String ca = profile.has("CACertBuiltin") ? null
-                : TrustStore.resolve(this, SecretStore.preferences(this).getString("ca", ""));
+                : TrustStore.resolve(this, SecretStore.ca(this));
         long handle = NativeClient.create(profile.toString().getBytes(StandardCharsets.UTF_8),
                 SecretStore.token(this), ca, this);
         if (handle == 0) throw new IllegalArgumentException();

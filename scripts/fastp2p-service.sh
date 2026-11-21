@@ -1,182 +1,77 @@
 #!/bin/sh
-# Stage and verify Linux service installations and rollbacks.
+# Install a root-managed Linux client from a verified executable and profile.
 set -eu
 umask 077
 prefix=/usr/local/fastp2p
 binary=$prefix/bin/fastp2p
+cli=/usr/local/bin/fastp2p
+config_dir=/etc/fastp2p
+profile=$config_dir/config.conf
 service=fastp2p-client
 fail() { printf '%s\n' "fastp2p: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || fail '服务管理需要 root 权限。'
-detect_init() {
-    if [ -f /etc/openwrt_release ] && [ -x /etc/rc.common ]; then
-        printf procd
-    elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-        printf systemd
-    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && [ -x /sbin/openrc-run ]; then
-        printf openrc
-    else
-        fail '没有检测到运行中的 systemd、OpenWrt procd 或 OpenRC；请在宿主机安装，或由容器的重启策略管理前台进程。'
-    fi
-}
-manager=$(detect_init)
-sdwan=${FASTP2P_SDWAN:-0}
-case "$sdwan" in 0|1) ;; *) fail 'FASTP2P_SDWAN 只能为 0 或 1。' ;; esac
-sdwan_requirements() {
-    command -v ip >/dev/null 2>&1 || fail 'SD-WAN 需要 iproute2（ip 命令），请先自行安装。'
-    [ -c /dev/net/tun ] || fail 'SD-WAN 需要 Linux TUN 驱动和 /dev/net/tun，请在宿主机或 VPS 上开启。'
-}
-parent=/var/lib/fastp2p
-if [ "$manager" = procd ]; then parent=/etc/fastp2p-client; fi
-state=$parent/config
-profile=$state/fastp2p.conf
-transaction=false
-locked=false
-install_backup=
-phase=
-discard_install_stage() {
-    if [ -n "$install_backup" ]; then
-        rm -f -- "$install_backup/incoming" "$install_backup/runtime.new" \
-            "$install_backup/cli.new" "$install_backup/controller.new" \
-            "$install_backup/identity.new" "$install_backup/ca.new"
-    fi
-}
-finish() {
-    status=$?
-    set +e
-    if [ "$status" -ne 0 ]; then
-        if $transaction; then
-            printf 'fastp2p: %s失败（状态 %s），正在回滚。\n' "$phase" "$status" >&2
-            rollback
-        elif [ -n "$install_backup" ]; then
-            rm -f -- "$install_backup/runtime" "$install_backup/cli" "$install_backup/controller"
-        fi
-    fi
-    discard_install_stage
-    if $locked; then rm -f /var/run/fastp2p-service.lock/pid; rmdir /var/run/fastp2p-service.lock; fi
-    exit "$status"
-}
-trap finish EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-case "${1:-}" in
-    check|profile) ;;
-    *)
-        mkdir -p /var/run
-        mkdir /var/run/fastp2p-service.lock 2>/dev/null || fail '另一个服务管理操作尚未结束；若上次被强制终止，请检查 /var/run/fastp2p-service.lock。'
-        locked=true
-        printf '%s\n' "$$" > /var/run/fastp2p-service.lock/pid ;;
-esac
-start_service() {
-    case "$manager" in
-        systemd) systemctl start "$service.service" ;;
-        procd) /etc/init.d/fastp2p start ;;
-        openrc) rc-service fastp2p start ;;
+
+if [ -f /etc/openwrt_release ] && [ -x /etc/rc.common ]; then
+    manager=procd
+    unit=/etc/init.d/fastp2p
+elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    manager=systemd
+    unit=/etc/systemd/system/$service.service
+elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && [ -x /sbin/openrc-run ]; then
+    manager=openrc
+    unit=/etc/init.d/fastp2p
+else
+    fail '需要运行中的 systemd、OpenWrt procd 或 OpenRC。'
+fi
+
+native() {
+    case "$manager:$1" in
+        systemd:status) systemctl is-active --quiet "$service.service" ;;
+        systemd:*) systemctl "$1" "$service.service" ;;
+        procd:*) "$unit" "$1" ;;
+        openrc:enable) rc-update add fastp2p default ;;
+        openrc:disable) rc-update del fastp2p default ;;
+        openrc:*) rc-service fastp2p "$1" ;;
     esac
 }
-service_running() {
-    case "$manager" in
-        systemd) systemctl is-active --quiet "$service.service" ;;
-        procd) /etc/init.d/fastp2p status ;;
-        openrc) rc-service fastp2p status ;;
-    esac
-}
-service_enabled() {
-    case "$manager" in
-        systemd) systemctl is-enabled --quiet "$service.service" ;;
-        procd) /etc/init.d/fastp2p enabled ;;
-        openrc) rc-update show default | awk '$1 == "fastp2p" { found=1 } END { exit !found }' ;;
-    esac
-}
-enable_service() {
-    case "$manager" in
-        systemd) systemctl enable "$service.service" ;;
-        procd) /etc/init.d/fastp2p enable ;;
-        openrc) rc-update add fastp2p default ;;
-    esac
-}
-disable_service() {
-    case "$manager" in
-        systemd) systemctl disable "$service.service" ;;
-        procd) if [ -x /etc/init.d/fastp2p ]; then /etc/init.d/fastp2p disable; fi ;;
-        openrc) if service_enabled; then rc-update del fastp2p default; fi ;;
-    esac
-}
-stop_service() {
+
+write_unit() {
     case "$manager" in
         systemd)
-            if systemctl cat "$service.service" >/dev/null 2>&1; then systemctl stop "$service.service"; fi ;;
-        procd|openrc)
-            if [ "$manager" = procd ]; then
-                [ -x /etc/init.d/fastp2p ] || return 0
-                set -- /etc/init.d/fastp2p
-            else
-                [ -f /etc/init.d/fastp2p ] || return 0
-                set -- rc-service fastp2p
-            fi
-            # Status 3 means inactive. Other states may still have a
-            # registered instance or a pending restart that needs stopping.
-            if service_running >/dev/null 2>&1 || [ "$?" -ne 3 ]; then
-                "$@" stop
-            fi ;;
-    esac
-}
-remove_service() {
-    stop_service
-    case "$manager" in
-        systemd)
-            if [ -e "/etc/systemd/system/$service.service" ]; then
-                systemctl disable "$service.service"
-                rm -f "/etc/systemd/system/$service.service"
-            fi
-            # A legacy migration override must not redirect the replacement unit.
-            rm -f "/etc/systemd/system/$service.service.d/20-remote-upgrade.conf"
-            systemctl daemon-reload ;;
-        procd) if [ -x /etc/init.d/fastp2p ]; then disable_service; rm -f /etc/init.d/fastp2p; fi ;;
-        openrc) if [ -f /etc/init.d/fastp2p ]; then disable_service; rm -f /etc/init.d/fastp2p; fi ;;
-    esac
-}
-write_service() {
-    case "$manager" in
-        systemd)
+            number=$(systemctl --version | awk 'NR==1 {print $2}')
             protection=full
-            number=$(systemctl --version | awk 'NR==1 { print $2 }')
-            case "$number" in *[!0-9]*|'') ;; *) if [ "$number" -ge 232 ]; then protection=strict; fi ;; esac
-            mkdir -p /etc/systemd/system
-            cat > "/etc/systemd/system/$service.service" <<EOF
+            case "$number" in ''|*[!0-9]*) ;; *) [ "$number" -lt 232 ] || protection=strict ;; esac
+            cat > "$unit" <<EOF
 [Unit]
-Description=fastp2p client
+Description=FastP2P client
 After=network-online.target
 Wants=network-online.target
-StartLimitInterval=0
+
 [Service]
 User=root
-Group=root
-ExecStart=$binary run --config $profile
+ExecStart=$binary run --config $profile --background
 Restart=always
 RestartSec=3
 TimeoutStopSec=30
 NoNewPrivileges=true
-PrivateTmp=true
 ProtectSystem=$protection
 ProtectHome=true
-ReadWriteDirectories=$prefix/bin $state
+ReadWriteDirectories=$prefix/bin $config_dir /tmp
+
 [Install]
 WantedBy=multi-user.target
 EOF
-            chmod 644 "/etc/systemd/system/$service.service"
-            systemctl daemon-reload
-            systemctl enable "$service.service" ;;
+            chmod 644 "$unit"
+            systemctl daemon-reload ;;
         procd)
-            cat > /etc/init.d/fastp2p <<EOF
+            cat > "$unit" <<EOF
 #!/bin/sh /etc/rc.common
-# fastp2p managed service
 START=95
 STOP=10
 USE_PROCD=1
 start_service() {
     procd_open_instance
-    procd_set_param command "$binary" run --config "$profile"
+    procd_set_param command "$binary" run --config "$profile" --background
     procd_set_param user root
     procd_set_param no_new_privs 1
     procd_set_param respawn 3600 3 0
@@ -185,345 +80,145 @@ start_service() {
     procd_close_instance
 }
 EOF
-            chmod 755 /etc/init.d/fastp2p
-            /etc/init.d/fastp2p enable ;;
+            chmod 755 "$unit" ;;
         openrc)
-            cat > /etc/init.d/fastp2p <<EOF
+            cat > "$unit" <<EOF
 #!/sbin/openrc-run
-# fastp2p managed service
-description="fastp2p client"
+description="FastP2P client"
 supervisor="supervise-daemon"
 command="$binary"
-command_args="run --config $profile"
+command_args="run --config $profile --background"
 command_user="root:root"
 pidfile="/run/fastp2p.pid"
 respawn_delay=3
 respawn_max=0
 depend() { need net; }
 EOF
-            chmod 755 /etc/init.d/fastp2p
-            rc-update add fastp2p default ;;
+            chmod 755 "$unit" ;;
     esac
 }
-file_metadata() {
-    if info=$(stat -c '%u:%g:%a:%h' -- "$1" 2>/dev/null) ||
-       info=$(busybox stat -c '%u:%g:%a:%h' -- "$1" 2>/dev/null); then
-        printf '%s\n' "$info"
-        return
-    fi
-    # Minimal OpenWrt images may have no stat applet. Read numeric metadata
-    # from the first record only, since the filename may contain a newline.
-    info=$(LC_ALL=C ls -ldn -- "$1" 2>/dev/null) || return 1
-    printf '%s\n' "$info" | LC_ALL=C awk '
-        function permissions(at, x) {
-            x=substr($1,at+2,1)
-            return 4*(substr($1,at,1)=="r") + 2*(substr($1,at+1,1)=="w") + (x ~ /[xst]/)
-        }
-        NR==1 && $1 ~ /^[-d][r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-][+.@]?$/ &&
-                 $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
-            special=4*(substr($1,4,1) ~ /[sS]/) + 2*(substr($1,7,1) ~ /[sS]/) + (substr($1,10,1) ~ /[tT]/)
-            mode=512*special + 64*permissions(2) + 8*permissions(5) + permissions(8)
-            printf "%s:%s:%o:%s\n", $3, $4, mode, $2
-            valid=1
-        }
-        END {exit !valid}'
+
+trusted_directory() {
+    [ ! -L "$1" ] && [ -d "$1" ] &&
+        ls -ldn "$1" | awk '$3 == 0 && substr($1,6,1) != "w" && substr($1,9,1) != "w" {ok=1} END {exit !ok}'
 }
-is_single_link_file() {
-    [ -f "$1" ] && [ ! -L "$1" ] || return 1
-    details=$(file_metadata "$1") || return 1
-    [ "${details##*:}" = 1 ]
-}
-prune_program_backups() {
-    # Only installer-owned directories and exact program filenames. Keep the
-    # saved profiles, certificates and diagnostic logs; never traverse links.
-    cleanup_pending=false
-    for cleanup_dir in "$prefix/.backups/"*; do
-        [ -d "$cleanup_dir" ] && [ ! -L "$cleanup_dir" ] || continue
-        printf '%s\n' "${cleanup_dir##*/}" | grep -Eq '^[0-9]{8}T[0-9]{6}\.[0-9]+$' || continue
-        details=$(file_metadata "$cleanup_dir") || continue
-        [ "${details%:*}" = 0:0:700 ] || continue
-        for cleanup_name in "$@"; do
-            cleanup_file=$cleanup_dir/$cleanup_name
-            if [ -f "$cleanup_file" ] || [ -L "$cleanup_file" ]; then
-                rm -f -- "$cleanup_file" || cleanup_pending=true
-            fi
-        done
-    done
-    if $cleanup_pending; then printf '%s\n' '部分安装临时文件未能清理，请检查文件权限。' >&2; fi
-    return 0
-}
-save_program() {
-    if [ -L "$1" ]; then
-        cp -pP -- "$1" "$2"
-    elif [ -f "$1" ]; then
-        ln -- "$1" "$2" 2>/dev/null || cp -p -- "$1" "$2"
+
+remove_unit() {
+    if [ -f "$unit" ]; then
+        if native status >/dev/null 2>&1; then native stop; fi
+        native disable >/dev/null 2>&1 || true
+        rm -f -- "$unit"
+        if [ "$manager" = systemd ]; then systemctl daemon-reload; fi
     fi
 }
-restore_program() {
-    if [ -f "$1" ] || [ -L "$1" ]; then
-        if [ ! -L "$1" ] && [ ! -L "$2" ] && [ "$1" -ef "$2" ]; then
-            rm -f -- "$1"
-        else
-            mv -fT -- "$1" "$2"
-        fi
-    else
-        rm -f -- "$2"
-    fi
-}
-install_service() {
-    source_binary=
-    source_profile=$profile
-    shift
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --binary) [ "$#" -ge 2 ] || fail '缺少程序路径。'; source_binary=$2; shift 2 ;;
-            --config) [ "$#" -ge 2 ] && [ "$2" = "$profile" ] || fail '服务配置路径无效。'; shift 2 ;;
-            --profile-source) [ "$#" -ge 2 ] || fail '缺少已校验配置路径。'; source_profile=$2; shift 2 ;;
-            *) fail '未知服务安装参数。' ;;
-        esac
-    done
-    [ -f "$source_binary" ] || fail '找不到已校验的客户端程序。'
-    [ -f "$source_profile" ] && [ ! -L "$source_profile" ] || fail '找不到已校验的客户端配置。'
-    [ "$("$source_binary" --root-service-abi 2>/dev/null || true)" = 1 ] ||
-        fail '网关缓存的客户端版本不支持 root 服务，请同步新版客户端后重新获取安装命令。'
-    if [ "$sdwan" -eq 1 ]; then
-        sdwan_requirements
-        "$source_binary" --check-sdwan || fail 'SD-WAN 环境检查失败，请检查 TUN、权限和客户端版本。'
-    fi
-    [ ! -L "$state" ] && [ ! -L "$profile" ] || fail '配置路径不能是符号链接。'
-    [ ! -L "$parent" ] || fail '数据目录不能是符号链接。'
-    parent_metadata=
-    config_metadata=
-    if [ -e "$parent" ]; then
-        [ -d "$parent" ] || fail '数据路径不是目录。'
-        details=$(file_metadata "$parent") || fail '无法读取数据目录的权限。'
-        parent_metadata=${details%:*}
-        parent_uid=${parent_metadata%%:*}
-        legacy_uid=$(id -u fastp2p 2>/dev/null || true)
-        [ "$parent_uid" -eq 0 ] || [ "$parent_uid" = "$legacy_uid" ] || fail '数据目录属于其他用户，未卸载原服务。'
-        if [ "$parent_uid" -ne 0 ]; then
-            # An old co-located gateway may still need to write this directory.
-            # Never take it away from a running gateway during client migration.
-            if [ "$manager" = systemd ]; then
-                for unit in fastp2p-gateway fastp2p-c-gateway openp2p-c-gateway; do
-                    if systemctl is-active --quiet "$unit.service"; then fail '请先迁移使用旧数据目录的网关，再升级客户端。'; fi
-                done
-            fi
-            if command -v pidof >/dev/null 2>&1; then
-                for process in fastp2p-gateway fastp2p-c-gateway openp2p-c-gateway; do
-                    if pidof "$process" >/dev/null 2>&1; then fail '检测到运行中的旧网关，请先迁移网关数据目录。'; fi
-                done
-            fi
-        fi
-    fi
-    if [ -e "$state" ]; then
-        [ -d "$state" ] || fail '配置路径不是目录。'
-        details=$(file_metadata "$state") || fail '无法读取配置目录的权限。'
-        config_metadata=${details%:*}
-    fi
-    [ ! -L "$prefix" ] || fail '安装目录不能是符号链接。'
-    bin_metadata=
-    [ ! -L "$prefix/bin" ] || fail '程序目录不能是符号链接。'
-    if [ -e "$prefix/bin" ]; then
-        [ -d "$prefix/bin" ] || fail '程序路径不是目录。'
-        details=$(file_metadata "$prefix/bin") || fail '无法读取程序目录的权限。'
-        bin_metadata=${details%:*}
-    fi
-    mkdir -p "$prefix"
-    chown 0:0 "$prefix"; chmod 755 "$prefix"
-    [ ! -L "$prefix/.backups" ] || fail '备份目录不能是符号链接。'
-    mkdir -p "$prefix/.backups"; chown 0:0 "$prefix/.backups"; chmod 700 "$prefix/.backups"
-    # A previous failed install may have left its incoming image and partial
-    # replacements on disk. Older verified backups and profiles are separate.
-    prune_program_backups incoming runtime.new cli.new controller.new
-    backup=$prefix/.backups/$(date +%Y%m%dT%H%M%S).$$
-    mkdir "$backup"; chmod 700 "$backup"
-    install_backup=$backup
-    # Stage one executable inode. The CLI symlink follows later image swaps.
-    if ! cp "$source_binary" "$backup/incoming"; then
-        bytes=$(wc -c < "$source_binary")
-        fail "无法暂存客户端（需 $bytes 字节），请检查 /usr/local 的磁盘空间。原服务尚未停止。"
-    fi
-    chmod 755 "$backup/incoming"
-    save_program "$backup/incoming" "$backup/runtime.new"
-    ln -s "$binary" "$backup/cli.new"
-    if [ "$manager" != procd ]; then
-        cp "$0" "$backup/controller.new"; chmod 755 "$backup/controller.new"
-    fi
-    cp "$source_profile" "$backup/desired-config"; chmod 600 "$backup/desired-config"
-    save_program "$binary" "$backup/runtime"
-    save_program /usr/local/bin/fastp2p "$backup/cli"
-    save_program "$prefix/fastp2p-service" "$backup/controller"
-    if [ -f /etc/fastp2p/client.json ]; then
-        cp -p /etc/fastp2p/client.json "$backup/legacy-profile.json"
-        for ca in /etc/fastp2p/client.json.ca.*.pem; do
-            [ ! -f "$ca" ] || cp -p "$ca" "$backup/${ca##*/}"
-        done
-    fi
-    if [ -f "/etc/systemd/system/$service.service" ]; then cp -p "/etc/systemd/system/$service.service" "$backup/unit"; fi
-    if [ -d "/etc/systemd/system/$service.service.d" ]; then cp -a "/etc/systemd/system/$service.service.d" "$backup/dropins"; fi
-    if [ -f /etc/init.d/fastp2p ]; then cp -p /etc/init.d/fastp2p "$backup/init"; fi
-    old_service=false
-    case "$manager" in
-        systemd) if systemctl cat "$service.service" >/dev/null 2>&1; then old_service=true; fi ;;
-        *) if [ -f /etc/init.d/fastp2p ]; then old_service=true; fi ;;
-    esac
-    old_enabled=false
-    if $old_service && service_enabled >/dev/null 2>&1; then old_enabled=true; fi
-    config_changed=false
-    parent_changed=false
-    bin_changed=false
-    restore_metadata() {
-        target=$1; metadata=$2
-        if [ -n "$metadata" ]; then
-            owner=${metadata%:*}; mode=${metadata##*:}
-            chown -h "$owner" "$target"; chmod "$mode" "$target"
-        else rmdir "$target" 2>/dev/null || true; fi
-    }
-    rollback() {
-        stop_service >/dev/null 2>&1 || true
-        # Remove the replacement's boot links, including fresh-install failures.
-        # Restoring an init file alone does not restore procd/OpenRC autostart.
-        disable_service >/dev/null 2>&1 || true
-        restore_program "$backup/runtime" "$binary"
-        restore_program "$backup/cli" /usr/local/bin/fastp2p
-        restore_program "$backup/controller" "$prefix/fastp2p-service"
-        discard_install_stage
-        if $config_changed; then
-            chown -h 0:0 "$state"; chmod 700 "$state"
-            rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
-            for saved in "$backup/config/"*; do
-                [ ! -f "$saved" ] || cp -p "$saved" "$state/${saved##*/}"
-            done
-        fi
-        case "$manager" in
-            systemd)
-                if [ -f "$backup/unit" ]; then cp -p "$backup/unit" "/etc/systemd/system/$service.service"; else rm -f "/etc/systemd/system/$service.service"; fi
-                if [ -d "$backup/dropins" ]; then mkdir -p "/etc/systemd/system/$service.service.d"; cp -a "$backup/dropins/." "/etc/systemd/system/$service.service.d/"; fi
-                systemctl daemon-reload >/dev/null 2>&1 || true ;;
-            *) if [ -f "$backup/init" ]; then cp -p "$backup/init" /etc/init.d/fastp2p; else rm -f /etc/init.d/fastp2p; fi ;;
-        esac
-        if $parent_changed; then
-            restore_metadata "$state" "$config_metadata"
-            restore_metadata "$parent" "$parent_metadata"
-        fi
-        if $bin_changed; then restore_metadata "$prefix/bin" "$bin_metadata"; fi
-        if $old_enabled; then enable_service >/dev/null 2>&1 || true; fi
-        if $old_service; then start_service >/dev/null 2>&1 || true; fi
-    }
-    phase=停止旧服务
-    transaction=true
-    printf '服务管理方式：%s；正在探测并卸载旧服务，保留配置。\n' "$manager"
-    remove_service
-    phase=准备安装与配置目录
-    [ ! -L "$prefix/bin" ] && [ ! -L "$parent" ] && [ ! -L "$state" ] || return 1
-    mkdir -p "$prefix/bin" "$parent" /usr/local/bin
-    # Stop the legacy service before taking over its writable directories.
-    parent_changed=true
-    chown -h 0:0 "$parent"; chmod 711 "$parent"
-    mkdir -p "$state"
-    chown -h 0:0 "$state"
-    [ -d "$state" ] && [ ! -L "$state" ] || fail '配置目录在迁移时发生变化。'
-    chmod 700 "$state"
-    mkdir "$backup/config"
-    for file in "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem; do
-        if [ -e "$file" ] || [ -L "$file" ]; then
-            is_single_link_file "$file" || fail '无法确认配置是单链接普通文件。'
-            cp -p "$file" "$backup/config/${file##*/}"
-        fi
-    done
-    config_changed=true
-    phase=更新程序文件
-    bin_changed=true
-    chown -h 0:0 "$prefix/bin"; chmod 755 "$prefix/bin"
-    mv -fT "$backup/runtime.new" "$binary"
-    mv -fT "$backup/cli.new" /usr/local/bin/fastp2p
-    if [ "$manager" = procd ]; then
-        rm -f -- "$prefix/fastp2p-service"
-    else
-        mv -fT "$backup/controller.new" "$prefix/fastp2p-service"
-    fi
-    phase=写入配置及证书
-    for ca in "$state"/fastp2p.conf.ca.*.pem; do
-        [ -f "$ca" ] || continue
-        is_single_link_file "$ca" || fail '无法确认证书是单链接普通文件。'
-        cp "$ca" "$backup/ca.new"; chmod 600 "$backup/ca.new"
-        mv -fT "$backup/ca.new" "$ca"
-    done
-    "$backup/incoming" --relocate-profile "$backup/desired-config" "$profile"
-    chown 0:0 "$profile"; chmod 600 "$profile"
-    # Give ancillary configuration new inodes so open descriptors held by the
-    # legacy service account cannot alter the files used by the root service.
-    for file in "$profile.identity" "$profile.previous"; do
-        saved=$backup/config/${file##*/}
-        [ -f "$saved" ] || continue
-        cp "$saved" "$backup/identity.new"
-        chmod 600 "$backup/identity.new"
-        mv -fT "$backup/identity.new" "$file"
-    done
-    # Pure schema checks cannot detect occupied ports or account permissions.
-    # Probe the full runtime with its installed permissions before committing.
-    phase=客户端启动检查
-    "$backup/incoming" run --config "$profile" --verify-start > "$backup/startup-check.log" 2>&1 ||
-        fail "客户端启动检查失败，正在恢复旧服务。诊断日志：$backup/startup-check.log"
-    phase=注册开机启动服务
-    write_service
-    phase=启动客户端服务
-    start_service
-    # Native init start commands may succeed before the child actually starts.
-    # Catch an immediate exit/crash while rollback files are still authoritative.
-    for check in 1 2 3; do
-        sleep 1
-        service_running >/dev/null 2>&1 || fail '客户端服务未持续运行，正在恢复旧服务。'
-    done
-    if [ "$manager" = procd ]; then
-        rm -f -- "$prefix/init"
-    else
-        printf '%s\n' "$manager" > "$prefix/init"
-    fi
-    transaction=false
-    prune_program_backups incoming runtime cli controller legacy-runtime legacy-runtime.old \
-        runtime.restore cli.restore controller.restore runtime.new cli.new controller.new
-    rm -f -- "$binary.old" || printf '%s\n' '服务已安装，但旧程序未能删除。' >&2
-    rm -f /var/lib/fastp2p-client/fastp2p /var/lib/fastp2p-client/fastp2p.old
-    rmdir /var/lib/fastp2p-client 2>/dev/null || true
-    rm -f /etc/fastp2p/client.json /etc/fastp2p/client.json.identity /etc/fastp2p/client.json.ca.*.pem
-    printf '%s\n' "服务安装完成，旧程序已清理；配置和诊断备份：$backup"
-}
+
 case "${1:-}" in
     check)
-        if [ "$sdwan" -eq 1 ]; then
-            sdwan_requirements
-            printf '%s\n' '已检查 ip 和 /dev/net/tun。转发其他设备的子网流量时，请启用 IPv4 转发并配置回程路由。'
+        case "${FASTP2P_SDWAN:-0}" in
+            0) ;;
+            1) command -v ip >/dev/null 2>&1 && [ -c /dev/net/tun ] ||
+                fail 'SD-WAN 需要 ip 命令和 /dev/net/tun。' ;;
+            *) fail 'FASTP2P_SDWAN 只能为 0 或 1。' ;;
+        esac
+        [ ! -e "$unit" ] && [ ! -L "$unit" ] || fail '请先卸载已有 FastP2P 服务。'
+        if [ -e "$config_dir" ] || [ -L "$config_dir" ]; then
+            trusted_directory "$config_dir" || fail '配置目录必须归 root 且禁止其他用户写入。'
         fi
-        mv --help 2>&1 | grep -q -- '-T' || fail '需要支持 -T 的 mv（GNU coreutils 或 BusyBox）。'
-        file_metadata / >/dev/null || fail '无法读取文件权限，请检查 stat 或 ls -ldn。'
-        if [ "$manager" = procd ]; then
-            distribution=$(awk -F= '
-                /^DISTRIB_ID=/ {gsub(/[^A-Za-z0-9_.-]/,"",$2); id=$2}
-                /^DISTRIB_RELEASE=/ {gsub(/[^A-Za-z0-9_.-]/,"",$2); version=$2}
-                END {printf "%s%s%s", id?id:"OpenWrt", version?" ":"", version}
-            ' /etc/openwrt_release)
-            printf '检测到系统：%s（procd）\n' "$distribution"
-        else
-            printf '%s\n' "检测到服务管理器：$manager"
-        fi ;;
-    profile) printf '%s\n' "$profile" ;;
-    install) install_service "$@" ;;
-    stop) stop_service ;;
-    start) start_service ;;
-    restart) stop_service; start_service ;;
-    uninstall)
-        case "$#:${2:-}" in 1:|2:--keep-config) ;; *) fail '卸载参数无效。' ;; esac
-        remove_service
-        if [ "${2:-}" != --keep-config ]; then
-            rm -f "$binary" "$binary.old" /usr/local/bin/fastp2p "$prefix/fastp2p-service"
-            rm -f "$profile" "$profile.previous" "$profile.identity" "$state"/fastp2p.conf.ca.*.pem
-            # Only this root-owned, installer-created backup directory is purged.
-            if [ -d "$prefix/.backups" ] && [ ! -L "$prefix/.backups" ]; then rm -rf -- "$prefix/.backups"; fi
-            rmdir "$prefix/bin" "$state" "$parent" 2>/dev/null || true
-            rm -f "$prefix/init"; rmdir "$prefix" 2>/dev/null || true
-        fi
-        printf '%s\n' '旧服务已卸载。' ;;
-    *) fail '用法：fastp2p-service install|uninstall [--keep-config]|start|stop|restart|check' ;;
+        printf '检测到服务管理器：%s\n' "$manager"
+        exit 0 ;;
+    profile) printf '%s\n' "$profile"; exit 0 ;;
+    start|stop|restart) native "$1"; exit ;;
+    install|uninstall) ;;
+    *) fail '用法：fastp2p-service install PROGRAM PROFILE | uninstall [--keep-config]' ;;
 esac
+
+lock=/var/run/fastp2p-service.lock
+mkdir "$lock" 2>/dev/null || fail '另一个服务管理操作尚未结束。'
+stage=
+config_created=false
+installing=false
+finish() {
+    status=$?
+    set +e
+    if $installing && [ "$status" -ne 0 ]; then
+        remove_unit
+        rm -f -- "$binary" "$cli" "$prefix/fastp2p-service"
+        if $config_created; then rm -f -- "$profile" "$profile.previous" "$profile.identity" "$profile".ca.*.pem; fi
+    fi
+    if [ -n "$stage" ]; then
+        rm -f -- "$stage/fastp2p" "$stage/controller" "$stage/startup.log"
+        rmdir "$stage"
+    fi
+    if $installing && [ "$status" -ne 0 ]; then
+        rmdir "$prefix/bin" "$prefix" "$config_dir" 2>/dev/null
+    fi
+    rmdir "$lock"
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ "$1" = uninstall ]; then
+    case "$#:${2:-}" in 1:|2:--keep-config) ;; *) fail '卸载参数无效。' ;; esac
+    trusted_directory "$prefix" && trusted_directory "$prefix/bin" || fail '程序目录权限无效。'
+    if [ -e "$config_dir" ] || [ -L "$config_dir" ]; then
+        trusted_directory "$config_dir" || fail '配置目录权限无效。'
+    fi
+    remove_unit
+    rm -f -- "$binary" "$binary.old" "$cli" "$prefix/fastp2p-service"
+    if [ "${2:-}" != --keep-config ]; then
+        rm -f -- "$profile" "$profile.previous" "$profile.identity" "$profile".ca.*.pem
+        rmdir "$config_dir" 2>/dev/null || true
+    fi
+    if trusted_directory /tmp/fastp2p; then
+        rm -f -- /tmp/fastp2p/fastp2p.log
+        rmdir /tmp/fastp2p 2>/dev/null || true
+    fi
+    rmdir "$prefix/bin" "$prefix" 2>/dev/null || true
+    printf '%s\n' 'FastP2P 已卸载。'
+    exit 0
+fi
+
+[ "$#" -eq 3 ] && [ -f "$2" ] && [ -f "$3" ] && [ ! -L "$3" ] || fail '缺少已校验的程序或配置。'
+"$0" check >/dev/null
+[ "$("$2" --service-profile)" = "$profile" ] || fail '客户端和安装器的配置路径不一致。'
+if [ "${FASTP2P_SDWAN:-0}" -eq 1 ]; then "$2" --check-sdwan; fi
+trusted_directory /usr/local || fail '/usr/local 必须归 root 且禁止其他用户写入。'
+for path in "$prefix" "$prefix/bin" "$config_dir"; do
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then mkdir -m 755 "$path"; fi
+    trusted_directory "$path" || fail "目录权限无效：$path"
+done
+mkdir -p /usr/local/bin
+trusted_directory /usr/local/bin || fail '/usr/local/bin 权限无效。'
+[ ! -e "$binary" ] && [ ! -L "$binary" ] && [ ! -e "$cli" ] && [ ! -L "$cli" ] ||
+    fail '请先卸载已有 FastP2P 程序。'
+if [ "$3" != "$profile" ]; then
+    [ ! -e "$profile" ] && [ ! -L "$profile" ] || fail '配置路径已被占用。'
+fi
+stage=$(mktemp -d "$prefix/.install.XXXXXXXX")
+cp "$2" "$stage/fastp2p" && chmod 755 "$stage/fastp2p" ||
+    fail '暂存程序失败，请检查 /usr/local 的可用空间。'
+installing=true
+if [ "$3" != "$profile" ]; then
+    config_created=true
+    "$stage/fastp2p" --relocate-profile "$3" "$profile"
+fi
+"$stage/fastp2p" run --config "$profile" --verify-start > "$stage/startup.log" 2>&1 || {
+    cat "$stage/startup.log" >&2
+    fail '客户端启动检查失败。'
+}
+mv "$stage/fastp2p" "$binary"
+ln -s "$binary" "$cli"
+if [ "$manager" != procd ]; then
+    cp "$0" "$stage/controller"
+    chmod 755 "$stage/controller"
+    mv "$stage/controller" "$prefix/fastp2p-service"
+fi
+write_unit
+native enable
+native start
+for check in 1 2 3; do sleep 1; native status >/dev/null 2>&1 || fail '客户端服务未持续运行。'; done
+installing=false
+printf 'FastP2P 已安装，配置 %s，日志 /tmp/fastp2p/fastp2p.log。\n' "$profile"
