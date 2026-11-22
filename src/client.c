@@ -201,6 +201,9 @@ typedef struct {
      * startup, while DNS and routing settle) must not throw away the mapping and
      * turn a measurable NAT into "unknown". */
     int retried;
+    /* The probe borrowed the peer listener socket: its mapping is the port the
+     * operator forwards, and that socket has to stay open when the probe ends. */
+    int shared;
 } nat_stun;
 typedef struct {
     int level;
@@ -436,6 +439,7 @@ static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
 static void report_nat(fastp2p_client *);
+static int nat_stun_input(fastp2p_client *, const uint8_t *, size_t, const op_addr *, uint64_t);
 static int family_usable(const fastp2p_client *, const tunnel *, int);
 static void tick_nat(fastp2p_client *, uint64_t);
 static void close_overlay(fastp2p_client *, int, int);
@@ -4766,6 +4770,12 @@ static void tick_udp_listeners(fastp2p_client *c, uint64_t now) {
             if (length < 0)
                 break;
             op_addr_normalize(&peer);
+            /* The probe borrows this socket when a listener owns public_port,
+             * so its replies arrive here: hand them over before the punch
+             * dispatcher treats them as an unknown datagram and drops them. */
+            if (family == OP_FAM_V4 && c->stun.phase && c->stun.shared &&
+                nat_stun_input(c, packet, (size_t)length, &peer, now))
+                continue;
             dispatch_udp_listener(c, family, &peer, packet, (size_t)length, now);
         }
     }
@@ -5652,8 +5662,9 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
             op_addr_port(&local) == op_addr_port(&s->mapped) && same_ip(&local, &s->mapped))
             s->no_nat = 1;
     }
-    if (s->fd >= 0)
+    if (s->fd >= 0 && !s->shared)
         op_close(s->fd);
+    s->shared = 0;
     s->fd = -1;
     s->phase = 0;
     /* Same mapping from every destination -> cone; anything else is a
@@ -5721,75 +5732,91 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
     s->count = resolved;
     s->server = 0;
     s->phase = 1;
-    s->fd = socket_bound(1, NULL, 0, 0);
+    /* A listener on public_port already owns the mapping the operator forwards, so
+     * probe from that socket: classifying an ephemeral port would describe a port no
+     * firewall rule can name, and the verdict would be about the wrong mapping. */
+    if (c->udp_listener[OP_FAM_V4] >= 0) {
+        s->fd = c->udp_listener[OP_FAM_V4];
+        s->shared = 1;
+    } else {
+        s->fd = socket_bound(1, NULL, 0, 0);
+    }
     if (s->fd < 0) {
         nat_stun_finish(c, mono());
         return;
     }
     nat_stun_send(c);
 }
+/* A reply is handed in by whoever owns the socket: the probe reads its own socket
+ * when it has one, and the peer listener passes replies over when the probe borrowed
+ * it, which is the case whenever a listener owns public_port. Returns 1 when the
+ * datagram was a matching reply. */
+static int nat_stun_input(fastp2p_client *c, const uint8_t *data, size_t length,
+                          const op_addr *from, uint64_t now) {
+    nat_stun *s = &c->stun;
+    fp_stun_mapped mapped;
+    if (!fp_stun_response(data, length, s->tid, &mapped) || !mapped.valid)
+        return 0;
+    if (s->phase == 1) {
+        if (mapped.has_alternate && op_addr_family(&mapped.alternate) == AF_INET) {
+            /* Only the address or port actually offered by the server can be
+             * used to interpret a missing filtering reply. */
+            s->ip_supported |= !same_ip(&mapped.alternate, &s->addr[s->server]);
+            s->port_supported |= op_addr_port(&mapped.alternate) != op_addr_port(&s->addr[s->server]);
+        }
+        if (!s->mapped_seen) {
+            op_addr_copy(&s->mapped, &mapped.address);
+            s->mapped_seen = 1;
+            /* A symmetric NAT changes the mapped *port* per destination, so the
+             * comparison has to include it - op_addr_equal deliberately compares
+             * endpoints without the port. */
+        } else if (!same_ip(&mapped.address, &s->mapped) ||
+                   op_addr_port(&mapped.address) != op_addr_port(&s->mapped)) {
+            s->mapped_same = 0;
+        }
+    }
+    /* The reply's source is the evidence, not the payload. Address and port are
+     * judged separately: a CHANGE-REQUEST answer may come from another address,
+     * another port, or both. */
+    if (s->phase != 1 && op_addr_family(from) == op_addr_family(&s->addr[s->server])) {
+        if (op_addr_port(from) != op_addr_port(&s->addr[s->server])) {
+            s->port_changed = 1;
+            s->port_supported = 1;
+        }
+        if (!same_ip(from, &s->addr[s->server])) {
+            s->ip_changed = 1;
+            s->ip_supported = 1;
+        }
+    }
+    /* Advance to the next variant, and to the next server once this one has
+     * answered all three: the cross-server comparison is what separates cone from
+     * symmetric. */
+    ++s->phase;
+    if (s->phase > 3) {
+        ++s->server;
+        s->phase = 1;
+    }
+    if (s->server >= s->count) {
+        nat_stun_finish(c, now);
+        return 1;
+    }
+    s->retried = 0;
+    nat_stun_send(c);
+    return 1;
+}
 static void nat_stun_step(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
     if (!s->phase)
         return;
-    if (s->fd >= 0) {
+    if (s->fd >= 0 && !s->shared) {
         uint8_t data[1024];
         op_addr from;
         memset(&from, 0, sizeof(from));
         from.len = (op_socklen)sizeof(from.u.storage);
         op_ssize received =
             op_recvfrom(s->fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
-        if (received > 0) {
-            fp_stun_mapped mapped;
-            if (fp_stun_response(data, (size_t)received, s->tid, &mapped) && mapped.valid) {
-                if (s->phase == 1) {
-                    if (mapped.has_alternate && op_addr_family(&mapped.alternate) == AF_INET) {
-                        /* Only the address or port actually offered by the server
-                         * can be used to interpret a missing filtering reply. */
-                        s->ip_supported |= !same_ip(&mapped.alternate, &s->addr[s->server]);
-                        s->port_supported |= op_addr_port(&mapped.alternate) != op_addr_port(&s->addr[s->server]);
-                    }
-                    if (!s->mapped_seen) {
-                        op_addr_copy(&s->mapped, &mapped.address);
-                        s->mapped_seen = 1;
-                    /* A symmetric NAT changes the mapped *port* per destination,
-                     * so the comparison has to include it - op_addr_equal
-                     * deliberately compares endpoints without the port. */
-                    } else if (!same_ip(&mapped.address, &s->mapped) ||
-                               op_addr_port(&mapped.address) != op_addr_port(&s->mapped)) {
-                        s->mapped_same = 0;
-                    }
-                }
-                /* The reply's source is the evidence, not the payload. Address and
-                 * port are judged separately: a CHANGE-REQUEST answer may come
-                 * from another address, another port, or both. */
-                if (s->phase != 1 && op_addr_family(&from) == op_addr_family(&s->addr[s->server])) {
-                    if (op_addr_port(&from) != op_addr_port(&s->addr[s->server])) {
-                        s->port_changed = 1;
-                        s->port_supported = 1;
-                    }
-                    if (!same_ip(&from, &s->addr[s->server])) {
-                        s->ip_changed = 1;
-                        s->ip_supported = 1;
-                    }
-                }
-                /* Advance to the next variant, and to the next server once this
-                 * one has answered all three: the cross-server comparison is
-                 * what separates cone from symmetric. */
-                ++s->phase;
-                if (s->phase > 3) {
-                    ++s->server;
-                    s->phase = 1;
-                }
-                if (s->server >= s->count) {
-                    nat_stun_finish(c, now);
-                    return;
-                }
-                s->retried = 0;
-                nat_stun_send(c);
-                return;
-            }
-        }
+        if (received > 0 && nat_stun_input(c, data, (size_t)received, &from, now))
+            return;
     }
     if (now < s->deadline)
         return;
