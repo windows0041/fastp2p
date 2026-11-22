@@ -5857,8 +5857,15 @@ static int tcp_nat_level(const fastp2p_client *c) {
 }
 static int nat_level(const fastp2p_client *c) {
     const nat_discovery *n = &c->nat[OP_FAM_V4];
-    if (n->type == NAT_UNKNOWN)
-        return 0;
+    if (n->type == NAT_UNKNOWN) {
+        /* The gateway probe only settles the mapping when its IPv4 rendezvous is
+         * reachable. A host on an IPv6-only path, or behind a carrier that drops
+         * that route, still has a measurable translation: STUN reports the same
+         * mapping from an outside observer, including "no translation at all" for
+         * a host whose NIC carries the public address. Reporting "unknown" there
+         * hid a perfectly open host, so fall back to the STUN verdict. */
+        return nat_filter_level(&c->udp_filter, mono());
+    }
     if (n->type != NAT_CONE)
         return 4;
     /* An external STUN observer settles it without needing a second node. Levels
