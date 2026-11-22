@@ -5752,6 +5752,11 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     else
         level = port_evidence ? 3 : 5;
     nat_filter_record(&c->udp_filter, level == 5 ? 0 : level, now);
+    /* The registry only learns the level when it is told: a login before the probe
+     * finishes carries the previous value, so publish the verdict as soon as there
+     * is one. Otherwise a host that is open reads as unknown until its next login. */
+    if (c->ws && c->login_ok)
+        report_nat(c);
     {
         char message[176];
         snprintf(message, sizeof(message),
