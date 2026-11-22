@@ -246,8 +246,11 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                              .username = op_string(p, "Username"),
                              .password = password,
                              .relay_node = op_string(p,"RelayNode"),
-                             .no_relay = (op_integer(p,"NoRelay") != 0 ||
-                                          op_integer(p,"noRelay") != 0) ? 1 : 0};
+                             /* A console switch arrives as a JSON boolean and the integer
+                              * accessor reads that as 0, so a rule saved as "no relay" came
+                              * back as "auto" on every reload and the client kept asking for
+                              * a relay the operator had already refused. */
+                             .no_relay = (op_flag(p,"NoRelay") || op_flag(p,"noRelay")) ? 1 : 0};
         rv = fastp2p_client_add_socks5(*out, &proxy, NULL);
     }
     json_object *sdwan;
