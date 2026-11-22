@@ -5649,6 +5649,20 @@ static void nat_filter_record(nat_filter *filter, int level, uint64_t now) {
 static int nat_filter_level(const nat_filter *filter, uint64_t now) {
     return now - filter->measured_at < NAT_FILTER_MAX_AGE ? filter->level : 0;
 }
+/* A listening socket is bound to the wildcard address, so its own endpoint says
+ * nothing about which address the outside world sees. Treat that as unknown rather
+ * than as a difference: the port is still the evidence this comparison needs. */
+static int addr_is_unspecified(const op_addr *a) {
+    op_addr copy = *a;
+    op_addr_normalize(&copy);
+    if (op_addr_family(&copy) == AF_INET)
+        return copy.u.in.sin_addr.s_addr == 0;
+    if (op_addr_family(&copy) == AF_INET6) {
+        static const uint8_t zero[16] = {0};
+        return !memcmp(&copy.u.in6.sin6_addr, zero, sizeof(zero));
+    }
+    return 0;
+}
 static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
     /* Read the local endpoint before closing: when the server reports exactly the
@@ -5659,7 +5673,8 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
         memset(&local, 0, sizeof(local));
         if (!op_addr_socketname(s->fd, &local) &&
             op_addr_family(&local) == op_addr_family(&s->mapped) &&
-            op_addr_port(&local) == op_addr_port(&s->mapped) && same_ip(&local, &s->mapped))
+            op_addr_port(&local) == op_addr_port(&s->mapped) &&
+            (addr_is_unspecified(&local) || same_ip(&local, &s->mapped)))
             s->no_nat = 1;
     }
     if (s->fd >= 0 && !s->shared)
