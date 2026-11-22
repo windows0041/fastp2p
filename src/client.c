@@ -5949,8 +5949,12 @@ static int tcp_nat_level(const fastp2p_client *c) {
     /* The TCP mapping probe needs a reachable echo server. When it never got a
      * sample - the IPv4 rendezvous is unreachable from this host - the UDP verdict
      * still says whether the interface itself is translated, and TCP shares it. */
-    if (!k->samples && nat_filter_level(&c->udp_filter, mono()) == 6)
-        return 6;
+    /* The UDP verdict describes the same interface: no translation at all (6) or
+     * no translation with a filtering firewall (7) both mean TCP shares that path
+     * and its "level" would describe a firewall rule, not a NAT mapping. */
+    int udp_level = nat_filter_level(&c->udp_filter, mono());
+    if (!k->samples && (udp_level == 6 || udp_level == 7))
+        return udp_level;
     return nat_filter_level(&c->tcp_filter, mono());
 }
 static int nat_level(const fastp2p_client *c) {
