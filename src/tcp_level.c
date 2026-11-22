@@ -276,8 +276,14 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
             return;
         }
         if (line > 0 && !strncmp(state->line, "mapped", 6)) {
-            static const char request[] = "probe\n";
-            if (send(state->dialer, request, sizeof(request) - 1, MSG_DONTWAIT) <= 0) {
+            /* Name the published port when it is known: the callback then tests the
+             * port peers actually dial instead of the ephemeral source port. */
+            char request[32];
+            int length = state->fixed_port
+                             ? snprintf(request, sizeof(request), "probe %u\n",
+                                        (unsigned)state->fixed_port)
+                             : snprintf(request, sizeof(request), "probe\n");
+            if (send(state->dialer, request, (size_t)length, MSG_DONTWAIT) <= 0) {
                 fp_tcp_level_close(state);
                 state->phase = 4;
                 return;

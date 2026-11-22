@@ -818,7 +818,12 @@ static void close_peer_listeners(op_socket listeners[OP_FAM_COUNT]) {
 static int bind_peer_listeners(fastp2p_client *c, uint16_t port, int udp) {
     op_socket *listeners = udp ? c->udp_listener : c->listener;
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
-        if (!family_wanted(c, family))
+        /* The peer listener is about the data plane, not the control connection: a host
+         * whose gateway is only reachable over IPv6 still has peers arriving over
+         * IPv4; skipping that listener made the IPv4 callback fail and the TCP
+         * verdict read port-restricted. IPv4 is always attempted, IPv6 only when
+         * the family is usable. */
+        if (family == OP_FAM_V6 && !family_wanted(c, OP_FAM_V6))
             continue;
         listeners[family] = socket_bound(udp, family == OP_FAM_V4 ? NULL : "::",
                                          port, BIND_PEER_LISTENER);
@@ -5953,7 +5958,7 @@ static int tcp_nat_level(const fastp2p_client *c) {
      * no translation with a filtering firewall (7) both mean TCP shares that path
      * and its "level" would describe a firewall rule, not a NAT mapping. */
     int udp_level = nat_filter_level(&c->udp_filter, mono());
-    if (!k->samples && (udp_level == 6 || udp_level == 7))
+    if (udp_level == 6 || udp_level == 7)
         return udp_level;
     return nat_filter_level(&c->tcp_filter, mono());
 }
