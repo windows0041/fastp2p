@@ -5886,8 +5886,20 @@ static void nat_stun_step(fastp2p_client *c, uint64_t now) {
  * cone-shaped mapping whose filtering has yet to be measured. */
 /* TCP level: the mapping settles symmetric, the callback probe settles the cones. */
 static int tcp_nat_level(const fastp2p_client *c) {
-    if (c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT)
+    const fp_tcp_family *k = &c->tcp_nat.family[OP_FAM_V4];
+    if (k->type == FP_NAT_DEPENDENT)
         return 4;
+    /* Nothing is translated means there is no filtering level to describe either.
+     * The same evidence the UDP path uses settles it - the mapped address equals one
+     * of our interface addresses - and unlike the callback probe it does not depend
+     * on a server that dials back, which a plain STUN server never does. */
+    if (k->type == FP_NAT_STABLE && k->samples && mapped_is_local_address(c, &k->mapped[0]))
+        return 6;
+    /* The TCP mapping probe needs a reachable echo server. When it never got a
+     * sample - the IPv4 rendezvous is unreachable from this host - the UDP verdict
+     * still says whether the interface itself is translated, and TCP shares it. */
+    if (!k->samples && nat_filter_level(&c->udp_filter, mono()) == 6)
+        return 6;
     return nat_filter_level(&c->tcp_filter, mono());
 }
 static int nat_level(const fastp2p_client *c) {
