@@ -403,6 +403,9 @@ struct fastp2p_client {
     /* Which family to offer first when both resolve, and how many attempts in a row
      * have failed: a route that completes the TCP handshake and then stays silent
      * never lets curl fall through, so the order has to move by itself. */
+    /* Both families were resolved for this connection, which is what makes a
+     * switch worth trying: the family bitmap above only describes reachability. */
+    int gateway_dual;
     int gateway_prefer_v6;
     unsigned gateway_failures;
     int families_wanted;  /* what we publish: observed 鈭?configured intent */
@@ -5252,7 +5255,7 @@ static void gateway_retry_next_family(fastp2p_client *c) {
     if (++c->gateway_failures < 2)
         return;
     c->gateway_failures = 0;
-    if ((c->gateway_families & FAM_V4) && (c->gateway_families & FAM_V6))
+    if (c->gateway_dual)
         c->gateway_prefer_v6 = !c->gateway_prefer_v6;
 }
 static void gateway_failed(fastp2p_client *c) {
@@ -5338,7 +5341,8 @@ static void connect_gateway(fastp2p_client *c) {
         /* The preferred family goes first. A route that answers the TCP handshake and
          * then goes silent never lets curl fall through to the second address, so the
          * order comes from the retry counter and not from the resolution order. */
-        int v6_first = ipv6 && (!ipv4 || c->gateway_prefer_v6);
+        c->gateway_dual = ipv4 && ipv6;
+    int v6_first = ipv6 && (!ipv4 || c->gateway_prefer_v6);
         int length = v6_first
                           ? snprintf(entry, sizeof(entry), "%s:%u:[%s]%s%s", urlhost, c->port,
                                      addresses[OP_FAM_V6], ipv4 ? "," : "", addresses[OP_FAM_V4])
