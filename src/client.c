@@ -5663,6 +5663,25 @@ static int addr_is_unspecified(const op_addr *a) {
     }
     return 0;
 }
+/* A listening socket is wildcard-bound, so the address half of "did anything get
+ * translated" has to come from the interface addresses the client already knows.
+ * Comparing only the port would call a port-preserving NAT "no NAT" and mislabel a
+ * filtered private host as an open one. */
+static int mapped_is_local_address(const fastp2p_client *c, const op_addr *mapped) {
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        const char *text = c->local_ip[family];
+        if (!text[0])
+            continue;
+        op_addr local;
+        if (op_addr_from_text(&local, text, 0))
+            continue;
+        if (op_addr_family(&local) != op_addr_family(mapped))
+            continue;
+        if (same_ip(&local, mapped))
+            return 1;
+    }
+    return 0;
+}
 static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
     /* Read the local endpoint before closing: when the server reports exactly the
@@ -5674,7 +5693,8 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
         if (!op_addr_socketname(s->fd, &local) &&
             op_addr_family(&local) == op_addr_family(&s->mapped) &&
             op_addr_port(&local) == op_addr_port(&s->mapped) &&
-            (addr_is_unspecified(&local) || same_ip(&local, &s->mapped)))
+            (addr_is_unspecified(&local) ? mapped_is_local_address(c, &s->mapped)
+                                          : same_ip(&local, &s->mapped)))
             s->no_nat = 1;
     }
     if (s->fd >= 0 && !s->shared)
