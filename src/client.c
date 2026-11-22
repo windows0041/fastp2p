@@ -5778,6 +5778,22 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
         return;
     if (c->nat[OP_FAM_V4].type != NAT_CONE && c->nat[OP_FAM_V4].type != NAT_UNKNOWN)
         return; /* symmetric is already NAT4, no stranger test needed */
+    /* The control connection may resolve over IPv6 only, in which case local_ip[v4]
+     * stays empty and the open-host comparison has no address to compare against.
+     * Ask the kernel which source address it would use for the STUN server: that is
+     * the address the mapping is measured against. */
+    if (!c->local_ip[OP_FAM_V4][0]) {
+        op_socket probe = socket_bound(1, NULL, 0, 0);
+        if (probe >= 0) {
+            if (!op_connect(probe, &s->addr[0].u.sa, s->addr[0].len)) {
+                op_addr source;
+                memset(&source, 0, sizeof(source));
+                if (!op_addr_socketname(probe, &source) && op_addr_family(&source) == AF_INET)
+                    op_addr_text(&source, c->local_ip[OP_FAM_V4], sizeof(c->local_ip[OP_FAM_V4]));
+            }
+            op_close(probe);
+        }
+    }
     *s = (nat_stun){.fd = -1, .mapped_same = 1};
     int resolved = 0;
     for (int i = 0; i < c->stun_count; ++i) {
