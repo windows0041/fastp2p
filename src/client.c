@@ -5295,6 +5295,15 @@ static void connect_gateway(fastp2p_client *c) {
                                      ipv6 ? "[" : "", addresses[OP_FAM_V6], ipv6 ? "]" : "");
         if (length > 0 && (size_t)length < sizeof(entry))
             c->resolve = curl_slist_append(NULL, entry);
+    /* Which endpoint the control connection actually dials, and which families the
+     * resolver offered: a failure here is otherwise indistinguishable from a
+     * rejected handshake in the log. */
+    {
+        char message[320];
+        snprintf(message, sizeof(message), "gateway dial: %s (v4=%s v6=%s resolve=%s)",
+                 entry, addresses[OP_FAM_V4], addresses[OP_FAM_V6], c->path);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
+    }
     }
     if (!c->resolve) {
         gateway_failed(c);
