@@ -443,6 +443,7 @@ static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
+static int local_is_public(const char *text);
 static void report_nat(fastp2p_client *);
 static int nat_stun_input(fastp2p_client *, const uint8_t *, size_t, const op_addr *, uint64_t);
 static int family_usable(const fastp2p_client *, const tunnel *, int);
@@ -5155,8 +5156,36 @@ static void report_client(fastp2p_client *c) {
     op_ju(j, "natLevel", (uint64_t)nat_level(c));
     op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
     report_families(c, j);
+    /* The refresh frame carries the addresses too: the login happens before the
+     * IPv4 mapping is known, so without this a host whose NIC is public keeps an
+     * empty public address in the registry forever. */
+    op_js(j, "IPv4", c->ip[OP_FAM_V4][0]
+                       ? c->ip[OP_FAM_V4]
+                       : (local_is_public(c->local_ip[OP_FAM_V4]) ? c->local_ip[OP_FAM_V4] : ""));
+    op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
     ws_json(c, 6, 0, j);
     json_object_put(j);
+}
+/* A host whose NIC carries the public address has a public "LAN" address: report it
+ * as the public one too, so the registry shows the same value in both fields instead
+ * of an empty public address waiting for a mapping that does not exist. */
+static int local_is_public(const char *text) {
+    struct in_addr address;
+    if (!text || !*text || inet_pton(AF_INET, text, &address) != 1)
+        return 0;
+    uint32_t value = ntohl(address.s_addr);
+    unsigned first = value >> 24, second = (value >> 16) & 0xff;
+    if (!first || first == 10 || first == 127 || first >= 224)
+        return 0;
+    if (first == 172 && second >= 16 && second <= 31)
+        return 0;
+    if (first == 192 && second == 168)
+        return 0;
+    if (first == 169 && second == 254)
+        return 0;
+    if (first == 100 && second >= 64 && second <= 127)
+        return 0;
+    return 1;
 }
 static void report_nat(fastp2p_client *c) {
     json_object *j = json_object_new_object();
@@ -5169,6 +5198,10 @@ static void report_nat(fastp2p_client *c) {
     op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
     report_families(c, j);
     /* NAT refresh must not replay gateway rules or managed configuration. */
+    op_js(j, "IPv4", c->ip[OP_FAM_V4][0]
+                       ? c->ip[OP_FAM_V4]
+                       : (local_is_public(c->local_ip[OP_FAM_V4]) ? c->local_ip[OP_FAM_V4] : ""));
+    op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
     ws_json(c, 6, 9, j); /* 6/8 is reserved for managed configuration ACKs. */
     json_object_put(j);
 }
