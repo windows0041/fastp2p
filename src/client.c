@@ -443,6 +443,7 @@ static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
+static int addr_text_set(const char *text);
 static int local_is_public(const char *text);
 static void report_nat(fastp2p_client *);
 static int nat_stun_input(fastp2p_client *, const uint8_t *, size_t, const op_addr *, uint64_t);
@@ -5159,7 +5160,7 @@ static void report_client(fastp2p_client *c) {
     /* The refresh frame carries the addresses too: the login happens before the
      * IPv4 mapping is known, so without this a host whose NIC is public keeps an
      * empty public address in the registry forever. */
-    op_js(j, "IPv4", c->ip[OP_FAM_V4][0]
+    op_js(j, "IPv4", addr_text_set(c->ip[OP_FAM_V4])
                        ? c->ip[OP_FAM_V4]
                        : (local_is_public(c->local_ip[OP_FAM_V4]) ? c->local_ip[OP_FAM_V4] : ""));
     op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
@@ -5169,6 +5170,12 @@ static void report_client(fastp2p_client *c) {
 /* A host whose NIC carries the public address has a public "LAN" address: report it
  * as the public one too, so the registry shows the same value in both fields instead
  * of an empty public address waiting for a mapping that does not exist. */
+/* The client seeds both v4 slots with "0.0.0.0" at init, so a non-empty check alone
+ * reports a bogus address: nothing learns the real value and "is this our own address"
+ * can never match. Treat the placeholder as unset everywhere. */
+static int addr_text_set(const char *text) {
+    return text && text[0] && strcmp(text, "0.0.0.0");
+}
 static int local_is_public(const char *text) {
     struct in_addr address;
     if (!text || !*text || inet_pton(AF_INET, text, &address) != 1)
@@ -5198,7 +5205,7 @@ static void report_nat(fastp2p_client *c) {
     op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
     report_families(c, j);
     /* NAT refresh must not replay gateway rules or managed configuration. */
-    op_js(j, "IPv4", c->ip[OP_FAM_V4][0]
+    op_js(j, "IPv4", addr_text_set(c->ip[OP_FAM_V4])
                        ? c->ip[OP_FAM_V4]
                        : (local_is_public(c->local_ip[OP_FAM_V4]) ? c->local_ip[OP_FAM_V4] : ""));
     op_js(j, "lanIP", c->local_ip[OP_FAM_V4]);
@@ -5851,7 +5858,7 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
     /* Now that a server address exists, ask the kernel which source address it
      * would use towards it: with an IPv6-only control path local_ip[v4] is
      * otherwise empty and the open-host comparison has nothing to compare. */
-    if (!c->local_ip[OP_FAM_V4][0]) {
+    if (!addr_text_set(c->local_ip[OP_FAM_V4])) {
         op_socket probe = socket_bound(1, NULL, 0, 0);
         if (probe >= 0) {
             if (!op_connect(probe, &s->addr[0].u.sa, s->addr[0].len)) {
