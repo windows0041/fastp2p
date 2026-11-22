@@ -27,6 +27,9 @@ typedef struct {
     uint16_t server_port;
     op_socket listener, dialer;
     uint16_t local_port;
+    /* Non-zero: probe from the business port itself, so the callback the server
+     * makes tests the port operators actually open rather than a random one. */
+    uint16_t fixed_port;
     uint64_t deadline;
     char line[96];
     size_t used;

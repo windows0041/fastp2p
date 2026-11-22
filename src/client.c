@@ -5708,8 +5708,10 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     /* Read the local endpoint before closing: when the server reports exactly the
      * address we sent from, there is no NAT in the path at all, and calling that
      * a full-cone NAT would be wrong. */
+    char local_text[OP_ADDR_TEXT] = "", mapped_text[OP_ADDR_TEXT] = "";
     if (s->fd >= 0 && s->mapped_seen && !s->no_nat) {
         op_addr local;
+        op_addr_text(&s->mapped, mapped_text, sizeof(mapped_text));
         memset(&local, 0, sizeof(local));
         if (!op_addr_socketname(s->fd, &local) &&
             op_addr_family(&local) == op_addr_family(&s->mapped) &&
@@ -5717,6 +5719,7 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
             (addr_is_unspecified(&local) ? mapped_is_local_address(c, &s->mapped)
                                           : same_ip(&local, &s->mapped)))
             s->no_nat = 1;
+        op_addr_text(&local, local_text, sizeof(local_text));
     }
     if (s->fd >= 0 && !s->shared)
         op_close(s->fd);
@@ -5760,12 +5763,14 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     {
         char message[176];
         snprintf(message, sizeof(message),
-                 "STUN NAT level: %d (mapping %s, other port %s, other address %s; "
-                 "server honours change-request: port %s, address %s)",
+"STUN NAT level: %d (mapping %s, other port %s, other address %s; "
+                 "server honours change-request: port %s, address %s; "
+                 "local %s mapped %s no_nat %d)",
                  level, !s->mapped_seen ? "unmeasured" : s->mapped_same ? "stable" : "per-destination",
                  s->port_changed ? "answered" : "no reply",
                  s->ip_changed ? "answered" : "no reply", port_evidence ? "yes" : "unknown",
-                 ip_evidence ? "yes" : "unknown");
+                 ip_evidence ? "yes" : "unknown",
+                 local_text, mapped_text, s->no_nat);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     if (c->ws && c->login_ok)
@@ -6486,6 +6491,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     if (!c->tcp_level.phase && c->tcp_level.server_port && c->ws && c->login_ok &&
         now >= c->tcp_filter.next_at) {
         c->tcp_level.attempt = 0;
+    c->tcp_level.fixed_port = (uint16_t)c->public_port;
         fp_tcp_level_start(&c->tcp_level);
     }
     fp_tcp_level_step(&c->tcp_level, now);

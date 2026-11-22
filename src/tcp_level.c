@@ -133,6 +133,18 @@ void fp_tcp_level_start(fp_tcp_level *state) {
      * listener is created only after this succeeds - putting it on the same port
      * beforehand lets the kernel steer the SYN-ACK to the listener and the
      * connect then never completes. */
+    if (state->fixed_port) {
+        /* Bind the outbound connection to the business port so the mapping the server
+         * records - and therefore the endpoint it calls back - is the one a peer would
+         * use. Another process may already own it; then the ephemeral port stays. */
+        op_addr any;
+        memset(&any, 0, sizeof(any));
+        any.u.sa.sa_family = (unsigned short)family;
+        any.len = family == AF_INET6 ? sizeof(any.u.in6) : sizeof(any.u.in);
+        op_addr_set_port(&any, state->fixed_port);
+        if (!op_bind(state->dialer, &any.u.sa, any.len))
+            state->local_port = state->fixed_port;
+    }
     if (op_connect(state->dialer, &state->server.u.sa, state->server.len) &&
         errno != EINPROGRESS) {
         TRACE("connect failed errno=%d", errno);
@@ -151,6 +163,10 @@ static int listen_here(fp_tcp_level *state) {
     if (op_addr_socketname(state->dialer, &local))
         return -1;
     state->local_port = op_addr_port(&local);
+    /* The business port is already served by the tunnel listener; a second socket
+     * on it would split the callbacks between the two. */
+    if (state->fixed_port && state->local_port == state->fixed_port)
+        return 0;
     int family = op_addr_family(&local);
     op_addr any;
     memset(&any, 0, sizeof(any));
