@@ -5761,7 +5761,7 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     if (c->ws && c->login_ok)
         report_nat(c);
     {
-        char message[176];
+        char message[320];
         snprintf(message, sizeof(message),
 "STUN NAT level: %d (mapping %s, other port %s, other address %s; "
                  "server honours change-request: port %s, address %s; "
@@ -5788,22 +5788,6 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
         return;
     if (c->nat[OP_FAM_V4].type != NAT_CONE && c->nat[OP_FAM_V4].type != NAT_UNKNOWN)
         return; /* symmetric is already NAT4, no stranger test needed */
-    /* The control connection may resolve over IPv6 only, in which case local_ip[v4]
-     * stays empty and the open-host comparison has no address to compare against.
-     * Ask the kernel which source address it would use for the STUN server: that is
-     * the address the mapping is measured against. */
-    if (!c->local_ip[OP_FAM_V4][0]) {
-        op_socket probe = socket_bound(1, NULL, 0, 0);
-        if (probe >= 0) {
-            if (!op_connect(probe, &s->addr[0].u.sa, s->addr[0].len)) {
-                op_addr source;
-                memset(&source, 0, sizeof(source));
-                if (!op_addr_socketname(probe, &source) && op_addr_family(&source) == AF_INET)
-                    op_addr_text(&source, c->local_ip[OP_FAM_V4], sizeof(c->local_ip[OP_FAM_V4]));
-            }
-            op_close(probe);
-        }
-    }
     *s = (nat_stun){.fd = -1, .mapped_same = 1};
     int resolved = 0;
     for (int i = 0; i < c->stun_count; ++i) {
@@ -5817,6 +5801,21 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
         return;
     }
     s->count = resolved;
+    /* Now that a server address exists, ask the kernel which source address it
+     * would use towards it: with an IPv6-only control path local_ip[v4] is
+     * otherwise empty and the open-host comparison has nothing to compare. */
+    if (!c->local_ip[OP_FAM_V4][0]) {
+        op_socket probe = socket_bound(1, NULL, 0, 0);
+        if (probe >= 0) {
+            if (!op_connect(probe, &s->addr[0].u.sa, s->addr[0].len)) {
+                op_addr source;
+                memset(&source, 0, sizeof(source));
+                if (!op_addr_socketname(probe, &source) && op_addr_family(&source) == AF_INET)
+                    op_addr_text(&source, c->local_ip[OP_FAM_V4], sizeof(c->local_ip[OP_FAM_V4]));
+            }
+            op_close(probe);
+        }
+    }
     s->server = 0;
     s->phase = 1;
     /* A listener on public_port already owns the mapping the operator forwards, so
