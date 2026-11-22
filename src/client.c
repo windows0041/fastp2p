@@ -5769,12 +5769,12 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
 static void nat_stun_start(fastp2p_client *c, uint64_t now) {
     nat_stun *s = &c->stun;
     if (s->phase || !c->stun_count || !c->ws || !c->login_ok ||
-        /* The probe measures the IPv4 mapping of this host, which the STUN servers
-         * answer independently of the address family the control connection uses.
-         * Tying it to the gateway family skipped the measurement on a v6-only path,
-         * so an open host reported "unknown". A local IPv4 address is the only
-         * precondition the probe actually needs. */
-        !c->local_ip[OP_FAM_V4][0] || now < c->udp_filter.next_at)
+        /* The probe measures this host's IPv4 mapping, which the STUN servers
+         * answer independently of the address family the control connection uses:
+         * tying it to the gateway family skipped the measurement on a v6-only path
+         * and reported an open host as "unknown". A host without IPv4 simply gets
+         * no reply, which leaves the verdict undetermined as before. */
+        now < c->udp_filter.next_at)
         return;
     if (c->nat[OP_FAM_V4].type != NAT_CONE && c->nat[OP_FAM_V4].type != NAT_UNKNOWN)
         return; /* symmetric is already NAT4, no stranger test needed */
