@@ -399,6 +399,11 @@ struct fastp2p_client {
      * uses `gateway` (the preferred one); probes and CURLOPT_RESOLVE use all. */
     op_addr gateway, gateway_addr[OP_FAM_COUNT];
     int gateway_families; /* bitmap: 1 = v4, 2 = v6 */
+    /* Which family to offer first when both resolve, and how many attempts in a row
+     * have failed: a route that completes the TCP handshake and then stays silent
+     * never lets curl fall through, so the order has to move by itself. */
+    int gateway_prefer_v6;
+    unsigned gateway_failures;
     int families_wanted;  /* what we publish: observed 鈭?configured intent */
     CURLM *multi;
     CURL *ws;
@@ -3333,6 +3338,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 }
             }
             c->login_ok = 1;
+            c->gateway_failures = 0;
             c->gateway_tcp_probe_v2 = op_integer(j, "tcpProbeV2") == 1;
             /* SPEC 搂3: only a V3 gateway brackets an IPv6 echo record; without
              * it this client keeps the legacy v4-only echo parsing. */
@@ -5196,7 +5202,15 @@ static void close_gateway(fastp2p_client *c) {
         set_state(c, FASTP2P_RECONNECTING, "gateway disconnected; retry scheduled");
     }
 }
+static void gateway_retry_next_family(fastp2p_client *c) {
+    if (++c->gateway_failures < 2)
+        return;
+    c->gateway_failures = 0;
+    if ((c->gateway_families & FAM_V4) && (c->gateway_families & FAM_V6))
+        c->gateway_prefer_v6 = !c->gateway_prefer_v6;
+}
 static void gateway_failed(fastp2p_client *c) {
+    gateway_retry_next_family(c);
     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
          "WSS connection failed: check gateway address, CA, certificate hostname and token");
     close_gateway(c);
@@ -5205,6 +5219,7 @@ static void gateway_failed(fastp2p_client *c) {
  * cannot distinguish an unreachable host from an unreadable CA or a hostname
  * mismatch, which is exactly what a reported failure usually needs. */
 static void gateway_failed_curl(fastp2p_client *c, CURLcode rv) {
+    gateway_retry_next_family(c);
     char message[448];
     if (c->curl_error[0])
         snprintf(message, sizeof(message), "WSS connection failed: %s (curl %d): %s",
@@ -5263,10 +5278,16 @@ static void connect_gateway(fastp2p_client *c) {
     int ipv4 = addresses[OP_FAM_V4][0] != 0, ipv6 = addresses[OP_FAM_V6][0] != 0;
     if (ipv4 || ipv6) {
         char entry[512];
-        /* Multiple entries for the same host and port replace each other. */
-        int length = snprintf(entry, sizeof(entry), "%s:%u:%s%s%s%s%s", urlhost, c->port,
-                              addresses[OP_FAM_V4], ipv4 && ipv6 ? "," : "", ipv6 ? "[" : "",
-                              addresses[OP_FAM_V6], ipv6 ? "]" : "");
+        /* The preferred family goes first. A route that answers the TCP handshake and
+         * then goes silent never lets curl fall through to the second address, so the
+         * order comes from the retry counter and not from the resolution order. */
+        int v6_first = ipv6 && (!ipv4 || c->gateway_prefer_v6);
+        int length = v6_first
+                          ? snprintf(entry, sizeof(entry), "%s:%u:[%s]%s%s", urlhost, c->port,
+                                     addresses[OP_FAM_V6], ipv4 ? "," : "", addresses[OP_FAM_V4])
+                          : snprintf(entry, sizeof(entry), "%s:%u:%s%s%s%s%s", urlhost, c->port,
+                                     addresses[OP_FAM_V4], ipv4 && ipv6 ? "," : "",
+                                     ipv6 ? "[" : "", addresses[OP_FAM_V6], ipv6 ? "]" : "");
         if (length > 0 && (size_t)length < sizeof(entry))
             c->resolve = curl_slist_append(NULL, entry);
     }
