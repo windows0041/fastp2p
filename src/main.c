@@ -29,7 +29,7 @@ static void request_restart(void *user) {
 /* Beijing time for every line, independent of the host zone: the log is read across
  * machines and a bare event sequence made ordering and rate impossible to judge. */
 static const char *beijing_stamp(void) {
-    static char text[40];
+    static char text[64];
     /* timespec_get is not declared by MinGW time.h under -std=gnu11, so the
      * milliseconds come from the platform and the seconds from time(). */
     time_t now = time(NULL);
