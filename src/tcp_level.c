@@ -163,10 +163,6 @@ static int listen_here(fp_tcp_level *state) {
     if (op_addr_socketname(state->dialer, &local))
         return -1;
     state->local_port = op_addr_port(&local);
-    /* The business port is already served by the tunnel listener; a second socket
-     * on it would split the callbacks between the two. */
-    if (state->fixed_port && state->local_port == state->fixed_port)
-        return 0;
     int family = op_addr_family(&local);
     op_addr any;
     memset(&any, 0, sizeof(any));

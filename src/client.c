@@ -405,6 +405,11 @@ struct fastp2p_client {
     /* Both families were resolved for this connection, which is what makes a
      * switch worth trying: the family bitmap above only describes reachability. */
     int gateway_dual;
+    /* 1 while the TCP peer listener is closed so the probe can own the port, and when
+     * that last happened: a probe that keeps failing must not close the listener on
+     * every 30 s retry. */
+    int tcp_relisten;
+    uint64_t tcp_handoff_at;
     int gateway_prefer_v6;
     unsigned gateway_failures;
     int families_wanted;  /* what we publish: observed 鈭?configured intent */
@@ -6563,6 +6568,17 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     if (!c->tcp_level.phase && c->tcp_level.server_port && c->ws && c->login_ok &&
         now >= c->tcp_filter.next_at) {
         c->tcp_level.attempt = 0;
+        /* The probe has to originate from the business port: only that mapping is
+         * named by an operator firewall rule, so a callback to any other port is
+         * dropped and the verdict would describe a port nobody can open. Release
+         * the TCP listener for the probe window and rebuild it below. */
+        c->tcp_relisten = 0;
+        if (c->public_port && c->listener[OP_FAM_V4] >= 0 &&
+            now - c->tcp_handoff_at >= NAT_FILTER_REFRESH) {
+            close_peer_listeners(c->listener);
+            c->tcp_relisten = 1;
+            c->tcp_handoff_at = now;
+        }
     c->tcp_level.fixed_port = (uint16_t)c->public_port;
         fp_tcp_level_start(&c->tcp_level);
     }
@@ -6575,6 +6591,12 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
                  c->tcp_level.other_ip);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
         nat_filter_record(&c->tcp_filter, c->tcp_level.level, mono());
+        if (c->tcp_relisten) {
+            c->tcp_relisten = 0;
+            if (bind_peer_listeners(c, c->public_port, 0))
+                emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+                     "TCP peer listener could not be restored after the probe");
+        }
         c->tcp_level.phase = 0;
         if (c->ws && c->login_ok)
             report_nat(c);
