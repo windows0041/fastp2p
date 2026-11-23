@@ -4458,7 +4458,7 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
 
             if (slot) {
                 op_close(t->fd);
-    t->fd = -1;
+                t->fd = fd;
                 t->udp_candidates[slot - 1] = -1;
                 t->local_port = socket_port(fd);
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP punch selected another local socket");
