@@ -57,8 +57,22 @@
 #define TCP_PUNCH_ATTEMPT_MS 250u
 /* How far a TCP dial walks around the port the peer reported: a carrier NAT picks
  * the mapping for a new destination out of a pool, so the reachable port is close
- * to, but not equal to, the one reported for a different destination. */
-#define TCP_PUNCH_SCAN 0
+ * to, but not equal to, the one reported for a different destination.
+ *
+ * A cone mapping keeps one port for every destination, so its reported port is
+ * the reachable one and a walk would only waste attempts; that is why this was
+ * zero. A symmetric (NAT4) mapping allocates per destination, usually within a
+ * small range of its previous choice, and then the reported port can never be
+ * dialled. Walking is therefore limited to the case that needs it: only silent
+ * (dropped) dials advance the window, and a refused one resets it because the
+ * peer's NAT answered on the reported port. */
+#define TCP_PUNCH_SCAN 32
+/* A dial that is silently dropped means the advertised endpoint was measured
+ * towards another destination and no longer maps to the peer. A refused dial is
+ * the opposite: the NAT answers, so the endpoint is live and worth retrying for
+ * the whole window. Give the silent case a few attempts, then ask for a fresh
+ * offer instead of dialling a dead port for thirty seconds. */
+#define TCP_PUNCH_STALE_ATTEMPTS 40u
 /* How often an active tunnel proves it is still there. */
 #define TCP_KEEPALIVE_MS 3000u
 #define UDP_DIRECT_WAIT (5 * NS)
@@ -232,6 +246,9 @@ typedef struct {
     uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port, udp_reverse_port6;
     int skip_udp_direct, udp_reverse6_retry, udp_reverse6_supported;
     unsigned tcp_attempts;
+    /* Consecutive silent (timed-out) dials: a refused one resets it, because a
+     * NAT that answers is worth retrying while a silent one is not. */
+    unsigned tcp_timeouts;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
     unsigned tcp_mapping, peer_tcp_mapping;
@@ -2395,9 +2412,12 @@ static uint16_t tcp_scan_port(uint16_t base, int step) {
 }
 static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
-    {
+    int saved = errno;
+    /* One line per attempt turned a stuck round into hundreds of log lines on a
+     * device whose log is capped. The first few and every tenth attempt keep the
+     * failure visible without flooding it. */
+    if (t->tcp_attempts <= 3 || t->tcp_attempts % 10 == 0) {
         char note[128];
-        int saved = errno;
         snprintf(note, sizeof(note), "TCP punch attempt %u failed: %s (listener %s)",
                  t->tcp_attempts, saved ? strerror(saved) : "unknown",
                  t->listen_fd >= 0 ? "up" : "down");
@@ -2405,19 +2425,37 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     }
     if (t->fd >= 0) op_close(t->fd);
     t->fd = -1;
-    /* Keep dialling for the whole window instead of giving up after one attempt.
-     * Simultaneous open needs both sides in SYN_SENT at the same moment: a
-     * refused dial comes back in a few milliseconds, so a retry is nearly free,
-     * while switching to listen-only throws away the mapping that lets the peer
-     * in. Measured across two carrier NATs: one side crossed on its first try,
-     * the other needed ten. */
-    unsigned limit = TCP_PUNCH_ATTEMPTS_RESPONDER;
-    if (t->tcp_scan < TCP_PUNCH_SCAN)
-        ++t->tcp_scan;
-    if (t->tcp_attempts >= limit) {
+    /* A refused dial comes back in a few milliseconds, so retrying it is nearly
+     * free and the peer may still answer: keep dialling for the whole window.
+     * A dial that times out was filtered or the advertised endpoint is stale;
+     * both make the rest of the window useless, so end the round and let the
+     * rule ladder retry with a freshly measured mapping. */
+    if (saved == ETIMEDOUT) {
+        ++t->tcp_timeouts;
+        /* Silent dials: walk the window around the reported port, because the
+         * peer's mapping for our destination is not the one it reported. The
+         * window wraps so a later pass retries the same ports, which also keeps
+         * our own NAT filter open towards them. */
+        if (t->tcp_scan < TCP_PUNCH_SCAN)
+            ++t->tcp_scan;
+        else
+            t->tcp_scan = 0;
+    } else {
+        t->tcp_timeouts = 0;
+        t->tcp_scan = 0; /* the peer's NAT answered: its reported port is live */
+    }
+    if (t->tcp_timeouts >= TCP_PUNCH_STALE_ATTEMPTS) {
+        close_tunnel(c, index, "TCP punch target does not answer; retrying with a fresh mapping");
+        return;
+    }
+    /* The old budget-based listen fallback: a NAT that answers keeps the round
+     * alive until the attempt budget is spent, then the socket is parked on the
+     * mapped port instead of dialling further. */
+    if (t->tcp_attempts >= TCP_PUNCH_ATTEMPTS_RESPONDER) {
         t->tcp_retry_at = 0;
         (void)tcp_punch_listen(c, index);
-    } else t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
+    } else
+        t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
 }
 
 static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
@@ -2514,7 +2552,9 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
              "TCP punch connect attempt %u to %s:%u from %s:%u adv=%u%s", t->tcp_attempts,
              target, (unsigned)op_addr_port(&shown), local, (unsigned)t->local_port,
              (unsigned)t->mapped_port, t->lan ? " (LAN)" : "");
-    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
+    /* Same throttle as the failure line: a stuck round must not bury the log. */
+    if (t->tcp_attempts <= 3 || t->tcp_attempts % 10 == 0)
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, message);
     if (t->fd < 0 || (op_connect(t->fd, &t->peer_addr.u.sa, t->peer_addr.len) && errno != EINPROGRESS)) {
         /* Record why the dial did not even start: refused, unreachable and a full
          * queue look identical in the retry log otherwise. */
@@ -2644,6 +2684,20 @@ static void tcp_predict_tick(fastp2p_client *c, int index, uint64_t now) {
         t->tcp_predict_role = TCP_PREDICT_NONE;
         tcp_punch_dial(c, index, now);
     }
+}
+/* The peer's own TCP mapping observation decides whether the port it published
+ * can be dialled at all, so name it next to the punch it explains: a
+ * destination-dependent mapping means that port belongs to another destination. */
+static void report_peer_tcp_mapping(fastp2p_client *c, const tunnel *t, json_object *j) {
+    if (t->transport != FASTP2P_TRANSPORT_TCP)
+        return;
+    unsigned nat = (unsigned)op_integer(j, "tcpNatType");
+    char note[128];
+    snprintf(note, sizeof(note), "peer TCP mapping: %s, movement %u",
+             nat == FP_NAT_STABLE ? "stable"
+                                  : nat == FP_NAT_DEPENDENT ? "destination-dependent" : "unknown",
+             t->peer_tcp_mapping);
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
 }
 static void start_underlay(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -3681,6 +3735,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
                 learn_tcp_mapping(t, j);
                 learn_sym_window(t, j);
+                report_peer_tcp_mapping(c, t, j);
                 {
                     char punch_text[OP_ADDR_TEXT];
                     if (v4_ok)
@@ -3753,6 +3808,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     t->udp_direct_port = (uint16_t)udp_port;
                 learn_tcp_mapping(t, j);
                 learn_sym_window(t, j);
+                report_peer_tcp_mapping(c, t, j);
                 int family = choose_punch_family(c, t);
                 t->udp_reverse6_supported = family == OP_FAM_V6 && t->udp_reverse_port6 &&
                                             op_integer(j, "udpReverse6Cap") == 1;
@@ -3802,11 +3858,15 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                      * sits in T_TIME until its deadline is indistinguishable from one that
                      * never got here without these two numbers. */
                     char when[200];
+                    /* Milliseconds and never negative: the earlier wording divided
+                     * nanoseconds by NS (so it printed seconds as "ms") and let an
+                     * already-passed deadline underflow to 18446744073 ms. */
+                    uint64_t before = mono();
                     snprintf(when, sizeof(when),
-                             "punch scheduled for %s in %llu ms (delay %lld ms, at+deadline %llu ms)",
-                             t->peer, (unsigned long long)((t->at - mono()) / NS),
-                             (long long)(delay / NS),
-                             (unsigned long long)((t->deadline - mono()) / NS));
+                             "punch scheduled for %s in %llu ms (delay %lld ms, deadline in %llu ms)",
+                             t->peer, (unsigned long long)((t->at > before ? t->at - before : 0) / MS),
+                             (long long)(delay / MS),
+                             (unsigned long long)((t->deadline > before ? t->deadline - before : 0) / MS));
                     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, when);
                 }
                 t->state = T_TIME;

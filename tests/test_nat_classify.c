@@ -46,6 +46,43 @@ static void tcp_retry(void) {
     assert(t->listen_fd>=0 && t->fd<0);
     assert(!t->tcp_retry_at && !tunnel_ready(t));close_tunnel(c,ti,NULL);op_close(endpoint);free(c);
 }
+/* The port window is what reaches a symmetric (NAT4) peer, whose mapping for us
+ * differs from the one it reported, so it must advance exactly on silent dials
+ * and reset as soon as the peer's NAT answers. */
+static void tcp_punch_walks_ports_when_silent(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    int ti = new_tunnel(c, "remote-node", 321, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    assert(tcp_scan_port(40000, 0) == 40000);
+    assert(tcp_scan_port(40000, 1) == 40001);
+    assert(tcp_scan_port(40000, 2) == 39999);
+    assert(tcp_scan_port(40000, 3) == 40002);
+    assert(tcp_scan_port(40000, 4) == 39998);
+    assert(tcp_scan_port(1, 2) == 65535);  /* the window wraps inside the range */
+    assert(tcp_scan_port(65535, 1) == 1);
+    /* A silently dropped dial walks the window; a refused one resets it. */
+    errno = ETIMEDOUT;
+    tcp_punch_failed(c, ti, mono());
+    assert(t->tcp_scan == 1 && t->tcp_timeouts == 1);
+    tcp_punch_failed(c, ti, mono());
+    assert(t->tcp_scan == 2 && t->tcp_timeouts == 2);
+    errno = ECONNREFUSED;
+    tcp_punch_failed(c, ti, mono());
+    assert(t->tcp_scan == 0 && t->tcp_timeouts == 0);
+    /* The window wraps instead of sticking on its last port. */
+    t->tcp_scan = TCP_PUNCH_SCAN;
+    errno = ETIMEDOUT;
+    tcp_punch_failed(c, ti, mono());
+    assert(t->tcp_scan == 0);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 static void tcp_punch_scheduling(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -774,6 +811,7 @@ static void public_round_budget(void) {
 int main(void) {
     assert(!op_platform_init());
     tcp_retry();
+    tcp_punch_walks_ports_when_silent();
     tcp_punch_scheduling();
     quic_uses_punch_endpoint();
     peer_listener_port_conflict();
