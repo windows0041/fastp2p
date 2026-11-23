@@ -242,47 +242,75 @@ jobs:
           name: fastp2p-windows-x86_64
           path: dist/fastp2p-windows-x86_64.exe
           if-no-files-found: error
-      - name: Native Windows protocol, lifecycle, TLS and QUIC tests
+      - name: Windows client reports its version
+        shell: pwsh
+        run: |
+          & build/windows/fastp2p.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows startup, pipes and logs
+        shell: pwsh
+        run: |
+          python tests/windows_startup.py --client build/windows/fastp2p.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows native unit tests (API, platform, wire, secure, session, socks)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & build/windows/fastp2p.exe --version
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python tests/windows_startup.py --client build/windows/fastp2p.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-api.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($t in @('test-api','test-platform','test-wire','test-secure','test-session-binding','test-socks')) {
+            Write-Host "::group::$t"
+            & "build/windows/$t.exe"
+            if ($LASTEXITCODE) { Write-Host "::error::$t failed with $LASTEXITCODE"; exit $LASTEXITCODE }
+            Write-Host "::endgroup::"
+          }
+      - name: Windows native unit tests (update, QUIC buffer, TCP NAT)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($t in @('test-update-windows','test-quic-buffer','test-tcp-nat')) {
+            Write-Host "::group::$t"
+            & "build/windows/$t.exe"
+            if ($LASTEXITCODE) { Write-Host "::error::$t failed with $LASTEXITCODE"; exit $LASTEXITCODE }
+            Write-Host "::endgroup::"
+          }
+      - name: Windows service and SD-WAN unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($t in @('test-service-windows','test-sdwan-windows')) {
+            Write-Host "::group::$t"
+            & "build/windows/$t.exe"
+            if ($LASTEXITCODE) { Write-Host "::error::$t failed with $LASTEXITCODE"; exit $LASTEXITCODE }
+            Write-Host "::endgroup::"
+          }
+      - name: Windows CLI identity
+        shell: pwsh
+        run: |
           python tests/identity_cli.py --client build/windows/fastp2p.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-platform.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-update-windows.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-quic-buffer.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-tcp-nat.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-service-windows.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-sdwan-windows.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-wire.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-secure.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-session-binding.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & build/windows/test-socks.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows TLS rejection
+        shell: pwsh
+        run: |
           $env:OPENSSL_EXE = 'C:\Program Files\Git\usr\bin\openssl.exe'
           python tests/tls_negative.py --client build/windows/fastp2p.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows QUIC interop
+        shell: pwsh
+        run: |
           python tests/quic_native.py --binary build/windows/quic-interop.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows enrollment integration
+        shell: pwsh
+        run: |
           python tests/enrollment_integration.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows config sync integration
+        shell: pwsh
+        run: |
           python tests/config_sync.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py --profile-probe build/windows/test-profile-probe.exe --fixture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows SOCKS integration
+        shell: pwsh
+        run: |
           python tests/socks_integration.py --client build/windows/fastp2p.exe --gateway tests/gateway_fixture.py --logs build/windows/socks
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: MSVC consumer of the C DLL

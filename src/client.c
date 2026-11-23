@@ -5356,8 +5356,10 @@ static void connect_gateway(fastp2p_client *c) {
      * rejected handshake in the log. */
     {
         char message[320];
-        snprintf(message, sizeof(message), "gateway dial: %s (v4=%s v6=%s resolve=%s)",
-                 entry, addresses[OP_FAM_V4], addresses[OP_FAM_V6], c->path);
+        /* Never echo the login URL: it carries the install token, and one of the
+         * release tests asserts the token never appears in client output. */
+        snprintf(message, sizeof(message), "gateway dial: %s:%u (v4=%s v6=%s)",
+                 urlhost, c->port, addresses[OP_FAM_V4], addresses[OP_FAM_V6]);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
     }
     }
