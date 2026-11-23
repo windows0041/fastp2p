@@ -2373,7 +2373,7 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     op_addr shown = t->peer_addr; /* a copy: the tunnel's own address must not change */
     op_addr_text(&shown, target, sizeof(target));
     int family_index = t->family >= 0 ? t->family : OP_FAM_V4;
-    if (c->local_ip[family_index])
+    if (addr_text_set(c->local_ip[family_index]))
         snprintf(local, sizeof(local), "%s", c->local_ip[family_index]);
     char message[192];
     /* Name the port dialled and the port this side advertises: with a cone mapping
@@ -5423,7 +5423,7 @@ static void gateway_failed(fastp2p_client *c) {
     /* The generic text below cannot tell a rejected option from a missing CA, and a
      * platform-specific setup failure looks identical to a refused connection. */
     {
-        char detail[224];
+        char detail[320];
         snprintf(detail, sizeof(detail), "WSS setup failed: host=%s port=%u ca=%s resolve=%s",
                  c->tls_host ? c->tls_host : c->host, (unsigned)c->port,
                  c->ca[0] || c->ca_pem ? "set" : "builtin", c->resolve ? "pinned" : "none");
@@ -5514,7 +5514,7 @@ static void connect_gateway(fastp2p_client *c) {
      * resolver offered: a failure here is otherwise indistinguishable from a
      * rejected handshake in the log. */
     {
-        char message[320];
+        char message[640];
         /* Never echo the login URL: it carries the install token, and one of the
          * release tests asserts the token never appears in client output. */
         snprintf(message, sizeof(message), "gateway dial: %s:%u (v4=%s v6=%s)",
