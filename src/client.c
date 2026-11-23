@@ -10,6 +10,7 @@
 #include "secure.h"
 #include "sdwan.h"
 #include "tcp_nat.h"
+#include "config_internal.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -88,6 +89,14 @@
 #define UDP_PUNCH_EXTRA_WINDOW 4
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
+/* A datagram larger than its buffer must be recognised as truncated instead of
+ * being forwarded as a shorter payload. POSIX reports the real length when
+ * MSG_TRUNC is passed; Windows fails the read with EMSGSIZE and gives none. */
+#ifdef _WIN32
+#define OP_MSG_TRUNC 0
+#else
+#define OP_MSG_TRUNC MSG_TRUNC
+#endif
 /* Tunnel frames.  Frames carrying application data or application control are
  * sealed with the session keys; handshake, keepalive and relay joining are
  * plaintext because they precede, or are handled outside, the session. */
@@ -103,7 +112,12 @@ enum {
     TUN_RELAY_JOIN = 10,
     TUN_RELAY_READY = 11,
     TUN_CERT_BIND = 12,
-    TUN_SDWAN_IPV4 = 13
+    TUN_SDWAN_IPV4 = 13,
+    /* Detached-tunnel handshake: the owner asks whether the peer still uses a
+     * tunnel before reclaiming it. An older peer ignores both frames, so no
+     * acknowledgement ever arrives and nothing is reclaimed. */
+    TUN_RELEASE = 14,
+    TUN_RELEASE_ACK = 15
 };
 /* Control-plane push sub-codes between two clients. */
 enum {
@@ -234,7 +248,10 @@ typedef struct {
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
-    uint64_t last_session_push, silent_logged, last_payload, active_since;
+    uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
+    /* Detached-tunnel reclamation handshake (see TUN_RELEASE). */
+    uint64_t release_sent;
+    int released;
     /* Peer's predicted mapping window: base port, direction and width. A
      * symmetric peer changes port per destination, so the peer tells us
      * where its next mapping is likely to land and we spray that range.
@@ -314,6 +331,10 @@ typedef struct {
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
     int has_session;
+    /* Only JSON-profile rules can be replaced by a managed update. Retain
+     * configured names independently of gateway-driven runtime renames. */
+    int profile_rule;
+    char configured_peer[32], configured_relay[32];
 } app;
 typedef struct {
     int used, udp, connected, local_udp, app_index, tunnel_index, waiting, peer_closed;
@@ -1181,6 +1202,19 @@ static int tunnel_ready(const tunnel *t) {
     return t->keyed && t->key_acked &&
            (t->transport != FASTP2P_TRANSPORT_QUIC || t->cert_checked);
 }
+static int tunnel_matches_rule(const tunnel *t, const app *a) {
+    const char *peer = t->relay_wait ? t->relay_peer : t->peer;
+    if (t->relay_link >= 0 || a->transport != t->transport || strcmp(peer, a->peer))
+        return 0;
+    if (!t->relay_wait)
+        return 1;
+    if (a->no_relay)
+        return 0;
+    /* A pinned relay constrains only the relays this node asks for. When the
+     * peer owns the session it has already picked a relay, and refusing to
+     * join there would leave both ends punching different relays forever. */
+    return !t->session_owner || !a->relay_node[0] || !strcmp(t->peer, a->relay_node);
+}
 static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
     for (int i = 0; i < NT; ++i)
         if (tunnel_ready(&c->tunnels[i]) && c->tunnels[i].transport == transport &&
@@ -1188,14 +1222,16 @@ static int active_tunnel(fastp2p_client *c, const char *peer, int transport) {
             return i;
     return -1;
 }
-static void close_overlay(fastp2p_client *c, int index, int notify) {
+static int active_rule_tunnel(fastp2p_client *c, const app *a) {
+    if (!a->no_relay && !a->relay_node[0])
+        return active_tunnel(c, a->peer, a->transport);
+    for (int i = 0; i < NT; ++i)
+        if (tunnel_ready(&c->tunnels[i]) && tunnel_matches_rule(&c->tunnels[i], a))
+            return i;
+    return -1;
+}
+static void close_overlay_now(fastp2p_client *c, int index, int notify) {
     overlay *o = &c->overlays[index];
-    if (!o->used)
-        return;
-    if (c->running && !c->stopping && (o->socks_state == S_TUNNEL || o->socks_state == S_ACK)) {
-        socks_failure(c, index, 1);
-        return;
-    }
     if (notify && o->tunnel_index >= 0 && c->tunnels[o->tunnel_index].state == T_ACTIVE) {
         json_object *j = json_object_new_object();
         op_ju(j, "id", o->id);
@@ -1206,7 +1242,7 @@ static void close_overlay(fastp2p_client *c, int index, int notify) {
         uint64_t parent = o->id;
         for (int i = 0; i < NO; ++i)
             if (c->overlays[i].used && c->overlays[i].socks_parent == parent)
-                close_overlay(c, i, 1);
+                close_overlay_now(c, i, 1);
     }
     if (o->socks_udp >= 0)
         op_close(o->socks_udp);
@@ -1219,6 +1255,16 @@ static void close_overlay(fastp2p_client *c, int index, int notify) {
     op_buffer_clear(&o->socks_rx);
     memset(o, 0, sizeof(*o));
     o->fd = o->socks_udp = -1;
+}
+static void close_overlay(fastp2p_client *c, int index, int notify) {
+    overlay *o = &c->overlays[index];
+    if (!o->used)
+        return;
+    if (c->running && !c->stopping && (o->socks_state == S_TUNNEL || o->socks_state == S_ACK)) {
+        socks_failure(c, index, 1);
+        return;
+    }
+    close_overlay_now(c, index, notify);
 }
 static void release_relay(fastp2p_client *c, int index) {
     for (int i = 0; i < NRL; ++i) {
@@ -1423,51 +1469,92 @@ static void push_session_ack(fastp2p_client *c, const char *peer, uint64_t sessi
     push(c, peer, PUSH_SESSION_ACK, j);
     json_object_put(j);
 }
+static int tunnel_has_users(const fastp2p_client *c, int index) {
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used && c->apps[i].tunnel_index == index)
+            return 1;
+    for (int i = 0; i < NO; ++i)
+        if (c->overlays[i].used && c->overlays[i].tunnel_index == index)
+            return 1;
+    return 0;
+}
+static int reserve_tunnel_slot(fastp2p_client *c, uint64_t now) {
+    for (int i = 0; i < NT; ++i)
+        if (!c->tunnels[i].state)
+            return i;
+    /* Rule churn must not fill the table with permanently unused tunnels.
+     * Only reclaim explicitly detached outgoing sessions, and only under
+     * pressure after a quiet window. Incoming overlays count as users too. */
+    uint64_t oldest = now;
+    int slot = -1;
+    for (int i = 0; i < NT; ++i) {
+        tunnel *t = &c->tunnels[i];
+        /* Only a tunnel the peer has confirmed as unused may be reclaimed, so a
+         * stream that is still open on the far end is never cut. */
+        if (!t->detached_at || !t->released || !t->initiator || !t->session_owner ||
+            t->relay_wait || t->relay_link >= 0 || op_buffer_size(&t->rx) ||
+            op_buffer_size(&t->tx) || (t->quic && opq_pending(t->quic)) ||
+            tunnel_has_users(c, i))
+            continue;
+        uint64_t activity = t->last_payload > t->detached_at ? t->last_payload : t->detached_at;
+        if (activity < oldest && now - activity >= 30 * NS) {
+            oldest = activity;
+            slot = i;
+        }
+    }
+    if (slot >= 0) {
+        char note[128];
+        snprintf(note, sizeof(note),
+                 "reclaimed tunnel %llu after the peer confirmed it is unused",
+                 (unsigned long long)c->tunnels[slot].id);
+        emit(c, FASTP2P_EVENT_TUNNEL, c->tunnels[slot].id, 0, note);
+        close_tunnel(c, slot, NULL);
+    }
+    return slot;
+}
 static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
         return -1;
-    for (int i = 0; i < NT; ++i)
-        if (!c->tunnels[i].state) {
-            tunnel *t = &c->tunnels[i];
-            memset(t, 0, sizeof(*t));
-            t->fd = t->listen_fd = t->alternate_fd = -1;
-            /* Zero is a valid descriptor: every probe slot must start closed or
-             * the first probe would close whatever owns fd 0. */
-            for (int p = 0; p < OP_FAM_COUNT; ++p)
-                t->probes[p].fd = -1;
-            t->relay_link = -1;
-            t->state = T_REPLY;
-            t->id = id;
-            t->peer_id = op_node_id(peer);
-            strcpy(t->peer, peer);
-            {
-                /* Every tunnel object starts in T_REPLY; without this line a tunnel that
-                 * never progresses cannot be told apart from one nobody created. */
-                char born[200];
-                snprintf(born, sizeof(born), "tunnel created: peer %s (%s, %s) id %llu state %d",
-                         peer, initiator ? "initiator" : "responder",
-                         transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp",
-                         (unsigned long long)id, (int)t->state);
-                emit(c, FASTP2P_EVENT_TUNNEL, id, 0, born);
-            }
-            t->transport = transport;
-            t->initiator = initiator;
-            t->deadline = mono() + 15 * NS;
-            if (initiator) {
-                /* The side that opens the tunnel owns the session secret. */
-                t->session = random_id();
-                fp_random(t->secret, sizeof(t->secret));
-                t->has_secret = t->session_owner = 1;
-                if (fp_crypto_init(&t->crypto, t->secret, t->session, c->node_id, t->peer_id, 1)) {
-                    t->state = T_FREE;
-                    return -1;
-                }
-                t->keyed = 1;
-            }
-            return i;
+    int i = reserve_tunnel_slot(c, mono());
+    if (i < 0) {
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "tunnel limit reached");
+        return -1;
+    }
+    tunnel *t = &c->tunnels[i];
+    memset(t, 0, sizeof(*t));
+    t->fd = t->listen_fd = t->alternate_fd = -1;
+    /* Zero is a valid descriptor: every probe slot must start closed or
+     * the first probe would close whatever owns fd 0. */
+    for (int p = 0; p < OP_FAM_COUNT; ++p)
+        t->probes[p].fd = -1;
+    t->relay_link = -1;
+    t->state = T_REPLY;
+    t->id = id;
+    t->peer_id = op_node_id(peer);
+    strcpy(t->peer, peer);
+    /* Every tunnel object starts in T_REPLY; distinguish a stalled tunnel from
+     * one that was never created. */
+    char born[200];
+    snprintf(born, sizeof(born), "tunnel created: peer %s (%s, %s) id %llu state %d",
+             peer, initiator ? "initiator" : "responder",
+             transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp",
+             (unsigned long long)id, (int)t->state);
+    emit(c, FASTP2P_EVENT_TUNNEL, id, 0, born);
+    t->transport = transport;
+    t->initiator = initiator;
+    t->deadline = mono() + 15 * NS;
+    if (initiator) {
+        /* The side that opens the tunnel owns the session secret. */
+        t->session = random_id();
+        fp_random(t->secret, sizeof(t->secret));
+        t->has_secret = t->session_owner = 1;
+        if (fp_crypto_init(&t->crypto, t->secret, t->session, c->node_id, t->peer_id, 1)) {
+            t->state = T_FREE;
+            return -1;
         }
-    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_ELIMIT, "tunnel limit reached");
-    return -1;
+        t->keyed = 1;
+    }
+    return i;
 }
 static int udp_packet(op_socket fd, const op_addr *peer, uint16_t main, uint16_t sub,
                       json_object *j) {
@@ -1515,6 +1602,20 @@ static int choose_punch_family(const fastp2p_client *c, const tunnel *t) {
         return OP_FAM_V4;
     return -1;
 }
+/* A borrowed probe socket belongs to the peer listener. Adopting it hands
+ * ownership over: the client must not keep a second copy of the descriptor, or
+ * closing the tunnel would break the listener that still pointed at it. */
+static void adopt_borrowed_probe(fastp2p_client *c, tunnel *t, int family) {
+    if (c->udp_listener[family] == t->probes[family].fd)
+        c->udp_listener[family] = -1;
+    if (c->stun.shared && c->stun.fd == t->probes[family].fd) {
+        c->stun.fd = -1;
+        c->stun.shared = 0;
+        c->stun.phase = 0;
+    }
+    t->fd = t->probes[family].fd;
+    t->probes[family].fd = -1;
+}
 /* Point the tunnel at `family`: active endpoints, the remote tuple and the
  * socket to punch with. For QUIC the probe socket of that family becomes the
  * punch socket and keeps the mapping that was advertised to the peer. */
@@ -1543,10 +1644,15 @@ static int use_punch_family(fastp2p_client *c, int index, int family) {
         return strcmp(t->mode, "tcppunch") ? 0 : tcp_punch_listen(c, index);
     }
     if (t->probes[family].fd >= 0) {
-        if (t->fd >= 0 && t->fd != t->probes[family].fd)
-            op_close(t->fd);
-        t->fd = t->probes[family].fd;
-        t->probes[family].fd = -1; /* t->fd owns the punch socket now */
+        op_socket previous = t->fd;
+        if (t->probes[family].borrowed)
+            adopt_borrowed_probe(c, t, family);
+        else {
+            t->fd = t->probes[family].fd;
+            t->probes[family].fd = -1; /* t->fd owns the punch socket now */
+        }
+        if (previous >= 0 && previous != t->fd)
+            op_close(previous);
     }
     if (t->fd >= 0 && socket_family(t->fd) != family) {
         op_close(t->fd);
@@ -1590,6 +1696,12 @@ static int tunnel_learn_peer(tunnel *t, const char *text, uint64_t port) {
  * relay. Returns 1 when the mapping was adopted and the peer can be answered. */
 static int probe_fallback_mapping(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
+    /* Only the mapping-probe stage of a UDP punch may adopt the business port.
+     * Reaching it from a later timeout restarted a negotiation that had already
+     * been published and replaced a socket another stage owned. */
+    if ((t->state != T_REPLY && t->state != T_PROBE) || t->transport != FASTP2P_TRANSPORT_QUIC ||
+        t->tcp_v2 || t->relay_wait || t->relay_link >= 0 || strcmp(t->mode, "udppunch"))
+        return 0;
     if (nat_filter_level(&c->udp_filter, mono()) < 6 || !c->public_port)
         return 0;
     int family = family_wanted(c, OP_FAM_V4) && c->ip[OP_FAM_V4][0]
@@ -1603,9 +1715,11 @@ static int probe_fallback_mapping(fastp2p_client *c, int index) {
     op_socket fd = c->udp_listener[family];
     if (fd < 0)
         return 0;
-    int borrowed = 1;
+    /* The slot may still hold this stage's own probe socket; close it before the
+     * borrowed listener takes its place. */
+    probe_close(&t->probes[family]);
     t->probes[family] = (nat_probe){.fd = fd};
-    t->probes[family].borrowed = borrowed;
+    t->probes[family].borrowed = 1;
     t->probes[family].local_port = socket_port(fd);
     t->fd = -1;
     t->family = family;
@@ -1771,6 +1885,22 @@ static void read_udp_mapping(fastp2p_client *c, nat_probe *p, int family, uint64
  * still goes out on the IPv4 answer at the same moment it would have in the old
  * build, so a broken v6 path can never make a previously working link slower
  * or fail. */
+/* A completed measurement in the other family means this tunnel can still be
+ * published when the preferred family's probe fails: its result must not be
+ * thrown away with the family that happened to be primary. */
+static int other_family_answered(const tunnel *t, int required) {
+    int other = required == OP_FAM_V4 ? OP_FAM_V6 : OP_FAM_V4;
+    return t->probes[other].state == PROBE_DONE && t->probes[other].mapped_port != 0;
+}
+/* Closes the tunnel when the preferred family failed and nothing else answered;
+ * returns 1 when the caller must stop. */
+static int required_family_failed(fastp2p_client *c, int index, int family, const char *reason) {
+    int required = primary_family(c);
+    if (family != required || other_family_answered(&c->tunnels[index], required))
+        return 0;
+    close_tunnel(c, index, reason);
+    return 1;
+}
 static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     int pending = 0, answered = 0;
@@ -1789,12 +1919,15 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
         }
         uint64_t probe_deadline = family == required ? t->deadline : p->deadline;
         if (now > probe_deadline) {
-            if (family == required) {
+            if (family == required && !other_family_answered(t, required)) {
                 if (probe_fallback_mapping(c, index))
                     return 1;
                 close_tunnel(c, index, "peer NAT mapping discovery timed out");
                 return -1;
             }
+            if (family == required)
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+                     "preferred mapping probe timed out; publishing the other family");
             probe_close(p);
             p->fd = -1;
             p->state = PROBE_FREE; /* advisory only: drop it and keep going */
@@ -1804,10 +1937,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
         if (p->state == PROBE_CONNECT) {
             int rv = connect_ready(p->fd);
             if (rv < 0) {
-                if (family == required) {
-                    close_tunnel(c, index, "TCP NAT connection failed");
+                if (required_family_failed(c, index, family, "TCP NAT connection failed"))
                     return -1;
-                }
                 probe_close(p);
                 p->fd = -1;
                 p->state = PROBE_FREE;
@@ -1817,10 +1948,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
             if (rv > 0) {
                 const char marker = c->gateway_tcp_probe_v2 || c->gateway_tcp_probe_v3 ? '2' : '1';
                 if (op_send(p->fd, &marker, 1, MSG_NOSIGNAL) != 1) {
-                    if (family == required) {
-                        close_tunnel(c, index, "TCP NAT marker failed");
+                    if (required_family_failed(c, index, family, "TCP NAT marker failed"))
                         return -1;
-                    }
                     probe_close(p);
                     p->fd = -1;
                     p->state = PROBE_FREE;
@@ -1840,10 +1969,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                 p->response[p->response_len] = 0;
                 p->last_rx = now;
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                if (family == required) {
-                    close_tunnel(c, index, "TCP NAT response failed");
+                if (required_family_failed(c, index, family, "TCP NAT response failed"))
                     return -1;
-                }
                 probe_close(p);
                 p->fd = -1;
                 p->state = PROBE_FREE;
@@ -1862,10 +1989,8 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                     p->response[length++] = '\n';
                 int parsed = fp_tcp_echo_response((uint8_t *)p->response, length, &mapped);
                 if (parsed < 0) {
-                    if (family == required) {
-                        close_tunnel(c, index, "invalid TCP NAT response");
+                    if (required_family_failed(c, index, family, "invalid TCP NAT response"))
                         return -1;
-                    }
                     probe_close(p);
                     p->fd = -1;
                     p->state = PROBE_FREE;
@@ -1896,6 +2021,12 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                 --pending;
             }
         }
+    }
+    if (!answered && !pending) {
+        /* Every family was dropped (advisory timeouts included): nothing is left
+         * to publish, so end the attempt instead of sitting in T_PROBE. */
+        close_tunnel(c, index, "NAT mapping probe failed for every family");
+        return -1;
     }
     if (!answered || pending)
         return 0;
@@ -2621,10 +2752,9 @@ static void session_ready(fastp2p_client *c, int index) {
     if (!tunnel_ready(t))
         return;
     int relayed = t->relay_wait;
-    const char *peer = relayed ? t->relay_peer : t->peer;
     for (int i = 0; i < NA; ++i) {
         app *a = &c->apps[i];
-        if (a->used && a->local && !strcmp(a->peer, peer) && a->transport == t->transport) {
+        if (a->used && a->local && tunnel_matches_rule(t, a)) {
             if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
                 continue; /* Keep existing overlays on their authenticated session. */
             a->tunnel_index = index;
@@ -2761,6 +2891,14 @@ static void session_receive(fastp2p_client *c, uint64_t peer_id, const char *pee
             }
         }
     }
+    /* Expired entries belong to attempts that no longer exist. Reclaim them
+     * before looking for a slot, or a long-lived node slowly fills the table
+     * and new sessions are refused. */
+    for (int i = 0; i < NPK; ++i)
+        if (c->keys[i].used && c->keys[i].deadline <= mono()) {
+            OPENSSL_cleanse(c->keys[i].secret, sizeof(c->keys[i].secret));
+            memset(&c->keys[i], 0, sizeof(c->keys[i]));
+        }
     int slot = -1;
     for (int i = 0; i < NPK; ++i)
         if (c->keys[i].used && c->keys[i].tunnel_id == tunnel_id &&
@@ -2818,6 +2956,9 @@ static void tunnel_active(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     t->state = T_ACTIVE;
     t->last_rx = t->last_hb = t->active_at = mono();
+    /* A tunnel that becomes active again is in use: forget any pending release. */
+    t->detached_at = t->release_sent = 0;
+    t->released = 0;
     /* Never cleared: active_at is reset once the link proves stable, and the
      * idle refresh needs the tunnel's real age. */
     t->active_since = mono();
@@ -3013,8 +3154,10 @@ static void tick_socks_udp(fastp2p_client *c, int index) {
         op_addr from;
         memset(&from, 0, sizeof(from));
         from.len = (op_socklen)sizeof(from.u.storage);
-        op_ssize n = op_recvfrom(parent->socks_udp, packet, sizeof(packet), MSG_DONTWAIT,
-                                 &from.u.sa, &from.len);
+        op_ssize n = op_recvfrom(parent->socks_udp, packet, sizeof(packet),
+                                 MSG_DONTWAIT | OP_MSG_TRUNC, &from.u.sa, &from.len);
+        if (n > (op_ssize)sizeof(packet) || (n < 0 && errno == EMSGSIZE))
+            continue; /* oversized association datagram: drop, never forward truncated */
         if (n < 0)
             break;
         op_addr_normalize(&from);
@@ -3945,6 +4088,8 @@ static int topen(fastp2p_client *c, int ti, uint16_t sub, const uint8_t *data, s
     /* Sealed frames only: a keepalive is plaintext, so this timestamp really means
      * the rule was carrying traffic, which is what decides an idle re-punch. */
     t->last_payload = mono();
+    /* Traffic from the peer proves it still uses this tunnel. */
+    t->released = 0;
     if (rv) {
         if (getenv("FP_DEBUG_KEYS"))
             fprintf(stderr, "auth fail ti=%d sub=%u len=%zu rxmax=%llu\n", ti, sub, len,
@@ -4094,6 +4239,22 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
     }
     if (sub == TUN_KEEPALIVE_ACK)
         return;
+    if (sub == TUN_RELEASE && len == 8 && op_u64(data) == t->id) {
+        /* A peer that detached its own rules asks whether this side still uses
+         * the tunnel. Confirm only when nothing here references it, so the peer
+         * can reclaim it without cutting a stream that is still in use. A relay
+         * hop never answers: the session belongs to the two endpoints. */
+        if (!tunnel_has_users(c, ti) && t->relay_link < 0) {
+            uint8_t id[8];
+            op_put64(id, t->id);
+            tframe(t, TUN_RELEASE_ACK, id, sizeof(id));
+        }
+        return;
+    }
+    if (sub == TUN_RELEASE_ACK && len == 8 && op_u64(data) == t->id) {
+        t->released = 1;
+        return;
+    }
     /* A plaintext hello or acknowledgement can land after this side is already
      * active: during a punch both ends answer the peer's hello, so the second
      * answer arrives once the tunnel is up. It carries only the tunnel id and is
@@ -4535,7 +4696,9 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (!t->state)
             return;
     }
-    if (t->state != T_ACTIVE && now > t->deadline) {
+    /* A tunnel that is still probing owns its deadline: dropping the preferred
+     * family must not close a tunnel whose other family already answered. */
+    if (t->state != T_ACTIVE && t->state != T_PROBE && now > t->deadline) {
         /* A mapping probe that never answered leaves the peer without a reply; the
          * fallback keeps a no-relay link alive instead of timing the tunnel out. */
         if (probe_fallback_mapping(c, ti))
@@ -4590,8 +4753,12 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         if (t->transport == FASTP2P_TRANSPORT_QUIC && !strcmp(t->mode, "udppunch")) {
             int f = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
             if (t->fd < 0 && t->probes[f].fd >= 0) {
-                t->fd = t->probes[f].fd;
-                t->probes[f].fd = -1;
+                if (t->probes[f].borrowed)
+                    adopt_borrowed_probe(c, t, f);
+                else {
+                    t->fd = t->probes[f].fd;
+                    t->probes[f].fd = -1;
+                }
             }
             if (t->fd < 0)
                 t->fd = socket_bound(1, c->local_ip[f], t->local_port, 1);
@@ -4747,6 +4914,16 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
          * heartbeat timeout would notice. The link then looks established while
          * nothing crosses it, which is what a rule hitting its deadline after an
          * idle period is really seeing. */
+        /* A rule update detached this tunnel. Ask the peer whether it still uses
+         * it; only its acknowledgement makes the slot safely reclaimable. */
+        if (t->detached_at && !t->released && !t->relay_wait && t->relay_link < 0 &&
+            !tunnel_has_users(c, ti) &&
+            (!t->release_sent || now - t->release_sent >= 2 * NS)) {
+            uint8_t id[8];
+            op_put64(id, t->id);
+            if (!tframe(t, TUN_RELEASE, id, sizeof(id)))
+                t->release_sent = now;
+        }
         if (now >= t->last_hb && now - t->last_hb >= TCP_KEEPALIVE_MS * MS) {
             tframe(t, TUN_KEEPALIVE, NULL, 0);
             t->last_hb = now;
@@ -5032,7 +5209,12 @@ static void tick_overlays(fastp2p_client *c, uint64_t now) {
             continue;
         for (int k = 0; k < 8; ++k) {
             uint8_t data[4096];
-            op_ssize n = op_recv(o->fd, data, sizeof(data), MSG_DONTWAIT);
+            op_ssize n = op_recv(o->fd, data, sizeof(data),
+                                 MSG_DONTWAIT | (o->udp ? OP_MSG_TRUNC : 0));
+            if (n > (op_ssize)sizeof(data) || (n < 0 && errno == EMSGSIZE)) {
+                /* Forwarding a truncated datagram would corrupt it silently. */
+                continue;
+            }
             if (n > 0 || (n == 0 && o->udp)) {
                 if (overlay_data(c, i, data, (size_t)n)) {
                     close_overlay(c, i, 1);
@@ -5114,7 +5296,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             }
         }
         if (a->tunnel_index < 0 && now >= a->retry && c->state == FASTP2P_ONLINE) {
-            int ti = active_tunnel(c, a->peer, a->transport);
+            int ti = active_rule_tunnel(c, a);
             if (ti >= 0) {
                 a->tunnel_index = ti;
                 a->link_deadline = mono() + 20 * NS;
@@ -5126,15 +5308,12 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             } else {
                 int in_progress = 0;
                 for (int k = 0; k < NA; ++k)
-                    if (k != i && c->apps[k].used && c->apps[k].local &&
-                        c->apps[k].relay_requested && c->apps[k].transport == a->transport &&
-                        !strcmp(c->apps[k].peer, a->peer))
+                    if (!a->no_relay && !a->relay_node[0] && k != i && c->apps[k].used &&
+                        c->apps[k].local && c->apps[k].relay_requested &&
+                        c->apps[k].transport == a->transport && !strcmp(c->apps[k].peer, a->peer))
                         in_progress = 1;
                 for (int k = 0; k < NT; ++k)
-                    if (c->tunnels[k].state && c->tunnels[k].relay_link < 0 &&
-                        c->tunnels[k].transport == a->transport &&
-                        (!strcmp(c->tunnels[k].peer, a->peer) ||
-                         (c->tunnels[k].relay_wait && !strcmp(c->tunnels[k].relay_peer, a->peer))))
+                    if (c->tunnels[k].state && tunnel_matches_rule(&c->tunnels[k], a))
                         in_progress = 1;
                 if (!in_progress) {
                     if (!a->udp_reverse6_retry && lan_punch_possible(c, a) && !a->lan_tried && !c->force_relay) {
@@ -5144,14 +5323,15 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             a->lan_tried = 1;
                             start_punch(c, ti);
                         }
-                    } else if (a->relay_node[0] || a->attempts >= PUBLIC_PUNCH_ROUNDS || c->force_relay) {
+                    } else if ((a->relay_node[0] && !a->no_relay) || a->attempts >= PUBLIC_PUNCH_ROUNDS ||
+                               c->force_relay) {
                         /* Direct attempts may already have sealed certificate
                          * frames. Never restart counters with that same key. */
                         a->session = random_id();
                         fp_random(a->secret, sizeof(a->secret));
                         a->has_session = 1;
                         a->link_deadline = now + 20 * NS;
-                        if (a->relay_node[0]) {
+                        if (a->relay_node[0] && !a->no_relay) {
                             /* The rule named its relay, so skip the offer and
                              * punch that node directly. */
                             int relay_index = relay_tunnel(c, a, a->relay_node, a->peer, 1);
@@ -5234,8 +5414,8 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                 op_addr from;
                 memset(&from, 0, sizeof(from));
                 from.len = (op_socklen)sizeof(from.u.storage);
-                op_ssize n = op_recvfrom(a->fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa,
-                                         &from.len);
+                op_ssize n = op_recvfrom(a->fd, data, sizeof(data), MSG_DONTWAIT | OP_MSG_TRUNC,
+                                         &from.u.sa, &from.len);
                 if (n < 0)
                     break;
                 op_addr_normalize(&from);
@@ -5455,6 +5635,12 @@ static void connect_gateway(fastp2p_client *c) {
         gateway_failed(c);
         return;
     }
+    /* Re-resolve on every attempt: a gateway that moved to another address after
+     * a DNS failover or a restart must be reachable without restarting the
+     * client. A failed lookup keeps the addresses resolved last time. */
+    int resolved = resolve_any_families(c->host, c->port, FAM_BOTH, &c->gateway, c->gateway_addr);
+    if (resolved)
+        c->gateway_families = resolved;
     /* The reachable set can change between attempts (a service that started
      * before IPv6 came up, a family that lost its route), and the login query
      * is what tells the gateway which families this node speaks. */
@@ -6260,7 +6446,7 @@ static int refresh_families(fastp2p_client *c) {
      * is deliberately not the gateway: publishing the gateway-reachable set made a
      * host whose IPv4 gateway route is filtered advertise IPv6 only, so every
      * IPv4 peer had no family in common and fell back to the relay. */
-    static const char *probe_text[OP_FAM_COUNT] = {"8.8.8.8:53", "[2001:4860:4860::8888]:53"};
+    static const char *probe_text[OP_FAM_COUNT] = {"8.8.8.8", "2001:4860:4860::8888"};
     int wanted = 0;
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         if (local_family_routable(&c->gateway_addr[family], family, c->local_ip[family])) {
@@ -6504,6 +6690,294 @@ int fastp2p_client_add_socks5(fastp2p_client *c, const fastp2p_socks5 *p, uint64
         *id = aid;
     return FASTP2P_OK;
 }
+void fp_client_mark_profile_rules(fastp2p_client *c) {
+    for (int i = 0; i < NA; ++i) {
+        app *a = &c->apps[i];
+        if (!a->used || !a->local || a->sdwan || a->profile_rule)
+            continue;
+        a->profile_rule = 1;
+        strcpy(a->configured_peer, a->peer);
+        strcpy(a->configured_relay, a->relay_node);
+    }
+}
+
+struct fp_rule_update {
+    fastp2p_client *client, *candidate;
+    /* Indexed by candidate rule: keep the owner of an existing slot when
+     * replacing a rule with the same TCP/UDP protocol and source port. */
+    int slot[NA];
+    unsigned char reserved[NA], unchanged[NA], borrow[NA], deferred[NA];
+    /* Listeners briefly closed so a new rule could take their exact port; the
+     * slot itself is replaced at commit, so abort must bind them again. */
+    int vacated[NA];
+    int vacated_count;
+};
+
+static int stage_listener(app *next) {
+    next->fd = socket_bound(next->udp, next->bind_ip, next->port, BIND_DEFAULT);
+    if (next->fd < 0)
+        return -1;
+    if (!next->udp && op_listen(next->fd, 64)) {
+        int error = errno;
+        op_close(next->fd);
+        next->fd = -1;
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+static void adopt_local_udp_overlays(fastp2p_client *c, int index) {
+    /* A local UDP overlay sends through the rule's own listening socket. */
+    for (int i = 0; i < NO; ++i)
+        if (c->overlays[i].used && c->overlays[i].local_udp &&
+            c->overlays[i].app_index == index)
+            c->overlays[i].fd = c->apps[index].fd;
+}
+
+static void vacate_listener(fp_rule_update *update, int index) {
+    app *a = &update->client->apps[index];
+    if (a->fd < 0)
+        return;
+    op_close(a->fd);
+    a->fd = -1;
+    update->vacated[update->vacated_count++] = index;
+}
+
+static void release_update(fp_rule_update *update, int restore) {
+    if (!update)
+        return;
+    fastp2p_client *c = update->client;
+    /* Staged sockets belong to the candidate; free them before rebinding so the
+     * old listener can take its port back. */
+    fastp2p_client_destroy(update->candidate);
+    update->candidate = NULL;
+    if (restore)
+        for (int k = 0; k < update->vacated_count; ++k) {
+            int index = update->vacated[k];
+            if (stage_listener(&c->apps[index])) {
+                emit(c, FASTP2P_EVENT_ERROR, c->apps[index].id, FASTP2P_EIO,
+                     "could not restore a listener after a rejected rule update");
+                continue;
+            }
+            adopt_local_udp_overlays(c, index);
+        }
+    free(update);
+}
+
+static int same_rule_listener(const app *a, const app *b) {
+    op_addr from, to;
+    return a->port == b->port && a->udp == b->udp &&
+           !op_addr_from_text(&from, a->bind_ip, a->port) &&
+           !op_addr_from_text(&to, b->bind_ip, b->port) &&
+           op_addr_family(&from) == op_addr_family(&to) && op_addr_equal(&from, &to);
+}
+
+static int same_profile_rule(const app *a, const app *b) {
+    return same_rule_listener(a, b) && a->socks == b->socks &&
+           a->transport == b->transport && a->no_relay == b->no_relay &&
+           a->dst_port == b->dst_port && !strcmp(a->destination, b->destination) &&
+           !strcmp(a->configured_peer, b->configured_peer) &&
+           !strcmp(a->configured_relay, b->configured_relay) &&
+           !strcmp(a->socks_user, b->socks_user) && !strcmp(a->socks_password, b->socks_password);
+}
+
+void fp_client_rules_abort(fp_rule_update *update) { release_update(update, 1); }
+
+int fp_client_rules_prepare(fastp2p_client *c, const char *json, fp_rule_update **out) {
+    if (!out)
+        return FASTP2P_EINVAL;
+    *out = NULL;
+    if (!c || !json)
+        return FASTP2P_EINVAL;
+    if (!c->running || c->stopping || c->validate_only)
+        return FASTP2P_ESTATE;
+    fp_rule_update *update = calloc(1, sizeof(*update));
+    if (!update)
+        return FASTP2P_ENOMEM;
+    update->client = c;
+    char token[21];
+    snprintf(token, sizeof(token), "%" PRIu64, c->token);
+    int rv = fp_config_create_validation_client(json, token, &update->candidate);
+    if (rv)
+        goto fail;
+
+    for (int i = 0; i < NA; ++i) {
+        app *next = &update->candidate->apps[i];
+        update->slot[i] = -1;
+        if (c->apps[i].used && !c->apps[i].profile_rule)
+            update->reserved[i] = 1;
+        if (!next->profile_rule)
+            continue;
+        for (int j = 0; j < NA; ++j) {
+            app *old = &c->apps[j];
+            if (!old->used || !old->local || old->sdwan || old->udp != next->udp ||
+                old->port != next->port)
+                continue;
+            if (!old->profile_rule) {
+                rv = FASTP2P_ESTATE;
+                goto fail;
+            }
+            update->slot[i] = j;
+            update->reserved[j] = 1;
+            update->unchanged[i] = same_profile_rule(old, next);
+            update->borrow[i] = old->fd >= 0 && same_rule_listener(old, next);
+            if (!strcmp(old->configured_peer, next->configured_peer))
+                strcpy(next->peer, old->peer);
+            if (!strcmp(old->configured_relay, next->configured_relay))
+                strcpy(next->relay_node, old->relay_node);
+            break;
+        }
+        /* Automatic profiles are parsed in a temporary instance that has not
+         * received the running client's assigned node name. */
+        if (!strcmp(next->peer, c->node)) {
+            rv = FASTP2P_EINVAL;
+            goto fail;
+        }
+    }
+    int keep[NA] = {0};
+    for (int i = 0; i < NA; ++i)
+        if (update->slot[i] >= 0 && update->unchanged[i])
+            keep[update->slot[i]] = 1;
+    /* Bind every listener the new rule set needs. A port that only becomes free
+     * after another rule moves is deferred: the rule that holds it is going away,
+     * so its listener is closed here and rebound again if this update is aborted. */
+    int deferred = 0;
+    for (int i = 0; i < NA; ++i) {
+        app *next = &update->candidate->apps[i];
+        if (!next->profile_rule)
+            continue;
+        if (update->slot[i] < 0) {
+            int j = 0;
+            while (j < NA && update->reserved[j])
+                ++j;
+            if (j == NA) {
+                rv = FASTP2P_ELIMIT;
+                goto fail;
+            }
+            update->slot[i] = j;
+            update->reserved[j] = 1;
+        }
+        if (update->borrow[i])
+            continue;
+        if (!stage_listener(next))
+            continue;
+        if (errno != EADDRINUSE) {
+            rv = FASTP2P_EIO;
+            goto fail;
+        }
+        update->deferred[i] = 1;
+        ++deferred;
+    }
+    if (deferred) {
+        int blocked = 0;
+        for (int i = 0; i < NA; ++i) {
+            if (!update->deferred[i])
+                continue;
+            const app *next = &update->candidate->apps[i];
+            for (int j = 0; j < NA; ++j) {
+                app *old = &c->apps[j];
+                if (!old->used || !old->profile_rule || old->fd < 0 || keep[j] ||
+                    old->udp != next->udp || old->port != next->port)
+                    continue;
+                /* This listener is about to be replaced: it is the one in the
+                 * way, and closing it releases the port for the new rule. */
+                int already = 0;
+                for (int k = 0; k < update->vacated_count; ++k)
+                    if (update->vacated[k] == j)
+                        already = 1;
+                if (!already)
+                    vacate_listener(update, j);
+                blocked = 1;
+            }
+        }
+        if (!blocked) {
+            /* Someone outside this client owns the port; nothing of ours can be
+             * released to make room. */
+            rv = FASTP2P_EIO;
+            goto fail;
+        }
+        for (int i = 0; i < NA; ++i) {
+            if (!update->deferred[i])
+                continue;
+            if (stage_listener(&update->candidate->apps[i])) {
+                rv = FASTP2P_EIO;
+                goto fail;
+            }
+        }
+    }
+    *out = update;
+    return FASTP2P_OK;
+
+fail:
+    fp_client_rules_abort(update);
+    return rv;
+}
+
+void fp_client_rules_commit(fp_rule_update *update) {
+    if (!update)
+        return;
+    fastp2p_client *c = update->client;
+    int keep[NA] = {0};
+    for (int i = 0; i < NA; ++i)
+        if (update->slot[i] >= 0 && update->unchanged[i])
+            keep[update->slot[i]] = 1;
+    uint64_t now = mono();
+    for (int i = 0; i < NA; ++i) {
+        app *old = &c->apps[i];
+        if (old->used && old->profile_rule && !keep[i] && old->tunnel_index >= 0) {
+            tunnel *t = &c->tunnels[old->tunnel_index];
+            /* Start the release handshake from scratch for this detach. */
+            t->detached_at = now;
+            t->release_sent = 0;
+            t->released = 0;
+        }
+    }
+    for (int i = 0; i < NO; ++i) {
+        overlay *o = &c->overlays[i];
+        if (o->used && o->app_index >= 0 && c->apps[o->app_index].profile_rule &&
+            !keep[o->app_index])
+            /* Pending SOCKS handshakes cannot outlive their app slot here. */
+            close_overlay_now(c, i, 1);
+    }
+    for (int i = 0; i < NA; ++i) {
+        int slot = update->slot[i];
+        if (slot < 0)
+            continue;
+        app *old = &c->apps[slot], *next = &update->candidate->apps[i];
+        if (update->unchanged[i]) {
+            /* A rename in the profile is metadata, not a new connection. */
+            strcpy(old->name, next->name);
+            if (!update->borrow[i]) {
+                old->fd = next->fd;
+                next->fd = -1;
+            }
+        } else {
+            if (update->borrow[i])
+                next->fd = old->fd;
+            else if (old->used && old->fd >= 0)
+                op_close(old->fd);
+            OPENSSL_cleanse(old, sizeof(*old));
+            *old = *next;
+            next->fd = -1;
+        }
+    }
+    for (int i = 0; i < NA; ++i) {
+        app *old = &c->apps[i];
+        if (!old->used || !old->profile_rule || update->reserved[i])
+            continue;
+        if (old->fd >= 0)
+            op_close(old->fd);
+        OPENSSL_cleanse(old, sizeof(*old));
+        old->fd = -1;
+        old->tunnel_index = -1;
+    }
+    /* An app is only a user of a tunnel. Other local rules or the remote
+     * endpoint may still be carrying traffic through that same tunnel, so the
+     * detached tunnel is only reclaimed after the peer confirms it is unused. */
+    release_update(update, 0);
+}
+
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
 #if defined(__linux__) || defined(_WIN32)
     fp_sdwan *state = malloc(sizeof(*state));

@@ -339,8 +339,291 @@ static void expired_nat_probes_release_sockets(void) {
     dispose(c);
 }
 
+static void rule_churn_reclaims_only_unused_tunnels(void) {
+    fastp2p_client *c = fixture();
+    uint64_t now = 100 * NS;
+    for (int i = 0; i < NT; ++i) {
+        int index = new_tunnel(c, "sender-node", (uint64_t)i + 1, FASTP2P_TRANSPORT_TCP, 1);
+        assert(index == i);
+        c->tunnels[i].state = T_ACTIVE;
+    }
+    for (int i = 0; i < 5; ++i)
+        c->tunnels[i].detached_at = NS;
+    c->tunnels[0].last_payload = now - NS;
+    c->tunnels[1].relay_link = 0;
+    c->tunnels[2].initiator = 0;
+    c->apps[0].used = 1;
+    c->apps[0].tunnel_index = 3;
+    c->overlays[0].used = 1;
+    c->overlays[0].app_index = -1; /* also protect incoming connections */
+    c->overlays[0].tunnel_index = 4;
+    c->tunnels[5].detached_at = now - NS;
+    assert(reserve_tunnel_slot(c, now) == -1);
+    c->tunnels[5].detached_at = 2 * NS;
+    /* Detached but not acknowledged by the peer: still not reclaimable. */
+    assert(reserve_tunnel_slot(c, now) == -1);
+    c->tunnels[5].released = 1;
+    /* An acknowledged relay session is still not ours to drop. */
+    c->tunnels[6].detached_at = 2 * NS;
+    c->tunnels[6].released = 1;
+    c->tunnels[6].relay_wait = 1;
+    assert(reserve_tunnel_slot(c, now) == 5);
+    assert(c->tunnels[5].state == T_FREE);
+    assert(c->tunnels[6].state == T_ACTIVE);
+    for (int i = 0; i < 5; ++i)
+        assert(c->tunnels[i].state == T_ACTIVE);
+    c->overlays[0].used = 0;
+    dispose(c);
+}
+
+static void release_request_requires_an_unused_tunnel(void) {
+    fastp2p_client *c = fixture();
+    int ti = new_tunnel(c, "sender-node", 700, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti == 0);
+    tunnel *t = &c->tunnels[ti];
+    t->state = T_ACTIVE;
+    t->detached_at = NS;
+    uint8_t frame[8];
+    op_put64(frame, t->id);
+    op_buffer_clear(&t->tx);
+    /* No local user: the request is acknowledged, but only the ACK releases. */
+    tunnel_message(c, ti, TUN_RELEASE, frame, 8);
+    assert(!t->released);
+    assert(op_buffer_size(&t->tx) == 16); /* 8-byte frame header + tunnel id */
+    op_buffer_clear(&t->tx);
+    /* An incoming connection still uses it: no acknowledgement. */
+    c->overlays[0].used = 1;
+    c->overlays[0].app_index = -1;
+    c->overlays[0].tunnel_index = ti;
+    tunnel_message(c, ti, TUN_RELEASE, frame, 8);
+    assert(!op_buffer_size(&t->tx));
+    c->overlays[0].used = 0;
+    /* A relay hop must never authorise a release: the session belongs to the
+     * two endpoints, not to the node carrying it. */
+    t->relay_link = 0;
+    tunnel_message(c, ti, TUN_RELEASE, frame, 8);
+    assert(!op_buffer_size(&t->tx));
+    t->relay_link = -1;
+    /* The peer's acknowledgement marks it reclaimable. */
+    op_put64(frame, t->id);
+    tunnel_message(c, ti, TUN_RELEASE_ACK, frame, 8);
+    assert(t->released);
+    dispose(c);
+}
+
+static int free_tcp_port(void) {
+    op_socket fd = socket_bound(0, "127.0.0.1", 0, BIND_DEFAULT);
+    assert(fd >= 0);
+    int port = socket_port(fd);
+    op_close(fd);
+    return port;
+}
+
+static int port_open(int port) {
+    op_addr address;
+    assert(!op_addr_from_text(&address, "127.0.0.1", (uint16_t)port));
+    op_socket fd = op_socket_open(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return 0;
+    int open = 0;
+    if (!op_connect(fd, &address.u.sa, address.len) || errno == EINPROGRESS) {
+        for (int i = 0; i < 200; ++i) {
+            int rv = connect_ready(fd);
+            if (rv > 0) {
+                open = 1;
+                break;
+            }
+            if (rv < 0)
+                break;
+            op_sleep_ms(1);
+        }
+    }
+    op_close(fd);
+    return open;
+}
+
+static void rule_json(char *out, size_t size, const char *bind_ip, int port) {
+    snprintf(out, size,
+             "{\"network\":{\"Node\":\"config-node\",\"ServerHost\":\"127.0.0.1\","
+             "\"ServerPort\":27183,\"Token\":\"1\"},\"apps\":["
+             "{\"AppName\":\"a\",\"BindIP\":\"%s\",\"SrcPort\":%d,"
+             "\"PeerNode\":\"peer-node\",\"DstHost\":\"127.0.0.1\",\"DstPort\":22,"
+             "\"Protocol\":\"tcp\",\"UnderlayProtocol\":\"tcp\"}],\"socks5\":[]}",
+             bind_ip, port);
+}
+
+static const char *app_bind_text(const app *a, char *out, size_t size) {
+    op_addr bound = {0};
+    if (a->fd < 0 || op_addr_socketname(a->fd, &bound) || op_addr_text(&bound, out, size))
+        return "(unbound)";
+    return out;
+}
+
+/* Changing the bind address keeps the port, so the old socket must be released
+ * before the new one can bind. The update has to succeed, and an aborted update
+ * has to put the previous listener back. */
+static void rule_update_changes_bind_address(void) {
+    int port = free_tcp_port();
+    char narrow[1200], wide[1200], text[OP_ADDR_TEXT];
+    rule_json(narrow, sizeof(narrow), "127.0.0.1", port);
+    rule_json(wide, sizeof(wide), "0.0.0.0", port);
+    fastp2p_client *c = NULL;
+    assert(!fastp2p_client_create_json(narrow, NULL, NULL, NULL, NULL, &c));
+    c->running = 1;
+    int index = -1;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used)
+            index = i;
+    assert(index >= 0);
+    assert(!strcmp(app_bind_text(&c->apps[index], text, sizeof(text)), "127.0.0.1"));
+    assert(port_open(port));
+
+    /* Widen the listener: the same port is held by the running rule, so on a
+     * platform that refuses the overlapping bind the old socket is released
+     * first. Windows accepts the pair, in which case nothing is vacated. */
+    fp_rule_update *update = NULL;
+    assert(!fp_client_rules_prepare(c, wide, &update));
+    int widened_vacated = update->vacated_count;
+    assert(widened_vacated <= 1);
+    fp_client_rules_commit(update);
+    index = -1;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used)
+            index = i;
+    assert(index >= 0);
+    assert(!strcmp(app_bind_text(&c->apps[index], text, sizeof(text)), "0.0.0.0"));
+    assert(socket_port(c->apps[index].fd) == port && port_open(port));
+
+    /* Narrow it again, then abort: the wide listener must be restored. A
+     * specific address cannot be bound over a wildcard listener on any
+     * platform, so this direction always exercises the release path. */
+    fp_rule_update *aborted = NULL;
+    assert(!fp_client_rules_prepare(c, narrow, &aborted));
+    assert(aborted->vacated_count <= 1);
+    assert(widened_vacated + aborted->vacated_count <= 2);
+    fp_client_rules_abort(aborted);
+    index = -1;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used)
+            index = i;
+    assert(index >= 0);
+    assert(!strcmp(app_bind_text(&c->apps[index], text, sizeof(text)), "0.0.0.0"));
+    assert(port_open(port));
+
+    /* The rollback path itself, independent of platform bind semantics: a
+     * released listener is bound again when the update is abandoned. */
+    fp_rule_update *rollback = NULL;
+    assert(!fp_client_rules_prepare(c, wide, &rollback));
+    index = -1;
+    for (int i = 0; i < NA; ++i)
+        if (c->apps[i].used)
+            index = i;
+    assert(index >= 0);
+    vacate_listener(rollback, index);
+    assert(c->apps[index].fd < 0);
+    fp_client_rules_abort(rollback);
+    assert(c->apps[index].fd >= 0);
+    assert(!strcmp(app_bind_text(&c->apps[index], text, sizeof(text)), "0.0.0.0"));
+    assert(port_open(port));
+
+    /* A port owned by another process is not ours to vacate: the update fails
+     * and the running listener keeps working. */
+    op_socket foreign = socket_bound(0, "127.0.0.1", 0, BIND_DEFAULT);
+    assert(foreign >= 0);
+    int foreign_port = socket_port(foreign);
+    assert(!op_listen(foreign, 4));
+    char blocked[1200];
+    rule_json(blocked, sizeof(blocked), "127.0.0.1", foreign_port);
+    fp_rule_update *rejected = NULL;
+    assert(fp_client_rules_prepare(c, blocked, &rejected) < 0);
+    assert(!rejected);
+    assert(port_open(port));
+    op_close(foreign);
+    fastp2p_client_destroy(c);
+}
+
+/* The business-port fallback belongs to the mapping-probe stage only, and the
+ * borrowed listener must change owner exactly once. */
+static void mapping_fallback_only_adopts_while_probing(void) {
+    fastp2p_client *c = fixture();
+    c->public_port = 5555;
+    c->families_wanted = FAM_V4;
+    strcpy(c->ip[OP_FAM_V4], "203.0.113.5");
+    nat_filter_record(&c->udp_filter, 6, mono());
+    op_socket listener = socket_bound(1, "127.0.0.1", 0, BIND_DEFAULT);
+    assert(listener >= 0);
+    c->udp_listener[OP_FAM_V4] = listener;
+    int ti = new_tunnel(c, "sender-node", 910, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti == 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "udppunch");
+    t->state = T_TIME;
+    /* A published negotiation is no longer a mapping probe: adopt nothing. */
+    assert(!probe_fallback_mapping(c, ti));
+    assert(c->udp_listener[OP_FAM_V4] == listener);
+    assert(t->fd < 0);
+    /* While the mapping is still being measured the business port is adopted. */
+    t->state = T_PROBE;
+    assert(probe_fallback_mapping(c, ti));
+    assert(t->mapped_ports[OP_FAM_V4] == (uint16_t)socket_port(listener));
+    assert(t->probes[OP_FAM_V4].borrowed);
+    /* Punching from it hands ownership to the tunnel; the listener keeps no fd. */
+    strcpy(t->peer_text[OP_FAM_V4], "203.0.113.9");
+    t->remote_ports[OP_FAM_V4] = 6000;
+    t->peer_ready[OP_FAM_V4] = 1;
+    assert(!use_punch_family(c, ti, OP_FAM_V4));
+    assert(c->udp_listener[OP_FAM_V4] < 0);
+    assert(t->fd == listener && t->probes[OP_FAM_V4].fd < 0);
+    dispose(c);
+}
+
+/* A completed measurement in the other family outlives the preferred family. */
+static void answered_family_survives_primary_failure(void) {
+    fastp2p_client *c = fixture();
+    c->families_wanted = FAM_V4 | FAM_V6;
+    int ti = new_tunnel(c, "sender-node", 920, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti == 0);
+    tunnel *t = &c->tunnels[ti];
+    t->state = T_PROBE;
+    t->probes[OP_FAM_V6] = (nat_probe){.fd = -1, .state = PROBE_DONE, .mapped_port = 41000};
+    assert(!required_family_failed(c, ti, OP_FAM_V4, "probe failed"));
+    assert(t->state == T_PROBE);
+    /* Without the other answer the same failure still ends the tunnel. */
+    t->probes[OP_FAM_V6].state = PROBE_FREE;
+    assert(required_family_failed(c, ti, OP_FAM_V4, "probe failed"));
+    assert(t->state == T_FREE);
+    dispose(c);
+}
+
+/* Expired pending keys must not occupy the table forever. */
+static void expired_pending_keys_are_reclaimed(void) {
+    fastp2p_client *c = fixture();
+    uint8_t secret[FP_SESSION_SECRET] = {4};
+    int ti = new_tunnel(c, "sender-node", 900, FASTP2P_TRANSPORT_QUIC, 0);
+    assert(ti == 0);
+    c->tunnels[ti].state = T_QUIC;
+    for (int i = 0; i < NPK; ++i) {
+        c->keys[i].used = 1;
+        c->keys[i].session = (uint64_t)i + 1;
+        c->keys[i].deadline = mono() - 1;
+    }
+    key(c, 900, 4242, 42000, secret);
+    int found = 0;
+    for (int i = 0; i < NPK; ++i)
+        if (c->keys[i].used && c->keys[i].session == 4242)
+            found = 1;
+    assert(found);
+    dispose(c);
+}
+
 int main(void) {
     assert(!op_platform_init());
+    mapping_fallback_only_adopts_while_probing();
+    answered_family_survives_primary_failure();
+    expired_pending_keys_are_reclaimed();
+    rule_churn_reclaims_only_unused_tunnels();
+    release_request_requires_an_unused_tunnel();
+    rule_update_changes_bind_address();
     expired_nat_probes_release_sockets();
     relay_cannot_steal_direct_rule();
     relay_endpoint_shares_only_with_the_logical_peer();
@@ -351,6 +634,7 @@ int main(void) {
     acknowledgement_and_certificate();
     retries_use_fresh_keys();
     sdwan_ingress_reaches_active_adapter();
-    puts("Connection IDs, reordered keys, duplicate delivery, ACK/certificate gates, fresh retry keys and SD-WAN ingress passed");
+    puts("Connection IDs, reordered keys, duplicate delivery, ACK/certificate gates, fresh retry "
+         "keys, SD-WAN ingress, tunnel release handshake and listener migration passed");
     return 0;
 }

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Rule-managed configuration: merge into fastp2p.conf, reload, persistence, rollback.
+"""Rule-managed configuration: persistence and transactional live updates.
 
-The gateway no longer accepts operator-supplied JSON fields (that endpoint now
-answers 410), so the only thing that reaches the client is the desired state the
-gateway renders from its forwarding rules. This test therefore drives /app and
-asserts on the resulting conf file, which is what the client actually reads.
+Drive the real gateway's /app endpoint and check the acknowledged revision,
+local profile, and existing TCP streams. The portable fixture cannot render
+managed rules, so it only checks the shared profile guarantees.
 """
 import argparse, json, os, secrets, socket, ssl, subprocess, sys, tempfile, time
+from contextlib import ExitStack, closing
 from pathlib import Path
 import http.client
+import socketserver
+import sqlite3
+import struct
+import threading
 from certificates import create_certificates
 
 p = argparse.ArgumentParser()
@@ -23,6 +27,7 @@ gateway = Path(args.gateway).resolve()
 
 with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
     root = Path(temporary)
+    database = root / 'nodes.sqlite3'
     create_certificates(root / 'tls', '127.0.0.1')
     env = dict(os.environ, FASTP2P_USER='config-admin',
                FASTP2P_PASSWORD=secrets.token_urlsafe(24), FASTP2P_TOKEN='9999999999999999')
@@ -37,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             try:
                 if action():
                     return
-            except (OSError, ValueError, AssertionError, KeyError):
+            except (OSError, ValueError, AssertionError, KeyError, sqlite3.OperationalError):
                 pass
             time.sleep(.05)
         raise TimeoutError('timed out waiting for ' + what)
@@ -56,7 +61,8 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
 
     def port():
         with socket.socket() as s:
-            s.bind(('127.0.0.1', 0))
+            # Exclude ports already in use even on the 127.0.0.2 listener.
+            s.bind(('0.0.0.0', 0))
             return s.getsockname()[1]
 
     def listening(number, address='127.0.0.1'):
@@ -88,40 +94,130 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
     config.write_text(json.dumps(local))
     results = {}
 
-    def start_client():
+    entry_node = 'config-test-node'
+    exit_node = 'config-exit-node'
+    rule_endpoint = '/api/v1/device/' + entry_node + '/app'
+
+    def start_client(profile=config, log='client'):
         client_env = env.copy()
         client_env.pop('FASTP2P_TOKEN', None)
-        process = subprocess.Popen([str(client), 'run', '--config', str(config)],
-                                   env=client_env, stdout=logs['client'],
+        process = subprocess.Popen([str(client), 'run', '--config', str(profile)],
+                                   cwd=root, env=client_env, stdout=logs[log],
                                    stderr=subprocess.STDOUT)
         children.append(process)
         return process
 
-    def rule_forwards(source, name, extra=None):
+    def online(*names):
+        status, reply = api('/api/v1/nodes')
+        return status == 200 and set(names) <= {
+            node['name'] for node in reply['nodes'] if node['isActive']}
+
+    def rule_forwards(source, name, target, extra=None):
         rule = {'appName': name, 'protocol': 'tcp', 'srcPort': source,
-                'peerNode': 'offline-peer-node', 'dstHost': '127.0.0.1', 'dstPort': 22,
+                'peerNode': exit_node, 'dstHost': '127.0.0.1', 'dstPort': target,
                 'punchPriority': 2}
         if extra:
             rule.update(extra)
         return rule
 
-    def forwards(source):
-        return any(int(a.get('SrcPort', 0)) == source for a in read_config().get('apps', []))
+    def profile_rule(source, group='apps'):
+        return next((row for row in read_config().get(group, [])
+                     if int(row.get('SrcPort', 0)) == source), None)
 
-    def rejected_rule(blocked, working):
-        """The conflicting rule never lands in the file and the working rule stays up.
+    def gateway_config_state():
+        # /config intentionally returns 410. The private real gateway records
+        # actual 6/8 ACKs in its database; queued submissions are not ACKs.
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=.2)) as db:
+            return db.execute('SELECT revision, ack_revision, state FROM node_configs WHERE node=?',
+                              (entry_node,)).fetchone()
 
-        The client remembers the rejected revision so a failed push is not
-        replayed in a loop; what matters here is that the node keeps serving the
-        rule it already had.
-        """
-        return not forwards(blocked) and listening(working)
+    def change_rule(rule, state='applied'):
+        previous = gateway_config_state()
+        previous_revision = previous[0] if previous else 0
+        assert api(rule_endpoint, rule)[0] == 200
+        queued = gateway_config_state()
+        assert queued and queued[0] > previous_revision, (rule['srcPort'], previous, queued)
+        revision = queued[0]
+        wait(lambda: gateway_config_state() == (revision, revision, state),
+             what=f'revision {revision} to acknowledge {state}')
+        return revision
+
+    def remove_rule(source, protocol='tcp'):
+        change_rule({'protocol': protocol, 'srcPort': 0,
+                     'protocol0': protocol, 'srcPort0': source})
+
+    def exact(sock, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise ConnectionError('existing TCP stream closed early')
+            data.extend(chunk)
+        return bytes(data)
+
+    class Echo(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                while line := self.rfile.readline(4096):
+                    self.wfile.write(self.server.tag + b':' + line)
+            except OSError:
+                pass
+
+    def echo_server(stack, tag):
+        server = stack.enter_context(socketserver.ThreadingTCPServer(('127.0.0.1', 0), Echo))
+        server.daemon_threads = True
+        server.tag = tag
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        stack.callback(thread.join)
+        stack.callback(server.shutdown)
+        return server.server_address[1]
+
+    def assert_echo(sock, tag):
+        payload = secrets.token_hex(12).encode() + b'\n'
+        sock.sendall(payload)
+        assert exact(sock, len(tag) + 1 + len(payload)) == tag + b':' + payload
+
+    def connect_forward(source, address='127.0.0.1', timeout=3):
+        return socket.create_connection((address, source), timeout=timeout)
+
+    def finish_stream(sock):
+        # Let the test peer initiate FIN so the FastP2P listener's address is
+        # not held in TIME_WAIT when the persistence test restarts the client.
+        sock.shutdown(socket.SHUT_WR)
+        assert sock.recv(1) == b''
+
+    def forwards_echo(source, tag, address='127.0.0.1'):
+        with connect_forward(source, address, timeout=1) as sock:
+            assert_echo(sock, tag)
+            finish_stream(sock)
+        return True
+
+    def connect_proxy(source, target, credentials=None):
+        sock = connect_forward(source)
+        try:
+            method = b'\x02' if credentials else b'\x00'
+            sock.sendall(b'\x05\x01' + method)
+            assert exact(sock, 2) == b'\x05' + method
+            if credentials:
+                username, password = credentials
+                sock.sendall(b'\x01' + bytes([len(username)]) + username + bytes([len(password)]) + password)
+                assert exact(sock, 2) == b'\x01\x00'
+            sock.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') +
+                         struct.pack('!H', target))
+            reply = exact(sock, 10)
+            assert reply[:4] == b'\x05\x00\x00\x01', reply
+        except BaseException:
+            sock.close()
+            raise
+        return sock
 
     try:
         process = subprocess.Popen(
             ([sys.executable, str(gateway)] if portable else [str(gateway)]) +
             ['--bind', '127.0.0.1', '--port', '37183', '--apiport', '31008',
-             '--cert', str(root / 'tls/server.crt'), '--key', str(root / 'tls/server.key')],
+             '--database', str(database), '--cert', str(root / 'tls/server.crt'),
+             '--key', str(root / 'tls/server.key')],
             cwd=root, env=env, stdout=logs['gateway'], stderr=subprocess.STDOUT)
         children.append(process)
         wait(lambda: api('/healthz', auth=False)[0] == 200)
@@ -131,8 +227,7 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
         assert status == 200
         jwt = value['token']
         current = start_client()
-        wait(lambda: any(n['isActive'] for n in api('/api/v1/nodes')[1]['nodes']),
-             what='the client to register')
+        wait(lambda: online(entry_node), what='the client to register')
 
         # Manual field configuration is gone: both methods answer 410 and the
         # console no longer offers it.
@@ -153,66 +248,146 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             assert saved['CACertFile'] == local['CACertFile']
             results['unsent_keys_and_credentials_preserved_across_reload'] = True
         else:
-            # A forwarding rule stored by the gateway must reach the client's own
-            # configuration file, and a key inside the rule that the renderer does
-            # not know must survive the round trip.
-            forward = port()
-            listen_address = '127.0.0.2'
-            assert api('/api/v1/device/config-test-node/app',
-                       rule_forwards(forward, 'config-forward',
-                                     {'customRuleKey': 42, 'whitelist': listen_address}))[0] == 200
-            wait(lambda: listening(forward, listen_address) and forwards(forward),
-                 what='the rule to reach fastp2p.conf and bind')
-            assert not listening(forward)
-            saved = read_config()
-            stored = [a for a in saved['apps'] if int(a.get('SrcPort', 0)) == forward]
-            assert stored, 'the rule never reached fastp2p.conf'
-            # A key the gateway's renderer does not understand still has to survive:
-            # it round-trips through the stored rule payload rather than being dropped.
-            assert stored[0]['customRuleKey'] == 42, stored[0]
-            assert stored[0]['BindIP'] == listen_address, stored[0]
-            results['rule_reaches_config_file_and_unknown_keys_survive'] = True
+            exit_profile = root / 'exit.json'
+            exit_network = dict(local['network'], Node=exit_node)
+            exit_profile.write_text(json.dumps({'network': exit_network,
+                                                'CACertFile': local['CACertFile']}))
+            logs['exit'] = (root / 'exit.log').open('w')
+            exit_client = start_client(exit_profile, 'exit')
+            wait(lambda: online(entry_node, exit_node), what='both peers to register')
 
-            # Unmanaged local keys and the credential material stay untouched.
-            assert saved['custom'] == {'nested': {'keep': 17, 'update': 1},
-                                       'onlyLocal': 'untouched'}
-            assert saved['network']['Token'] == local['network']['Token']
-            assert saved['CACertFile'] == local['CACertFile']
-            assert current.poll() is None and not saved['_fastp2pManaged']['pending']
-            results['unsent_keys_and_credentials_preserved_across_reload'] = True
+            with ExitStack() as stack:
+                first_target = echo_server(stack, b'first')
+                second_target = echo_server(stack, b'second')
+                forward = port()
+                listen_address = '127.0.0.2'
+                revision = change_rule(rule_forwards(forward, 'config-forward', first_target,
+                                                     {'customRuleKey': 42, 'whitelist': listen_address}))
+                wait(lambda: forwards_echo(forward, b'first', listen_address),
+                     what='the first end-to-end TCP forward')
+                assert not listening(forward)
+                stored = profile_rule(forward)
+                assert stored and stored['customRuleKey'] == 42, stored
+                assert stored['BindIP'] == listen_address, stored
+                results['rule_reaches_config_file_and_unknown_keys_survive'] = True
 
-            # Deleting the rule removes it again, and the listener goes with it.
-            changed = port()
-            assert api('/api/v1/device/config-test-node/app',
-                       rule_forwards(changed, 'web-rule'))[0] == 200
-            wait(lambda: listening(changed) and forwards(changed), what='the second rule')
-            assert api('/api/v1/device/config-test-node/app',
-                       {'protocol': 'tcp', 'srcPort': 0, 'protocol0': 'tcp',
-                        'srcPort0': forward})[0] == 200
-            wait(lambda: not forwards(forward) and not listening(forward, listen_address),
-                 what='the first rule to disappear')
-            assert listening(changed)
-            results['rules_replace_as_a_set_and_disappear_when_deleted'] = True
+                saved = read_config()
+                assert saved['custom'] == {'nested': {'keep': 17, 'update': 1},
+                                           'onlyLocal': 'untouched'}
+                assert saved['network']['Token'] == local['network']['Token']
+                assert saved['CACertFile'] == local['CACertFile']
+                assert saved['_fastp2pManaged']['revision'] == revision
+                assert not saved['_fastp2pManaged']['pending']
+                results['unsent_keys_and_credentials_preserved_across_reload'] = True
 
-            # A restart re-reads the file the gateway wrote rather than losing it.
-            current.terminate()
-            current.wait(timeout=8)
-            current = start_client()
-            wait(lambda: listening(changed) and forwards(changed), what='restart to restore the rule')
-            assert read_config()['custom']['nested']['keep'] == 17
-            results['restart_reads_the_same_config_file'] = True
+                # Keep the same stream open across all the rule changes. Polling
+                # for a fresh connection could miss a full teardown and reconnect.
+                stable = stack.enter_context(connect_forward(forward, listen_address))
+                assert_echo(stable, b'first')
+                changed = port()
+                change_rule(rule_forwards(changed, 'web-rule', first_target))
+                assert_echo(stable, b'first')
+                wait(lambda: forwards_echo(changed, b'first'), what='the second TCP forward')
 
-            # Validation still has to protect a working node: a rule whose local port        # is already taken must not be applied, and must not disturb the rule
-            # that currently works.
-            with socket.socket() as occupied:
-                occupied.bind(('0.0.0.0', 0))
-                occupied.listen()
-                taken = occupied.getsockname()[1]
-                assert api('/api/v1/device/config-test-node/app',
-                           rule_forwards(taken, 'conflicting-rule'))[0] == 200
-                wait(lambda: rejected_rule(taken, changed),
-                     timeout=40, what='the conflicting rule to be rolled back')
-            results['bind_failure_rolls_back_without_losing_working_rules'] = True
+                # Edit the destination but retain the existing listening tuple.
+                change_rule(rule_forwards(changed, 'web-rule', second_target,
+                                          {'protocol0': 'tcp', 'srcPort0': changed}))
+                assert_echo(stable, b'first')
+                assert profile_rule(changed)['DstPort'] == second_target
+                wait(lambda: forwards_echo(changed, b'second'), what='the edited TCP destination')
+                results['adding_and_editing_tcp_rules_preserves_existing_stream'] = True
+
+                proxy_port = port()
+                proxy_rule = {'appName': 'live-proxy', 'protocol': 'socks5', 'srcPort': proxy_port,
+                              'peerNode': exit_node, 'punchPriority': 2}
+                change_rule(proxy_rule)
+                assert profile_rule(proxy_port, 'socks5')['Name'] == 'live-proxy'
+                with connect_proxy(proxy_port, second_target) as unprotected_proxy:
+                    assert_echo(unprotected_proxy, b'second')
+                    finish_stream(unprotected_proxy)
+                assert_echo(stable, b'first')
+                results['adding_socks5_preserves_existing_tcp_stream'] = True
+
+                credentials = (b'config-user', secrets.token_hex(12).encode())
+                change_rule(dict(proxy_rule, protocol0='socks5', srcPort0=proxy_port,
+                                 Username=credentials[0].decode(), Password=credentials[1].decode()))
+                with connect_forward(proxy_port) as unauthenticated:
+                    # Use the authenticated listener without opening a stream;
+                    # a SOCKS rejection is server-initiated and would put this
+                    # listener in TIME_WAIT before the persistence check.
+                    unauthenticated.sendall(b'\x05\x02\x00\x02')
+                    assert exact(unauthenticated, 2) == b'\x05\x02'
+                proxy = stack.enter_context(connect_proxy(proxy_port, second_target, credentials))
+                assert_echo(proxy, b'second')
+                assert_echo(stable, b'first')
+                results['editing_socks5_credentials_preserves_existing_tcp_stream'] = True
+
+                # All rules use the same peer and TCP underlay. Removing one of
+                # them must not close the tunnel held by the two active streams.
+                remove_rule(changed)
+                assert not profile_rule(changed) and not listening(changed)
+                assert_echo(stable, b'first')
+                assert_echo(proxy, b'second')
+                results['deleting_shared_tunnel_rule_preserves_other_streams'] = True
+                results['rules_replace_as_a_set_and_disappear_when_deleted'] = True
+
+                before = config.read_bytes()
+                with socket.socket() as occupied:
+                    occupied.bind(('0.0.0.0', 0))
+                    occupied.listen()
+                    taken = occupied.getsockname()[1]
+                    change_rule(rule_forwards(taken, 'conflicting-rule', second_target), 'failed')
+                    assert config.read_bytes() == before and not profile_rule(taken)
+                    assert listening(forward, listen_address) and listening(proxy_port)
+                    assert current.poll() is None and exit_client.poll() is None
+                    assert online(entry_node, exit_node)
+                    assert_echo(stable, b'first')
+                    assert_echo(proxy, b'second')
+                    remove_rule(taken)
+                results['bind_failure_rolls_back_without_losing_working_rules'] = True
+
+                # Force the atomic writer to fail after the candidate listener was
+                # prepared, without changing permissions or the live profile.
+                not_saved = port()
+                temporary_profile = config.with_name(config.name + f'.tmp.{current.pid}')
+                before = config.read_bytes()
+                with temporary_profile.open('xb'):
+                    pass
+                try:
+                    change_rule(rule_forwards(not_saved, 'write-failure-rule', second_target), 'failed')
+                    assert config.read_bytes() == before and not profile_rule(not_saved)
+                    assert not listening(not_saved), 'failed save leaked a staged listener'
+                    assert_echo(stable, b'first')
+                    assert_echo(proxy, b'second')
+                finally:
+                    temporary_profile.unlink(missing_ok=True)
+                # The same gateway rule can be retried after the failure. A
+                # changed payload creates another revision on the same listener.
+                change_rule(rule_forwards(not_saved, 'retried-after-write-failure', second_target,
+                                          {'protocol0': 'tcp', 'srcPort0': not_saved}))
+                wait(lambda: forwards_echo(not_saved, b'second'), what='the retried rule to bind')
+                assert_echo(stable, b'first')
+                assert_echo(proxy, b'second')
+                remove_rule(not_saved)
+                results['save_failure_closes_staged_listener_and_preserves_existing_streams'] = True
+
+                # A deliberate restart is a profile persistence check. Drain
+                # the application streams before asking FastP2P to stop.
+                finish_stream(stable)
+                finish_stream(proxy)
+                stable.close()
+                proxy.close()
+                current.terminate()
+                current.wait(timeout=8)
+                current = start_client()
+                wait(lambda: listening(forward, listen_address) and listening(proxy_port),
+                     what='restart to bind both rules from the saved profile')
+                wait(lambda: online(entry_node, exit_node), what='the restarted client to register')
+                assert current.poll() is None
+                assert profile_rule(forward)['DstPort'] == first_target
+                assert profile_rule(proxy_port, 'socks5')['Username'] == credentials[0].decode()
+                assert read_config()['custom']['nested']['keep'] == 17
+                results['restart_reads_the_same_config_file'] = True
 
         if args.fixture:
             # The fixture never triggers a managed rewrite, so the profile is still
@@ -222,10 +397,6 @@ with tempfile.TemporaryDirectory(prefix='fastp2p-config-sync-') as temporary:
             assert config.read_bytes().startswith(b'FPD1')
             assert env['FASTP2P_TOKEN'].encode() not in config.read_bytes()
             results['windows_DPAPI_retained_after_merge_reload_and_rollback'] = True
-        elif args.fixture:
-            # No rule was applied, so the gateway never asked for a managed
-            # rewrite and the file keeps the permissions the test created it with.
-            results['fixture_gateway_skips_mode_check'] = True
         else:
             assert config.stat().st_mode & 0o077 == 0
         results['success'] = True

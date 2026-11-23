@@ -50,6 +50,9 @@ static int socket_error(void) {
     case WSAENOTCONN:
         errno = ENOTCONN;
         break;
+    case WSAEMSGSIZE:
+        errno = EMSGSIZE;
+        break;
     default:
         errno = EIO;
         break;

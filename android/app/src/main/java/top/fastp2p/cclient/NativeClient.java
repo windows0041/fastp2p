@@ -8,6 +8,8 @@ final class NativeClient {
     static native int start(long handle);
     static native int attachSdwanTun(long handle, int fd);
     static native int enableConfigPush(long handle);
+    // Called only during onGatewayConfig; returning success from that callback commits the plan.
+    static native int prepareGatewayRules(long handle, byte[] jsonUtf8);
     static native int publicPort(long handle);
     static native int step(long handle);
     static native void destroy(long handle);

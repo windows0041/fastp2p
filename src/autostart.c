@@ -1,16 +1,56 @@
 #include "install.h"
 #include "identity_file.h"
+#include "log_rotation.h"
+#include "platform.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #include <windows.h>
 static HANDLE stop_event;
 /* Set by the service control handler; the run loop reads it through
  * fastp2p_runtime_stopping. The named event alone is not enough because a stop
  * can arrive while the client is still starting up. */
 static volatile int stop_requested;
+/* The runtime log is the only diagnostic an installed node keeps, and these
+ * devices can have very little flash. Bound it to one file: when it reaches
+ * three quarters of a megabyte, keep only the newest half. The copy uses one
+ * fixed 16 KiB buffer, so rotation does not scale with device memory. */
+#define FP_LOG_ROTATE_AT (768u * 1024u)
+#define FP_LOG_KEEP (512u * 1024u)
+static WCHAR runtime_log_path[4096];
+
+static int rotate_log(void) {
+    if (!runtime_log_path[0])
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    /* The streams hold the old log open, so release them before the file is
+     * replaced, then attach them to the trimmed file. */
+    _wfreopen(L"NUL", L"w", stdout);
+    _wfreopen(L"NUL", L"w", stderr);
+    int fresh = fp_log_trim_wide(runtime_log_path, FP_LOG_ROTATE_AT, FP_LOG_KEEP);
+    if (fresh < 0)
+        runtime_log_path[0] = 0; /* do not retry a log that cannot be rewritten */
+    if (fresh > 0)
+        _close(fresh);
+    if (!runtime_log_path[0]) {
+        _wfreopen(L"NUL", L"w", stdout);
+        _wfreopen(L"NUL", L"w", stderr);
+        return -1;
+    }
+    if (!_wfreopen(runtime_log_path, L"ab", stdout) ||
+        !_wfreopen(runtime_log_path, L"ab", stderr)) {
+        runtime_log_path[0] = 0;
+        return -1;
+    }
+    return fresh < 0 ? -1 : fresh;
+}
+
 int fastp2p_runtime_prepare(const char *profile) { (void)profile; return 0; }
 static int wide(const char *text, WCHAR out[4096]) {
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, out, 4096) ? 0 : -1;
@@ -44,6 +84,11 @@ int fastp2p_runtime_begin(const char *profile, int background) {
                 return -1;
         }
         if (!_wfreopen(path, L"ab", stdout) || !_wfreopen(path, L"ab", stderr)) return -1;
+        if (wcslen(path) < 4096) {
+            wcscpy(runtime_log_path, path);
+            /* A log left behind by a previous run may already be over the cap. */
+            (void)rotate_log();
+        }
     }
     return 0;
 }
@@ -166,6 +211,29 @@ static int open_log_directory(void) {
     return fd;
 }
 
+/* One file, newest half kept, fixed-size buffer: see src/log_rotation.c. */
+#define FP_LOG_ROTATE_AT (768u * 1024u)
+#define FP_LOG_KEEP (512u * 1024u)
+static char runtime_log_path[4096];
+
+static int rotate_log(void) {
+    if (!runtime_log_path[0])
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    int fresh = fp_log_trim(runtime_log_path, FP_LOG_ROTATE_AT, FP_LOG_KEEP);
+    if (fresh <= 0)
+        return fresh;
+    /* stdout and stderr follow the renamed inode, so one file stays on disk. */
+    if (dup2(fresh, STDOUT_FILENO) < 0 || dup2(fresh, STDERR_FILENO) < 0) {
+        close(fresh);
+        return -1;
+    }
+    if (fresh != STDOUT_FILENO && fresh != STDERR_FILENO)
+        close(fresh);
+    return 1;
+}
+
 int fastp2p_runtime_begin(const char *profile, int background) {
     if (!background || !profile || strcmp(profile, FASTP2P_SYSTEM_PROFILE))
         return 0;
@@ -189,7 +257,12 @@ int fastp2p_runtime_begin(const char *profile, int background) {
     }
     if (log != STDOUT_FILENO && log != STDERR_FILENO)
         close(log);
-    return failed ? -1 : 0;
+    if (failed)
+        return -1;
+    snprintf(runtime_log_path, sizeof(runtime_log_path), "%s", FASTP2P_LOG_FILE);
+    /* A log left behind by a previous run may already be over the cap. */
+    (void)rotate_log();
+    return 0;
 }
 int fastp2p_runtime_stopping(void) { return 0; }
 void fastp2p_runtime_request_stop(void) {}
@@ -296,6 +369,7 @@ static int delete_installation(int keep_config) {
     int log = open_log_directory();
     if (log >= 0) {
         (void)unlinkat(log, "fastp2p.log", 0);
+        (void)unlinkat(log, "fastp2p.log.rotate", 0);
         close(log);
         (void)rmdir(FASTP2P_LOG_DIR);
     }
@@ -351,3 +425,15 @@ int fastp2p_enable_autostart(const char *profile, const char *ca) {
     return -1;
 }
 #endif
+
+void fastp2p_runtime_tick(void) {
+    /* A check is a single stat, and rotating at 768 KiB leaves room for any
+     * burst that can arrive between two checks, so the file never reaches the
+     * 1 MiB cap. */
+    static uint64_t next;
+    uint64_t now = op_monotonic_ns();
+    if (next && now < next)
+        return;
+    next = now + UINT64_C(500000000);
+    (void)rotate_log();
+}

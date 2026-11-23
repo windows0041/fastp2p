@@ -224,6 +224,50 @@ int fastp2p_profile_write(const char *path, const char *text) {
 #endif
 }
 typedef struct { int online, failed; char node[32]; } verification;
+char *fp_profile_pretty(json_object *root) {
+    if (!json_object_is_type(root, json_type_object))
+        return NULL;
+    const char *text =
+        json_object_to_json_string_ext(root, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_SPACED);
+    if (!text)
+        return NULL;
+    size_t length = strlen(text);
+    char *copy = malloc(length + 2);
+    if (!copy)
+        return NULL;
+    memcpy(copy, text, length);
+    /* One trailing newline: the file is edited by hand, and a missing final
+     * newline makes every editor show a "no newline at end of file" marker. */
+    if (!length || text[length - 1] != '\n')
+        copy[length++] = '\n';
+    copy[length] = 0;
+    return copy;
+}
+/* The machine-wide profile must keep its service-account key protection. */
+static int profile_is_machine(const char *path) {
+#ifdef _WIN32
+    char machine[4096];
+    return fastp2p_service_supported() && !fastp2p_service_profile(machine) &&
+           !strcmp(machine, path);
+#else
+    (void)path;
+    return 0;
+#endif
+}
+int fastp2p_format_profile(const char *path) {
+    if (!path || !*path)
+        return -1;
+    json_object *root = fastp2p_profile_read(path);
+    if (!root)
+        return -1;
+    char *text = fp_profile_pretty(root);
+    int result = text ? (profile_is_machine(path) ? fastp2p_profile_write_machine(path, text)
+                                                  : fastp2p_profile_write(path, text))
+                      : -1;
+    free(text);
+    json_object_put(root);
+    return result;
+}
 int fastp2p_profile_relocate(const char *source,const char *destination) {
     json_object *root=fastp2p_profile_read(source),*value=NULL;
     int result=-1;
@@ -241,13 +285,15 @@ int fastp2p_profile_relocate(const char *source,const char *destination) {
         free(ca);if(failed)goto done;
         json_object_object_add(root,"CACertFile",json_object_new_string(path));
     }
-    const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
+    char *text=fp_profile_pretty(root);
+    if(!text)goto done;
 #ifdef _WIN32
     char machine[4096];
     result=!fastp2p_service_profile(machine)&&!strcmp(machine,destination)?fastp2p_profile_write_machine(destination,text):fastp2p_profile_write(destination,text);
 #else
     result=fastp2p_profile_write(destination,text);
 #endif
+    free(text);
 done:
     if(root)json_object_put(root);
     return result;
@@ -449,9 +495,12 @@ static int install_token(const char *token, const char *token_file, const char *
 #endif
     }
     if (machine) fastp2p_install_step("[3/5] 网关校验通过，正在写入加密配置…");
-    const char *plain = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
-    if ((machine ? fastp2p_profile_write_machine(profile, plain)
-                 : fastp2p_profile_write(profile, plain))) goto fail;
+    char *plain = fp_profile_pretty(root);
+    if (!plain) goto fail;
+    int saved = machine ? fastp2p_profile_write_machine(profile, plain)
+                        : fastp2p_profile_write(profile, plain);
+    free(plain);
+    if (saved) goto fail;
     json_object_put(root); json_object_put(enrollment); if (previous) json_object_put(previous);
     if (!no_service) {
         if (machine) fastp2p_install_step("[4/5] 正在注册 Windows 服务并设为开机自启…");

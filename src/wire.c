@@ -139,13 +139,11 @@ int op_frame_take(op_buffer *b, uint16_t *main, uint16_t *sub, uint8_t **body, s
     op_buffer_consume(b, length + 8);
     return 1;
 }
-json_object *op_json(const void *data, size_t len) {
-    if (!data || len > OP_FRAME_LIMIT || len > INT_MAX || !fp_utf8_valid(data,len))
-        return NULL;
+static json_object *parse_exact(const void *data, size_t len, int flags) {
     json_tokener *t = json_tokener_new();
     if (!t)
         return NULL;
-    json_tokener_set_flags(t, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    json_tokener_set_flags(t, flags);
     errno = 0;
     json_object *o = json_tokener_parse_ex(t, data, (int)len);
     int range_error = errno == ERANGE;
@@ -156,6 +154,25 @@ json_object *op_json(const void *data, size_t len) {
         o = NULL;
     }
     json_tokener_free(t);
+    return o;
+}
+static int has_high_byte(const unsigned char *data, size_t len) {
+    for (size_t i = 0; i < len; ++i)
+        if (data[i] & 0x80)
+            return 1;
+    return 0;
+}
+json_object *op_json(const void *data, size_t len) {
+    if (!data || len > OP_FRAME_LIMIT || len > INT_MAX || !fp_utf8_valid(data,len))
+        return NULL;
+    json_object *o = parse_exact(data, len, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    if (!o && has_high_byte(data, len)) {
+        /* json-c 0.18 (and distro builds of it) compare a signed char in strict
+         * string parsing, so raw non-ASCII text is rejected as a control
+         * sequence. The bytes were validated as UTF-8 above, so retry without
+         * the strict checks instead of refusing a legitimate configuration. */
+        o = parse_exact(data, len, JSON_TOKENER_VALIDATE_UTF8);
+    }
     return o;
 }
 json_object *op_get(json_object *o, const char *name) {

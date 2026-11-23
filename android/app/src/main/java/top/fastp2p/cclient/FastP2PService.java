@@ -17,6 +17,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class FastP2PService extends VpnService {
@@ -53,7 +54,29 @@ public final class FastP2PService extends VpnService {
         return config;
     }
 
-    public int onGatewayConfig(byte[] bytes, long revision) {
+    private static boolean sameJson(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof JSONObject && b instanceof JSONObject) {
+            JSONObject left = (JSONObject)a, right = (JSONObject)b;
+            if (left.length() != right.length()) return false;
+            for (java.util.Iterator<String> keys = left.keys(); keys.hasNext();) {
+                String key = keys.next();
+                if (!right.has(key) || !sameJson(left.opt(key), right.opt(key))) return false;
+            }
+            return true;
+        }
+        if (a instanceof JSONArray && b instanceof JSONArray) {
+            JSONArray left = (JSONArray)a, right = (JSONArray)b;
+            if (left.length() != right.length()) return false;
+            for (int i = 0; i < left.length(); ++i) {
+                if (!sameJson(left.opt(i), right.opt(i))) return false;
+            }
+            return true;
+        }
+        return a != null && b != null && a.equals(b);
+    }
+
+    public int onGatewayConfig(long handle, byte[] bytes, long revision) {
         if (revision <= 0 || configurationBase == null) return -1;
         if (managedReloadAt != 0) return 1;
         try {
@@ -62,16 +85,28 @@ public final class FastP2PService extends VpnService {
             for (String key : MANAGED_FIELDS) {
                 if (patch.has(key)) desired.put(key, patch.get(key));
             }
-            if (desired.toString().equals(managedFields.toString()) && revision == managedRevision)
+            if (sameJson(desired, managedFields) && revision == managedRevision)
                 return managedRejected ? -1 : managedReady ? 0 : 1;
             JSONObject candidate = applyManaged(configurationBase, desired);
+            JSONObject record = new JSONObject().put("source", configurationSource)
+                    .put("revision", revision).put("fields", desired);
+            if (managedReady && sameJson(candidate.opt("sdwan"),
+                    applyManaged(configurationBase, effectiveManaged).opt("sdwan"))) {
+                int result = NativeClient.prepareGatewayRules(handle,
+                        candidate.toString().getBytes(StandardCharsets.UTF_8));
+                if (result != 0) return result;
+                // JNI commits this prepared plan only after the callback returns success.
+                SecretStore.saveManaged(this, record.toString());
+                managedFields = effectiveManaged = desired;
+                managedRevision = revision;
+                managedRejected = false;
+                return 0;
+            }
             long test = NativeClient.create(candidate.toString().getBytes(StandardCharsets.UTF_8),
                     configurationToken, configurationCa, this);
             if (test == 0) return -1;
             NativeClient.destroy(test);
-            SecretStore.saveManaged(this, new JSONObject().put("source", configurationSource)
-                    .put("revision", revision).put("fields", desired)
-                    .put("fallback", effectiveManaged).toString());
+            SecretStore.saveManaged(this, record.put("fallback", effectiveManaged).toString());
             managedReloadAt = SystemClock.elapsedRealtime() + 200;
             return 1;
         } catch (Exception error) {

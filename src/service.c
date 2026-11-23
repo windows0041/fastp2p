@@ -472,6 +472,9 @@ int fastp2p_service_purge(void) {
     if (!windows_temp_directory(temp) && GetFileAttributesW(temp) != INVALID_FILE_ATTRIBUTES &&
         !fastp2p_windows_log(log)) {
         DeleteFileW(log);
+        WCHAR rotating[4096];
+        if (swprintf(rotating, 4096, L"%ls.rotate", log) > 0)
+            DeleteFileW(rotating);
         RemoveDirectoryW(temp);
     }
 

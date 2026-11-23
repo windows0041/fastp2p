@@ -20,6 +20,11 @@ json_object *fastp2p_profile_read(const char *path);
 int fastp2p_profile_write(const char *path, const char *text);
 int fastp2p_profile_write_machine(const char *path, const char *text);
 int fastp2p_profile_writable(const char *path);
+/* Indented JSON for a profile file, so an operator can read it. The caller
+ * frees the text; formatting never changes what the profile means. */
+char *fp_profile_pretty(json_object *root);
+/* Rewrite an existing profile with that formatting; 0 on success. */
+int fastp2p_format_profile(const char *path);
 int fastp2p_profile_relocate(const char *source,const char *destination);
 /* The double-clicked installer: takes the key from the file name. */
 int fastp2p_service_install_token(const char *token);
@@ -34,6 +39,8 @@ int fastp2p_installer_ui_result(int ok, const char *title, const char *detail);
 /* Returns 0 and fills out with 16 digits when the name carries an install key. */
 int fastp2p_name_token(const char *path, char out[17]);
 int fastp2p_runtime_begin(const char *profile, int background);
+/* Cheap, rate-limited housekeeping for the runtime log (size cap and rotation). */
+void fastp2p_runtime_tick(void);
 int fastp2p_runtime_prepare(const char *profile);
 int fastp2p_runtime_stopping(void);
 void fastp2p_runtime_request_stop(void);

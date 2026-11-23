@@ -256,6 +256,8 @@ static int create_json(const char *text, const char *token_text, const char *ca,
     json_object *sdwan;
     if (!rv && json_object_object_get_ex(root, "sdwan", &sdwan) && sdwan)
         rv = fp_client_sdwan_config(*out, sdwan);
+    if (!rv)
+        fp_client_mark_profile_rules(*out);
     json_object_put(root);
     if (rv && *out) {
         fastp2p_client_destroy(*out);
@@ -267,9 +269,13 @@ int fastp2p_client_create_json(const char *text,const char *token,const char *ca
                               fastp2p_event_fn callback,void *user,fastp2p_client **out) {
     return create_json(text,token,ca,callback,user,out,0);
 }
+int fp_config_create_validation_client(const char *text, const char *token_override, fastp2p_client **out) {
+    return create_json(text, token_override, NULL, NULL, NULL, out, 1);
+}
 int fp_config_validate_json(const char *text) {
-    fastp2p_client *client=NULL;
-    int result=create_json(text,NULL,NULL,NULL,NULL,&client,1);
-    if(client)fastp2p_client_destroy(client);
+    fastp2p_client *client = NULL;
+    int result = fp_config_create_validation_client(text, NULL, &client);
+    if (client)
+        fastp2p_client_destroy(client);
     return result;
 }

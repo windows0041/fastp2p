@@ -18,6 +18,9 @@
 
 static volatile sig_atomic_t interrupted;
 static int was_online;
+/* Set when this run failed before the client could be created: the profile
+ * itself is unusable, so a managed reload must roll back instead of retrying. */
+static int config_start_failed;
 static uint64_t cleanup_online_since, cleanup_next;
 static void signal_stop(int sig) {
     (void)sig;
@@ -110,6 +113,7 @@ static void usage(void) {
          "fastp2p service --config FILE   (started by the Windows service manager)\n"
          "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
          "fastp2p run [--config FILE]\n"
+         "fastp2p format [--config FILE]   (rewrite the profile as indented JSON)\n"
          "fastp2p --check-sdwan (checks Linux TUN or Windows Wintun dependencies)\n"
          "fastp2p stop [--config FILE]\n"
          "fastp2p --config FILE [--serverhost HOST] [--node NAME] [--cacert FILE]\n"
@@ -166,6 +170,25 @@ static int client_main(int argc, char **argv) {
         else if (argc != 2) return 2;
         if (!path) { if (fastp2p_default_profile(profile)) return 2; path = profile; }
         return fastp2p_stop_installed(path) ? 1 : 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "format")) {
+        /* The profile is JSON; one line is unreadable for an operator who has to
+         * check a token or a port. Rewrite it, and let the caller keep using the
+         * same file: no restart is needed because the client reads it as JSON. */
+        char profile[4096];
+        const char *path = NULL;
+        if (argc == 4 && !strcmp(argv[2], "--config")) path = argv[3];
+        else if (argc != 2) return 2;
+        if (!path) {
+            if (fastp2p_default_profile(profile)) return 2;
+            path = profile;
+        }
+        if (fastp2p_format_profile(path)) {
+            fprintf(stderr, "Cannot rewrite %s as readable JSON\n", path);
+            return 1;
+        }
+        printf("formatted %s\n", path);
+        return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "run")) { --argc; ++argv; }
     const char *config_file = NULL, *host = NULL, *node = NULL, *ca = NULL;
@@ -254,6 +277,7 @@ static int client_main(int argc, char **argv) {
     json_object *root = config_file ? fastp2p_profile_read(config_file) : json_object_new_object();
     if (errno == ERANGE || !root || !json_object_is_type(root, json_type_object)) {
         fputs("Invalid JSON configuration\n", stderr);
+        config_start_failed = 1;
         if (root)
             json_object_put(root);
         return 2;
@@ -278,6 +302,7 @@ static int client_main(int argc, char **argv) {
     if (!public_port)
         public_port = number(network, "PublicIPPort");
     if (port > 65535 || public_port > 65535) {
+        config_start_failed = 1;
         json_object_put(root);
         return 2;
     }
@@ -303,6 +328,9 @@ static int client_main(int argc, char **argv) {
                                      env, ca, event, NULL, &client);
     if (rv) {
         fputs("Invalid client configuration (network, forward or SOCKS5 rule)\n", stderr);
+        /* Exit 2 is the documented "this configuration cannot be used" code; the
+         * flag tells the reload loop it must roll a pushed profile back. */
+        config_start_failed = 1;
         json_object_put(root);
         return 2;
     }
@@ -342,6 +370,7 @@ static int client_main(int argc, char **argv) {
         }
         if (verify_start && was_online)
             break;
+        fastp2p_runtime_tick();
         uint64_t now=op_monotonic_ns();
         if(!verify_start && cleanup_online_since && now-cleanup_online_since>=UINT64_C(5000000000) && now>=cleanup_next){
             fp_update_cleanup();cleanup_next=now+UINT64_C(5000000000);
@@ -365,17 +394,25 @@ done:
     if (!verify_start && fp_update_run_pending(original_argv))
         rv = FASTP2P_EIO;
     json_object_put(root);
-    return rv == FP_CONFIG_RELOAD ? rv : rv ? 1 : 0;
+    /* Keep the real code: the caller distinguishes a bad configuration from a
+     * network failure before it decides to roll a pushed profile back. */
+    return rv;
 }
 static int client_loop(int argc,char **argv) {
     int result;
     do {
+        config_start_failed = 0;
         result=client_main(argc,argv);
-    /* Only a configuration-class failure (EINVAL) proves the pushed config is bad. A DNS
-     * or I/O failure says nothing about it, and rolling back on those discarded a valid config. */
-    if(result==FASTP2P_EINVAL && !interrupted && fp_config_sync_failed())result=FP_CONFIG_RELOAD;
+    /* A profile that cannot be loaded or started is rolled back. A DNS or I/O
+     * failure says nothing about the configuration itself, so it is left to the
+     * service manager instead of discarding a valid config. */
+    if((config_start_failed || result==FASTP2P_EINVAL) && !interrupted && fp_config_sync_failed())
+        result=FP_CONFIG_RELOAD;
     } while(result==FP_CONFIG_RELOAD && !interrupted && !fastp2p_runtime_stopping());
-    fp_config_sync_close();return result==FP_CONFIG_RELOAD?0:result;
+    fp_config_sync_close();
+    /* Exit 2 stays reserved for usage/profile-identity failures; a client
+     * runtime error (now a negative code) is a plain failure. */
+    return result==FP_CONFIG_RELOAD?0:result==2?2:result?1:0;
 }
 
 int main(int argc, char **argv) {

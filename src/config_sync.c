@@ -28,13 +28,24 @@ static const char *string(json_object *root,const char *key) {
 static json_object *metadata(json_object *root) {
     json_object *value=get(root,META);
     if(!json_object_is_type(value,json_type_object)) {
-        value=json_object_new_object();json_object_object_add(root,META,value);
+        value = json_object_new_object();
+        if (!value)
+            return NULL;
+        if (json_object_object_add(root, META, value)) {
+            json_object_put(value);
+            return NULL;
+        }
     }
     return value;
 }
 static int save(const char *path,json_object *root) {
-    const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
-    return sync_state.machine?fastp2p_profile_write_machine(path,text):fastp2p_profile_write(path,text);
+    /* Indented JSON: the operator reads and edits this file, and the parser
+     * does not care about whitespace. */
+    char *text=fp_profile_pretty(root);
+    if(!text)return -1;
+    int result=sync_state.machine?fastp2p_profile_write_machine(path,text):fastp2p_profile_write(path,text);
+    free(text);
+    return result;
 }
 static void digest(const char *text,char out[65]) {
     unsigned char bytes[32];unsigned length=0;
@@ -58,10 +69,41 @@ static int rollback(void) {
     fputs("Gateway configuration could not start; restored previous configuration.\n",stderr);
     return 1;
 }
+static int rule_field(const char *key) {
+    return !strcmp(key, "apps") || !strcmp(key, "socks5");
+}
+static int unchanged_outside_rules(json_object *a, json_object *b) {
+    json_object_object_foreach(a, key, value) {
+        json_object *other;
+        if (!rule_field(key) && strcmp(key, META) &&
+            (!json_object_object_get_ex(b, key, &other) || !json_object_equal(value, other)))
+            return 0;
+    }
+    return 1;
+}
+static int update_metadata(json_object *root, uint64_t revision, const char *hash, int pending) {
+    json_object *meta = metadata(root);
+    if (!meta)
+        return -1;
+    json_object *values[] = {json_object_new_uint64(revision), json_object_new_string(hash),
+                             json_object_new_boolean(pending)};
+    const char *keys[] = {"revision", "digest", "pending"};
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(values) / sizeof(*values); ++i) {
+        if (!values[i] || json_object_object_add(meta, keys[i], values[i])) {
+            if (values[i]) json_object_put(values[i]);
+            failed = 1;
+        }
+    }
+    json_object_object_del(meta, "rejectedRevision");
+    json_object_object_del(meta, "rejectedDigest");
+    return failed ? -1 : 0;
+}
 static int receive(const char *fields,uint64_t revision,void *user) {
-    (void)user;
+    fastp2p_client *client = user;
     if(!sync_state.path[0]||!sync_state.active||sync_state.reload||strlen(fields)>65536)return FASTP2P_ESTATE;
     json_object *patch=json_tokener_parse(fields),*current=fastp2p_profile_read(sync_state.path),*next=NULL;
+    fp_rule_update *rules = NULL;
     int result=FASTP2P_EINVAL;char hash[65];digest(fields,hash);
     json_object *forbidden=NULL;
     if(!patch||!current||!*hash||json_object_object_get_ex(patch,META,&forbidden)) {
@@ -78,16 +120,40 @@ static int receive(const char *fields,uint64_t revision,void *user) {
        (!json_object_is_type(product,json_type_string)||strcmp(json_object_get_string(product),"fastp2p"))) {
         fputs("Gateway configuration product mismatch.\n",stderr);goto done;
     }
-    result=fp_config_validate_json(json_object_to_json_string_ext(next,JSON_C_TO_STRING_PLAIN));
-    if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if(json_object_equal(next,sync_state.active)) {result=0;goto done;}
-    if(save(sync_state.previous,current)) {result=FASTP2P_EIO;goto done;}
-    meta=metadata(next);
-    json_object_object_add(meta,"revision",json_object_new_uint64(revision));
-    json_object_object_add(meta,"digest",json_object_new_string(hash));
-    json_object_object_add(meta,"pending",json_object_new_boolean(1));
-    json_object_object_del(meta,"rejectedRevision");json_object_object_del(meta,"rejectedDigest");
-    if(save(sync_state.path,next)) {result=FASTP2P_EIO;goto done;}
+    const char *text = json_object_to_json_string_ext(next, JSON_C_TO_STRING_PLAIN);
+    json_object *field;
+    int has_rules = json_object_object_get_ex(patch, "apps", &field) ||
+                    json_object_object_get_ex(patch, "socks5", &field);
+    /* The gateway can include other, unchanged fields in its full snapshot.
+     * Compare against the file just read, not the startup snapshot: an operator
+     * edit made while the client runs must not demote a rules-only push to a
+     * full reload that drops every tunnel. */
+    if (has_rules && !sync_state.pending && unchanged_outside_rules(next, current) &&
+        unchanged_outside_rules(current, next)) {
+        result = fp_client_rules_prepare(client, text, &rules);
+        if (result) {
+            fprintf(stderr, "Gateway rules could not be prepared (%d); keeping current rules.\n", result);
+            goto done;
+        }
+        if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
+            fputs("Gateway rules could not be saved; keeping current rules.\n", stderr);
+            result = FASTP2P_EIO;
+            goto done;
+        }
+        /* All fallible work is done. No step can run between save and commit. */
+        fp_client_rules_commit(rules);
+        rules = NULL;
+        json_object_put(sync_state.active);
+        sync_state.active = json_object_get(next);
+        result = FASTP2P_OK;
+        goto done;
+    }
+    /* Non-rule changes still reload the entire instance. */
+    result=fp_config_validate_json(text);
+    if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
+    if (update_metadata(next, revision, hash, 1)) {result=FASTP2P_ENOMEM;goto done;}
+    if(save(sync_state.previous,current) || save(sync_state.path,next)) {result=FASTP2P_EIO;goto done;}
     if(sync_state.rollback)json_object_put(sync_state.rollback);
     sync_state.rollback=json_object_get(current);sync_state.revision=revision;
     snprintf(sync_state.digest,sizeof(sync_state.digest),"%s",hash);
@@ -96,6 +162,7 @@ static int receive(const char *fields,uint64_t revision,void *user) {
     sync_state.deadline=op_monotonic_ns()+UINT64_C(25000000000);
     result=1;
 done:
+    if (rules) fp_client_rules_abort(rules);
     if(patch)json_object_put(patch);
     if(current)json_object_put(current);
     if(next)json_object_put(next);
@@ -130,7 +197,7 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
         fputs("Profile is not writable; managed configuration pushes are disabled.\n",stderr);
         return 0;
     }
-    return fastp2p_client_set_config_handler(client,receive,NULL);
+    return fastp2p_client_set_config_handler(client, receive, client);
 }
 void fp_config_sync_online(uint16_t public_port) {
     sync_state.online=1;
