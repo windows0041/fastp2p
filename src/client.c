@@ -19,7 +19,6 @@
 #include <time.h>
 #include <curl/curl.h>
 #include <openssl/rand.h>
-#include <openssl/ssl.h>
 
 #define NT 32
 #define NA 64
@@ -5259,6 +5258,15 @@ static void gateway_retry_next_family(fastp2p_client *c) {
         c->gateway_prefer_v6 = !c->gateway_prefer_v6;
 }
 static void gateway_failed(fastp2p_client *c) {
+    /* The generic text below cannot tell a rejected option from a missing CA, and a
+     * platform-specific setup failure looks identical to a refused connection. */
+    {
+        char detail[224];
+        snprintf(detail, sizeof(detail), "WSS setup failed: host=%s port=%u ca=%s resolve=%s",
+                 c->tls_host ? c->tls_host : c->host, (unsigned)c->port,
+                 c->ca[0] || c->ca_pem ? "set" : "builtin", c->resolve ? "pinned" : "none");
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, detail);
+    }
     gateway_retry_next_family(c);
     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
          "WSS connection failed: check gateway address, CA, certificate hostname and token");
@@ -5278,17 +5286,6 @@ static void gateway_failed_curl(fastp2p_client *c, CURLcode rv) {
                  curl_easy_strerror(rv), (int)rv);
     emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
     close_gateway(c);
-}
-/* An OpenSSL 3.5 stack offers a post-quantum key share by default, which pushes the
- * ClientHello past one datagram. On a path that drops the fragments (a PMTUD
- * blackhole, common on IPv6) the handshake never completes and the client only sees
- * an empty reply. Keep the classical groups so the first flight fits. */
-static CURLcode tls_classical_groups(CURL *curl, void *ssl_ctx, void *userptr) {
-    (void)curl;
-    (void)userptr;
-    if (ssl_ctx)
-        SSL_CTX_set1_curves_list((SSL_CTX *)ssl_ctx, "X25519:P-256:P-384:P-521");
-    return CURLE_OK;
 }
 static void connect_gateway(fastp2p_client *c) {
     c->ws = curl_easy_init();
@@ -5385,7 +5382,6 @@ static void connect_gateway(fastp2p_client *c) {
     SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
     SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
     SETOPT(CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
-    SETOPT(CURLOPT_SSL_CTX_FUNCTION, tls_classical_groups);
     SETOPT(CURLOPT_PROTOCOLS_STR, "wss");
     if (fp_tls_set_ca(c->ws, c->ca, c->ca_pem) != CURLE_OK) {
         gateway_failed(c);
