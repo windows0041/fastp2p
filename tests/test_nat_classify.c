@@ -808,8 +808,103 @@ static void public_round_budget(void) {
     free(c);
 }
 
+static char captured[256];
+static void capture_event(fastp2p_client *client, const fastp2p_event *event, void *user) {
+    (void)client;
+    (void)user;
+    snprintf(captured, sizeof(captured), "%s", event->message ? event->message : "");
+}
+/* A rule that refuses the relay used to re-enter the relay branch on every retry:
+ * it asked the gateway, was refused again, and never punched again. It must
+ * restart the direct rounds instead of filling the log every two seconds. */
+static void relay_disabled_restarts_direct_rounds(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->state = FASTP2P_ONLINE;
+    c->node_id = op_node_id("local-node");
+    c->callback = capture_event;
+    app *a = &c->apps[0];
+    a->used = a->local = 1;
+    a->no_relay = 1;
+    a->attempts = PUBLIC_PUNCH_ROUNDS;
+    a->transport = FASTP2P_TRANSPORT_TCP;
+    a->tunnel_index = -1;
+    a->retry = 0;
+    strcpy(a->peer, "remote-node");
+    a->port = 1234;
+    a->dst_port = 22;
+    captured[0] = 0;
+    tick_apps(c, mono());
+    assert(strstr(captured, "relay is disabled for this rule") != NULL);
+    assert(a->attempts <= 1); /* a fresh direct round was started, not another relay request */
+    assert(!a->relay_requested);
+    for (int i = 0; i < NT; ++i)
+        if (c->tunnels[i].state)
+            close_tunnel(c, i, NULL);
+    free(c);
+}
+/* A peer that reports a destination-dependent mapping gets the filter spray and
+ * a parked listener; the listener must own the port after the spray sockets. */
+static void dependent_peer_sprays_and_parks(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "remote-node", 77, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    t->peer_tcp_dependent = 1;
+    t->family = OP_FAM_V4;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", 9));
+    t->remote_ports[OP_FAM_V4] = 9;
+    op_socket local = socket_bound(0, "127.0.0.1", 0, 1);
+    assert(local >= 0);
+    t->local_port = socket_port(local);
+    op_close(local);
+    t->tcp_attempts = TCP_PUNCH_STALE_ATTEMPTS;
+    t->tcp_timeouts = TCP_PUNCH_STALE_ATTEMPTS - 1;
+    errno = ETIMEDOUT;
+    tcp_punch_failed(c, ti, mono());
+    assert(t->state == T_TCP_CONNECT && t->listen_fd >= 0 && !t->tcp_retry_at);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+/* A minute of direct attempts without a tunnel pauses the ladder for ten seconds
+ * instead of hammering the same unresponsive mapping. */
+static void direct_attempts_pause_after_a_minute(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->state = FASTP2P_ONLINE;
+    c->node_id = op_node_id("local-node");
+    c->callback = capture_event;
+    app *a = &c->apps[0];
+    a->used = a->local = 1;
+    a->transport = FASTP2P_TRANSPORT_TCP;
+    a->tunnel_index = -1;
+    a->retry = 0;
+    strcpy(a->peer, "remote-node");
+    a->port = 1234;
+    a->dst_port = 22;
+    a->punch_since = mono() - 61 * NS;
+    captured[0] = 0;
+    uint64_t before = mono();
+    tick_apps(c, mono());
+    assert(strstr(captured, "pausing 10 s") != NULL);
+    assert(a->retry >= before + 9 * NS);
+    assert(a->attempts == 0); /* no new round started during the pause */
+    for (int i = 0; i < NT; ++i)
+        if (c->tunnels[i].state)
+            close_tunnel(c, i, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
+    relay_disabled_restarts_direct_rounds();
+    dependent_peer_sprays_and_parks();
+    direct_attempts_pause_after_a_minute();
     tcp_retry();
     tcp_punch_walks_ports_when_silent();
     tcp_punch_scheduling();

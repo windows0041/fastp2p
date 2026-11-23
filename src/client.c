@@ -73,6 +73,13 @@
  * the whole window. Give the silent case a few attempts, then ask for a fresh
  * offer instead of dialling a dead port for thirty seconds. */
 #define TCP_PUNCH_STALE_ATTEMPTS 40u
+/* A peer whose mapping changes per destination cannot be dialled on the port it
+ * reported, and it cannot know the port it will use towards us. What still works
+ * is opening our own port-restricted filter across a wide window: one SYN per
+ * candidate port makes the NAT admit the peer's own simultaneous SYN from that
+ * port, and then a listener on our advertised port accepts it. 256 ports each
+ * side costs about half a second of SYNs, not a timeout per port. */
+#define TCP_PUNCH_SPRAY 256
 /* How often an active tunnel proves it is still there. */
 #define TCP_KEEPALIVE_MS 3000u
 #define UDP_DIRECT_WAIT (5 * NS)
@@ -249,6 +256,9 @@ typedef struct {
     /* Consecutive silent (timed-out) dials: a refused one resets it, because a
      * NAT that answers is worth retrying while a silent one is not. */
     unsigned tcp_timeouts;
+    /* The peer measured a mapping that changes per destination (NAT4): the port
+     * it published belongs to another destination, so it cannot be dialled. */
+    int peer_tcp_dependent;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
     unsigned tcp_mapping, peer_tcp_mapping;
@@ -331,6 +341,9 @@ typedef struct {
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
     uint64_t link_deadline;
+    /* Start of the current run of direct attempts for this rule; after a minute
+     * without a tunnel the ladder pauses briefly instead of hammering. */
+    uint64_t punch_since;
     /* Relays that already failed for this rule; the gateway is asked to skip
      * them so one unreachable candidate cannot pin the link forever. */
     struct {
@@ -2357,10 +2370,11 @@ static void probe_complete(fastp2p_client *c, int index) {
                 op_ju(j, "udpPunchDual", 1);
         }
         push(c, t->peer, 2, j);
-        /* Give the initiator a short window to dial the shared listener.
-         * Immediate punch resumes after that window, or starts right away
-         * when the peer did not request a direct attempt. */
-        uint64_t delay = reverse_port ? 100 * MS : t->tcp_direct_port ? TCP_DIRECT_WAIT
+        /* The v2 punch starts immediately: the ladder paces the retries and the
+         * initiator may still reach our shared listener in parallel. */
+        uint64_t delay = reverse_port ? 100 * MS
+                         : t->tcp_v2 ? 0
+                         : t->tcp_direct_port ? TCP_DIRECT_WAIT
                          : t->tcp_punch_immediate || t->udp_punch_role ? 0 : 3 * NS;
         t->at = mono() + delay;
         t->state = t->udp_direct_port && !reverse_port ? T_UDP_DIRECT : T_TIME;
@@ -2410,6 +2424,32 @@ static uint16_t tcp_scan_port(uint16_t base, int step) {
         port -= 65535;
     return (uint16_t)port;
 }
+/* Open our own NAT towards the ports a destination-dependent peer may use, then
+ * listen: the peer's SYN arrives from its real mapping, which is inside the
+ * sprayed range, so the filter admits it and the listener accepts. */
+static void tcp_punch_spray(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    uint16_t base = t->remote_ports[family];
+    if (!base)
+        base = (uint16_t)op_addr_port(&t->peer_addr);
+    if (!base || !t->peer_addr.len)
+        return;
+    for (int step = -TCP_PUNCH_SPRAY; step <= TCP_PUNCH_SPRAY; ++step) {
+        int port = (int)base + step;
+        if (!step || port < 1 || port > 65535)
+            continue;
+        op_addr target = t->peer_addr;
+        op_addr_set_port(&target, (uint16_t)port);
+        /* Same local port as the advertised one: the peer's filter was opened
+         * towards exactly that port, so this is the source it can reach. */
+        op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+        if (fd < 0)
+            continue;
+        (void)op_connect(fd, &target.u.sa, target.len);
+        op_close(fd); /* the SYN created the mapping and the filter entry */
+    }
+}
 static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     int saved = errno;
@@ -2445,6 +2485,18 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
         t->tcp_scan = 0; /* the peer's NAT answered: its reported port is live */
     }
     if (t->tcp_timeouts >= TCP_PUNCH_STALE_ATTEMPTS) {
+        if (t->peer_tcp_dependent) {
+            /* Open our filter across the range the peer's mapping may use first;
+             * a listener on the same port could not bind next to those sockets. */
+            tcp_punch_spray(c, index);
+            if (tcp_punch_listen(c, index) == 0) {
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+                     "TCP mapping changes per destination; sprayed its port range and parked listening");
+                t->tcp_retry_at = 0;
+                t->tcp_timeouts = 0;
+                return;
+            }
+        }
         close_tunnel(c, index, "TCP punch target does not answer; retrying with a fresh mapping");
         return;
     }
@@ -2688,10 +2740,12 @@ static void tcp_predict_tick(fastp2p_client *c, int index, uint64_t now) {
 /* The peer's own TCP mapping observation decides whether the port it published
  * can be dialled at all, so name it next to the punch it explains: a
  * destination-dependent mapping means that port belongs to another destination. */
-static void report_peer_tcp_mapping(fastp2p_client *c, const tunnel *t, json_object *j) {
+static void report_peer_tcp_mapping(fastp2p_client *c, tunnel *t, json_object *j) {
     if (t->transport != FASTP2P_TRANSPORT_TCP)
         return;
     unsigned nat = (unsigned)op_integer(j, "tcpNatType");
+    if (nat == FP_NAT_DEPENDENT)
+        t->peer_tcp_dependent = 1;
     char note[128];
     snprintf(note, sizeof(note), "peer TCP mapping: %s, movement %u",
              nat == FP_NAT_STABLE ? "stable"
@@ -2715,7 +2769,11 @@ static void start_underlay(fastp2p_client *c, int index) {
          * a few milliseconds, so the budget is spent on breadth, not on waiting. */
         t->deadline = now + 30 * NS;
         uint16_t direct_port = t->tcp_direct_port;
-        t->tcp_direct_port = 0;
+        /* The dial happens once per tunnel; the responder keeps the port so the
+         * shared listener can still adopt the initiator's connection while the
+         * punch is running (tick_accept matches on it). */
+        if (t->initiator)
+            t->tcp_direct_port = 0;
         if (t->initiator && direct_port) {
             op_addr endpoint = t->peer_addr;
             op_addr_set_port(&endpoint, direct_port);
@@ -2816,6 +2874,9 @@ static void session_ready(fastp2p_client *c, int index) {
             a->link_deadline = 0;
             a->ready_at = mono() + 100 * MS;
             a->relay_requested = 0;
+            /* The link works, so the next failure starts a fresh minute rather
+             * than inheriting the pause of an older streak. */
+            a->punch_since = 0;
             /* attempts is deliberately not reset here: a tunnel that completes
              * the key exchange and then dies must not restart the direct-punch
              * ladder, or a pair that cannot punch never reaches the relay. */
@@ -5076,8 +5137,12 @@ static void tick_accept(fastp2p_client *c, uint64_t now) {
                 tunnel *t = &c->tunnels[ti];
                 op_addr expected;
                 int family = op_family_index(op_addr_family(&p->peer));
-                int waiting = t->state == T_TIME && t->tcp_direct_port && family >= 0 &&
-                              t->peer_ready[family];
+                /* A punch that now starts immediately would otherwise leave this
+                 * gate behind and drop the initiator's direct connection: the
+                 * shared listener may complete the tunnel for as long as the
+                 * punch is still establishing. */
+                int waiting = (t->state == T_TIME || t->state == T_TCP_CONNECT) &&
+                              t->tcp_direct_port && family >= 0 && t->peer_ready[family];
                 const char *wanted = waiting ? t->peer_text[family] : t->ip;
                 if ((waiting || t->state == T_DIRECT) && t->server &&
                     !op_addr_from_text(&expected, wanted, 0) &&
@@ -5356,6 +5421,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
             }
         }
         if (a->tunnel_index < 0 && now >= a->retry && c->state == FASTP2P_ONLINE) {
+            uint64_t next_retry = now + 2 * NS;
             int ti = active_rule_tunnel(c, a);
             if (ti >= 0) {
                 a->tunnel_index = ti;
@@ -5383,6 +5449,14 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             a->lan_tried = 1;
                             start_punch(c, ti);
                         }
+                    } else if (a->no_relay && a->attempts >= PUBLIC_PUNCH_ROUNDS && !c->force_relay) {
+                        /* The operator disabled the relay for this rule. Asking for
+                         * one every two seconds only filled the log and left the
+                         * ladder stuck in this branch, so restart the direct rounds
+                         * instead: the next attempt gets a freshly measured mapping. */
+                        emit(c, FASTP2P_EVENT_TUNNEL, a->id, 0,
+                             "direct attempts exhausted; the relay is disabled for this rule, retrying direct");
+                        a->attempts = 0;
                     } else if ((a->relay_node[0] && !a->no_relay) || a->attempts >= PUBLIC_PUNCH_ROUNDS ||
                                c->force_relay) {
                         /* Direct attempts may already have sealed certificate
@@ -5433,7 +5507,17 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                             }
                             json_object_put(j);
                         }
+                    } else if (a->punch_since && now - a->punch_since >= 60 * NS) {
+                        /* A full minute of direct attempts without a tunnel: pause
+                         * briefly instead of hammering a mapping that never answers,
+                         * then start the next minute with a freshly measured one. */
+                        emit(c, FASTP2P_EVENT_TUNNEL, a->id, 0,
+                             "direct attempts for a minute without a tunnel; pausing 10 s");
+                        a->punch_since = now;
+                        next_retry = now + 10 * NS;
                     } else {
+                        if (!a->punch_since)
+                            a->punch_since = now;
                         ti = app_tunnel(c, a, a->peer, a->transport);
                         if (ti >= 0) {
                             ++a->attempts;
@@ -5443,7 +5527,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                     }
                 }
             }
-            a->retry = now + 2 * NS;
+            a->retry = next_retry;
         }
         if (a->tunnel_index < 0 || !a->synced ||
             !tunnel_ready(&c->tunnels[a->tunnel_index]) || now < a->ready_at)
