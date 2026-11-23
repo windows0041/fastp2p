@@ -26,6 +26,35 @@ static void signal_stop(int sig) {
 static void request_restart(void *user) {
     *(int *)user = 1;
 }
+/* Beijing time for every line, independent of the host zone: the log is read across
+ * machines and a bare event sequence made ordering and rate impossible to judge. */
+static const char *beijing_stamp(void) {
+    static char text[40];
+    /* timespec_get is not declared by MinGW time.h under -std=gnu11, so the
+     * milliseconds come from the platform and the seconds from time(). */
+    time_t now = time(NULL);
+    int millis = 0;
+#ifdef _WIN32
+    SYSTEMTIME system_time;
+    GetSystemTime(&system_time);
+    millis = system_time.wMilliseconds;
+#else
+    struct timespec ts;
+    if (!clock_gettime(CLOCK_REALTIME, &ts))
+        millis = (int)(ts.tv_nsec / 1000000);
+#endif
+    time_t shifted = now + 8 * 3600;
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &shifted);
+#else
+    gmtime_r(&shifted, &tm);
+#endif
+    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d:%02d.%03d +0800",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+             tm.tm_sec, millis);
+    return text;
+}
 static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     (void)user;
     static const char *types[] = {"state", "error", "tunnel", "forward", "heartbeat"};
@@ -42,6 +71,7 @@ static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     json_object_object_add(j, "id", json_object_new_uint64(e->id));
     json_object_object_add(j, "code", json_object_new_int(e->code));
     json_object_object_add(j, "message", json_object_new_string(e->message));
+    json_object_object_add(j, "time", json_object_new_string(beijing_stamp()));
     puts(json_object_to_json_string_ext(j, JSON_C_TO_STRING_PLAIN));
     fflush(stdout);
     json_object_put(j);
@@ -341,7 +371,9 @@ static int client_loop(int argc,char **argv) {
     int result;
     do {
         result=client_main(argc,argv);
-        if(result && result!=FP_CONFIG_RELOAD && !interrupted && fp_config_sync_failed())result=FP_CONFIG_RELOAD;
+    /* Only a configuration-class failure (EINVAL) proves the pushed config is bad. A DNS
+     * or I/O failure says nothing about it, and rolling back on those discarded a valid config. */
+    if(result==FASTP2P_EINVAL && !interrupted && fp_config_sync_failed())result=FP_CONFIG_RELOAD;
     } while(result==FP_CONFIG_RELOAD && !interrupted && !fastp2p_runtime_stopping());
     fp_config_sync_close();return result==FP_CONFIG_RELOAD?0:result;
 }

@@ -162,6 +162,9 @@ typedef struct {
     /* Advisory families (anything but the primary one) get their own, shorter
      * budget so an unreachable v6 probe cannot hold up the v4 answer. */
     uint64_t deadline;
+    /* A socket borrowed from the shared UDP listener: it must never be closed
+     * here, because the peer listener owns it for the rest of the run. */
+    int borrowed;
     int sample_udp_ports;
     uint16_t udp_ports[UDP_MAPPING_SAMPLES];
     uint32_t udp_ips[UDP_MAPPING_SAMPLES];
@@ -451,6 +454,7 @@ static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static void report_client(fastp2p_client *);
+static int nat_filter_level(const nat_filter *filter, uint64_t now);
 static int addr_text_set(const char *text);
 static int local_is_public(const char *text);
 static void report_nat(fastp2p_client *);
@@ -1260,10 +1264,15 @@ static void close_udp_candidates(tunnel *t) {
     t->udp_candidate_count = 0;
 }
 /* t->fd owns the active punch socket after a probe socket is adopted. */
+static void probe_close(nat_probe *p) {
+    if (p->fd >= 0 && !p->borrowed)
+        op_close(p->fd);
+    p->fd = -1;
+}
 static void probe_socket_close(tunnel *t) {
     for (int index = 0; index < OP_FAM_COUNT; ++index) {
         op_socket fd = t->probes[index].fd;
-        if (fd >= 0 && fd != t->fd)
+        if (fd >= 0 && fd != t->fd && !t->probes[index].borrowed)
             op_close(fd);
         t->probes[index].fd = -1;
     }
@@ -1431,6 +1440,16 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
             t->id = id;
             t->peer_id = op_node_id(peer);
             strcpy(t->peer, peer);
+            {
+                /* Every tunnel object starts in T_REPLY; without this line a tunnel that
+                 * never progresses cannot be told apart from one nobody created. */
+                char born[200];
+                snprintf(born, sizeof(born), "tunnel created: peer %s (%s, %s) id %llu state %d",
+                         peer, initiator ? "initiator" : "responder",
+                         transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp",
+                         (unsigned long long)id, (int)t->state);
+                emit(c, FASTP2P_EVENT_TUNNEL, id, 0, born);
+            }
             t->transport = transport;
             t->initiator = initiator;
             t->deadline = mono() + 15 * NS;
@@ -1565,6 +1584,58 @@ static int tunnel_learn_peer(tunnel *t, const char *text, uint64_t port) {
     }
     return 0;
 }
+/* No gateway mapping probe answered, but a host without translation peers on its
+ * business port: its own address and that port are the mapping, and answering the
+ * peer with them keeps a no-relay link alive instead of falling through to the
+ * relay. Returns 1 when the mapping was adopted and the peer can be answered. */
+static int probe_fallback_mapping(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    if (nat_filter_level(&c->udp_filter, mono()) < 6 || !c->public_port)
+        return 0;
+    int family = family_wanted(c, OP_FAM_V4) && c->ip[OP_FAM_V4][0]
+                     ? OP_FAM_V4
+                     : family_wanted(c, OP_FAM_V6) && c->ip[OP_FAM_V6][0] ? OP_FAM_V6 : -1;
+    if (family < 0)
+        return 0;
+    /* The business port cannot be bound twice - the listener owns it exclusively -
+     * so borrow that socket the way the STUN exchange already does. Its mapping is
+     * the port peers know, which is exactly what the answer needs. */
+    op_socket fd = c->udp_listener[family];
+    if (fd < 0)
+        return 0;
+    int borrowed = 1;
+    t->probes[family] = (nat_probe){.fd = fd};
+    t->probes[family].borrowed = borrowed;
+    t->probes[family].local_port = socket_port(fd);
+    t->fd = -1;
+    t->family = family;
+    t->local_port = t->probes[family].local_port;
+    t->mapped_port = t->local_port;
+    t->mapped_ports[family] = t->local_port;
+    /* c->ip can still be 0.0.0.0 when the control plane never learned this
+     * address; the STUN exchange measured it independently, so publish that
+     * instead of answering the peer with an unusable address. */
+    const char *mapped_ip = c->ip[family];
+    char stun_text[OP_ADDR_TEXT] = "";
+    if (!addr_text_set(mapped_ip) || !address_of_family(mapped_ip, family)) {
+        if (!c->stun.mapped_seen ||
+            op_family_index(op_addr_family(&c->stun.mapped)) != family)
+            return 0;
+        if (op_addr_text(&c->stun.mapped, stun_text, sizeof(stun_text)) ||
+            !address_of_family(stun_text, family))
+            return 0;
+        mapped_ip = stun_text;
+    }
+    snprintf(t->mapped_text[family], OP_ADDR_TEXT, "%s", mapped_ip);
+    char note[176];
+    snprintf(note, sizeof(note),
+             "no gateway mapping probe; answering with the business port %u (no translation)",
+             (unsigned)t->local_port);
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    probe_complete(c, index);
+    return 1;
+}
+
 static int start_probe(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     probe_socket_close(t);
@@ -1647,8 +1718,11 @@ static int start_probe(fastp2p_client *c, int index) {
         }
         ++started;
     }
-    if (!started)
+    if (!started) {
+        if (probe_fallback_mapping(c, index))
+            return 0;
         return -1;
+    }
     t->state = T_PROBE;
     return 0;
 }
@@ -1716,10 +1790,12 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
         uint64_t probe_deadline = family == required ? t->deadline : p->deadline;
         if (now > probe_deadline) {
             if (family == required) {
+                if (probe_fallback_mapping(c, index))
+                    return 1;
                 close_tunnel(c, index, "peer NAT mapping discovery timed out");
                 return -1;
             }
-            op_close(p->fd);
+            probe_close(p);
             p->fd = -1;
             p->state = PROBE_FREE; /* advisory only: drop it and keep going */
             continue;
@@ -1732,7 +1808,7 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                     close_tunnel(c, index, "TCP NAT connection failed");
                     return -1;
                 }
-                op_close(p->fd);
+                probe_close(p);
                 p->fd = -1;
                 p->state = PROBE_FREE;
                 --pending;
@@ -1745,7 +1821,7 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                         close_tunnel(c, index, "TCP NAT marker failed");
                         return -1;
                     }
-                    op_close(p->fd);
+                    probe_close(p);
                     p->fd = -1;
                     p->state = PROBE_FREE;
                     --pending;
@@ -1768,7 +1844,7 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                     close_tunnel(c, index, "TCP NAT response failed");
                     return -1;
                 }
-                op_close(p->fd);
+                probe_close(p);
                 p->fd = -1;
                 p->state = PROBE_FREE;
                 --pending;
@@ -1790,7 +1866,7 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
                         close_tunnel(c, index, "invalid TCP NAT response");
                         return -1;
                     }
-                    op_close(p->fd);
+                    probe_close(p);
                     p->fd = -1;
                     p->state = PROBE_FREE;
                     --pending;
@@ -1996,7 +2072,14 @@ static void probe_complete(fastp2p_client *c, int index) {
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
      * old peer reads (SPEC 搂5). */
-    op_ju(j, "coneNatPort", t->mapped_ports[OP_FAM_V4]);
+    /* A host whose mapping is its own address has no translation, so the business
+     * port *is* the public port. Publishing 0 there - which is what happens when
+     * the gateway mapping probe is unreachable - leaves the peer with no port to
+     * dial, so it punches blindly and ends up on the relay. */
+    int no_translation = nat_filter_level(&c->udp_filter, mono()) >= 6;
+    op_ju(j, "coneNatPort", t->mapped_ports[OP_FAM_V4]
+                              ? t->mapped_ports[OP_FAM_V4]
+                              : (no_translation ? c->public_port : 0));
     if (t->mapped_ports[OP_FAM_V6]) {
         op_js(j, "fromIP6",
               t->lan ? c->local_ip[OP_FAM_V6] : t->mapped_text[OP_FAM_V6]);
@@ -2050,6 +2133,14 @@ static void probe_complete(fastp2p_client *c, int index) {
             t->mapped_ports[OP_FAM_V4] && !strcmp(t->mode, "udppunch"))
             op_ju(j, "udpPunchDual", 1);
         push(c, t->peer, PUSH_CONNECT, j);
+        {
+            /* Prove the offer left this host: without it a silent T_REPLY timeout
+             * cannot be told apart from a push the gateway never delivered. */
+            char sent[180];
+            snprintf(sent, sizeof(sent), "connect request sent to %s (mode %s, family %d, tunnel %llu)",
+                     t->peer, t->mode, t->family, (unsigned long long)t->id);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, sent);
+        }
         t->state = T_REPLY;
         t->deadline = mono() + 12 * NS;
     } else {
@@ -2058,6 +2149,19 @@ static void probe_complete(fastp2p_client *c, int index) {
         op_ju(j, "punchts", ts);
         uint16_t reverse_port = 0;
         int family = choose_punch_family(c, t);
+        {
+            /* Which family the responder picked and why: a host whose own v6 mapping
+             * was never measured must not answer on a v6 endpoint the peer cannot
+             * reach, and without these numbers the choice is invisible. */
+            char pick[240];
+            snprintf(pick, sizeof(pick),
+                     "punch family %d (v4 usable=%d mapped=%u/%s, v6 usable=%d mapped=%u/%s, ipv4_only=%d, reverse6=%u)",
+                     family, family_usable(c, t, OP_FAM_V4), (unsigned)t->mapped_ports[OP_FAM_V4],
+                     t->mapped_text[OP_FAM_V4], family_usable(c, t, OP_FAM_V6),
+                     (unsigned)t->mapped_ports[OP_FAM_V6], t->mapped_text[OP_FAM_V6], t->ipv4_only,
+                     (unsigned)t->udp_reverse_port6);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, pick);
+        }
         if (!t->lan && family == OP_FAM_V4) {
             const char *ip = t->mapped_text[OP_FAM_V4];
             uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
@@ -2298,7 +2402,7 @@ static void tcp_candidate_connected(tunnel *t, op_socket fd, uint64_t now) {
     close_tcp_candidates(t);
     op_close(t->listen_fd);
     t->listen_fd = -1;
-    t->fd = fd;
+t->fd = fd;
     t->state = T_HANDSHAKE;
     t->deadline = now + 10 * NS;
     if (!t->server) {
@@ -3288,6 +3392,14 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         sender = op_u64(data);
         data += 16;
         len -= 16;
+        if (main == 3 && sub == PUSH_CONNECT) {
+            /* The receiving side of the same offer: its presence or absence decides
+             * whether the gateway delivered the push or the peer ignored it. */
+            char got[180];
+            snprintf(got, sizeof(got), "connect request received from id %llu (%u bytes)",
+                     (unsigned long long)sender, (unsigned)len);
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, got);
+        }
     }
     if (main == 3 && sub == PUSH_READY) {
         json_object *ready = op_json(data, len);
@@ -3542,6 +3654,18 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 }
                 t->at = mono() + (t->udp_direct_port ? 0 : (uint64_t)delay);
                 t->deadline = t->at + 10 * NS;
+                {
+                    /* Say how long the punch waits and what the deadline is: a tunnel that
+                     * sits in T_TIME until its deadline is indistinguishable from one that
+                     * never got here without these two numbers. */
+                    char when[200];
+                    snprintf(when, sizeof(when),
+                             "punch scheduled for %s in %llu ms (delay %lld ms, at+deadline %llu ms)",
+                             t->peer, (unsigned long long)((t->at - mono()) / NS),
+                             (long long)(delay / NS),
+                             (unsigned long long)((t->deadline - mono()) / NS));
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, when);
+                }
                 t->state = T_TIME;
             } else if (t->state == T_REPLY)
                 close_tunnel(c, ti, "peer rejected connection or sent an invalid response");
@@ -3678,7 +3802,16 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         json_object_object_add(ack,"error",json_object_new_int(result<0));
         json_object_object_add(ack,"state",json_object_new_string(result<0?"failed":result?"saved":"applied"));
         ws_json(c,6,8,ack);json_object_put(ack);
-        if(result<0)emit(c,FASTP2P_EVENT_ERROR,revision,result,"gateway configuration rejected or could not be saved");
+        if(result<0){
+            /* The handler's reason lives in the CLI layer, so publish the code and the
+             * revision: EINVAL means the payload was refused, EIO that it could not be
+             * written, and the revision says whether the gateway retried the same one. */
+            char message[192];
+            snprintf(message,sizeof(message),
+                     "gateway configuration rejected or could not be saved (code %d, revision %llu, login=%d report=%d handler=%d)",
+                     result,(unsigned long long)revision,(int)(c->login_ok!=0),(int)(c->report_ok!=0),(int)(c->config_handler!=NULL));
+            emit(c,FASTP2P_EVENT_ERROR,revision,result,message);
+        }
     } else if (main == 3 && sub == 18) {
         /* UPDATE: the operator asked for this node to be upgraded. Download,
          * verify, then hand over to the new build. */
@@ -4149,7 +4282,7 @@ static void accept_punch(fastp2p_client *c, int ti) {
     if (!t->server && t->state == T_TCP_CONNECT) {
         if (t->fd >= 0)
             op_close(t->fd);
-        t->fd = fd;
+t->fd = fd;
         t->state = T_HANDSHAKE;
         op_close(t->listen_fd);
         t->listen_fd = -1;
@@ -4325,7 +4458,7 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
 
             if (slot) {
                 op_close(t->fd);
-                t->fd = fd;
+    t->fd = -1;
                 t->udp_candidates[slot - 1] = -1;
                 t->local_port = socket_port(fd);
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP punch selected another local socket");
@@ -4403,7 +4536,16 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             return;
     }
     if (t->state != T_ACTIVE && now > t->deadline) {
-        close_tunnel(c, ti, "tunnel establishment timed out");
+        /* A mapping probe that never answered leaves the peer without a reply; the
+         * fallback keeps a no-relay link alive instead of timing the tunnel out. */
+        if (probe_fallback_mapping(c, ti))
+            return;
+        /* Name the peer: several tunnels run at once and the bare message made it
+         * impossible to tell which one timed out. */
+        char why[160];
+        snprintf(why, sizeof(why), "tunnel establishment timed out (peer %s, mode %s, state %d)",
+                 t->peer, t->mode, (int)t->state);
+        close_tunnel(c, ti, why);
         return;
     }
     if (t->state == T_PROBE) {
@@ -4423,6 +4565,18 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         int family = choose_punch_family(c, t);
         if (family < 0)
             family = t->family;
+        if (!family_usable(c, t, family)) {
+            /* Nothing to aim at: say which half is missing, otherwise the tunnel just
+             * sits in T_TIME until its deadline and the log names only the timeout. */
+            char why[240];
+            snprintf(why, sizeof(why),
+                     "no usable punch endpoint for %s (family=%d mapped v4=%u/%s v6=%u/%s peer v4=%s/%d v6=%s/%d)",
+                     t->peer, family, (unsigned)t->mapped_ports[OP_FAM_V4], t->mapped_text[OP_FAM_V4],
+                     (unsigned)t->mapped_ports[OP_FAM_V6], t->mapped_text[OP_FAM_V6],
+                     t->peer_text[OP_FAM_V4], (int)t->peer_ready[OP_FAM_V4],
+                     t->peer_text[OP_FAM_V6], (int)t->peer_ready[OP_FAM_V6]);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, why);
+        }
         if (family_usable(c, t, family)) {
             if (use_punch_family(c, ti, family)) {
                 close_tunnel(c, ti, "could not prepare the peer address family");
@@ -5005,8 +5159,11 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
                                 start_punch(c, relay_index);
                         } else {
                             a->relay_requested = 1;
-                            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
-                                 "relay requested from the gateway after a failed direct attempt");
+                            char relay_message[160];
+                            snprintf(relay_message, sizeof(relay_message),
+                                     "relay requested from the gateway after a failed direct attempt (peer %s, protocol %s)",
+                                     a->peer, a->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
+                            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, relay_message);
                             json_object *j = json_object_new_object();
                             op_js(j, "peerNode", a->peer);
                             op_js(j, "underlayProtocol", a->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic");
@@ -5828,6 +5985,16 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
         level = ip_evidence ? 2 : 5;
     else
         level = port_evidence ? 3 : 5;
+    /* The mapping probe is the only other writer of c->ip, and it never runs in a
+     * family the gateway is unreachable in - on a host whose IPv4 gateway route is
+     * filtered, c->ip stayed 0.0.0.0 and every tunnel answer published that as the
+     * address to dial. STUN measured the same mapping independently: keep it. */
+    if (s->mapped_seen && addr_text_set(c->ip[OP_FAM_V4]) == 0) {
+        char observed[OP_ADDR_TEXT];
+        if (!op_addr_text(&s->mapped, observed, sizeof(observed)) &&
+            address_of_family(observed, OP_FAM_V4))
+            snprintf(c->ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", observed);
+    }
     nat_filter_record(&c->udp_filter, level == 5 ? 0 : level, now);
     /* The registry only learns the level when it is told: a login before the probe
      * finishes carries the previous value, so publish the verdict as soon as there
@@ -6088,13 +6255,27 @@ static int local_family_routable(const op_addr *gateway, int family, char source
  * before IPv6 is usable would otherwise advertise IPv4-only for its whole
  * lifetime, and a host that loses a family would keep claiming it. */
 static int refresh_families(fastp2p_client *c) {
+    /* A public destination per family, used only for a route lookup (connect() on a
+     * UDP socket sends nothing). This is what a data-plane peer would need, and it
+     * is deliberately not the gateway: publishing the gateway-reachable set made a
+     * host whose IPv4 gateway route is filtered advertise IPv6 only, so every
+     * IPv4 peer had no family in common and fell back to the relay. */
+    static const char *probe_text[OP_FAM_COUNT] = {"8.8.8.8:53", "[2001:4860:4860::8888]:53"};
     int wanted = 0;
-    for (int family = 0; family < OP_FAM_COUNT; ++family)
-        if (local_family_routable(&c->gateway_addr[family], family, c->local_ip[family]))
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        if (local_family_routable(&c->gateway_addr[family], family, c->local_ip[family])) {
             wanted |= family_bit(family);
+            continue;
+        }
+        op_addr probe;
+        memset(&probe, 0, sizeof(probe));
+        if (op_addr_from_text(&probe, probe_text[family], 53) == 0 &&
+            local_family_routable(&probe, family, c->local_ip[family]))
+            wanted |= family_bit(family);
+    }
     if (!wanted)
-        /* Nothing verified: keep the family the name resolved to so the client
-         * still attempts the historical path instead of refusing to run. */
+        /* Nothing verified at all: keep the family the name resolved to so the
+         * client still attempts the historical path instead of refusing to run. */
         wanted = (c->gateway_families & FAM_V4) ? FAM_V4 : FAM_V6;
     c->families_wanted = wanted;
     return wanted;

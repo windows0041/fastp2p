@@ -46,8 +46,11 @@ static int rollback(void) {
     json_object *root=NULL;if(json_object_deep_copy(sync_state.rollback,&root,NULL))return 0;
     json_object *meta=metadata(root);
     json_object_object_add(meta,"pending",json_object_new_boolean(0));
-    json_object_object_add(meta,"rejectedRevision",json_object_new_uint64(sync_state.revision));
-    json_object_object_add(meta,"rejectedDigest",json_object_new_string(sync_state.digest));
+    /* Do not remember the revision as rejected: the reason it failed to start may have
+     * been a network error, and a remembered rejection blocks the identical retry for
+     * good - the gateway keeps sending the same revision until it is accepted. */
+    json_object_object_del(meta,"rejectedRevision");
+    json_object_object_del(meta,"rejectedDigest");
     int result=save(sync_state.path,root);json_object_put(root);
     if(result) {fputs("Cannot restore the previous configuration.\n",stderr);return 0;}
     sync_state.pending=sync_state.reload=0;
@@ -65,11 +68,16 @@ static int receive(const char *fields,uint64_t revision,void *user) {
         fputs("Cannot read a valid current profile or accept reserved configuration fields.\n",stderr);goto done;
     }
     json_object *meta=get(current,META);
-    if(integer(meta,"rejectedRevision")==revision&&!strcmp(string(meta,"rejectedDigest"),hash))goto done;
-    if(fp_config_merge(current,patch,&next))goto done;
+    if(integer(meta,"rejectedRevision")==revision&&!strcmp(string(meta,"rejectedDigest"),hash)) {
+        fputs("This revision was already rejected by the running configuration.\n",stderr);
+        goto done;
+    }
+    if(fp_config_merge(current,patch,&next)) {fputs("Gateway configuration could not be merged.\n",stderr);goto done;}
     json_object *product=NULL;
     if(json_object_object_get_ex(next,"product",&product)&&
-       (!json_object_is_type(product,json_type_string)||strcmp(json_object_get_string(product),"fastp2p")))goto done;
+       (!json_object_is_type(product,json_type_string)||strcmp(json_object_get_string(product),"fastp2p"))) {
+        fputs("Gateway configuration product mismatch.\n",stderr);goto done;
+    }
     result=fp_config_validate_json(json_object_to_json_string_ext(next,JSON_C_TO_STRING_PLAIN));
     if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if(json_object_equal(next,sync_state.active)) {result=0;goto done;}
@@ -102,13 +110,27 @@ int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *act
     if(sync_state.active)json_object_put(sync_state.active);
     sync_state.active=json_object_get(active);sync_state.online=0;sync_state.reload=0;
     json_object *meta=get(active,META);
+    /* A "rejected" marker only describes the run that rejected it: the reason may have
+     * been a network failure, and leaving it on disk blocks the identical revision for
+     * good, because the gateway keeps resending it until it is accepted. */
+    if(meta&&(integer(meta,"rejectedRevision")||*string(meta,"rejectedDigest"))) {
+        json_object_object_del(meta,"rejectedRevision");
+        json_object_object_del(meta,"rejectedDigest");
+        if(save(path,active))fputs("Cannot clear the stale configuration rejection.\n",stderr);
+        else fputs("Cleared a stale configuration rejection marker.\n",stderr);
+    }
     if(json_object_get_boolean(get(meta,"pending"))) {
         if(!sync_state.rollback)sync_state.rollback=fastp2p_profile_read(sync_state.previous);
         sync_state.pending=1;sync_state.revision=integer(meta,"revision");
         snprintf(sync_state.digest,sizeof(sync_state.digest),"%s",string(meta,"digest"));
         sync_state.deadline=op_monotonic_ns()+UINT64_C(25000000000);
     }
-    return client&&fastp2p_profile_writable(path)?fastp2p_client_set_config_handler(client,receive,NULL):0;
+    if(!client)return 0;
+    if(!fastp2p_profile_writable(path)) {
+        fputs("Profile is not writable; managed configuration pushes are disabled.\n",stderr);
+        return 0;
+    }
+    return fastp2p_client_set_config_handler(client,receive,NULL);
 }
 void fp_config_sync_online(uint16_t public_port) {
     sync_state.online=1;
