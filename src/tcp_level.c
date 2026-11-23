@@ -276,14 +276,12 @@ void fp_tcp_level_step(fp_tcp_level *state, uint64_t now) {
             return;
         }
         if (line > 0 && !strncmp(state->line, "mapped", 6)) {
-            /* Name the published port when it is known: the callback then tests the
-             * port peers actually dial instead of the ephemeral source port. */
-            char request[32];
-            int length = state->fixed_port
-                             ? snprintf(request, sizeof(request), "probe %u\n",
-                                        (unsigned)state->fixed_port)
-                             : snprintf(request, sizeof(request), "probe\n");
-            if (send(state->dialer, request, (size_t)length, MSG_DONTWAIT) <= 0) {
+            /* Ask for the endpoint the server observed, not for a specific port.
+             * When the NAT allocates a port dynamically the published port does not
+             * exist on the public side, so requesting it measures nothing and reports
+             * a filtered path for a host that is actually full cone. */
+            static const char request[] = "probe\n";
+            if (send(state->dialer, request, sizeof(request) - 1, MSG_DONTWAIT) <= 0) {
                 fp_tcp_level_close(state);
                 state->phase = 4;
                 return;
