@@ -90,6 +90,10 @@
 /* A destination-dependent peer's punch is a guess, so the reported port gets only
  * a few attempts before the filter window is opened and the socket is parked. */
 #define TCP_PUNCH_QUICK_ATTEMPTS 3u
+/* A peer whose mapping is stable has one reachable port, so a silent dial means
+ * the report is stale: retrying it for long is pointless, but a couple of seconds
+ * covers a lost SYN. */
+#define TCP_PUNCH_STABLE_ATTEMPTS 10u
 /* Ports dialled from the peer's measured step; each one opens our filter towards
  * exactly the port its own allocator is about to use. */
 #define TCP_PUNCH_PREDICT_PORTS 20
@@ -2464,6 +2468,23 @@ static uint16_t tcp_scan_port(uint16_t base, int step) {
         port -= 65535;
     return (uint16_t)port;
 }
+/* The peer's own mapping observation decides how it can be dialled, and the two
+ * families of cases need opposite strategies:
+ *  - a stable (cone) peer keeps one mapping per source port, so its published port
+ *    is the only reachable one. Walking to its neighbours cannot help, and on a
+ *    destination-dependent NAT every different destination port also changes the
+ *    peer's source mapping, which is exactly what our filter must learn;
+ *  - a peer whose mapping changes per destination has to be reached by opening a
+ *    window (predicted from its measured step, or sprayed when there is none). */
+enum { TCP_PEER_UNKNOWN, TCP_PEER_STABLE, TCP_PEER_MOVES };
+static int tcp_peer_kind(const tunnel *t) {
+    if (t->peer_tcp_dependent || t->peer_tcp_mapping == FP_TCP_MAP_INCREMENT ||
+        t->peer_tcp_mapping == FP_TCP_MAP_DECREMENT)
+        return TCP_PEER_MOVES;
+    if (t->peer_tcp_mapping == FP_TCP_MAP_STABLE)
+        return TCP_PEER_STABLE;
+    return TCP_PEER_UNKNOWN;
+}
 /* Open our own NAT towards the ports a destination-dependent peer may use, then
  * listen: the peer's SYN arrives from its real mapping, which is inside the
  * sprayed range, so the filter admits it and the listener accepts. */
@@ -2536,11 +2557,14 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
         /* Silent dials: walk the window around the reported port, because the
          * peer's mapping for our destination is not the one it reported. The
          * window wraps so a later pass retries the same ports, which also keeps
-         * our own NAT filter open towards them. */
-        if (t->tcp_scan < TCP_PUNCH_SCAN)
-            ++t->tcp_scan;
-        else
-            t->tcp_scan = 0;
+         * our own NAT filter open towards them. A stable peer is the exception:
+         * its reported port is the reachable one, so there is no window to walk. */
+        if (tcp_peer_kind(t) != TCP_PEER_STABLE) {
+            if (t->tcp_scan < TCP_PUNCH_SCAN)
+                ++t->tcp_scan;
+            else
+                t->tcp_scan = 0;
+        }
     } else {
         t->tcp_timeouts = 0;
         t->tcp_scan = 0; /* the peer's NAT answered: its reported port is live */
@@ -2549,9 +2573,12 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
      * reported port gets only a few attempts: each second spent dialling is a
      * second its own SYN is filtered. A cone peer keeps the longer walk because
      * its reported port is usually the reachable one. */
-    unsigned limit = t->peer_tcp_dependent ? TCP_PUNCH_QUICK_ATTEMPTS : TCP_PUNCH_STALE_ATTEMPTS;
+    int peer_kind = tcp_peer_kind(t);
+    unsigned limit = peer_kind == TCP_PEER_MOVES     ? TCP_PUNCH_QUICK_ATTEMPTS
+                   : peer_kind == TCP_PEER_STABLE ? TCP_PUNCH_STABLE_ATTEMPTS
+                                                  : TCP_PUNCH_STALE_ATTEMPTS;
     if (t->tcp_timeouts >= limit) {
-        if (t->peer_tcp_dependent) {
+        if (peer_kind == TCP_PEER_MOVES) {
             /* Open our filter before parking: a listener cannot bind next to the
              * spray sockets, so the spray has to go first. With a measured step
              * the window is the ones the peer will really use. */
@@ -2614,15 +2641,30 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     }
     ++t->tcp_attempts;
     t->tcp_retry_at = 0;
-    /* Walk a small window around the port the peer reported: the mapping a carrier
-     * NAT allocates for *this* destination is close to, but not necessarily equal
-     * to, the port it observed towards another one. Attempt zero keeps the reported
-     * port, so a pair that works today is unaffected. */
+    int peer_kind = tcp_peer_kind(t);
+    /* Walk a small window around the port the peer reported, but only when it can
+     * possibly be right: a stable peer has exactly one reachable port, so the walk
+     * there is wasted attempts (and it would keep changing the peer's own mapping). */
     {
         int walk_family = t->family >= 0 ? t->family : OP_FAM_V4;
         uint16_t reported = t->remote_ports[walk_family];
-        if (reported && t->tcp_scan)
-            op_addr_set_port(&t->peer_addr, tcp_scan_port(reported, t->tcp_scan));
+        if (reported) {
+            if (t->tcp_scan && peer_kind != TCP_PEER_STABLE)
+                op_addr_set_port(&t->peer_addr, tcp_scan_port(reported, t->tcp_scan));
+            else
+                op_addr_set_port(&t->peer_addr, reported);
+        }
+    }
+    if (t->tcp_attempts == 1) {
+        const char *strategy = peer_kind == TCP_PEER_STABLE
+                                   ? "single reported port (peer mapping stable)"
+                               : peer_kind == TCP_PEER_MOVES
+                                   ? (t->peer_tcp_step ? "predicted window from the peer's measured step"
+                                                       : "walk and window (peer mapping moves per destination)")
+                                   : "walk around the reported port (peer mapping unknown)";
+        char note[160];
+        snprintf(note, sizeof(note), "TCP punch strategy: %s", strategy);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     /* A refused dial returns at once, but a silently dropped one would spend the
      * whole window on a single attempt. Bound it so the retry budget survives. */
@@ -4896,6 +4938,18 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             sampled = -1; /* still running: keep the probe state and fall through */
         if (sampled >= 0) {
             if (t->tcp_sample_alloc) {
+                /* Name the outcome: "no movement" in the peer's log can mean a
+                 * random allocator or a sample that never completed, and the two
+                 * call for different next steps. */
+                unsigned samples = t->tcp_sample->samples;
+                char note[128];
+                if (t->tcp_step)
+                    snprintf(note, sizeof(note), "TCP allocation samples: %u, step %+d (prediction possible)",
+                             samples, t->tcp_step);
+                else
+                    snprintf(note, sizeof(note), "TCP allocation samples: %u, no constant step (%s)",
+                             samples, samples < 3 ? "too few answers" : "random allocation");
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
                 /* A measured step is also a movement: publish it so the peer dials
                  * the computed port instead of a blind window. */
                 t->tcp_mapping = t->tcp_step > 0 ? FP_TCP_MAP_INCREMENT

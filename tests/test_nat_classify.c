@@ -967,8 +967,79 @@ static void dependent_peer_parks_quickly(void) {
     close_tunnel(c, ti, NULL);
     free(c);
 }
+/* A peer with a stable mapping has one reachable port: the dial must keep the
+ * reported one instead of walking (which would also change the peer's own source
+ * mapping when its NAT is destination-dependent). A moving peer still walks. */
+static void stable_peer_keeps_the_reported_port(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "remote-node", 79, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    t->family = OP_FAM_V4;
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    t->remote_ports[OP_FAM_V4] = 41000;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", 41000));
+    op_socket local = socket_bound(0, "127.0.0.1", 0, 1);
+    assert(local >= 0);
+    t->local_port = socket_port(local);
+    op_close(local);
+
+    assert(tcp_peer_kind(t) == TCP_PEER_STABLE);
+    t->tcp_scan = 3;
+    tcp_punch_dial(c, ti, mono());
+    assert(op_addr_port(&t->peer_addr) == 41000); /* no walk for a stable peer */
+
+    t->peer_tcp_mapping = FP_TCP_MAP_INCREMENT;
+    assert(tcp_peer_kind(t) == TCP_PEER_MOVES);
+    t->tcp_scan = 3;
+    tcp_punch_dial(c, ti, mono());
+    assert(op_addr_port(&t->peer_addr) == tcp_scan_port(41000, 3)); /* a moving peer walks */
+
+    t->peer_tcp_mapping = 0;
+    assert(tcp_peer_kind(t) == TCP_PEER_UNKNOWN);
+    t->peer_tcp_dependent = 1;
+    assert(tcp_peer_kind(t) == TCP_PEER_MOVES); /* the peer's NAT type wins over its map field */
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+/* A stable peer that stays silent has a stale report: the round ends after a few
+ * dials so the ladder can measure a fresh mapping, instead of walking for 11 s. */
+static void stable_peer_ends_the_round_early(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "remote-node", 80, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    t->family = OP_FAM_V4;
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    t->remote_ports[OP_FAM_V4] = 41001;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", 41001));
+    op_socket local = socket_bound(0, "127.0.0.1", 0, 1);
+    assert(local >= 0);
+    t->local_port = socket_port(local);
+    op_close(local);
+    t->tcp_attempts = TCP_PUNCH_STABLE_ATTEMPTS;
+    t->tcp_timeouts = TCP_PUNCH_STABLE_ATTEMPTS - 1;
+    errno = ETIMEDOUT;
+    tcp_punch_failed(c, ti, mono());
+    assert(!t->state); /* closed: a fresh mapping, not another walk */
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
+    stable_peer_keeps_the_reported_port();
+    stable_peer_ends_the_round_early();
     alloc_step_detection();
     dependent_peer_parks_quickly();
     relay_disabled_restarts_direct_rounds();
