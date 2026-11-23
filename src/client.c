@@ -35,7 +35,10 @@
 #define MS UINT64_C(1000000)
 #define PEER_PORT_MIN 1024u
 #define PEER_PORT_COUNT (9999u - PEER_PORT_MIN + 1u)
-#define TCP_DIRECT_WAIT (10 * NS)
+/* A dial to the peer's shared listener answers within an RTT or is filtered; one
+ * second is enough, and a silent ten-second wait only delayed the punch and let
+ * the mapping it would use grow stale. */
+#define TCP_DIRECT_WAIT (1 * NS)
 /* Simultaneous open: both sides must be in SYN_SENT at the same instant, so a
  * refused dial is retried quickly and for the whole window rather than once.
  * A carrier NAT refuses in ~5 ms, so the retry interval is short; the jitter
