@@ -259,6 +259,10 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
     if (k->phase == 1) {
         op_addr bind_to;
         memset(&bind_to, 0, sizeof(bind_to));
+        /* An allocation sample must keep the destination fixed and let the NAT
+         * hand out a new mapping, so it never reuses the previous local port. */
+        if (k->fresh_source)
+            k->source_port = 0;
         if (k->source.len) {
             bind_to = k->source;
         } else if (op_addr_from_text(&bind_to, family == OP_FAM_V6 ? "::" : "0.0.0.0", k->source_port)) {
@@ -385,6 +389,50 @@ int fp_tcp_punch_sample_step(fp_tcp_family *sample, uint64_t now, unsigned *mapp
     }
     *mapping = step == 0 ? FP_TCP_MAP_STABLE : step > 0 ? FP_TCP_MAP_INCREMENT : FP_TCP_MAP_DECREMENT;
     *port = op_addr_port(&sample->mapped[sample->samples - 1]);
+    return 1;
+}
+
+int fp_tcp_alloc_delta(const op_addr *mapped, unsigned count, int *step, uint16_t *port) {
+    *step = 0;
+    if (count < 3 || !mapped)
+        return -1;
+    *port = op_addr_port(&mapped[count - 1]);
+    int delta = (int)op_addr_port(&mapped[1]) - (int)op_addr_port(&mapped[0]);
+    if (delta == 0 || delta > 4096 || delta < -4096)
+        return 0;
+    for (unsigned i = 2; i < count; ++i)
+        if ((int)op_addr_port(&mapped[i]) - (int)op_addr_port(&mapped[i - 1]) != delta)
+            return 0;
+    *step = delta;
+    return 1;
+}
+
+fp_tcp_family *fp_tcp_alloc_sample_start(const op_addr *gateway, unsigned count) {
+    if (!gateway || !gateway->len || count < 3 || count > FP_TCP_PROBE_MAX)
+        return NULL;
+    fp_tcp_family *sample = calloc(1, sizeof(*sample));
+    if (!sample)
+        return NULL;
+    sample->fd = -1;
+    for (unsigned i = 0; i < FP_TCP_PROBE_MAX; ++i)
+        sample->held[i] = -1;
+    sample->fresh_source = 1;
+    for (unsigned i = 0; i < count; ++i) {
+        sample->targets[i].address = *gateway;
+        op_addr_set_port(&sample->targets[i].address, 27180);
+        sample->targets[i].stun = 0;
+    }
+    sample->target_count = count;
+    sample->prepared = sample->phase = 1;
+    return sample;
+}
+
+int fp_tcp_alloc_sample_step(fp_tcp_family *sample, uint64_t now, int *step, uint16_t *port) {
+    *step = 0;
+    if (!family_step(sample, OP_FAM_V4, now))
+        return 0;
+    if (sample->samples >= 3)
+        fp_tcp_alloc_delta(sample->mapped, sample->samples, step, port);
     return 1;
 }
 

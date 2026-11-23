@@ -30,6 +30,9 @@ typedef struct {
     op_socket fd, held[FP_TCP_PROBE_MAX];
     op_addr source;
     uint16_t source_port;
+    /* Every probe binds a fresh local port: with one destination per probe the
+     * differences between the observed ports are the allocator's own step. */
+    int fresh_source;
     int phase, prepared;
     uint64_t deadline, next_cycle;
     uint8_t request[20], response[1024];
@@ -58,6 +61,14 @@ fp_tcp_family *fp_tcp_punch_sample_start(const fp_tcp_family *catalog, const op_
 /* 0 while running, 1 on completion. Ports come from the last successful sample. */
 int fp_tcp_punch_sample_step(fp_tcp_family *sample, uint64_t now, unsigned *mapping, uint16_t *port);
 void fp_tcp_punch_sample_free(fp_tcp_family *sample);
+/* Allocation sampling: the same destination probed from a fresh local port each
+ * time. A destination-dependent (NAT4) peer's next allocation is predicted from
+ * the step between those samples, which is what the punching side dials. */
+fp_tcp_family *fp_tcp_alloc_sample_start(const op_addr *gateway, unsigned count);
+/* 0 while running, 1 on completion; step 0 means no constant step was seen. */
+int fp_tcp_alloc_sample_step(fp_tcp_family *sample, uint64_t now, int *step, uint16_t *port);
+/* -1 no usable sample, 0 no constant step, 1 constant step found. */
+int fp_tcp_alloc_delta(const op_addr *mapped, unsigned count, int *step, uint16_t *port);
 /* -1 malformed, 0 incomplete, 1 complete. Exposed only to internal tests. */
 int fp_tcp_stun_response(const uint8_t *data, size_t length, const uint8_t transaction[12],
                          struct sockaddr_in *mapped);

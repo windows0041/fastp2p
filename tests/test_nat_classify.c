@@ -900,8 +900,77 @@ static void direct_attempts_pause_after_a_minute(void) {
             close_tunnel(c, i, NULL);
     free(c);
 }
+/* Allocation samples: the step between consecutive allocations of a symmetric
+ * NAT is what the peer's prediction is built from. */
+static void alloc_step_detection(void) {
+    op_addr mapped[4];
+    int step = 0;
+    uint16_t port = 0;
+    for (unsigned i = 0; i < 3; ++i)
+        assert(!op_addr_from_text(&mapped[i], "36.140.165.200", (uint16_t)(5000 + i + 1)));
+    assert(fp_tcp_alloc_delta(mapped, 3, &step, &port) == 1 && step == 1 && port == 5003);
+    assert(!op_addr_from_text(&mapped[0], "36.140.165.200", 100));
+    assert(!op_addr_from_text(&mapped[1], "36.140.165.200", 108));
+    assert(!op_addr_from_text(&mapped[2], "36.140.165.200", 116));
+    assert(fp_tcp_alloc_delta(mapped, 3, &step, &port) == 1 && step == 8 && port == 116);
+    assert(!op_addr_from_text(&mapped[0], "36.140.165.200", 40000));
+    assert(!op_addr_from_text(&mapped[1], "36.140.165.200", 39999));
+    assert(!op_addr_from_text(&mapped[2], "36.140.165.200", 39998));
+    assert(fp_tcp_alloc_delta(mapped, 3, &step, &port) == 1 && step == -1 && port == 39998);
+    /* A random allocator has no constant difference; a constant one, however
+     * large the jump, is still predictable. */
+    assert(!op_addr_from_text(&mapped[0], "36.140.165.200", 1000));
+    assert(!op_addr_from_text(&mapped[1], "36.140.165.200", 2000));
+    assert(!op_addr_from_text(&mapped[2], "36.140.165.200", 1200));
+    assert(fp_tcp_alloc_delta(mapped, 3, &step, &port) == 0);
+    assert(!op_addr_from_text(&mapped[1], "36.140.165.200", 2000));
+    assert(!op_addr_from_text(&mapped[2], "36.140.165.200", 3000));
+    assert(fp_tcp_alloc_delta(mapped, 3, &step, &port) == 1 && step == 1000 && port == 3000);
+    assert(fp_tcp_alloc_delta(mapped, 2, &step, &port) == -1);
+    /* The prediction follows the measured step, not a fixed +-1. */
+    assert(tcp_predict_next_port(FP_TCP_MAP_INCREMENT, 116, 8) == 124);
+    assert(tcp_predict_next_port(FP_TCP_MAP_DECREMENT, 124, -8) == 116);
+    assert(tcp_predict_next_port(FP_TCP_MAP_NONE, 116, 0) == 0);
+    assert(tcp_predict_next_port(FP_TCP_MAP_INCREMENT, 65535, 8) == 0);
+}
+/* A destination-dependent peer with a measured step parks after a few dials and
+ * listens for the rest of the peer's own window. */
+static void dependent_peer_parks_quickly(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "remote-node", 78, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    t->peer_tcp_dependent = 1;
+    t->peer_tcp_step = 8;
+    t->peer_tcp_last_port = 30000;
+    t->family = OP_FAM_V4;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", 30001));
+    t->remote_ports[OP_FAM_V4] = 30001;
+    op_socket local = socket_bound(0, "127.0.0.1", 0, 1);
+    assert(local >= 0);
+    t->local_port = socket_port(local);
+    op_close(local);
+    t->tcp_attempts = TCP_PUNCH_QUICK_ATTEMPTS;
+    t->tcp_timeouts = TCP_PUNCH_QUICK_ATTEMPTS - 1;
+    t->deadline = mono() + 5 * NS;
+    errno = ETIMEDOUT;
+    uint64_t before = mono();
+    tcp_punch_failed(c, ti, before);
+    assert(t->state == T_TCP_CONNECT && t->listen_fd >= 0); /* parked, not closed */
+    assert(t->deadline >= before + 25 * NS);               /* keeps listening */
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
+    alloc_step_detection();
+    dependent_peer_parks_quickly();
     relay_disabled_restarts_direct_rounds();
     dependent_peer_sprays_and_parks();
     direct_attempts_pause_after_a_minute();

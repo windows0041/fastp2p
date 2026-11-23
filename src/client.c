@@ -30,7 +30,7 @@
 /* Sessions this node is willing to relay for at once. */
 #define RELAY_SESSION_LIMIT 4
 #define SYM_WINDOW_MAX 50
-#define TCP_PREDICT_PORTS 4
+#define TCP_PREDICT_PORTS 8
 #define NS UINT64_C(1000000000)
 #define MS UINT64_C(1000000)
 #define PEER_PORT_MIN 1024u
@@ -83,6 +83,16 @@
  * port, and then a listener on our advertised port accepts it. 256 ports each
  * side costs about half a second of SYNs, not a timeout per port. */
 #define TCP_PUNCH_SPRAY 256
+/* Allocation samples taken towards the gateway probe port right before a punch:
+ * three consecutive allocations are enough to tell a constant step from a random
+ * one, and the newest sample is the base the peer's prediction starts from. */
+#define TCP_ALLOC_SAMPLES 4u
+/* A destination-dependent peer's punch is a guess, so the reported port gets only
+ * a few attempts before the filter window is opened and the socket is parked. */
+#define TCP_PUNCH_QUICK_ATTEMPTS 3u
+/* Ports dialled from the peer's measured step; each one opens our filter towards
+ * exactly the port its own allocator is about to use. */
+#define TCP_PUNCH_PREDICT_PORTS 20
 /* How often an active tunnel proves it is still there. */
 #define TCP_KEEPALIVE_MS 3000u
 #define UDP_DIRECT_WAIT (5 * NS)
@@ -264,7 +274,13 @@ typedef struct {
     int peer_tcp_dependent;
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
+    /* 1 while tcp_sample measures allocations rather than destinations. */
+    int tcp_sample_alloc;
     unsigned tcp_mapping, peer_tcp_mapping;
+    /* Signed port step of our own / the peer's allocator; 0 when no constant
+     * step was observed (random allocation), which is the NAT4 case we cannot
+     * predict. */
+    int tcp_step, peer_tcp_step;
     uint16_t tcp_last_port, peer_tcp_last_port;
     /* How far the dial has walked around the port the peer reported. A carrier NAT
      * allocates the mapping for a new destination from a pool, so the port that is
@@ -2087,8 +2103,17 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
         if (!op_addr_socketname(t->probes[adopt].fd, &source) &&
             !op_addr_from_text(&bind_address, source_text(c, adopt), 0) &&
             op_addr_equal(&source, &bind_address) &&
-            !op_addr_from_text(&mapped, t->mapped_ip, t->mapped_port))
-            t->tcp_sample = fp_tcp_punch_sample_start(&c->tcp_nat.family[adopt], &source, &mapped);
+            !op_addr_from_text(&mapped, t->mapped_ip, t->mapped_port)) {
+            if (c->tcp_nat.family[adopt].type == FP_NAT_DEPENDENT) {
+                /* This endpoint's mapping moves per destination, so its peer has to
+                 * guess the port. Measure how its allocator steps so that the guess
+                 * becomes a computed window instead of a blind one. */
+                t->tcp_sample = fp_tcp_alloc_sample_start(&c->gateway_addr[adopt], TCP_ALLOC_SAMPLES);
+                t->tcp_sample_alloc = t->tcp_sample != NULL;
+            } else {
+                t->tcp_sample = fp_tcp_punch_sample_start(&c->tcp_nat.family[adopt], &source, &mapped);
+            }
+        }
         if (t->tcp_sample) {
             t->state = T_TCP_SAMPLE;
             t->deadline = now + 2 * NS;
@@ -2098,21 +2123,31 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     probe_complete(c, index);
     return 1;
 }
-static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port) {
-    if (mapping == FP_TCP_MAP_INCREMENT && last_port && last_port < UINT16_MAX)
-        return (uint16_t)(last_port + 1);
-    if (mapping == FP_TCP_MAP_DECREMENT && last_port > 1)
-        return (uint16_t)(last_port - 1);
-    return 0;
+static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port, int step) {
+    if (!last_port)
+        return 0;
+    int delta = step ? step : mapping == FP_TCP_MAP_INCREMENT ? 1
+                               : mapping == FP_TCP_MAP_DECREMENT ? -1 : 0;
+    if (!delta)
+        return 0;
+    int port = (int)last_port + delta;
+    if (port < 1 || port > 65535)
+        return 0;
+    return (uint16_t)port;
 }
 static void learn_tcp_mapping(tunnel *t, json_object *j) {
     uint64_t mapping = op_integer(j, "tcpPunchMap");
     uint64_t port = op_integer(j, "tcpPunchLastPort");
+    int64_t step = op_integer(j, "tcpPunchStep");
     if (t->tcp_punch_immediate && mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_DECREMENT &&
         port > 0 && port <= 65535) {
         t->peer_tcp_mapping = (unsigned)mapping;
         t->peer_tcp_last_port = (uint16_t)port;
         t->peer_tcp_pair = op_integer(j, "tcpPunchPair") == 1;
+        /* The step the peer measured on its own allocator: the next allocation it
+         * makes towards us is this far from its last sample. */
+        if (step >= -4096 && step <= 4096 && step != 0)
+            t->peer_tcp_step = (int)step;
     }
 }
 /* Offer the peer a window to spray when our own mapping shifts per destination.
@@ -2230,7 +2265,9 @@ static void probe_complete(fastp2p_client *c, int index) {
     if (t->tcp_mapping) {
         op_ju(j, "tcpPunchMap", t->tcp_mapping);
         op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
-        if (tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port))
+        if (t->tcp_step)
+            op_ju(j, "tcpPunchStep", (uint64_t)(int64_t)t->tcp_step);
+        if (tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port, t->tcp_step))
             op_ju(j, "tcpPunchPair", 1);
     }
     /* Each family publishes independently: only the pair that was actually
@@ -2453,6 +2490,27 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
         op_close(fd); /* the SYN created the mapping and the filter entry */
     }
 }
+/* Dial the ports the peer's own allocator is about to use: the step it measured
+ * towards the gateway is the step its mapping towards us takes, so each dial
+ * opens our filter towards a port it will really appear from. */
+static void tcp_punch_predict(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    if (!t->peer_tcp_step || !t->peer_tcp_last_port || !t->peer_addr.len)
+        return;
+    for (int i = 1; i <= TCP_PUNCH_PREDICT_PORTS; ++i) {
+        int port = (int)t->peer_tcp_last_port + t->peer_tcp_step * i;
+        if (port < 1 || port > 65535)
+            break;
+        op_addr target = t->peer_addr;
+        op_addr_set_port(&target, (uint16_t)port);
+        op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+        if (fd < 0)
+            continue;
+        (void)op_connect(fd, &target.u.sa, target.len);
+        op_close(fd);
+    }
+}
 static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     int saved = errno;
@@ -2487,16 +2545,29 @@ static void tcp_punch_failed(fastp2p_client *c, int index, uint64_t now) {
         t->tcp_timeouts = 0;
         t->tcp_scan = 0; /* the peer's NAT answered: its reported port is live */
     }
-    if (t->tcp_timeouts >= TCP_PUNCH_STALE_ATTEMPTS) {
+    /* A destination-dependent peer makes every dial towards it a guess, so the
+     * reported port gets only a few attempts: each second spent dialling is a
+     * second its own SYN is filtered. A cone peer keeps the longer walk because
+     * its reported port is usually the reachable one. */
+    unsigned limit = t->peer_tcp_dependent ? TCP_PUNCH_QUICK_ATTEMPTS : TCP_PUNCH_STALE_ATTEMPTS;
+    if (t->tcp_timeouts >= limit) {
         if (t->peer_tcp_dependent) {
-            /* Open our filter across the range the peer's mapping may use first;
-             * a listener on the same port could not bind next to those sockets. */
-            tcp_punch_spray(c, index);
+            /* Open our filter before parking: a listener cannot bind next to the
+             * spray sockets, so the spray has to go first. With a measured step
+             * the window is the ones the peer will really use. */
+            int predicted = t->peer_tcp_step != 0;
+            if (predicted)
+                tcp_punch_predict(c, index);
+            else
+                tcp_punch_spray(c, index);
             if (tcp_punch_listen(c, index) == 0) {
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
-                     "TCP mapping changes per destination; sprayed its port range and parked listening");
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, predicted
+                     ? "TCP mapping changes per destination; dialled the predicted window and parked listening"
+                     : "TCP mapping changes per destination; sprayed its port range and parked listening");
                 t->tcp_retry_at = 0;
                 t->tcp_timeouts = 0;
+                /* Cover the peer's whole dial window, not the rest of ours. */
+                t->deadline = now + 30 * NS;
                 return;
             }
         }
@@ -2661,7 +2732,10 @@ static int tcp_send_prediction_ready(fastp2p_client *c, const tunnel *t) {
     return rv;
 }
 static void tcp_predict_open(fastp2p_client *c, tunnel *t, uint64_t now) {
-    int direction = t->peer_tcp_mapping == FP_TCP_MAP_INCREMENT ? 1 : -1;
+    /* The peer measured its own allocator's step; its mapping towards us is the
+     * next allocations in that sequence. */
+    int direction = t->peer_tcp_step ? t->peer_tcp_step
+                                     : t->peer_tcp_mapping == FP_TCP_MAP_INCREMENT ? 1 : -1;
     /* Some destination-dependent NATs still reuse the observed port for a
      * particular peer. Open that tuple alongside the predicted ones. */
     for (int i = 0; i <= TCP_PREDICT_PORTS; ++i) {
@@ -2695,7 +2769,7 @@ static void tcp_predict_pair(fastp2p_client *c, tunnel *t, uint64_t now) {
         return;
     /* A second destination could consume our next translated port. Each
      * side therefore sends a SYN to exactly one peer endpoint per round. */
-    uint16_t port = tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port);
+    uint16_t port = tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port, t->peer_tcp_step);
     if (tcp_predict_add_candidate(c, t, port) <= 0) {
         t->tcp_predict_wait = now;
         return;
@@ -2798,8 +2872,9 @@ static void start_underlay(fastp2p_client *c, int index) {
                 t->tcp_predict_role = TCP_PREDICT_OPEN;
             else if (tcp_mapping_moves(t->tcp_mapping) && t->peer_tcp_mapping == FP_TCP_MAP_STABLE)
                 t->tcp_predict_role = TCP_PREDICT_DIAL;
-            else if (t->peer_tcp_pair && tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port) &&
-                     tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port))
+            else if (t->peer_tcp_pair &&
+                     tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port, t->tcp_step) &&
+                     tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port, t->peer_tcp_step))
                 t->tcp_predict_role = TCP_PREDICT_PAIR;
         }
         if (t->tcp_predict_role) {
@@ -4812,13 +4887,27 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     if (!t->state)
         return;
-    if (t->state == T_TCP_SAMPLE &&
-        (now >= t->deadline || fp_tcp_punch_sample_step(t->tcp_sample, now, &t->tcp_mapping, &t->tcp_last_port))) {
-        fp_tcp_punch_sample_free(t->tcp_sample);
-        t->tcp_sample = NULL;
-        probe_complete(c, ti);
-        if (!t->state)
-            return;
+    if (t->state == T_TCP_SAMPLE && t->tcp_sample) {
+        int sampled = t->tcp_sample_alloc
+                          ? fp_tcp_alloc_sample_step(t->tcp_sample, now, &t->tcp_step, &t->tcp_last_port)
+                          : fp_tcp_punch_sample_step(t->tcp_sample, now, &t->tcp_mapping, &t->tcp_last_port);
+        int expired = now >= t->deadline;
+        if (!sampled && !expired)
+            sampled = -1; /* still running: keep the probe state and fall through */
+        if (sampled >= 0) {
+            if (t->tcp_sample_alloc) {
+                /* A measured step is also a movement: publish it so the peer dials
+                 * the computed port instead of a blind window. */
+                t->tcp_mapping = t->tcp_step > 0 ? FP_TCP_MAP_INCREMENT
+                                 : t->tcp_step < 0 ? FP_TCP_MAP_DECREMENT : FP_TCP_MAP_NONE;
+            }
+            fp_tcp_punch_sample_free(t->tcp_sample);
+            t->tcp_sample = NULL;
+            t->tcp_sample_alloc = 0;
+            probe_complete(c, ti);
+            if (!t->state)
+                return;
+        }
     }
     /* A tunnel that is still probing owns its deadline: dropping the preferred
      * family must not close a tunnel whose other family already answered. */
