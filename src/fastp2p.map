@@ -1,7 +1,4 @@
 FASTP2P_1 {
     global: fastp2p_*;
-            fp_client_rules_prepare;
-            fp_client_rules_commit;
-            fp_client_rules_abort;
     local: *;
 };

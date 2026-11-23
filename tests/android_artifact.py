@@ -46,6 +46,11 @@ with zipfile.ZipFile(args.apk) as apk, tempfile.TemporaryDirectory(prefix='fastp
                 file=Path(temp)/(abi+'.so');file.write_bytes(data)
                 output=subprocess.check_output([str(tools/'llvm-nm'),'--dynamic','--defined-only',str(file)],text=True)
                 exported={line.split()[-1].split('@')[0] for line in output.splitlines() if ' T ' in line}
-                assert exported==required,{'abi':abi,'missing':list(required-exported),'extra':list(exported-required)}
+                # The JNI adapter is a separate library and prepares rule updates
+                # through these three helpers; they are not part of the public C
+                # ABI, so nothing else may be added here.
+                jni_only={'fp_client_rules_prepare','fp_client_rules_commit','fp_client_rules_abort'}
+                assert exported==required|jni_only,\
+                    {'abi':abi,'missing':list(required-exported),'extra':list(exported-required-jni_only)}
     subprocess.run([str(Path(args.ndk).parents[1]/'build-tools/36.0.0/zipalign'),'-c','-P','16','4',args.apk],check=True)
 print('Android arm64/x86_64 C ABI, JNI payloads, notices, package identity, signature and 16 KB alignment passed')

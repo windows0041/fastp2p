@@ -86,8 +86,14 @@ target_link_libraries(fastp2p PRIVATE fastp2p_quic fastp2p_port_mapping ${FASTP2
 set_target_properties(fastp2p PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 1)
 set_target_properties(fastp2p PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
 if(UNIX AND NOT APPLE AND FASTP2P_BUILD_SHARED)
-  target_link_options(fastp2p PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/fastp2p.map")
-  set_property(TARGET fastp2p APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/fastp2p.map")
+  # Android also exports the three rule-transaction helpers its JNI adapter calls,
+  # so it gets its own list; every other symbol stays local on both platforms.
+  set(FASTP2P_EXPORT_MAP "${CMAKE_CURRENT_SOURCE_DIR}/src/fastp2p.map")
+  if(ANDROID)
+    set(FASTP2P_EXPORT_MAP "${CMAKE_CURRENT_SOURCE_DIR}/src/fastp2p-android.map")
+  endif()
+  target_link_options(fastp2p PRIVATE "LINKER:--version-script=${FASTP2P_EXPORT_MAP}")
+  set_property(TARGET fastp2p APPEND PROPERTY LINK_DEPENDS "${FASTP2P_EXPORT_MAP}")
 endif()
 if(APPLE AND FASTP2P_BUILD_SHARED)
   target_link_options(fastp2p PRIVATE "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/fastp2p.exports")

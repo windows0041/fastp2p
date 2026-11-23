@@ -1,0 +1,10 @@
+/* Android build: the public C ABI plus the rule-transaction helpers that the
+ * JNI adapter in libfastp2p_jni.so calls. They are deliberately not part of
+ * include/fastp2p.h, and the desktop libraries do not export them. */
+FASTP2P_1 {
+    global: fastp2p_*;
+            fp_client_rules_prepare;
+            fp_client_rules_commit;
+            fp_client_rules_abort;
+    local: *;
+};
