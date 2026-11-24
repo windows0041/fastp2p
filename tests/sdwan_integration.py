@@ -269,6 +269,12 @@ with socket.create_connection((sys.argv[1], 23456), timeout=6) as stream:
                 assert all(nodes[2] in (link['a'], link['b']) for link in api(path)[1]['links'])
                 reply = output(*ns(names[0], 'ping', '-4', '-c', '1', '-W', '2', '10.3.2.2'))
                 assert 'ttl=63' in reply, reply
+                # A packet addressed to the hub itself must arrive as well: the branch
+                # writes it into the hub's own TUN instead of forwarding it, and that is
+                # the path a hub drops when its host firewall filters inbound traffic on
+                # the interface.
+                center_reply = output(*ns(names[0], 'ping', '-4', '-c', '2', '-W', '2', '10.3.2.3'))
+                assert 'ttl=64' in center_reply, center_reply
                 assert ping(lan_names[0], lans[1] + '.3') and ping(lan_names[1], lans[0] + '.3')
                 stop(clients[2])
                 wait_for(lambda: any(m['node'] == nodes[2] and m['state'] == 'offline'
