@@ -1036,8 +1036,58 @@ static void stable_peer_ends_the_round_early(void) {
     assert(!t->state); /* closed: a fresh mapping, not another walk */
     free(c);
 }
+/* A responder never runs the per-tunnel sample, so it must still publish its
+ * client-wide classification: otherwise a stable endpoint stays silent and the
+ * peer walks neighbour ports for nothing. */
+static void responder_publishes_a_stable_mapping(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    int ti = new_tunnel(c, "remote-node", 91, FASTP2P_TRANSPORT_TCP, 0);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    t->tcp_punch_immediate = 1;
+    t->mapped_port = 40000;
+
+    json_object *j = json_object_new_object();
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_DEPENDENT;
+    publish_tcp_mapping(c, t, j);
+    assert(!op_integer(j, "tcpPunchMap")); /* nothing useful to publish */
+    json_object_put(j);
+
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_STABLE;
+    j = json_object_new_object();
+    publish_tcp_mapping(c, t, j);
+    assert(op_integer(j, "tcpPunchMap") == FP_TCP_MAP_STABLE);
+    assert(op_integer(j, "tcpPunchLastPort") == 40000);
+    json_object_put(j);
+
+    /* A tunnel that did sample keeps its own result and step. */
+    t->tcp_mapping = FP_TCP_MAP_INCREMENT;
+    t->tcp_last_port = 41000;
+    t->tcp_step = 8;
+    j = json_object_new_object();
+    publish_tcp_mapping(c, t, j);
+    assert(op_integer(j, "tcpPunchMap") == FP_TCP_MAP_INCREMENT);
+    assert(op_integer(j, "tcpPunchLastPort") == 41000);
+    assert(op_integer(j, "tcpPunchStep") == 8);
+    json_object_put(j);
+
+    /* A QUIC tunnel has no TCP mapping to publish. */
+    int qi = new_tunnel(c, "remote-node", 92, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(qi >= 0);
+    c->tunnels[qi].mapped_port = 40001;
+    j = json_object_new_object();
+    publish_tcp_mapping(c, &c->tunnels[qi], j);
+    assert(!op_integer(j, "tcpPunchMap"));
+    json_object_put(j);
+    close_tunnel(c, qi, NULL);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
+    responder_publishes_a_stable_mapping();
     stable_peer_keeps_the_reported_port();
     stable_peer_ends_the_round_early();
     alloc_step_detection();

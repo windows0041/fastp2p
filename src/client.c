@@ -2139,6 +2139,28 @@ static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port, int 
         return 0;
     return (uint16_t)port;
 }
+/* Tell the peer what this side knows about its own TCP mapping. The per-tunnel
+ * sample wins when it produced one; otherwise the client-wide classification is
+ * published. That second path matters for a responder: it never samples (the gate
+ * below needs an initiator or a peer that already published), so without it a
+ * stable endpoint stays silent and the peer walks its neighbour ports for nothing. */
+static void publish_tcp_mapping(const fastp2p_client *c, const tunnel *t, json_object *j) {
+    if (t->tcp_mapping) {
+        op_ju(j, "tcpPunchMap", t->tcp_mapping);
+        op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
+        if (t->tcp_step)
+            op_ju(j, "tcpPunchStep", (uint64_t)(int64_t)t->tcp_step);
+        if (tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port, t->tcp_step))
+            op_ju(j, "tcpPunchPair", 1);
+        return;
+    }
+    if (t->transport != FASTP2P_TRANSPORT_TCP || !t->mapped_port)
+        return;
+    if (c->tcp_nat.family[OP_FAM_V4].type != FP_NAT_STABLE)
+        return;
+    op_ju(j, "tcpPunchMap", FP_TCP_MAP_STABLE);
+    op_ju(j, "tcpPunchLastPort", t->mapped_port);
+}
 static void learn_tcp_mapping(tunnel *t, json_object *j) {
     uint64_t mapping = op_integer(j, "tcpPunchMap");
     uint64_t port = op_integer(j, "tcpPunchLastPort");
@@ -2266,14 +2288,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_ju(j, "tcpNatType", c->tcp_nat.family[OP_FAM_V4].type);
     if (t->tcp_v2) op_ju(j, "tcpPunchV2", 1);
     if (t->tcp_punch_immediate) op_ju(j, "tcpPunchImmediate", 1);
-    if (t->tcp_mapping) {
-        op_ju(j, "tcpPunchMap", t->tcp_mapping);
-        op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
-        if (t->tcp_step)
-            op_ju(j, "tcpPunchStep", (uint64_t)(int64_t)t->tcp_step);
-        if (tcp_predict_next_port(t->tcp_mapping, t->tcp_last_port, t->tcp_step))
-            op_ju(j, "tcpPunchPair", 1);
-    }
+    publish_tcp_mapping(c, t, j);
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
      * old peer reads (SPEC 搂5). */
