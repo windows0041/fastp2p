@@ -176,6 +176,8 @@ jobs:
 
   cross-android:
     needs: preflight
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     outputs:
@@ -189,37 +191,48 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: Cache apt packages (ninja-build)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        continue-on-error: true
-        with:
-          packages: ninja-build
-          version: 1.0
+      - name: Fetch the toolchain packages from the CI release
+        id: aptpkg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/apt-debs"
+          if gh release download ci-apt-android-v1 --pattern '*.deb' --dir "$HOME/apt-debs" --clobber >/dev/null 2>&1 &&
+             compgen -G "$HOME/apt-debs/*.deb" >/dev/null; then
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::the release has no packages yet, this run fills it"
+            echo "fetched=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Android NDK
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          # When the apt cache restored these packages, skip the archive
-          # round trip entirely: a slow mirror was the last thing that could
-          # still hold this job for minutes.
-          if sudo dpkg -s ninja-build >/dev/null 2>&1; then
-            echo "toolchain restored from the apt cache"
-          else
-            sudo apt-get "${APT_OPTS[@]}" update -qq
-            sudo apt-get "${APT_OPTS[@]}" install -y ninja-build
+          PKGS="ninja-build"
+          if dpkg -s $PKGS >/dev/null 2>&1; then
+            echo "packages already present in the image"
+            exit 0
           fi
-          python3 -m pip install cmake==3.31.6
-          # A dropped download used to kill the job; each attempt keeps the parts
-          # sdkmanager already finished, so a retry only fetches what is missing.
-          for attempt in 1 2 3; do
-            if "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1; then
-              break
-            fi
-            if [ "$attempt" = 3 ]; then tail -60 sdk-install.log; exit 1; fi
-            echo "::warning::sdkmanager attempt $attempt failed, retrying"
-            sleep 15
-          done
+          if compgen -G "$HOME/apt-debs/*.deb" >/dev/null; then
+            echo "installing from the release packages"
+            sudo dpkg -i "$HOME"/apt-debs/*.deb || sudo apt-get -f install -y || true
+            dpkg -s $PKGS >/dev/null 2>&1 && exit 0
+            echo "::warning::the release packages were incomplete, falling back to apt"
+          fi
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y $PKGS
+          mkdir -p "$HOME/apt-debs"
+          sudo cp /var/cache/apt/archives/*.deb "$HOME/apt-debs/" 2>/dev/null || true
+      - name: Publish the toolchain packages for later runs
+        if: steps.aptpkg.outputs.fetched != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          compgen -G "$HOME/apt-debs/*.deb" >/dev/null || exit 0
+          gh release upload ci-apt-android-v1 "$HOME"/apt-debs/*.deb --clobber
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
@@ -466,6 +479,8 @@ jobs:
           path: build/client-release/Testing/Temporary/LastTest.log
   musl:
     needs: preflight
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -477,25 +492,47 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Cache apt packages (ninja-build)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        continue-on-error: true
-        with:
-          packages: ninja-build qemu-user-static
-          version: 1.0
+      - name: Fetch the toolchain packages from the CI release
+        id: aptpkg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/apt-debs"
+          if gh release download ci-apt-musl-v1 --pattern '*.deb' --dir "$HOME/apt-debs" --clobber >/dev/null 2>&1 &&
+             compgen -G "$HOME/apt-debs/*.deb" >/dev/null; then
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::the release has no packages yet, this run fills it"
+            echo "fetched=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Static musl toolchain and emulator
         run: |
-          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          # When the apt cache restored these packages, skip the archive
-          # round trip entirely: a slow mirror was the last thing that could
-          # still hold this job for minutes.
-          if sudo dpkg -s ninja-build qemu-user-static >/dev/null 2>&1; then
-            echo "toolchain restored from the apt cache"
-          else
-            sudo apt-get "${APT_OPTS[@]}" update -qq
-            sudo apt-get "${APT_OPTS[@]}" install -y ninja-build qemu-user-static
+          set -euo pipefail
+          PKGS="ninja-build qemu-user-static"
+          if dpkg -s $PKGS >/dev/null 2>&1; then
+            echo "packages already present in the image"
+            exit 0
           fi
-
+          if compgen -G "$HOME/apt-debs/*.deb" >/dev/null; then
+            echo "installing from the release packages"
+            sudo dpkg -i "$HOME"/apt-debs/*.deb || sudo apt-get -f install -y || true
+            dpkg -s $PKGS >/dev/null 2>&1 && exit 0
+            echo "::warning::the release packages were incomplete, falling back to apt"
+          fi
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y $PKGS
+          mkdir -p "$HOME/apt-debs"
+          sudo cp /var/cache/apt/archives/*.deb "$HOME/apt-debs/" 2>/dev/null || true
+      - name: Publish the toolchain packages for later runs
+        if: steps.aptpkg.outputs.fetched != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          compgen -G "$HOME/apt-debs/*.deb" >/dev/null || exit 0
+          gh release upload ci-apt-musl-v1 "$HOME"/apt-debs/*.deb --clobber
       - uses: actions/cache@v4
         with:
           path: ~/musl-cross
