@@ -1120,9 +1120,37 @@ static void punch_role_follows_both_nat_types(void) {
     close_tunnel(c, ti, NULL);
     free(c);
 }
+/* The dialer's local port is remembered per peer, not per rule: a pure responder
+ * (the rule lives on the other node) has no app to hold it. */
+static void punch_port_memory_is_per_peer(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    assert(punch_port_get(c, "peer-a") == 0);
+    punch_port_note(c, "peer-a", 40000);
+    assert(punch_port_get(c, "peer-a") == 40000);
+    assert(punch_port_get(c, "peer-b") == 0);
+    punch_port_note(c, "peer-b", 41000);
+    assert(punch_port_get(c, "peer-a") == 40000 && punch_port_get(c, "peer-b") == 41000);
+
+    /* A new tunnel towards that peer picks the remembered port up, in either role. */
+    int ti = new_tunnel(c, "peer-a", 94, FASTP2P_TRANSPORT_TCP, 0);
+    assert(ti >= 0 && c->tunnels[ti].prefer_local_port == 40000);
+    close_tunnel(c, ti, NULL);
+    int qi = new_tunnel(c, "peer-a", 95, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(qi >= 0 && c->tunnels[qi].prefer_local_port == 0);
+    close_tunnel(c, qi, NULL);
+
+    /* After the rotation window the port is dropped so a hopeless one is abandoned. */
+    for (unsigned i = 0; i < TCP_DIALER_PORT_ROUNDS; ++i)
+        punch_port_note(c, "peer-a", (uint16_t)(40000 + i));
+    assert(punch_port_get(c, "peer-a") == 0);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
+    punch_port_memory_is_per_peer();
     responder_publishes_a_stable_mapping();
     stable_peer_keeps_the_reported_port();
     stable_peer_ends_the_round_early();

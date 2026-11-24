@@ -379,10 +379,7 @@ typedef struct {
     int attempts, relay_wanted, relay_requested;
     int lan_tried, udp_direct_tried, udp_reverse6_retry, ipv4_retry;
     int no_relay;  /* operator disabled relay fallback for this rule */
-    /* Local port a dialer keeps across rounds, and how many rounds it has lived;
-     * a fixed local port keeps the NAT mapping towards the peer constant. */
-    uint16_t punch_local_port;
-    unsigned punch_rounds;
+
     /* Operator-chosen relay for this rule; empty means automatic. */
     char relay_node[32];
     uint64_t link_deadline;
@@ -459,6 +456,14 @@ struct fastp2p_client {
     uint64_t port_mapping_wait_until;
     uint64_t token, node_id, reconnect_at, last_rx, heartbeat_at, heartbeat_sent;
     int64_t clock_delta;
+    /* Local port a dialer keeps per peer, so the NAT mapping towards that peer
+     * does not move between rounds. Keyed by peer because a pure responder has no
+     * rule (app) to hold it. */
+    struct {
+        char peer[32];
+        uint16_t port;
+        unsigned rounds;
+    } punch_ports[8];
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
     /* NAT classification is per family (DUALSTACK-SPEC �?/�?). Index 0 holds
@@ -549,6 +554,8 @@ static void relay_join(fastp2p_client *, int);
 static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
+static uint16_t punch_port_get(fastp2p_client *, const char *);
+static void punch_port_note(fastp2p_client *, const char *, uint16_t);
 static void report_client(fastp2p_client *);
 static int nat_filter_level(const nat_filter *filter, uint64_t now);
 static int addr_text_set(const char *text);
@@ -1411,19 +1418,8 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     /* A dialer keeps its local port for a few rounds: the mapping towards the peer
      * stays put, so a window that worked once keeps working, while a hopeless port
      * is still abandoned after that. */
-    if (t->punch_role == TCP_PUNCH_DIALER && t->local_port)
-        for (int i = 0; i < NA; ++i) {
-            app *a = &c->apps[i];
-            if (!a->used || !a->local || strcmp(a->peer, t->peer))
-                continue;
-            if (a->punch_rounds >= TCP_DIALER_PORT_ROUNDS) {
-                a->punch_local_port = 0;
-                a->punch_rounds = 0;
-            } else {
-                a->punch_local_port = t->local_port;
-                ++a->punch_rounds;
-            }
-        }
+    if (t->punch_role == TCP_PUNCH_DIALER)
+        punch_port_note(c, t->peer, t->local_port);
     char failed_relay[32];
     failed_relay[0] = 0;
     /* Remember a relay hop that never carried an application session so the
@@ -1603,6 +1599,42 @@ static int reserve_tunnel_slot(fastp2p_client *c, uint64_t now) {
     }
     return slot;
 }
+/* The last local port used towards a peer: a dialer re-binds it so the mapping the
+ * peer must open a window towards stays put. Peer-keyed, because the responder of
+ * a rule that lives on the other node has no app to remember it in. */
+static uint16_t punch_port_get(fastp2p_client *c, const char *peer) {
+    for (int i = 0; i < 8; ++i)
+        if (c->punch_ports[i].peer[0] && !strcmp(c->punch_ports[i].peer, peer))
+            return c->punch_ports[i].port;
+    return 0;
+}
+static void punch_port_note(fastp2p_client *c, const char *peer, uint16_t port) {
+    if (!peer || !*peer || !port)
+        return;
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < 8; ++i) {
+        if (!c->punch_ports[i].peer[0]) {
+            if (free_slot < 0)
+                free_slot = i;
+        } else if (!strcmp(c->punch_ports[i].peer, peer)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        slot = free_slot; /* a full table keeps the old behaviour: no memory */
+    if (slot < 0)
+        return;
+    if (!c->punch_ports[slot].peer[0])
+        copy_string(c->punch_ports[slot].peer, sizeof(c->punch_ports[slot].peer), peer);
+    if (c->punch_ports[slot].rounds >= TCP_DIALER_PORT_ROUNDS) {
+        c->punch_ports[slot].port = 0;
+        c->punch_ports[slot].rounds = 0;
+    } else {
+        c->punch_ports[slot].port = port;
+        ++c->punch_ports[slot].rounds;
+    }
+}
 static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
         return -1;
@@ -1623,6 +1655,8 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
     t->id = id;
     t->peer_id = op_node_id(peer);
     strcpy(t->peer, peer);
+    if (transport == FASTP2P_TRANSPORT_TCP)
+        t->prefer_local_port = punch_port_get(c, peer);
     /* Every tunnel object starts in T_REPLY; distinguish a stalled tunnel from
      * one that was never created. */
     char born[200];
@@ -1889,13 +1923,23 @@ static int start_probe(fastp2p_client *c, int index) {
         /* A dialer re-binds the port it used last round, so its mapping towards
          * the peer does not move while the peer is opening its window. */
         op_socket fd = -1;
-        if (family == OP_FAM_V4 && t->prefer_local_port)
+        int preferred_missed = 0;
+        if (family == OP_FAM_V4 && t->prefer_local_port) {
             fd = socket_bound(t->transport == FASTP2P_TRANSPORT_QUIC, c->local_ip[family],
                               t->prefer_local_port, 1);
+            preferred_missed = fd < 0;
+        }
         if (fd < 0)
             fd = socket_bound(t->transport == FASTP2P_TRANSPORT_QUIC, c->local_ip[family], 0, 1);
         if (fd < 0)
             continue;
+        if (preferred_missed) {
+            char note[128];
+            snprintf(note, sizeof(note),
+                     "TCP punch preferred local port %u unavailable, using %u",
+                     (unsigned)t->prefer_local_port, (unsigned)socket_port(fd));
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        }
         t->probes[family].fd = fd;
         t->probes[family].local_port = socket_port(fd);
         t->probes[family].response_len = 0;
@@ -3191,10 +3235,7 @@ static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport
     tunnel *t = &c->tunnels[ti];
     t->skip_udp_direct = a->udp_direct_tried;
     t->udp_reverse6_retry = a->udp_reverse6_retry;
-    /* A rule that has been dialling keeps its local port: the mapping the peer
-     * has to open a window towards stays the same from round to round. */
-    if (transport == FASTP2P_TRANSPORT_TCP && a->punch_local_port)
-        t->prefer_local_port = a->punch_local_port;
+
     /* A retry must not reset AEAD counters under a previously used key. */
     a->session = t->session;
     memcpy(a->secret, t->secret, FP_SESSION_SECRET);
