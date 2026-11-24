@@ -104,11 +104,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Restore the cross toolchain from cache
-        uses: actions/cache@v4
-        with:
-          path: ~/mingw-toolchain.tar
-          key: mingw-${{ runner.os }}-24.04-1
       - name: Install cross toolchain
         timeout-minutes: 15
         run: |
@@ -117,31 +112,18 @@ jobs:
             echo "toolchain already present in the image"
             exit 0
           fi
-          # A tarball this workflow wrote itself: restoring it is seconds, while an
-          # apt round trip against a slow archive mirror has held this job for ten
-          # minutes even with every package cached as a .deb.
-          if [ -f "$HOME/mingw-toolchain.tar" ]; then
-            echo "restoring the cached toolchain"
-            sudo tar -C / -xf "$HOME/mingw-toolchain.tar"
-            exit 0
-          fi
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          # A hung mirror must not eat the whole budget: bound the update and retry
-          # once before giving up.
+          # The archive round trip is the only slow part (a slow mirror cost ten
+          # minutes once), so bound it and retry once instead of failing here.
           for attempt in 1 2; do
             if timeout 240 sudo apt-get "${APT_OPTS[@]}" update -qq &&
                sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build; then
-              break
+              exit 0
             fi
             if [ "$attempt" = 2 ]; then echo "::error::apt could not provide the cross toolchain"; exit 1; fi
             echo "::warning::apt attempt $attempt failed, retrying"
             sleep 10
           done
-          sudo tar -C / -cf "$HOME/mingw-toolchain.tar" \
-            $(dpkg -L gcc-mingw-w64-x86-64 gcc-mingw-w64-x86-64-posix gcc-mingw-w64-base \
-                binutils-mingw-w64-x86-64 ninja-build 2>/dev/null | grep -E '^/(usr|etc)' | sort -u)
-
-          python3 -m pip install cmake==3.31.6
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
