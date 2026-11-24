@@ -32,13 +32,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-15 arm64 runners are scarce and can sit in the queue for a long
-          # time, which holds the whole release. macos-14 arm64 comes from the same
-          # pool of images and has been the faster label to get.
-          - runner: macos-14
+          # Both targets build on the Intel image: clang cross-compiles to arm64 and
+          # the pinned dependencies take -arch arm64, so the release never waits for
+          # an arm64 runner (this repository cannot even schedule one: the label is
+          # reported as an unsupported configuration). arm64 artefacts are validated
+          # by building and packaging only - its unit tests cannot execute here.
+          - runner: macos-15-intel
             target: macos-arm64
+            run_tests: false
           - runner: macos-15-intel
             target: macos-x86_64
+            run_tests: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -67,17 +71,19 @@ jobs:
           cmake --install build
           cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
           cmake --build build/consumer
-          build/consumer/sdk-consumer
+          if [ "${{ matrix.run_tests }}" = "true" ]; then build/consumer/sdk-consumer; fi
       - name: Package SDK
         run: |
           python3 scripts/sdk-metadata.py --sdk dist/${{ matrix.target }}
           tar -C dist -czf dist/fastp2p-${{ matrix.target }}.tar.gz ${{ matrix.target }}
       - name: ABI, lifecycle and TLS validation
+        if: matrix.run_tests
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
           ctest --test-dir build --output-on-failure
           dist/${{ matrix.target }}/bin/fastp2p --version
       - name: Enroll a profile through the macOS /etc system alias
+        if: matrix.run_tests
         run: |
           export OPENSSL_EXE="$(brew --prefix openssl@3)/bin/openssl"
           config_dir=$(sudo mktemp -d /etc/fastp2p-ci.XXXXXXXX)
