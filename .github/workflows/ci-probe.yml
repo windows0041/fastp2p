@@ -1,6 +1,8 @@
 name: CI token probe
 on:
   workflow_dispatch:
+  push:
+    tags: ['ci-push-probe-*']
 # Exactly the build.yml shape: the workflow asks for read, the job asks for write.
 permissions:
   contents: read
