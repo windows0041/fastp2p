@@ -1,0 +1,26 @@
+name: CI token probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe release creation from this ref
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          sha=$(curl -sS -H "Authorization: Bearer $TOKEN" \
+                 "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/tags/${GITHUB_REF_NAME#refs/tags/}" \
+                 | python3 -c 'import json,sys;print(json.load(sys.stdin)["object"]["sha"])' 2>/dev/null)
+          [ -n "$sha" ] || sha="$GITHUB_SHA"
+          echo "ref=$GITHUB_REF_NAME sha=$sha"
+          code=$(curl -sS -o /tmp/rel.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
+            -d "{\"tag_name\":\"ci-probe-release-v2\",\"target_commitish\":\"$sha\",\"name\":\"probe\",\"body\":\"probe\",\"draft\":true}")
+          echo "POST /releases -> $code"
+          head -c 300 /tmp/rel.json; echo
