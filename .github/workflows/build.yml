@@ -8,7 +8,9 @@ permissions:
   contents: read
 concurrency:
   group: c-clients-${{ github.ref }}
-  cancel-in-progress: false
+  # A new push supersedes an older build of the same branch, so the runner queue
+  # never waits behind a stale run. A tag build is never cancelled.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 jobs:
   preflight:
     runs-on: ubuntu-24.04
@@ -103,9 +105,12 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install cross toolchain
+        timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y gcc-mingw-w64-x86-64 ninja-build
+          set -euo pipefail
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build
           python3 -m pip install cmake==3.31.6
       - uses: actions/cache@v4
         with:
@@ -146,11 +151,23 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Android NDK
+        timeout-minutes: 15
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ninja-build
+          set -euo pipefail
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y ninja-build
           python3 -m pip install cmake==3.31.6
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1 || { tail -60 sdk-install.log; exit 1; }
+          # A dropped download used to kill the job; each attempt keeps the parts
+          # sdkmanager already finished, so a retry only fetches what is missing.
+          for attempt in 1 2 3; do
+            if "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "build-tools;36.0.0" "platforms;android-36" > sdk-install.log 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then tail -60 sdk-install.log; exit 1; fi
+            echo "::warning::sdkmanager attempt $attempt failed, retrying"
+            sleep 15
+          done
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
@@ -158,8 +175,17 @@ jobs:
           restore-keys: |
             c-deps-android-
             c-deps-cross-
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
       - name: Build and validate Android APK
         id: android
+        timeout-minutes: 20
         env:
           FASTP2P_ANDROID_KEYSTORE_BASE64: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_BASE64 }}
           FASTP2P_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.FASTP2P_ANDROID_KEYSTORE_PASSWORD }}
@@ -178,7 +204,16 @@ jobs:
           else
             echo "::notice::Building a debug APK for CI validation. Configure the Android signing secrets to include a signed APK in Releases."
           fi
-          bash scripts/build-android.sh > android-build.log 2>&1 || { tail -80 android-build.log; exit 1; }
+          # Maven Central answers 429 under load; a retry reuses everything Gradle
+          # already downloaded, so a transient refusal no longer fails the run.
+          for attempt in 1 2 3; do
+            if bash scripts/build-android.sh > android-build.log 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then tail -80 android-build.log; exit 1; fi
+            echo "::warning::android build attempt $attempt failed, retrying"
+            sleep 20
+          done
           apk="android/app/build/outputs/apk/$variant/app-$variant.apk"
           python3 tests/android_artifact.py --apk "$apk" --ndk "$ANDROID_NDK_HOME"
           if [[ "$variant" == release ]]; then
@@ -340,8 +375,9 @@ jobs:
     steps:
       - name: Native Debian 12 build dependencies
         run: |
-          apt-get update -qq
-          apt-get install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          apt-get "${APT_OPTS[@]}" update -qq
+          apt-get "${APT_OPTS[@]}" install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/cache@v4
         with:
@@ -391,8 +427,9 @@ jobs:
           python-version: '3.13'
       - name: Static musl toolchain and emulator
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ninja-build qemu-user-static
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y ninja-build qemu-user-static
       - uses: actions/cache@v4
         with:
           path: ~/musl-cross
