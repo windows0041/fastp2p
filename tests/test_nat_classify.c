@@ -1259,12 +1259,57 @@ static void target_family_switch_needs_no_mapping(void) {
     assert(t->family == OP_FAM_V4);
     free(c);
 }
+/* A central section must give the hub one rule slot per peer: the hub is recognised
+ * by comparing the centre with this node's name, and the slots are chosen from that
+ * index. When the comparison ran against the hostname (before the gateway assigned a
+ * name) every peer ended up with -1 and sdwan_receive refused every packet. */
+static void sdwan_central_assigns_slots(void) {
+    struct { const char *mode, *center, *node; unsigned slots; } cases[] = {
+        {"mesh", "", "xrwgxserver", 2},
+        {"central", "xrwgxserver", "xrwgxserver", 2},   /* this node is the hub */
+        {"central", "redmibook", "xrwgxserver", 1},     /* a peer is the hub */
+    };
+    for (unsigned k = 0; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+        c->node_confirmed = 1;
+        snprintf(c->node, sizeof(c->node), "%s", cases[k].node);
+        char text[512];
+        snprintf(text, sizeof(text),
+                 "{\"Mode\":\"%s\",\"Center\":\"%s\",\"Subnet\":\"10.3.2.0/24\","
+                 "\"Address\":\"10.3.2.30\",\"Peers\":["
+                 "{\"Node\":\"redmibook\",\"Address\":\"10.3.2.10\"},"
+                 "{\"Node\":\"ubuntu06\",\"Address\":\"10.3.2.20\"}]}",
+                 cases[k].mode, cases[k].center);
+        json_object *cfg = json_tokener_parse(text);
+        assert(cfg);
+        assert(fp_client_sdwan_config(c, cfg) == FASTP2P_OK);
+        json_object_put(cfg);
+        assert(c->sdwan && c->sdwan->peer_count == 2);
+        unsigned assigned = 0;
+        for (unsigned i = 0; i < c->sdwan->peer_count; ++i)
+            assigned += c->sdwan->peers[i].app_index >= 0;
+        assert(assigned == cases[k].slots);
+        if (cases[k].slots) {
+            int slot = -1;
+            for (unsigned i = 0; i < c->sdwan->peer_count; ++i)
+                if (c->sdwan->peers[i].app_index >= 0)
+                    slot = c->sdwan->peers[i].app_index;
+            assert(slot >= 0 && c->apps[slot].sdwan && c->apps[slot].used);
+        }
+        fp_sdwan_stop(c->sdwan);
+        free(c->sdwan);
+        c->sdwan = NULL;
+        free(c);
+    }
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     v6_is_skipped_when_the_host_has_no_v6();
     punch_target_family_wins();
     only_a_preserving_mapping_is_pinned();
+    sdwan_central_assigns_slots();
     target_family_switch_needs_no_mapping();
     punch_port_memory_is_per_peer();
     dialer_port_survives_the_round();

@@ -456,6 +456,8 @@ struct fastp2p_client {
     uint64_t port_mapping_wait_until;
     uint64_t token, node_id, reconnect_at, last_rx, heartbeat_at, heartbeat_sent;
     int64_t clock_delta;
+    /* 1 once the gateway has named this node; before that c->node is the hostname */
+    int node_confirmed;
     /* Local port a dialer keeps per peer, so the NAT mapping towards that peer
      * does not move between rounds. Keyed by peer because a pure responder has no
      * rule (app) to hold it. */
@@ -4116,6 +4118,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 if (c->automatic_node || strcmp(c->node, assigned)) {
                     strcpy(c->node, assigned);
                     c->node_id = op_node_id(c->node);
+                    c->node_confirmed = 1;
                     char message[64];
                     snprintf(message, sizeof(message), "node name: %s", c->node);
                     emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
@@ -7708,9 +7711,10 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         state->center_index = FP_SDWAN_LOCAL;
     for (unsigned i = 0; i < state->peer_count; ++i) {
         const char *peer = state->peers[i].node;
-        if (!valid_node(peer) || !strcmp(c->node, peer)) {
+        if (!valid_node(peer) || (c->node_confirmed && !strcmp(c->node, peer))) {
             char note[128];
-            snprintf(note, sizeof(note), "sdwan peer name %s is not a valid remote node", peer);
+            snprintf(note, sizeof(note), "sdwan peer name %s is not a valid remote node%s", peer,
+                     c->node_confirmed ? "" : " (hostname matches, but no name is assigned yet)");
             sdwan_refusal(c, note);
             free(state);
             return FASTP2P_EINVAL;
@@ -7718,11 +7722,21 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         if (state->central && !strcmp(state->center, peer))
             state->center_index = (int)i;
     }
+    /* The slot assignment works on the client's live state, so it has to be installed
+     * first: reading it back through c->sdwan after the fact made every section fail
+     * with "could not give every peer a rule slot" and took the whole configuration
+     * down with it. */
+    c->sdwan = state;
     if (sdwan_assign_slots(c)) {
+        char note[192];
+        snprintf(note, sizeof(note),
+                 "sdwan could not give every peer a rule slot (central=%d center_index=%d peers=%u)",
+                 state->central, state->center_index, state->peer_count);
+        sdwan_refusal(c, note);
+        c->sdwan = NULL;
         free(state);
         return FASTP2P_EINVAL;
     }
-    c->sdwan = state;
     sdwan_reconcile(c);
     return FASTP2P_OK;
 #else
