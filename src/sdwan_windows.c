@@ -231,6 +231,31 @@ static const char *failure(fp_sdwan *state, const char *action, DWORD code) {
     return state->error;
 }
 
+/* Windows hands packets a TUN writes to the stack as *inbound* traffic on that
+ * interface, and the Public profile's default policy drops them - an ICMP echo request
+ * addressed to this node's overlay address never reaches the stack, so the hub looks
+ * like it silently discards packets while every rule inside the client is correct.
+ * Allow inbound traffic on the overlay adapter only: nothing but packets this client
+ * wrote into it can arrive there. */
+static void allow_overlay_interface(void) {
+    static const wchar_t application[] = L"C:\\Windows\\System32\\netsh.exe";
+    wchar_t command[512];
+    _snwprintf(command, ARRAYSIZE(command),
+               L"\"%s\" advfirewall firewall add rule name=\"FastP2P overlay\" "
+               L"dir=in action=allow interface=\"fastp2p0\" profile=any enable=yes",
+               application);
+    command[ARRAYSIZE(command) - 1] = 0;
+    STARTUPINFOW startup = {0};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {0};
+    if (!CreateProcessW(application, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
+                        &startup, &process))
+        return;
+    WaitForSingleObject(process.hProcess, 5000);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+}
+
 const char *fp_sdwan_start(fp_sdwan *state) {
     if (state->windows)
         return "SD-WAN Wintun is already active";
@@ -268,6 +293,7 @@ const char *fp_sdwan_start(fp_sdwan *state) {
         return failure(state, "route conflicts with an existing Windows route", error);
     if (error)
         return failure(state, "cannot install the Windows routes", error);
+    allow_overlay_interface();
     return NULL;
 }
 
