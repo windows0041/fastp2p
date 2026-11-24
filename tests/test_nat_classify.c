@@ -1085,8 +1085,44 @@ static void responder_publishes_a_stable_mapping(void) {
     close_tunnel(c, ti, NULL);
     free(c);
 }
+/* Mixed pairs get a division of labour; equal or unknown types keep both dialling,
+ * and a role the gateway assigned is never overridden. */
+static void punch_role_follows_both_nat_types(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "remote-node", 93, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_STABLE;
+    t->peer_tcp_dependent = 1;
+    assert(punch_role_decide(c, t) == TCP_PUNCH_OPENER);
+
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_DEPENDENT;
+    t->peer_tcp_dependent = 0;
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    assert(punch_role_decide(c, t) == TCP_PUNCH_DIALER);
+
+    /* Two stable endpoints dial each other as before. */
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_STABLE;
+    assert(punch_role_decide(c, t) == TCP_PUNCH_AUTO);
+
+    /* The gateway's assignment wins over the local guess. */
+    t->punch_role = TCP_PUNCH_OPENER;
+    c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_DEPENDENT;
+    assert(punch_role_decide(c, t) == TCP_PUNCH_OPENER);
+
+    t->punch_role = TCP_PUNCH_AUTO;
+    t->peer_tcp_mapping = 0;
+    t->peer_tcp_dependent = 0;
+    c->tcp_nat.family[OP_FAM_V4].type = 0; /* unknown */
+    assert(punch_role_decide(c, t) == TCP_PUNCH_AUTO);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
+    punch_role_follows_both_nat_types();
     responder_publishes_a_stable_mapping();
     stable_peer_keeps_the_reported_port();
     stable_peer_ends_the_round_early();
