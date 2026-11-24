@@ -104,26 +104,36 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Restore the cross toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: ~/mingw-debs
+          key: mingw-debs-24.04-1
       - name: Install cross toolchain
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           if dpkg -s gcc-mingw-w64-x86-64 >/dev/null 2>&1; then
             echo "toolchain already present in the image"
             exit 0
           fi
-          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          # The archive round trip is the only slow part (a slow mirror cost ten
-          # minutes once), so bound it and retry once instead of failing here.
-          for attempt in 1 2; do
-            if timeout 240 sudo apt-get "${APT_OPTS[@]}" update -qq &&
-               sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build; then
-              exit 0
+          # The cached .deb files install without touching the network. Keeping them
+          # ourselves is what makes this reliable: an apt round trip against a slow
+          # mirror has held this job for ten to twenty minutes even when every
+          # package was already cached as a .deb elsewhere.
+          if compgen -G "$HOME/mingw-debs/*.deb" >/dev/null; then
+            echo "installing the toolchain from cached packages"
+            if ! sudo dpkg -i "$HOME"/mingw-debs/*.deb; then
+              sudo apt-get -f install -y || true
             fi
-            if [ "$attempt" = 2 ]; then echo "::error::apt could not provide the cross toolchain"; exit 1; fi
-            echo "::warning::apt attempt $attempt failed, retrying"
-            sleep 10
-          done
+            dpkg -s gcc-mingw-w64-x86-64 >/dev/null 2>&1 && exit 0
+            echo "cached packages were incomplete, falling back to the archive"
+          fi
+          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${APT_OPTS[@]}" update -qq
+          sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build
+          mkdir -p "$HOME/mingw-debs"
+          sudo cp /var/cache/apt/archives/*.deb "$HOME/mingw-debs/" 2>/dev/null || true
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
