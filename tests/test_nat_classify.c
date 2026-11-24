@@ -1281,7 +1281,16 @@ static void sdwan_section_builds_rules(void) {
                  cases[k].mode, cases[k].center, cases[k].transport);
         json_object *cfg = json_tokener_parse(text);
         assert(cfg);
+#if defined(__linux__) || defined(_WIN32)
         assert(fp_client_sdwan_config(c, cfg) == FASTP2P_OK);
+#else
+        /* SD-WAN needs a TUN device, so the section is refused on this platform; the
+         * parse itself still has to accept the document. */
+        assert(fp_client_sdwan_config(c, cfg) == FASTP2P_EINVAL);
+        json_object_put(cfg);
+        free(c);
+        continue;
+#endif
         json_object_put(cfg);
         assert(c->sdwan && c->sdwan->peer_count == 2);
         assert(c->sdwan->transport == (cases[k].tcp ? FASTP2P_TRANSPORT_TCP : FASTP2P_TRANSPORT_QUIC));
