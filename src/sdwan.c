@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "sdwan.h"
 #include "platform.h"
 #include <string.h>
@@ -88,20 +89,29 @@ static int virtual_address(const char *text, uint32_t subnet, unsigned bits, uin
            *address == subnet || *address == (subnet | ~mask) ? -1 : 0;
 }
 
-int fp_sdwan_parse(fp_sdwan *state, json_object *config) {
+static int sdwan_reject(char *why, size_t why_len, const char *reason) {
+    if (why && why_len)
+        snprintf(why, why_len, "%s", reason);
+    return -1;
+}
+
+/* `why` names the check that refused the section: the console only shows a count
+ * and a revision, so a rejected push used to be impossible to diagnose from the
+ * client log. */
+int fp_sdwan_parse(fp_sdwan *state, json_object *config, char *why, size_t why_len) {
     *state = (fp_sdwan){.fd = -1, .center_index = FP_SDWAN_NO_ROUTE};
     if (!json_object_is_type(config, json_type_object))
-        return -1;
+        return sdwan_reject(why, why_len, "sdwan section is not an object");
     json_object *value, *peers;
     if (json_object_object_get_ex(config, "Mode", &value)) {
         const char *mode = string_value(value);
         if (!mode || (strcmp(mode, "central") && strcmp(mode, "mesh")))
-            return -1;
+            return sdwan_reject(why, why_len, "sdwan Mode must be central or mesh");
         state->central = !strcmp(mode, "central");
         if (state->central) {
             const char *center = get_string(config, "Center");
             if (!center || strlen(center) >= sizeof(state->center))
-                return -1;
+                return sdwan_reject(why, why_len, "sdwan Center name is missing or too long");
             strcpy(state->center, center);
         }
     }
@@ -110,29 +120,48 @@ int fp_sdwan_parse(fp_sdwan *state, json_object *config) {
     unsigned bits;
     if (json_object_object_get_ex(config, "Subnet", &value))
         pool = string_value(value);
-    if (!pool || parse_prefix(pool, &subnet, &bits) || bits > 30 ||
-        virtual_address(get_string(config, "Address"), subnet, bits, &state->address) ||
-        !json_object_object_get_ex(config, "Peers", &peers) ||
-        !json_object_is_type(peers, json_type_array) || !json_object_array_length(peers) ||
-        json_object_array_length(peers) > FP_SDWAN_MAX_PEERS)
+    if (!pool || parse_prefix(pool, &subnet, &bits) || bits > 30)
+        return sdwan_reject(why, why_len, "sdwan Subnet is not a usable IPv4 prefix");
+    if (virtual_address(get_string(config, "Address"), subnet, bits, &state->address))
+        return sdwan_reject(why, why_len, "sdwan Address is outside the Subnet");
+    if (!json_object_object_get_ex(config, "Peers", &peers) ||
+        !json_object_is_type(peers, json_type_array) || !json_object_array_length(peers))
+        return sdwan_reject(why, why_len, "sdwan Peers is missing or empty");
+    if (json_object_array_length(peers) > FP_SDWAN_MAX_PEERS) {
+        if (why && why_len) snprintf(why, why_len, "sdwan has more than %d peers", FP_SDWAN_MAX_PEERS);
         return -1;
+    }
     if (add_route(state, state->address, 32, FP_SDWAN_LOCAL) ||
         add_routes(state, config, "LocalRoutes", FP_SDWAN_LOCAL, subnet, bits))
-        return -1;
+        return sdwan_reject(why, why_len, "sdwan LocalRoutes do not fit the routing table");
     for (size_t i = 0; i < json_object_array_length(peers); ++i) {
         json_object *peer = json_object_array_get_idx(peers, i);
         if (!json_object_is_type(peer, json_type_object))
-            return -1;
+            return sdwan_reject(why, why_len, "sdwan peer entry is not an object");
         const char *name = get_string(peer, "Node");
         uint32_t address;
-        if (!name || !*name || strlen(name) >= sizeof(state->peers[0].node) ||
-            virtual_address(get_string(peer, "Address"), subnet, bits, &address) ||
-            add_route(state, address, 32, (int)i) ||
-            add_routes(state, peer, "Routes", (int)i, subnet, bits))
+        if (!name || !*name || strlen(name) >= sizeof(state->peers[0].node))
+            return sdwan_reject(why, why_len, "sdwan peer has an invalid Node name");
+        if (virtual_address(get_string(peer, "Address"), subnet, bits, &address)) {
+            if (why && why_len)
+                snprintf(why, why_len, "sdwan peer %s address is outside the Subnet", name);
             return -1;
+        }
+        if (add_route(state, address, 32, (int)i)) {
+            if (why && why_len)
+                snprintf(why, why_len, "sdwan peer %s routes conflict with an earlier entry", name);
+            return -1;
+        }
+        if (add_routes(state, peer, "Routes", (int)i, subnet, bits)) {
+            if (why && why_len)
+                snprintf(why, why_len, "sdwan peer %s Routes do not fit the routing table", name);
+            return -1;
+        }
         for (size_t j = 0; j < i; ++j)
-            if (!strcmp(state->peers[j].node, name))
+            if (!strcmp(state->peers[j].node, name)) {
+                snprintf(why && why_len ? why : NULL, why_len, "sdwan peer %s is listed twice", name);
                 return -1;
+            }
         strcpy(state->peers[i].node, name);
         state->peers[i].app_index = -1;
     }

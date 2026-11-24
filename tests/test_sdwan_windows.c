@@ -66,7 +66,7 @@ int main(void) {
     json_object *config = json_tokener_parse(text);
     const uint32_t remote = UINT32_C(0xc6120182);
     const uint32_t subnet = UINT32_C(0xcb007100);
-    CHECK(config && !fp_sdwan_parse(&state, config));
+    CHECK(config && !fp_sdwan_parse(&state, config, NULL, 0));
     CHECK(address_exists(state.address) == 0);
     CHECK(route_exists(remote, 32) == 0 && route_exists(subnet, 24) == 0);
     const char *error = fp_sdwan_start(&state);

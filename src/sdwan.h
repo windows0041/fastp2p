@@ -38,7 +38,7 @@ typedef struct {
 } fp_sdwan;
 
 /* Returns 0 on success; callers allocate the optional configuration. */
-int fp_sdwan_parse(fp_sdwan *state, json_object *config);
+int fp_sdwan_parse(fp_sdwan *state, json_object *config, char *why, size_t why_len);
 int fp_sdwan_owner(const fp_sdwan *state, uint32_t address);
 int fp_sdwan_ipv4(const uint8_t *packet, size_t length, uint32_t *source, uint32_t *destination);
 

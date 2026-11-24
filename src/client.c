@@ -7573,7 +7573,10 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
     fp_sdwan *state = malloc(sizeof(*state));
     if (!state)
         return FASTP2P_EIO;
-    if (fp_sdwan_parse(state, config)) {
+    char why[192] = "";
+    if (fp_sdwan_parse(state, config, why, sizeof(why))) {
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL,
+             why[0] ? why : "sdwan configuration rejected");
         free(state);
         return FASTP2P_EINVAL;
     }
@@ -7585,6 +7588,9 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
     for (unsigned i = 0; i < state->peer_count; ++i) {
         const char *peer = state->peers[i].node;
         if (!valid_node(peer) || !strcmp(c->node, peer)) {
+            char note[128];
+            snprintf(note, sizeof(note), "sdwan peer name %s is not a valid remote node", peer);
+            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
             free(state);
             return FASTP2P_EINVAL;
         }
@@ -7593,8 +7599,17 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
     }
     unsigned needed = !state->central || state->center_index == FP_SDWAN_LOCAL ? state->peer_count :
                       state->center_index >= 0 ? 1 : 0;
-    if (needed > available ||
-        (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE)) {
+    if (needed > available) {
+        char note[160];
+        snprintf(note, sizeof(note), "sdwan needs %u rule slots, only %u are free", needed, available);
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
+        free(state);
+        return FASTP2P_EINVAL;
+    }
+    if (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE) {
+        char note[160];
+        snprintf(note, sizeof(note), "sdwan center %s is not one of the peers", state->center);
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
         free(state);
         return FASTP2P_EINVAL;
     }
