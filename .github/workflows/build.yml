@@ -104,6 +104,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Cache apt packages (gcc-mingw-w64-x86-64)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        continue-on-error: true
+        with:
+          packages: gcc-mingw-w64-x86-64 ninja-build
+          version: 1.0
       - name: Install cross toolchain
         timeout-minutes: 10
         run: |
@@ -150,6 +156,12 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - name: Cache apt packages (ninja-build)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        continue-on-error: true
+        with:
+          packages: ninja-build
+          version: 1.0
       - name: Android NDK
         timeout-minutes: 15
         run: |
@@ -375,9 +387,9 @@ jobs:
     steps:
       - name: Native Debian 12 build dependencies
         run: |
-          APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          apt-get "${APT_OPTS[@]}" update -qq
-          apt-get "${APT_OPTS[@]}" install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
+          # This job runs inside a slim container: sh, not bash, so no arrays.
+          apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true update -qq
+          apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true install -y git curl wget python3 ca-certificates build-essential cmake ninja-build pkg-config openssl iproute2 iptables libwebsockets-dev libjson-c-dev libssl-dev libsqlite3-dev zstd
       - uses: actions/checkout@v5
       - uses: actions/cache@v4
         with:
@@ -425,6 +437,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Cache apt packages (ninja-build)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        continue-on-error: true
+        with:
+          packages: ninja-build qemu-user-static
+          version: 1.0
       - name: Static musl toolchain and emulator
         run: |
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
