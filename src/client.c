@@ -2436,9 +2436,17 @@ static void probe_complete(fastp2p_client *c, int index) {
      * the gateway mapping probe is unreachable - leaves the peer with no port to
      * dial, so it punches blindly and ends up on the relay. */
     int no_translation = nat_filter_level(&c->udp_filter, mono()) >= 6;
+    /* An unmeasured mapping still has to name a port: with 0 the peer learns
+     * nothing for this family and the round starts with no dialable endpoint at all.
+     * The listening port is the best available guess - it is the right answer on a
+     * port-preserving mapping, and on a translating one it is still a port the peer
+     * can spray around. */
     op_ju(j, "coneNatPort", t->mapped_ports[OP_FAM_V4]
                               ? t->mapped_ports[OP_FAM_V4]
-                              : (no_translation ? c->public_port : 0));
+                              : (no_translation ? c->public_port : t->local_port));
+    if (!t->mapped_ports[OP_FAM_V4] && !no_translation)
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+             "TCP punch mapping not measured; advertising the listening port instead");
     if (t->mapped_ports[OP_FAM_V6]) {
         op_js(j, "fromIP6",
               t->lan ? c->local_ip[OP_FAM_V6] : t->mapped_text[OP_FAM_V6]);
@@ -5267,7 +5275,9 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
          * from; it keeps the historical text target learned from the peer. */
         int family = choose_punch_family(c, t);
         if (family < 0)
-            family = t->family;
+            family = t->peer_ready[OP_FAM_V4] ? OP_FAM_V4
+                   : t->peer_ready[OP_FAM_V6] ? OP_FAM_V6
+                                              : t->family;
         if (!family_usable(c, t, family)) {
             /* Nothing to aim at: say which half is missing, otherwise the tunnel just
              * sits in T_TIME until its deadline and the log names only the timeout. */
@@ -5287,16 +5297,21 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             }
         } else if (!punch_family_available(c, family)) {
             /* The peer asked for a family this host has no address in. Answer in the
-             * one we do have when the peer published there; otherwise end the round
-             * instead of installing an address every dial would refuse. */
+             * one we do have when the peer published there; otherwise stay quiet with
+             * the listener up - the peer keeps dialling our known port for the whole
+             * window, and closing here ended the round before its SYN had a chance. */
             int other = family == OP_FAM_V6 ? OP_FAM_V4 : OP_FAM_V6;
-            if (!family_usable(c, t, other) || use_punch_family(c, ti, other)) {
-                close_tunnel(c, ti, "peer chose an address family this host does not support");
+            if (family_usable(c, t, other) && use_punch_family(c, ti, other) == 0) {
+                char note[160];
+                snprintf(note, sizeof(note), "peer chose family %d, answering in family %d", family, other);
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+            } else {
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+                     "peer published no usable endpoint; listening only this round");
+                tcp_punch_listen(c, ti);
+                t->at = t->deadline + 1;
                 return;
             }
-            char note[160];
-            snprintf(note, sizeof(note), "peer chose family %d, answering in family %d", family, other);
-            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         } else if (!t->peer_addr.len &&
                    op_addr_from_text(&t->peer_addr, t->ip, t->remote_port)) {
             close_tunnel(c, ti, "invalid peer address");
