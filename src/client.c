@@ -7613,7 +7613,12 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         free(state);
         return FASTP2P_EINVAL;
     }
-    if (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE) {
+    /* The validator builds this client before login, so c->node is still unknown: a
+     * central section whose Center is this very node would otherwise look like a
+     * center that is not among the peers and the whole push would be refused. The
+     * check stays for the apply path, where the node name is known. */
+    if (state->central && state->center[0] && c->node[0] &&
+        state->center_index == FP_SDWAN_NO_ROUTE) {
         char note[160];
         snprintf(note, sizeof(note), "sdwan center %s is not one of the peers", state->center);
         sdwan_refusal(c, note);
