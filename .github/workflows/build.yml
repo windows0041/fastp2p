@@ -32,7 +32,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          # macos-15 arm64 runners are scarce and can sit in the queue for a long
+          # time, which holds the whole release. macos-14 arm64 comes from the same
+          # pool of images and has been the faster label to get.
+          - runner: macos-14
             target: macos-arm64
           - runner: macos-15-intel
             target: macos-x86_64
