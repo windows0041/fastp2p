@@ -7619,6 +7619,46 @@ static void sdwan_refusal(fastp2p_client *c, const char *note) {
  * whose Center is this very node then resolves to "not one of the peers", and every
  * packet is dropped later because sdwan_send cannot find an owner for the center.
  * Re-derive the index once the real node name is known. */
+/* Give every peer that this node must reach a rule slot. The count depends on
+ * whether this node is the hub, which is only known once the node name is: a section
+ * parsed before login leaves centre_index unresolved, so the slots have to be
+ * (re)assigned when the name arrives, not only when the document is parsed. */
+static int sdwan_assign_slots(fastp2p_client *c) {
+    fp_sdwan *state = c->sdwan;
+    if (!state || !state->peer_count)
+        return -1;
+    int hub = !state->central || state->center_index == FP_SDWAN_LOCAL;
+    if (state->central && !hub && state->center_index < 0)
+        return -1;
+    unsigned needed = hub || !state->central ? state->peer_count : 1;
+    unsigned available = 0;
+    for (int i = 0; i < NA; ++i)
+        available += !c->apps[i].used;
+    if (needed > available)
+        return -1;
+    int slot = 0;
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        fp_sdwan_peer *peer = &state->peers[i];
+        if (!hub && state->center_index != (int)i) {
+            peer->app_index = -1;
+            continue;
+        }
+        if (peer->app_index >= 0 && c->apps[peer->app_index].used &&
+            c->apps[peer->app_index].sdwan && !strcmp(c->apps[peer->app_index].peer, peer->node))
+            continue;   /* already has its slot */
+        while (slot < NA && c->apps[slot].used)
+            ++slot;
+        if (slot >= NA)
+            return -1;
+        peer->app_index = slot;
+        app *a = &c->apps[slot++];
+        *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
+                   .transport = FASTP2P_TRANSPORT_QUIC, .id = random_id()};
+        strcpy(a->peer, peer->node);
+    }
+    return 0;
+}
+
 static void sdwan_reconcile(fastp2p_client *c) {
     fp_sdwan *state = c->sdwan;
     if (!state || !state->central || !state->center[0] || !c->node[0])
@@ -7630,8 +7670,12 @@ static void sdwan_reconcile(fastp2p_client *c) {
         for (unsigned i = 0; i < state->peer_count; ++i)
             if (!strcmp(state->center, state->peers[i].node))
                 index = (int)i;
-    if (index == state->center_index)
+    if (index == state->center_index) {
+        /* The centre resolved correctly at parse time, but a slot may still be
+         * missing when the peer list grew after the section was applied. */
+        (void)sdwan_assign_slots(c);
         return;
+    }
     state->center_index = index;
     {
         char note[160];
@@ -7639,6 +7683,7 @@ static void sdwan_reconcile(fastp2p_client *c) {
                  state->center, index == FP_SDWAN_LOCAL ? "this host" : "a peer", c->node);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
     }
+    (void)sdwan_assign_slots(c);
 }
 
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
@@ -7669,39 +7714,9 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         if (state->central && !strcmp(state->center, peer))
             state->center_index = (int)i;
     }
-    unsigned needed = !state->central || state->center_index == FP_SDWAN_LOCAL ? state->peer_count :
-                      state->center_index >= 0 ? 1 : 0;
-    if (needed > available) {
-        char note[160];
-        snprintf(note, sizeof(note), "sdwan needs %u rule slots, only %u are free", needed, available);
-        sdwan_refusal(c, note);
+    if (sdwan_assign_slots(c)) {
         free(state);
         return FASTP2P_EINVAL;
-    }
-    /* A center that is neither this node nor one of the peers has no tunnel to build,
-     * but it is not a reason to refuse the whole configuration - doing so blocked
-     * every push of a central network to its own hub and took the SD-WAN down with
-     * it. Say it once and keep the section: the peers that do resolve still connect. */
-    if (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE) {
-        char note[192];
-        snprintf(note, sizeof(note),
-                 "sdwan center %s is not this node (%s) and not among the peers; peers still connect",
-                 state->center, c->node[0] ? c->node : "?");
-        emit(c, FASTP2P_EVENT_ERROR, 0, 0, note);
-        fprintf(stderr, "sdwan configuration warning: %s\n", note);
-    }
-    int slot = 0;
-    for (unsigned i = 0; i < state->peer_count; ++i) {
-        if (state->central && state->center_index != FP_SDWAN_LOCAL && state->center_index != (int)i)
-            continue;
-        while (c->apps[slot].used)
-            ++slot;
-        fp_sdwan_peer *peer = &state->peers[i];
-        peer->app_index = slot;
-        app *a = &c->apps[slot++];
-        *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
-                   .transport = FASTP2P_TRANSPORT_QUIC, .id = random_id()};
-        strcpy(a->peer, peer->node);
     }
     c->sdwan = state;
     sdwan_reconcile(c);
