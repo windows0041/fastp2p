@@ -464,6 +464,7 @@ struct fastp2p_client {
         uint16_t port;
         unsigned rounds;
     } punch_ports[8];
+    uint64_t sdwan_drop_at;
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
     /* NAT classification is per family (DUALSTACK-SPEC �?/�?). Index 0 holds
@@ -4553,15 +4554,39 @@ static int tseal(fastp2p_client *c, tunnel *t, uint16_t sub, const void *data, s
         return -1;
     return tframe(t, sub, buffer, written);
 }
+/* The overlay can look healthy - TUN up, routes installed, "peer attached" - while
+ * every packet dies inside the client. These counters are the only way to tell which
+ * stage dropped it, and they stay silent unless something is actually lost. */
+static void sdwan_note_drop(fastp2p_client *c, const char *why) {
+    uint64_t now = mono();
+    if (c->sdwan_drop_at && now < c->sdwan_drop_at)
+        return;
+    c->sdwan_drop_at = now + 30 * NS;
+    char note[160];
+    snprintf(note, sizeof(note), "sdwan: dropping packets (%s)", why);
+    emit(c, FASTP2P_EVENT_ERROR, 0, 0, note);
+    fprintf(stderr, "sdwan data path: %s\n", why);
+}
+
 static void sdwan_send(fastp2p_client *c, int owner, const uint8_t *packet, size_t length) {
     const fp_sdwan *state = c->sdwan;
     if (state->central && state->center_index != FP_SDWAN_LOCAL)
         owner = state->center_index;
-    if (owner < 0 || state->peers[owner].app_index < 0)
+    if (owner < 0 || state->peers[owner].app_index < 0) {
+        sdwan_note_drop(c, "no route or rule slot for the destination peer");
         return;
+    }
     const app *a = &c->apps[state->peers[owner].app_index];
-    if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index]))
+    if (a->synced && a->tunnel_index >= 0 && tunnel_ready(&c->tunnels[a->tunnel_index])) {
         (void)tseal(c, &c->tunnels[a->tunnel_index], TUN_SDWAN_IPV4, packet, length);
+        return;
+    }
+    {
+        char why[96];
+        snprintf(why, sizeof(why), "link to %s is not ready (synced=%d tunnel=%d)",
+                 a->peer, a->synced, a->tunnel_index);
+        sdwan_note_drop(c, why);
+    }
 }
 
 static void sdwan_receive(fastp2p_client *c, const tunnel *t, uint8_t *packet, size_t length) {
@@ -4570,14 +4595,18 @@ static void sdwan_receive(fastp2p_client *c, const tunnel *t, uint8_t *packet, s
     if (fp_sdwan_ipv4(packet, length, &source, &destination))
         return;
     int from = fp_sdwan_owner(state, source), to = fp_sdwan_owner(state, destination);
-    if (from < 0 || to == FP_SDWAN_NO_ROUTE)
+    if (from < 0 || to == FP_SDWAN_NO_ROUTE) {
+        sdwan_note_drop(c, "received a packet from an unknown overlay source");
         return;
+    }
     int hub = state->central && state->center_index == FP_SDWAN_LOCAL;
     int incoming = state->central && !hub ? state->center_index : from;
     const char *peer = t->relay_wait ? t->relay_peer : t->peer;
     if (incoming < 0 || state->peers[incoming].app_index < 0 ||
-        strcmp(peer, c->apps[state->peers[incoming].app_index].peer))
+        strcmp(peer, c->apps[state->peers[incoming].app_index].peer)) {
+        sdwan_note_drop(c, "received a packet on a link that is not its route");
         return;
+    }
     if (to == FP_SDWAN_LOCAL) {
         fp_sdwan_write(state, packet, length);
         return;
@@ -7697,8 +7726,10 @@ static void tick_sdwan(fastp2p_client *c) {
             fp_sdwan_owner(state, source) != FP_SDWAN_LOCAL)
             continue;
         int owner = fp_sdwan_owner(state, destination);
-        if (owner < 0)
+        if (owner < 0) {
+            sdwan_note_drop(c, "no peer owns the destination");
             continue;
+        }
         sdwan_send(c, owner, packet, (size_t)length);
     }
 }
