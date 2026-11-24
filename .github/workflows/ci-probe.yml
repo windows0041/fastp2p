@@ -1,26 +1,28 @@
 name: CI token probe
 on:
   workflow_dispatch:
+# Exactly the build.yml shape: the workflow asks for read, the job asks for write.
 permissions:
-  contents: write
+  contents: read
 jobs:
-  probe:
+  job-level-write:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
-      - name: Probe release creation from this ref
+      - name: Probe release creation
         env:
           TOKEN: ${{ github.token }}
         run: |
           set +e
-          sha=$(curl -sS -H "Authorization: Bearer $TOKEN" \
-                 "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/tags/${GITHUB_REF_NAME#refs/tags/}" \
-                 | python3 -c 'import json,sys;print(json.load(sys.stdin)["object"]["sha"])' 2>/dev/null)
-          [ -n "$sha" ] || sha="$GITHUB_SHA"
-          echo "ref=$GITHUB_REF_NAME sha=$sha"
-          code=$(curl -sS -o /tmp/rel.json -w '%{http_code}' -X POST \
+          code=$(curl -sS -o /tmp/a.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
-            -d "{\"tag_name\":\"ci-probe-release-v2\",\"target_commitish\":\"$sha\",\"name\":\"probe\",\"body\":\"probe\",\"draft\":true}")
-          echo "POST /releases -> $code"
-          head -c 300 /tmp/rel.json; echo
+            -d '{"tag_name":"ci-probe-job-write","name":"probe","body":"probe","draft":true}')
+          echo "job-level write on ref=$GITHUB_REF_NAME -> $code"
+          head -c 300 /tmp/a.json; echo
+          echo "---- ref details"
+          curl -sS -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print("event", d["event"], "head_branch", d.get("head_branch"))'
