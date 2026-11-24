@@ -104,6 +104,17 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Prefer the official Ubuntu archive
+        run: |
+          set -euo pipefail
+          # The region mirror the runner ships with measured ~200 kB/s today, which
+          # is why 40 MB of packages took fifteen minutes. Keep the packages on the
+          # official CDN instead; a dead entry is ignored by apt.
+          for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$file" ] || continue
+            sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$file"
+          done
+          sudo rm -f /etc/apt/apt-mirrors.txt
       - name: Restore the cross toolchain packages
         uses: actions/cache@v4
         with:
