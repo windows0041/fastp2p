@@ -1214,10 +1214,17 @@ static void punch_target_family_wins(void) {
     assert(t->family == OP_FAM_V4);
     assert(op_family_index(op_addr_family(&t->peer_addr)) == OP_FAM_V4);
 
-    /* A target in a family this host has no address for ends the round. */
+    /* A target in a family this host has no address for ends the round, even when
+     * the tunnel's own family already matches it. */
     assert(!op_addr_from_text(&t->peer_addr, "2409:895a:f363::9", 42000));
     t->family = OP_FAM_V4;
     assert(punch_realign_family(c, ti) == -1);
+    int ti2 = new_tunnel(c, "peer-fam2", 199, FASTP2P_TRANSPORT_TCP, 0);
+    assert(ti2 >= 0);
+    tunnel *v6 = &c->tunnels[ti2];
+    assert(!op_addr_from_text(&v6->peer_addr, "2409:895a:f363::9", 42000));
+    v6->family = OP_FAM_V6;
+    assert(punch_realign_family(c, ti2) == -1);
     free(c);
 }
 /* A port-preserving mapping is pinned; any other mapping rotates every round,

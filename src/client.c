@@ -2831,12 +2831,14 @@ static int punch_realign_family(fastp2p_client *c, int index) {
     int target = op_family_index(op_addr_family(&t->peer_addr));
     if (target < 0)
         return 0;
-    if (t->family == target)
-        return 0;
     if (!punch_family_available(c, target)) {
+        /* Matching family or not, this host cannot open the socket: dialling would
+         * fail every attempt with EAFNOSUPPORT and burn the whole window. */
         close_tunnel(c, index, "TCP punch target family is unavailable here");
         return -1;
     }
+    if (t->family == target)
+        return 0;
     if (use_punch_family(c, index, target) != 0) {
         close_tunnel(c, index, "TCP punch target family could not be selected");
         return -1;
@@ -5268,6 +5270,18 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                 close_tunnel(c, ti, "could not prepare the peer address family");
                 return;
             }
+        } else if (!punch_family_available(c, family)) {
+            /* The peer asked for a family this host has no address in. Answer in the
+             * one we do have when the peer published there; otherwise end the round
+             * instead of installing an address every dial would refuse. */
+            int other = family == OP_FAM_V6 ? OP_FAM_V4 : OP_FAM_V6;
+            if (!family_usable(c, t, other) || use_punch_family(c, ti, other)) {
+                close_tunnel(c, ti, "peer chose an address family this host does not support");
+                return;
+            }
+            char note[160];
+            snprintf(note, sizeof(note), "peer chose family %d, answering in family %d", family, other);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         } else if (!t->peer_addr.len &&
                    op_addr_from_text(&t->peer_addr, t->ip, t->remote_port)) {
             close_tunnel(c, ti, "invalid peer address");
