@@ -7568,6 +7568,14 @@ void fp_client_rules_commit(fp_rule_update *update) {
     release_update(update, 0);
 }
 
+/* The configuration validator builds a throwaway client whose event callback is
+ * empty, so a refusal reported only through emit() never reaches the log file. The
+ * same text goes to stderr, which is where the background client keeps its log. */
+static void sdwan_refusal(fastp2p_client *c, const char *note) {
+    emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
+    fprintf(stderr, "sdwan configuration rejected: %s\n", note);
+}
+
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
 #if defined(__linux__) || defined(_WIN32)
     fp_sdwan *state = malloc(sizeof(*state));
@@ -7575,8 +7583,7 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         return FASTP2P_EIO;
     char why[192] = "";
     if (fp_sdwan_parse(state, config, why, sizeof(why))) {
-        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL,
-             why[0] ? why : "sdwan configuration rejected");
+        sdwan_refusal(c, why[0] ? why : "sdwan configuration rejected");
         free(state);
         return FASTP2P_EINVAL;
     }
@@ -7590,7 +7597,7 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         if (!valid_node(peer) || !strcmp(c->node, peer)) {
             char note[128];
             snprintf(note, sizeof(note), "sdwan peer name %s is not a valid remote node", peer);
-            emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
+            sdwan_refusal(c, note);
             free(state);
             return FASTP2P_EINVAL;
         }
@@ -7602,14 +7609,14 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
     if (needed > available) {
         char note[160];
         snprintf(note, sizeof(note), "sdwan needs %u rule slots, only %u are free", needed, available);
-        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
+        sdwan_refusal(c, note);
         free(state);
         return FASTP2P_EINVAL;
     }
     if (state->central && state->center[0] && state->center_index == FP_SDWAN_NO_ROUTE) {
         char note[160];
         snprintf(note, sizeof(note), "sdwan center %s is not one of the peers", state->center);
-        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EINVAL, note);
+        sdwan_refusal(c, note);
         free(state);
         return FASTP2P_EINVAL;
     }
