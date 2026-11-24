@@ -555,6 +555,7 @@ static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
 static int punch_realign_family(fastp2p_client *, int);
+static void sdwan_reconcile(fastp2p_client *);
 static uint16_t punch_port_get(fastp2p_client *, const char *);
 static void punch_port_note(fastp2p_client *, const char *, uint16_t);
 static void punch_port_forget(fastp2p_client *, const char *);
@@ -4117,6 +4118,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     char message[64];
                     snprintf(message, sizeof(message), "node name: %s", c->node);
                     emit(c, FASTP2P_EVENT_STATE, c->node_id, 0, message);
+                    sdwan_reconcile(c);
                 }
             }
             c->login_ok = 1;
@@ -7576,6 +7578,33 @@ static void sdwan_refusal(fastp2p_client *c, const char *note) {
     fprintf(stderr, "sdwan configuration rejected: %s\n", note);
 }
 
+/* The SD-WAN section is parsed before login, when this host is still known by its
+ * hostname - xrwgx035 for a node the gateway calls xrwgxserver. A central section
+ * whose Center is this very node then resolves to "not one of the peers", and every
+ * packet is dropped later because sdwan_send cannot find an owner for the center.
+ * Re-derive the index once the real node name is known. */
+static void sdwan_reconcile(fastp2p_client *c) {
+    fp_sdwan *state = c->sdwan;
+    if (!state || !state->central || !state->center[0] || !c->node[0])
+        return;
+    int index = FP_SDWAN_NO_ROUTE;
+    if (!strcmp(state->center, c->node))
+        index = FP_SDWAN_LOCAL;
+    else
+        for (unsigned i = 0; i < state->peer_count; ++i)
+            if (!strcmp(state->center, state->peers[i].node))
+                index = (int)i;
+    if (index == state->center_index)
+        return;
+    state->center_index = index;
+    {
+        char note[160];
+        snprintf(note, sizeof(note), "sdwan center %s resolved to %s as node %s",
+                 state->center, index == FP_SDWAN_LOCAL ? "this host" : "a peer", c->node);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    }
+}
+
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
 #if defined(__linux__) || defined(_WIN32)
     fp_sdwan *state = malloc(sizeof(*state));
@@ -7639,6 +7668,7 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         strcpy(a->peer, peer->node);
     }
     c->sdwan = state;
+    sdwan_reconcile(c);
     return FASTP2P_OK;
 #else
     (void)c;
