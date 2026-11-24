@@ -3,6 +3,7 @@
 #include "fastp2p.h"
 #include <json-c/json.h>
 #define FP_CONFIG_RELOAD 75
+int fp_config_sync_persist_node(const char *node);
 int fp_config_sync_bind(fastp2p_client *,const char *path,json_object *active);
 void fp_config_sync_online(uint16_t public_port);
 int fp_config_sync_tick(void);

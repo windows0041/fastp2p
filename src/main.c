@@ -58,6 +58,7 @@ static const char *beijing_stamp(void) {
              tm.tm_sec, millis);
     return text;
 }
+static char persisted_node[32];
 static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     (void)user;
     static const char *types[] = {"state", "error", "tunnel", "forward", "heartbeat"};
@@ -362,6 +363,16 @@ static int client_main(int argc, char **argv) {
     while (!interrupted && !fastp2p_runtime_stopping() && (!deadline || time(NULL) < deadline) &&
            fastp2p_client_state(client) != FASTP2P_STOPPED) {
         rv = fastp2p_client_step(client, 10);
+        /* The gateway may have assigned a node name that differs from the hostname;
+         * remember it (outside the event callback, which holds the client lock) so the
+         * next parse starts from the right name. */
+        if (!persisted_node[0] && fastp2p_client_state(client) == FASTP2P_ONLINE) {
+            const char *assigned = fastp2p_client_node(client);
+            if (assigned && *assigned && !fp_config_sync_persist_node(assigned)) {
+                snprintf(persisted_node, sizeof(persisted_node), "%s", assigned);
+                fprintf(stderr, "node name %s stored in the profile\n", assigned);
+            }
+        }
         if (rv)
             break;
         if (restart_requested) {
