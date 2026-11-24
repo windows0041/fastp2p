@@ -2774,12 +2774,6 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
      * reported port gets only a few attempts: each second spent dialling is a
      * second its own SYN is filtered. A cone peer keeps the longer walk because
      * its reported port is usually the reachable one. */
-    /* The source socket and the target must belong to one family. A tunnel that
-     * ends up with a v6 source and a v4 target fails every dial with EAFNOSUPPORT
-     * and burns the whole window, which is what a dual-stack initiator produced when
-     * the answer carried the peer's v4 endpoint. */
-    if (punch_realign_family(c, index) < 0)
-        return;
     int peer_kind = tcp_peer_kind(t);
     unsigned limit = t->punch_role == TCP_PUNCH_OPENER ? TCP_OPENER_QUICK_ATTEMPTS
                    : peer_kind == TCP_PEER_MOVES      ? TCP_PUNCH_QUICK_ATTEMPTS
@@ -2839,9 +2833,24 @@ static int punch_realign_family(fastp2p_client *c, int index) {
     }
     if (t->family == target)
         return 0;
-    if (use_punch_family(c, index, target) != 0) {
-        close_tunnel(c, index, "TCP punch target family could not be selected");
-        return -1;
+    if (use_punch_family(c, index, target) == 0)
+        return 0;
+    /* No measured mapping in that family: the source socket still has to agree with
+     * the target, or every dial keeps failing on the family mismatch. */
+    t->family = target;
+    t->attempted_ipv6 = target == OP_FAM_V6;
+    if (t->listen_fd >= 0) {
+        op_close(t->listen_fd);
+        t->listen_fd = -1;
+    }
+    if (t->fd >= 0) {
+        op_close(t->fd);
+        t->fd = -1;
+    }
+    {
+        char note[160];
+        snprintf(note, sizeof(note), "TCP punch source family set to %d to match the target", target);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     return 0;
 }
@@ -2851,6 +2860,12 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         close_tunnel(c, index, "invalid TCP punch peer address");
         return;
     }
+    /* The source socket and the target must belong to one family, and this host must
+     * have that family at all. Dialling a v4 target from a v6 source fails every
+     * attempt with EAFNOSUPPORT and burns the whole window, so the check belongs here,
+     * before the first dial, not after a failure. */
+    if (punch_realign_family(c, index) < 0)
+        return;
     /* A peer may publish an address that is ours (both nodes can egress the same
      * carrier NAT). Dialling it reaches our own NAT, which has no hairpin, so swap in
      * the address the gateway observed and, while that answer is still missing, skip

@@ -1244,12 +1244,28 @@ static void only_a_preserving_mapping_is_pinned(void) {
     close_tunnel(c, ti, NULL);
     free(c);
 }
+/* Even with no measured mapping in the target's family the source must be switched:
+ * otherwise every dial keeps failing on the family mismatch. */
+static void target_family_switch_needs_no_mapping(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    strcpy(c->local_ip[OP_FAM_V4], "192.0.2.10");
+    int ti = new_tunnel(c, "peer-sw", 200, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    assert(!op_addr_from_text(&t->peer_addr, "198.51.100.9", 41000));
+    t->family = OP_FAM_V6;
+    assert(punch_realign_family(c, ti) == 0);
+    assert(t->family == OP_FAM_V4);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     v6_is_skipped_when_the_host_has_no_v6();
     punch_target_family_wins();
     only_a_preserving_mapping_is_pinned();
+    target_family_switch_needs_no_mapping();
     punch_port_memory_is_per_peer();
     dialer_port_survives_the_round();
     responder_publishes_a_stable_mapping();
