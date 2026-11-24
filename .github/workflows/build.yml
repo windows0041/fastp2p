@@ -99,6 +99,8 @@ jobs:
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -115,11 +117,24 @@ jobs:
             sudo sed -i -E 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$file"
           done
           sudo rm -f /etc/apt/apt-mirrors.txt
-      - name: Restore the cross toolchain packages
-        uses: actions/cache@v4
-        with:
-          path: ~/mingw-debs
-          key: mingw-debs-24.04-1
+      - name: Fetch the toolchain packages from the CI release
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/mingw-debs"
+          # A release in this repository is a faster and steadier source than any
+          # apt mirror: the packages are downloaded once, by CI itself, and every
+          # later run installs them from here.
+          if gh release download ci-apt-packages-v1 --pattern '*.deb' --dir "$HOME/mingw-debs" --clobber >/dev/null 2>&1 &&
+             compgen -G "$HOME/mingw-debs/*.deb" >/dev/null; then
+            echo "fetched $(ls "$HOME/mingw-debs"/*.deb | wc -l) packages from the release"
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::the release has no packages yet, this run fills it"
+            echo "fetched=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install cross toolchain
         timeout-minutes: 25
         run: |
@@ -128,23 +143,25 @@ jobs:
             echo "toolchain already present in the image"
             exit 0
           fi
-          # The cached .deb files install without touching the network. Keeping them
-          # ourselves is what makes this reliable: an apt round trip against a slow
-          # mirror has held this job for ten to twenty minutes even when every
-          # package was already cached as a .deb elsewhere.
           if compgen -G "$HOME/mingw-debs/*.deb" >/dev/null; then
-            echo "installing the toolchain from cached packages"
-            if ! sudo dpkg -i "$HOME"/mingw-debs/*.deb; then
-              sudo apt-get -f install -y || true
-            fi
+            echo "installing the toolchain from the release packages"
+            sudo dpkg -i "$HOME"/mingw-debs/*.deb || sudo apt-get -f install -y || true
             dpkg -s gcc-mingw-w64-x86-64 >/dev/null 2>&1 && exit 0
-            echo "cached packages were incomplete, falling back to the archive"
+            echo "::warning::the release packages were incomplete, falling back to apt"
           fi
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
           sudo apt-get "${APT_OPTS[@]}" update -qq
           sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build
           mkdir -p "$HOME/mingw-debs"
           sudo cp /var/cache/apt/archives/*.deb "$HOME/mingw-debs/" 2>/dev/null || true
+      - name: Publish the toolchain packages for later runs
+        if: steps.toolchain.outputs.fetched != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          compgen -G "$HOME/mingw-debs/*.deb" >/dev/null || exit 0
+          gh release upload ci-apt-packages-v1 "$HOME"/mingw-debs/*.deb --clobber
       - uses: actions/cache@v4
         with:
           path: ~/fastp2p-dev/cross
