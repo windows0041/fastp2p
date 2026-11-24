@@ -1259,12 +1259,59 @@ static void target_family_switch_needs_no_mapping(void) {
     assert(t->family == OP_FAM_V4);
     free(c);
 }
+/* A central section must give the hub one rule slot per peer, and the transport the
+ * operator asked for must reach the rules it creates. */
+static void sdwan_section_builds_rules(void) {
+    struct { const char *mode, *center, *node, *transport; unsigned slots; int tcp; } cases[] = {
+        {"mesh", "", "xrwgxserver", "quic", 2, 0},
+        {"central", "xrwgxserver", "xrwgxserver", "quic", 2, 0},   /* this node is the hub */
+        {"central", "redmibook", "xrwgxserver", "udp", 1, 0},      /* a peer is the hub */
+        {"mesh", "", "xrwgxserver", "tcp", 2, 1},
+    };
+    for (unsigned k = 0; k < sizeof(cases) / sizeof(cases[0]); ++k) {
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+        snprintf(c->node, sizeof(c->node), "%s", cases[k].node);
+        char text[640];
+        snprintf(text, sizeof(text),
+                 "{\"Mode\":\"%s\",\"Center\":\"%s\",\"Transport\":\"%s\","
+                 "\"Subnet\":\"10.3.2.0/24\",\"Address\":\"10.3.2.30\",\"Peers\":["
+                 "{\"Node\":\"redmibook\",\"Address\":\"10.3.2.10\"},"
+                 "{\"Node\":\"ubuntu06\",\"Address\":\"10.3.2.20\"}]}",
+                 cases[k].mode, cases[k].center, cases[k].transport);
+        json_object *cfg = json_tokener_parse(text);
+        assert(cfg);
+        assert(fp_client_sdwan_config(c, cfg) == FASTP2P_OK);
+        json_object_put(cfg);
+        assert(c->sdwan && c->sdwan->peer_count == 2);
+        assert(c->sdwan->transport == (cases[k].tcp ? FASTP2P_TRANSPORT_TCP : FASTP2P_TRANSPORT_QUIC));
+        unsigned assigned = 0;
+        int slot = -1;
+        for (unsigned i = 0; i < c->sdwan->peer_count; ++i) {
+            if (c->sdwan->peers[i].app_index < 0)
+                continue;
+            ++assigned;
+            slot = c->sdwan->peers[i].app_index;
+        }
+        assert(assigned == cases[k].slots);
+        if (slot >= 0) {
+            assert(c->apps[slot].sdwan && c->apps[slot].used);
+            assert(c->apps[slot].transport ==
+                   (cases[k].tcp ? FASTP2P_TRANSPORT_TCP : FASTP2P_TRANSPORT_QUIC));
+        }
+        fp_sdwan_stop(c->sdwan);
+        free(c->sdwan);
+        c->sdwan = NULL;
+        free(c);
+    }
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     v6_is_skipped_when_the_host_has_no_v6();
     punch_target_family_wins();
     only_a_preserving_mapping_is_pinned();
+    sdwan_section_builds_rules();
     target_family_switch_needs_no_mapping();
     punch_port_memory_is_per_peer();
     dialer_port_survives_the_round();

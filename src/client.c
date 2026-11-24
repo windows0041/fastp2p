@@ -449,6 +449,9 @@ struct fastp2p_client {
     const char *ca_pem, *tls_host;
     char error[192], path[2048], hostname[256], device_id[33];
     int automatic_node;
+    /* Name the gateway assigned last time: used as the local name while the login
+     * stays automatic, so a profile without Node still compares names correctly. */
+    char node_hint[32];
     uint16_t port, public_port, requested_public_port;
     int auto_port_mapping;
     fp_port_mapping *port_mapping;
@@ -766,6 +769,14 @@ static size_t node_base(char out[32], const char *hostname) {
     return used;
 }
 static void automatic_candidate(fastp2p_client *c) {
+    if (c->node_hint[0]) {
+        /* The gateway told us which name it assigns to this device; use it instead of
+         * the hostname-derived one. The login is still automatic, so the gateway never
+         * sees a manual claim (and never answers 409 over a stale session). */
+        snprintf(c->node, sizeof(c->node), "%s", c->node_hint);
+        c->node_id = op_node_id(c->node);
+        return;
+    }
     size_t used = node_base(c->node, c->hostname), i = 0;
     while (used < 8) {
         unsigned char digit = (unsigned char)c->device_id[i++];
@@ -773,6 +784,19 @@ static void automatic_candidate(fastp2p_client *c) {
     }
     c->node[used] = 0;
     c->node_id = op_node_id(c->node);
+}
+int fp_client_set_node_hint(fastp2p_client *c, const char *hint) {
+    if (!c || !c->automatic_node || c->running || c->in_callback || !hint)
+        return FASTP2P_EINVAL;
+    if (strlen(hint) < 8 || strlen(hint) >= sizeof(c->node_hint))
+        return FASTP2P_EINVAL;
+    for (const char *p = hint; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+              *p == '_' || *p == '-'))
+            return FASTP2P_EINVAL;
+    memcpy(c->node_hint, hint, strlen(hint) + 1);
+    automatic_candidate(c);
+    return FASTP2P_OK;
 }
 int fastp2p_client_set_identity(fastp2p_client *c, const char *identity) {
     if (!c || !c->automatic_node || c->running || c->in_callback || !identity || strlen(identity) != 32)
@@ -7700,7 +7724,7 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         peer->app_index = slot;
         app *a = &c->apps[slot++];
         *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
-                   .transport = FASTP2P_TRANSPORT_QUIC, .id = random_id()};
+                   .transport = state->transport, .id = random_id()};
         strcpy(a->peer, peer->node);
     }
     c->sdwan = state;
@@ -7806,7 +7830,11 @@ int fastp2p_client_start(fastp2p_client *c) {
             fastp2p_client_stop(c);
             return FASTP2P_EIO;
         }
-        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "SD-WAN TUN interface ready");
+        char ready[128];
+        snprintf(ready, sizeof(ready), "SD-WAN TUN interface ready (%s transport, %u peers, %s)",
+                 c->sdwan->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic",
+                 c->sdwan->peer_count, c->sdwan->central ? "central" : "mesh");
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, ready);
     }
     c->running = 1;
     if (c->auto_port_mapping && !c->validate_only)

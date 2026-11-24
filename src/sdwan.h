@@ -29,6 +29,9 @@ typedef struct {
     char error[160];
 #endif
     int central, center_index;
+    /* Transport for every rule this section creates: FASTP2P_TRANSPORT_QUIC (UDP punch
+     * plus QUIC) unless the operator asks for TCP hole punching instead. */
+    int transport;
     char center[32];
     uint32_t address;
     fp_sdwan_peer peers[FP_SDWAN_MAX_PEERS];

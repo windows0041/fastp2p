@@ -125,6 +125,10 @@ static int create_json(const char *text, const char *token_text, const char *ca,
                        .on_event = callback,
                        .user = user};
     rv = fastp2p_client_create(&cfg, out);
+    if (!rv) {
+        const char *hint = op_string(network, "NodeHint");
+        if (*hint) (void)fp_client_set_node_hint(*out, hint);
+    }
     if (!rv && port_mapping)
         fp_client_set_auto_port_mapping(*out, json_object_get_boolean(port_mapping));
     if (!rv && ca_pem) fp_client_set_ca_pem(*out, ca_pem);

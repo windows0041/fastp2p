@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "fastp2p.h"
 #include "sdwan.h"
 #include "platform.h"
 #include <string.h>
@@ -114,6 +115,14 @@ int fp_sdwan_parse(fp_sdwan *state, json_object *config, char *why, size_t why_l
                 return sdwan_reject(why, why_len, "sdwan Center name is missing or too long");
             strcpy(state->center, center);
         }
+    }
+    state->transport = FASTP2P_TRANSPORT_QUIC;
+    if (json_object_object_get_ex(config, "Transport", &value)) {
+        const char *transport = string_value(value);
+        if (!transport ||
+            (strcmp(transport, "quic") && strcmp(transport, "udp") && strcmp(transport, "tcp")))
+            return sdwan_reject(why, why_len, "sdwan Transport must be quic, udp or tcp");
+        state->transport = strcmp(transport, "tcp") ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP;
     }
     const char *pool = "10.3.2.0/24";
     uint32_t subnet;

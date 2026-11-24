@@ -199,14 +199,15 @@ int fp_config_sync_persist_node(const char *node) {
             return -1;
         }
     }
-    const char *current = string(network, "Node");
-    int automatic = json_object_get_boolean(get(network, "AutoNode")) != 0;
-    if (!automatic && !strcmp(current, node)) {
+    const char *current = string(network, "NodeHint");
+    if (!strcmp(current, node)) {
         json_object_put(root);
         return 0;
     }
-    json_object_object_add(network, "Node", json_object_new_string(node));
-    json_object_object_add(network, "AutoNode", json_object_new_boolean(0));
+    /* A hint, not a claim: the profile keeps logging in automatically (the gateway
+     * resolves the name from the device) while local code comparing names - the SD-WAN
+     * centre above all - starts from the name the gateway actually assigns. */
+    json_object_object_add(network, "NodeHint", json_object_new_string(node));
     int saved = save(sync_state.path, root);
     json_object_put(root);
     return saved;
