@@ -39,9 +39,11 @@ jobs:
           # by building and packaging only - its unit tests cannot execute here.
           - runner: macos-15-intel
             target: macos-arm64
+            arch: arm64
             run_tests: false
           - runner: macos-15-intel
             target: macos-x86_64
+            arch: x86_64
             run_tests: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -65,11 +67,11 @@ jobs:
           key: c-deps-${{ matrix.target }}-${{ hashFiles('deps.lock.json', 'scripts/build-deps.py') }}
       - name: Build CLI and C SDK
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFASTP2P_DEPS_ROOT="$HOME/fastp2p-dev/cross/prefix/${{ matrix.target }}" -DCMAKE_INSTALL_PREFIX="$PWD/dist/${{ matrix.target }}"
           cmake --build build --parallel 3
           cmake --build build --target example-embed
           cmake --install build
-          cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
+          cmake -S tests/sdk-consumer -B build/consumer -G Ninja -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_PREFIX_PATH="$PWD/dist/${{ matrix.target }}"
           cmake --build build/consumer
           if [ "${{ matrix.run_tests }}" = "true" ]; then build/consumer/sdk-consumer; fi
       - name: Package SDK
