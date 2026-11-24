@@ -6286,6 +6286,13 @@ static void connect_gateway(fastp2p_client *c) {
         size_t used = strlen(c->path);
         snprintf(c->path + used, sizeof(c->path) - used, "&autonode=1&deviceid=%s&hostname=%s",
                  c->device_id, hostname);
+    } else if (c->device_id[0]) {
+        /* A fixed node name still has to say which device is asking: the gateway only
+         * lets the device that owns an automatically created record claim that name,
+         * and without the device id it cannot tell who is claiming. An older gateway
+         * ignores the parameter. */
+        size_t used = strlen(c->path);
+        snprintf(c->path + used, sizeof(c->path) - used, "&deviceid=%s", c->device_id);
     }
     /* One pinned answer per *usable* family, v4 first so the preferred family
      * keeps the historical order (SPEC �?). A family this host cannot route to
