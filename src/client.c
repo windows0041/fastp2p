@@ -1415,11 +1415,6 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
         reason = message;
     }
     uint64_t id = t->id;
-    /* A dialer keeps its local port for a few rounds: the mapping towards the peer
-     * stays put, so a window that worked once keeps working, while a hopeless port
-     * is still abandoned after that. */
-    if (t->punch_role == TCP_PUNCH_DIALER)
-        punch_port_note(c, t->peer, t->local_port);
     char failed_relay[32];
     failed_relay[0] = 0;
     /* Remember a relay hop that never carried an application session so the
@@ -1942,6 +1937,16 @@ static int start_probe(fastp2p_client *c, int index) {
         }
         t->probes[family].fd = fd;
         t->probes[family].local_port = socket_port(fd);
+        if (family == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_TCP) {
+            /* One line per tunnel: whether the port the peer already knows was kept.
+             * Recorded here, once, so overlapping rounds cannot rotate it early. */
+            char note[128];
+            snprintf(note, sizeof(note), "TCP punch local port %u%s",
+                     (unsigned)t->probes[family].local_port,
+                     t->prefer_local_port == t->probes[family].local_port ? " (kept)" : " (new)");
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+            punch_port_note(c, t->peer, t->probes[family].local_port);
+        }
         t->probes[family].response_len = 0;
         t->probes[family].last_rx = mono();
         t->probes[family].deadline = mono() + (family == OP_FAM_V4 ? 5 * NS : 2 * NS);

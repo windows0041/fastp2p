@@ -1147,10 +1147,27 @@ static void punch_port_memory_is_per_peer(void) {
     assert(punch_port_get(c, "peer-a") == 0);
     free(c);
 }
+/* The whole round trip: a dialler round ends, and the next tunnel towards the same
+ * peer asks its probe for the same local port. */
+static void dialer_port_survives_the_round(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    /* The port is recorded when the probe binds it, so this is the moment a round
+     * hands its port to the next one. */
+    punch_port_note(c, "peer-p", 39851);
+    assert(punch_port_get(c, "peer-p") == 39851);
+    int t2 = new_tunnel(c, "peer-p", 97, FASTP2P_TRANSPORT_TCP, 1);
+    assert(t2 >= 0);
+    assert(c->tunnels[t2].prefer_local_port == 39851);
+    close_tunnel(c, t2, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     punch_port_memory_is_per_peer();
+    dialer_port_survives_the_round();
     responder_publishes_a_stable_mapping();
     stable_peer_keeps_the_reported_port();
     stable_peer_ends_the_round_early();
