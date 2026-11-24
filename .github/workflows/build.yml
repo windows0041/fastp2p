@@ -568,27 +568,11 @@ jobs:
         with:
           pattern: fastp2p-*
           path: release-input
-      - name: Release token diagnostics
-        env:
-          TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          echo "token length: ${#TOKEN}"
-          curl -sS -o /tmp/get.json -w 'GET release by tag -> %{http_code}\n' \
-            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME"
-          head -c 200 /tmp/get.json; echo
-          curl -sS -o /tmp/post.json -w 'POST releases -> %{http_code}\n' -X POST \
-            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
-            -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"diagnostic\",\"body\":\"diagnostic\",\"draft\":true}"
-          head -c 300 /tmp/post.json; echo
       - name: Publish verified clients and C SDKs
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           ANDROID_VARIANT: ${{ needs.cross-android.outputs.variant }}
         run: |
-          echo "publish token length: ${#GITHUB_TOKEN}"
           args=()
           if [[ "$ANDROID_VARIANT" == debug && "$GITHUB_REF_TYPE" == branch ]]; then
             args+=(--without-android)
