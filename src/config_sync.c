@@ -168,6 +168,50 @@ done:
     if(next)json_object_put(next);
     return result;
 }
+/* Write the node name the gateway assigned into the profile, once. The name is only
+ * known after login, so a document parsed before that carries the hostname instead -
+ * and every decision that compares the assigned name with a configuration value
+ * (which node is the SD-WAN hub, which peer a rule slot belongs to) is then wrong.
+ * Persisting it here makes the next parse - including the validator that runs on every
+ * pushed document - start from the right name. */
+int fp_config_sync_persist_node(const char *node) {
+    if (!sync_state.path[0] || !node || !*node)
+        return -1;
+    FILE *file = fopen(sync_state.path, "rb");
+    if (!file)
+        return -1;
+    char buffer[1 << 20];
+    size_t length = fread(buffer, 1, sizeof(buffer) - 1, file);
+    fclose(file);
+    buffer[length] = 0;
+    json_object *root = json_tokener_parse(buffer);
+    if (!root || !json_object_is_type(root, json_type_object)) {
+        if (root)
+            json_object_put(root);
+        return -1;
+    }
+    json_object *network = NULL;
+    if (!json_object_object_get_ex(root, "network", &network) ||
+        !json_object_is_type(network, json_type_object)) {
+        network = json_object_new_object();
+        if (!network || json_object_object_add(root, "network", network)) {
+            json_object_put(root);
+            return -1;
+        }
+    }
+    const char *current = string(network, "Node");
+    int automatic = json_object_get_boolean(get(network, "AutoNode")) != 0;
+    if (!automatic && !strcmp(current, node)) {
+        json_object_put(root);
+        return 0;
+    }
+    json_object_object_add(network, "Node", json_object_new_string(node));
+    json_object_object_add(network, "AutoNode", json_object_new_boolean(0));
+    int saved = save(sync_state.path, root);
+    json_object_put(root);
+    return saved;
+}
+
 int fp_config_sync_bind(fastp2p_client *client,const char *path,json_object *active) {
     if(!path||strlen(path)>=sizeof(sync_state.path)-10)return 0;
     if(sync_state.path[0]&&strcmp(sync_state.path,path))fp_config_sync_close();

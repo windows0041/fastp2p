@@ -58,10 +58,20 @@ static const char *beijing_stamp(void) {
              tm.tm_sec, millis);
     return text;
 }
+static char persisted_node[32];
 static void event(fastp2p_client *c, const fastp2p_event *e, void *user) {
     (void)user;
     static const char *types[] = {"state", "error", "tunnel", "forward", "heartbeat"};
     if (e->state == FASTP2P_ONLINE && e->type == FASTP2P_EVENT_STATE) {
+        /* The gateway may have assigned a node name that differs from the hostname;
+         * remember it so the next parse starts from the right name. */
+        const char *assigned = fastp2p_client_node(c);
+        if (assigned && *assigned && !persisted_node[0]) {
+            if (!fp_config_sync_persist_node(assigned)) {
+                snprintf(persisted_node, sizeof(persisted_node), "%s", assigned);
+                fprintf(stderr, "node name %s stored in the profile\n", assigned);
+            }
+        }
         was_online = 1;
         fp_config_sync_online(fastp2p_client_public_port(c));
         cleanup_online_since=op_monotonic_ns();cleanup_next=0;
