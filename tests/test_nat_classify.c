@@ -1220,11 +1220,29 @@ static void punch_target_family_wins(void) {
     assert(punch_realign_family(c, ti) == -1);
     free(c);
 }
+/* A port-preserving mapping is pinned; any other mapping rotates every round,
+ * because pinning it only repeats the same miss. */
+static void only_a_preserving_mapping_is_pinned(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    assert(punch_port_worth_keeping(34191, 34191));
+    assert(!punch_port_worth_keeping(26025, 38563));
+    assert(!punch_port_worth_keeping(0, 38563));
+    punch_port_note(c, "peer-k", 34191);
+    assert(punch_port_get(c, "peer-k") == 34191);
+    punch_port_forget(c, "peer-k");
+    assert(punch_port_get(c, "peer-k") == 0);
+    int ti = new_tunnel(c, "peer-k", 100, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0 && c->tunnels[ti].prefer_local_port == 0);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     v6_is_skipped_when_the_host_has_no_v6();
     punch_target_family_wins();
+    only_a_preserving_mapping_is_pinned();
     punch_port_memory_is_per_peer();
     dialer_port_survives_the_round();
     responder_publishes_a_stable_mapping();

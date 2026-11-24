@@ -557,6 +557,7 @@ static int tcp_punch_listen(fastp2p_client *, int);
 static int punch_realign_family(fastp2p_client *, int);
 static uint16_t punch_port_get(fastp2p_client *, const char *);
 static void punch_port_note(fastp2p_client *, const char *, uint16_t);
+static void punch_port_forget(fastp2p_client *, const char *);
 static void report_client(fastp2p_client *);
 static int nat_filter_level(const nat_filter *filter, uint64_t now);
 static int addr_text_set(const char *text);
@@ -1631,6 +1632,20 @@ static void punch_port_note(fastp2p_client *c, const char *peer, uint16_t port) 
         ++c->punch_ports[slot].rounds;
     }
 }
+static void punch_port_forget(fastp2p_client *c, const char *peer) {
+    for (int i = 0; i < 8; ++i)
+        if (c->punch_ports[i].peer[0] && !strcmp(c->punch_ports[i].peer, peer)) {
+            c->punch_ports[i].port = 0;
+            c->punch_ports[i].rounds = 0;
+        }
+}
+/* Only a mapping that hands the same port back is worth pinning: the peer then
+ * reaches us by dialling the port it was told. A carrier that answers with another
+ * port keeps that mapping stable but unguessable, and pinning it just repeats the
+ * same miss every round, so the port is rotated instead. */
+static int punch_port_worth_keeping(uint16_t mapped, uint16_t local) {
+    return local && mapped == local;
+}
 static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
         return -1;
@@ -1944,16 +1959,6 @@ static int start_probe(fastp2p_client *c, int index) {
         }
         t->probes[family].fd = fd;
         t->probes[family].local_port = socket_port(fd);
-        if (family == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_TCP) {
-            /* One line per tunnel: whether the port the peer already knows was kept.
-             * Recorded here, once, so overlapping rounds cannot rotate it early. */
-            char note[128];
-            snprintf(note, sizeof(note), "TCP punch local port %u%s",
-                     (unsigned)t->probes[family].local_port,
-                     t->prefer_local_port == t->probes[family].local_port ? " (kept)" : " (new)");
-            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
-            punch_port_note(c, t->peer, t->probes[family].local_port);
-        }
         t->probes[family].response_len = 0;
         t->probes[family].last_rx = mono();
         t->probes[family].deadline = mono() + (family == OP_FAM_V4 ? 5 * NS : 2 * NS);
@@ -2201,6 +2206,18 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     t->local_port = t->probes[adopt].local_port;
     t->mapped_port = t->probes[adopt].mapped_port;
     address_copy(t->mapped_ip, t->probes[adopt].mapped_ip);
+    if (adopt == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_TCP && !t->lan) {
+        int keeping = punch_port_worth_keeping(t->mapped_port, t->local_port);
+        char note[160];
+        snprintf(note, sizeof(note), "TCP punch local port %u (mapping %u: %s)",
+                 (unsigned)t->local_port, (unsigned)t->mapped_port,
+                 keeping ? "port-preserving, keeping it" : "moves, rotating next round");
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        if (keeping)
+            punch_port_note(c, t->peer, t->local_port);
+        else
+            punch_port_forget(c, t->peer);
+    }
     if (adopt == OP_FAM_V4 && !t->lan && !t->relay_wait && t->tcp_punch_immediate &&
         (t->initiator || t->peer_tcp_mapping) && (c->gateway_tcp_probe_v2 || c->gateway_tcp_probe_v3)) {
         op_addr source, mapped, bind_address;
