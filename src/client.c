@@ -4604,7 +4604,14 @@ static void sdwan_receive(fastp2p_client *c, const tunnel *t, uint8_t *packet, s
     const char *peer = t->relay_wait ? t->relay_peer : t->peer;
     if (incoming < 0 || state->peers[incoming].app_index < 0 ||
         strcmp(peer, c->apps[state->peers[incoming].app_index].peer)) {
-        sdwan_note_drop(c, "received a packet on a link that is not its route");
+        char why[192];
+        const char *expected = incoming >= 0 && state->peers[incoming].app_index >= 0
+                                   ? c->apps[state->peers[incoming].app_index].peer : "?";
+        snprintf(why, sizeof(why),
+                 "received a packet on link %s but source %u belongs to %s (from=%d to=%d incoming=%d hub=%d)",
+                 peer, (unsigned)source, expected, from, to, incoming,
+                 state->central && state->center_index == FP_SDWAN_LOCAL);
+        sdwan_note_drop(c, why);
         return;
     }
     if (to == FP_SDWAN_LOCAL) {
