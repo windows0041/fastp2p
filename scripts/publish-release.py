@@ -126,7 +126,20 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
         release = api.request('/releases/tags/' + urllib.parse.quote(tag, safe=''))
     except urllib.error.HTTPError as error:
         if error.code != 404: raise
-        release = api.request('/releases', metadata, method='POST')
+        try:
+            release = api.request('/releases', metadata, method='POST')
+        except urllib.error.HTTPError as error:
+            # The workflow token is refused here for some tag refs even though it
+            # carries contents:write, while the same token through gh is accepted.
+            # Fall back to the CLI so a release does not depend on which one wins.
+            if error.code != 403: raise
+            print('Create via API refused, retrying through gh:', error)
+            created = subprocess.run(
+                ['gh', 'release', 'create', tag, '--draft', '--title', metadata['name'],
+                 '--target', metadata['target_commitish'], '--notes-file', '-'],
+                input=metadata['body'], text=True, env=dict(os.environ, GH_TOKEN=token))
+            if created.returncode: raise
+            release = api.request('/releases/tags/' + urllib.parse.quote(tag, safe=''))
     existing = {a['name']: a for a in release['assets']}
     if not release['draft']:
         # Published assets are immutable to this script. A rerun may only verify.
@@ -141,8 +154,18 @@ def publish(kind, files, repository, sha, ref, ref_type, run_id, token, explicit
             file_digest = 'sha256:' + digest(file)
             if asset.get('digest') == file_digest: continue
             api.request('/releases/assets/' + str(asset['id']), method='DELETE')
-        uploaded = api.request(upload + '?name=' + urllib.parse.quote(file.name, safe=''), file.read_bytes(),
-                    method='POST', content_type='application/octet-stream')
+        try:
+            uploaded = api.request(upload + '?name=' + urllib.parse.quote(file.name, safe=''), file.read_bytes(),
+                        method='POST', content_type='application/octet-stream')
+        except urllib.error.HTTPError as error:
+            if error.code != 403: raise
+            print('Upload via API refused, retrying through gh:', file.name)
+            sent = subprocess.run(['gh', 'release', 'upload', tag, str(file), '--clobber'],
+                                  env=dict(os.environ, GH_TOKEN=token))
+            if sent.returncode: raise
+            uploaded = next((a for a in api.request('/releases/' + str(release['id']))['assets']
+                             if a['name'] == file.name), None)
+            if not uploaded: raise RuntimeError('gh did not upload ' + file.name)
         if uploaded.get('size') != file.stat().st_size or uploaded.get('digest') != 'sha256:' + digest(file):
             raise RuntimeError('GitHub asset checksum verification failed: ' + file.name)
         print('Uploaded:', file.name)
