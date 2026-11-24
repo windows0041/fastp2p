@@ -7628,8 +7628,12 @@ static int sdwan_assign_slots(fastp2p_client *c) {
     if (!state || !state->peer_count)
         return -1;
     int hub = !state->central || state->center_index == FP_SDWAN_LOCAL;
+    /* An unresolved centre is not an error: the document is parsed before login, and
+     * reconcile assigns the slots once the real node name says which node is the hub.
+     * Treating it as a failure rejected the whole configuration and left the client
+     * restarting in a loop. */
     if (state->central && !hub && state->center_index < 0)
-        return -1;
+        return 0;
     unsigned needed = hub || !state->central ? state->peer_count : 1;
     unsigned available = 0;
     for (int i = 0; i < NA; ++i)
