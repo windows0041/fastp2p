@@ -115,8 +115,16 @@ jobs:
         run: |
           set -euo pipefail
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          sudo apt-get "${APT_OPTS[@]}" update -qq
-          sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build
+          # When the apt cache restored these packages, skip the archive
+          # round trip entirely: a slow mirror was the last thing that could
+          # still hold this job for minutes.
+          if sudo dpkg -s gcc-mingw-w64-x86-64 ninja-build >/dev/null 2>&1; then
+            echo "toolchain restored from the apt cache"
+          else
+            sudo apt-get "${APT_OPTS[@]}" update -qq
+            sudo apt-get "${APT_OPTS[@]}" install -y gcc-mingw-w64-x86-64 ninja-build
+          fi
+
           python3 -m pip install cmake==3.31.6
       - uses: actions/cache@v4
         with:
@@ -167,8 +175,15 @@ jobs:
         run: |
           set -euo pipefail
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          sudo apt-get "${APT_OPTS[@]}" update -qq
-          sudo apt-get "${APT_OPTS[@]}" install -y ninja-build
+          # When the apt cache restored these packages, skip the archive
+          # round trip entirely: a slow mirror was the last thing that could
+          # still hold this job for minutes.
+          if sudo dpkg -s ninja-build >/dev/null 2>&1; then
+            echo "toolchain restored from the apt cache"
+          else
+            sudo apt-get "${APT_OPTS[@]}" update -qq
+            sudo apt-get "${APT_OPTS[@]}" install -y ninja-build
+          fi
           python3 -m pip install cmake==3.31.6
           # A dropped download used to kill the job; each attempt keeps the parts
           # sdkmanager already finished, so a retry only fetches what is missing.
@@ -446,8 +461,16 @@ jobs:
       - name: Static musl toolchain and emulator
         run: |
           APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true)
-          sudo apt-get "${APT_OPTS[@]}" update -qq
-          sudo apt-get "${APT_OPTS[@]}" install -y ninja-build qemu-user-static
+          # When the apt cache restored these packages, skip the archive
+          # round trip entirely: a slow mirror was the last thing that could
+          # still hold this job for minutes.
+          if sudo dpkg -s ninja-build qemu-user-static >/dev/null 2>&1; then
+            echo "toolchain restored from the apt cache"
+          else
+            sudo apt-get "${APT_OPTS[@]}" update -qq
+            sudo apt-get "${APT_OPTS[@]}" install -y ninja-build qemu-user-static
+          fi
+
       - uses: actions/cache@v4
         with:
           path: ~/musl-cross
