@@ -304,7 +304,14 @@ static void udp_punch_uses_winning_socket(void) {
     t->sym_up = 1;
     t->punch_started = mono();
     t->deadline = t->punch_started + 5 * NS;
-    tick_tunnel(c, ti, t->punch_started);
+    /* The extra sockets are opened on the first tick, but a host under port
+     * pressure can refuse one: retry a few ticks before insisting on all of them
+     * (this failed once on a macOS arm64 runner while every other platform
+     * passed). */
+    for (int attempt = 0; attempt < 8 && t->udp_candidate_count < UDP_PUNCH_EXTRA_SOCKETS; ++attempt) {
+        tick_tunnel(c, ti, t->punch_started);
+        op_sleep_ms(2);
+    }
     assert(t->udp_candidate_count == UDP_PUNCH_EXTRA_SOCKETS);
     assert(drain(peer, SPRAY_WAIT));
 
