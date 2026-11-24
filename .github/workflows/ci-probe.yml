@@ -33,6 +33,22 @@ jobs:
             -d "{\"tag_name\":\"${{ inputs.tag }}\",\"name\":\"probe\",\"draft\":true,\"body\":\"probe\"}")
           echo "POST /releases -> $code"
           cat /tmp/release.json; echo
+      - name: Probe the real release payload
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          sha=$(git rev-parse HEAD)
+          code=$(curl -sS -o /tmp/real.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/"$GITHUB_REPOSITORY"/releases \
+            -d "{\"tag_name\":\"fastp2p-client-v2.0.83\",\"target_commitish\":\"$sha\",\"name\":\"probe\",\"body\":\"probe\",\"draft\":true,\"prerelease\":false}")
+          echo "with target_commitish -> $code"; head -c 300 /tmp/real.json; echo
+          code2=$(curl -sS -o /tmp/real2.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/"$GITHUB_REPOSITORY"/releases \
+            -d "{\"tag_name\":\"fastp2p-client-v2.0.83\",\"name\":\"probe\",\"body\":\"probe\",\"draft\":true}")
+          echo "without target_commitish -> $code2"; head -c 300 /tmp/real2.json; echo
       - name: Probe a contents write
         env:
           TOKEN: ${{ github.token }}
