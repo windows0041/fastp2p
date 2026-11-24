@@ -14,26 +14,32 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Token permissions
+        env:
+          TOKEN: ${{ github.token }}
         run: |
           echo "GITHUB_TOKEN Permissions"
           echo "Contents: write (declared for this job)"
-          curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
+          curl -sS -H "Authorization: Bearer $TOKEN" \
                https://api.github.com/repos/"$GITHUB_REPOSITORY" | head -c 300; echo
       - name: Probe release creation
+        env:
+          TOKEN: ${{ github.token }}
         run: |
           set +e
           code=$(curl -sS -o /tmp/release.json -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/"$GITHUB_REPOSITORY"/releases \
             -d "{\"tag_name\":\"${{ inputs.tag }}\",\"name\":\"probe\",\"draft\":true,\"body\":\"probe\"}")
           echo "POST /releases -> $code"
           cat /tmp/release.json; echo
       - name: Probe a contents write
+        env:
+          TOKEN: ${{ github.token }}
         run: |
           set +e
           code=$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/"$GITHUB_REPOSITORY"/git/refs \
             -d "{\"ref\":\"refs/heads/ci-probe-tmp\",\"sha\":\"$GITHUB_SHA\"}")
