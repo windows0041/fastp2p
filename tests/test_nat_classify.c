@@ -1170,9 +1170,61 @@ static void dialer_port_survives_the_round(void) {
     close_tunnel(c, t2, NULL);
     free(c);
 }
+/* A peer that publishes IPv6 must not drag a host without any IPv6 address into
+ * dialling it: the kernel answers EAFNOSUPPORT and the whole window is lost. */
+static void v6_is_skipped_when_the_host_has_no_v6(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "peer-v6", 98, FASTP2P_TRANSPORT_TCP, 0);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->peer_text[OP_FAM_V4], "198.51.100.9");
+    strcpy(t->peer_text[OP_FAM_V6], "2409:895a:f363:b139:b814:b5ff:fe8b:c238");
+    strcpy(t->mapped_text[OP_FAM_V4], "172.16.12.192");
+    strcpy(t->mapped_text[OP_FAM_V6], "2409:895a:f363::1");
+    t->peer_ready[OP_FAM_V4] = t->peer_ready[OP_FAM_V6] = 1;
+    t->mapped_ports[OP_FAM_V4] = 40000;
+    t->mapped_ports[OP_FAM_V6] = 40001;
+    /* A host that has its own v6 address prefers it, as before. */
+    strcpy(c->local_ip[OP_FAM_V6], "2409:895a:f363::2");
+    assert(choose_punch_family(c, t) == OP_FAM_V6);
+    /* Without one, the same tunnel must not keep the v6 choice. */
+    c->local_ip[OP_FAM_V6][0] = 0;
+    assert(family_usable(c, t, OP_FAM_V6) == 0);
+    assert(choose_punch_family(c, t) == OP_FAM_V4);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+/* The family the target address belongs to wins over a stale choice: dialling a
+ * v4 target from a v6 source fails every attempt with EAFNOSUPPORT. */
+static void punch_target_family_wins(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    strcpy(c->local_ip[OP_FAM_V4], "192.0.2.10");
+    int ti = new_tunnel(c, "peer-fam", 99, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->peer_text[OP_FAM_V4], "198.51.100.9");
+    strcpy(t->mapped_text[OP_FAM_V4], "192.0.2.10");
+    t->peer_ready[OP_FAM_V4] = 1;
+    t->mapped_ports[OP_FAM_V4] = 41000;
+    t->family = OP_FAM_V6;                       /* stale choice from the answer */
+    assert(!op_addr_from_text(&t->peer_addr, "198.51.100.9", 41000));
+    assert(punch_realign_family(c, ti) == 0);
+    assert(t->family == OP_FAM_V4);
+    assert(op_family_index(op_addr_family(&t->peer_addr)) == OP_FAM_V4);
+
+    /* A target in a family this host has no address for ends the round. */
+    assert(!op_addr_from_text(&t->peer_addr, "2409:895a:f363::9", 42000));
+    t->family = OP_FAM_V4;
+    assert(punch_realign_family(c, ti) == -1);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
+    v6_is_skipped_when_the_host_has_no_v6();
+    punch_target_family_wins();
     punch_port_memory_is_per_peer();
     dialer_port_survives_the_round();
     responder_publishes_a_stable_mapping();

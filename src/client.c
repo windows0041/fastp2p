@@ -554,6 +554,7 @@ static void relay_join(fastp2p_client *, int);
 static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
+static int punch_realign_family(fastp2p_client *, int);
 static uint16_t punch_port_get(fastp2p_client *, const char *);
 static void punch_port_note(fastp2p_client *, const char *, uint16_t);
 static void report_client(fastp2p_client *);
@@ -1705,6 +1706,12 @@ static int probe_running(const tunnel *t) {
 static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
     if (family < 0 || family >= OP_FAM_COUNT)
         return 0;
+    /* A family this host cannot open a socket for is never usable, however
+     * reachable the peer looks in it. A dual-stack initiator publishes a v6
+     * endpoint; an answering peer without any v6 address used to copy that choice
+     * and spend its whole window on dials the kernel refused with EAFNOSUPPORT. */
+    if (family == OP_FAM_V6 && !address_of_family(c->local_ip[OP_FAM_V6], OP_FAM_V6))
+        return 0;
     if (!t->peer_ready[family] || !address_of_family(t->peer_text[family], family))
         return 0;
     if (t->lan)
@@ -2750,6 +2757,12 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
      * reported port gets only a few attempts: each second spent dialling is a
      * second its own SYN is filtered. A cone peer keeps the longer walk because
      * its reported port is usually the reachable one. */
+    /* The source socket and the target must belong to one family. A tunnel that
+     * ends up with a v6 source and a v4 target fails every dial with EAFNOSUPPORT
+     * and burns the whole window, which is what a dual-stack initiator produced when
+     * the answer carried the peer's v4 endpoint. */
+    if (punch_realign_family(c, index) < 0)
+        return;
     int peer_kind = tcp_peer_kind(t);
     unsigned limit = t->punch_role == TCP_PUNCH_OPENER ? TCP_OPENER_QUICK_ATTEMPTS
                    : peer_kind == TCP_PEER_MOVES      ? TCP_PUNCH_QUICK_ATTEMPTS
@@ -2789,6 +2802,30 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
         t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
 }
 
+/* 1 when this host can actually open a socket in `family`; a host with no IPv6
+ * address must never punch there, however dual-stack the peer looks. */
+static int punch_family_available(const fastp2p_client *c, int family) {
+    return family >= 0 && family < OP_FAM_COUNT && address_of_family(c->local_ip[family], family);
+}
+/* Make the tunnel's family agree with the address it is about to dial. Returns 0
+ * when the tunnel is dialable, -1 when the round has to end instead. */
+static int punch_realign_family(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    int target = op_family_index(op_addr_family(&t->peer_addr));
+    if (target < 0)
+        return 0;
+    if (t->family == target)
+        return 0;
+    if (!punch_family_available(c, target)) {
+        close_tunnel(c, index, "TCP punch target family is unavailable here");
+        return -1;
+    }
+    if (use_punch_family(c, index, target) != 0) {
+        close_tunnel(c, index, "TCP punch target family could not be selected");
+        return -1;
+    }
+    return 0;
+}
 static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     if (!t->peer_addr.len) {
@@ -2804,9 +2841,16 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         char substitute[OP_ADDR_TEXT];
         const char *chosen = punch_peer_text(c, t->peer, t->peer_text[index_family], substitute,
                                              sizeof(substitute));
+        op_addr replacement;
+        /* Only an address of this tunnel's own family may replace the peer's: the
+         * gateway-observed address is IPv4, and swapping it into a v6 endpoint is
+         * how a v6 source ended up dialling a v4 target. */
         if (chosen && strcmp(chosen, t->peer_text[index_family]) &&
-            !op_addr_from_text(&t->peer_addr, chosen, t->remote_ports[index_family]))
+            !op_addr_from_text(&replacement, chosen, t->remote_ports[index_family]) &&
+            op_family_index(op_addr_family(&replacement)) == index_family) {
+            op_addr_copy(&t->peer_addr, &replacement);
             snprintf(t->peer_text[index_family], OP_ADDR_TEXT, "%s", chosen);
+        }
         else if (c->ip[OP_FAM_V4][0] && !strcmp(t->peer_text[index_family], c->ip[OP_FAM_V4])) {
             /* Ask the gateway who the peer really is, then retry. */
             json_object *ask = json_object_new_object();
