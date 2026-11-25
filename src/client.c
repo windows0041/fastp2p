@@ -366,6 +366,9 @@ typedef struct {
     fp_crypto crypto;
     /* Relay role: forward this tunnel's application frames to a paired tunnel. */
     int relay_link;
+    /* One line per round: an inbound punch SYN whose port is not the advertised one is
+     * the connect-back signal, and logging it once keeps the round readable. */
+    int inbound_logged;
     int relay_ready;
     char relay_peer[32];
     int cert_sent, cert_checked;
@@ -404,6 +407,13 @@ typedef struct {
     uint64_t session;
     uint8_t secret[FP_SESSION_SECRET];
     int has_session;
+    /* Consecutive failed tunnel rounds, and the instant the next one may start. A round
+     * that fails used to be replaced immediately - about one new tunnel every two
+     * seconds - which churned sockets, ports and the log without improving the odds.
+     * The delay doubles per failure and is capped, so a hopeless pair settles down while
+     * a transient one still retries quickly. */
+    unsigned fail_rounds;
+    uint64_t retry_after;
     /* Only JSON-profile rules can be replaced by a managed update. Retain
      * configured names independently of gateway-driven runtime renames. */
     int profile_rule;
@@ -553,6 +563,7 @@ static int tcp_nat_level(const fastp2p_client *);
 static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
+static uint64_t app_retry_delay(unsigned);
 static void release_relay(fastp2p_client *, int);
 static void bind_pending_key(fastp2p_client *, int);
 static void relay_join(fastp2p_client *, int);
@@ -1522,8 +1533,16 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     t->relay_link = -1;
     if (reason)
         emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EIO, reason);
-}
-static int hex_value(char ch) {
+    /* The app that owned this tunnel waits before starting another round. */
+    for (int ai = 0; ai < NA; ++ai) {
+        app *a = &c->apps[ai];
+        if (!a->used || a->tunnel_index != index)
+            continue;
+        ++a->fail_rounds;
+        a->retry_after = mono() + app_retry_delay(a->fail_rounds);
+    }
+
+}static int hex_value(char ch) {
     if (ch >= '0' && ch <= '9')
         return ch - '0';
     if (ch >= 'a' && ch <= 'f')
@@ -3304,6 +3323,11 @@ static void start_underlay(fastp2p_client *c, int index) {
     t->state = T_TCP_CONNECT;
 }
 static void session_ready(fastp2p_client *c, int index) {
+    for (int ai = 0; ai < NA; ++ai)
+        if (c->apps[ai].used && c->apps[ai].tunnel_index == index) {
+            c->apps[ai].fail_rounds = 0;
+            c->apps[ai].retry_after = 0;
+        }
     tunnel *t = &c->tunnels[index];
     if (!tunnel_ready(t))
         return;
@@ -3367,7 +3391,15 @@ static void relay_join(fastp2p_client *c, int index) {
     fp_join_proof(c->token, t->session, op_node_id(t->relay_peer), frame + 16);
     tframe(t, TUN_RELAY_JOIN, frame, sizeof(frame));
 }
+static uint64_t app_retry_delay(unsigned rounds) {
+    uint64_t delay = 1 * NS;
+    for (unsigned i = 1; i < rounds && delay < 15 * NS; ++i)
+        delay *= 2;
+    return delay > 15 * NS ? 15 * NS : delay;
+}
 static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport) {
+    if (a->retry_after && mono() < a->retry_after)
+        return -1;
     int ti = new_tunnel(c, peer, random_id(), transport, 1);
     if (ti < 0)
         return -1;
@@ -3408,6 +3440,7 @@ static int relay_tunnel(fastp2p_client *c, app *a, const char *relay, const char
     return ti;
 }
 static void start_punch(fastp2p_client *c, int ti) {
+    c->tunnels[ti].inbound_logged = 0;
     tunnel *t = &c->tunnels[ti];
     strcpy(t->mode, t->transport == FASTP2P_TRANSPORT_TCP ? "tcppunch" : "udppunch");
     t->tcp_v2 = t->transport == FASTP2P_TRANSPORT_TCP;
@@ -5016,26 +5049,38 @@ static void accept_punch(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     if (t->listen_fd < 0 || (t->state != T_TCP_CONNECT && t->state != T_HANDSHAKE))
         return;
-    op_addr peer;
+    op_addr peer, peer_len_probe;
     memset(&peer, 0, sizeof(peer));
+    memset(&peer_len_probe, 0, sizeof(peer_len_probe));
     peer.len = (op_socklen)sizeof(peer.u.storage);
     op_socket fd = op_accept(t->listen_fd, &peer.u.sa, &peer.len);
     if (fd < 0)
         return;
     op_addr_normalize(&peer);
+    /* Connect-back: the port in the offer is what the gateway measured, i.e. the peer's
+     * mapping *towards the gateway*. Towards us a destination-dependent NAT allocates
+     * something else, so requiring the advertised port here rejected every inbound SYN
+     * that actually made it - the one connection that proves the hole is open. Accept it
+     * from the peer's address whatever the port; the session secret rejects impostors. */
+    int from_peer = !op_addr_from_text(&peer_len_probe, t->ip, 0) && op_addr_equal(&peer, &peer_len_probe);
+    if (from_peer && t->remote_port && op_addr_port(&peer) != t->remote_port) {
+        if (!t->inbound_logged) {
+            char note[160];
+            t->inbound_logged = 1;
+            snprintf(note, sizeof(note), "inbound punch SYN from %s:%u (advertised %u); answering it",
+                     t->ip, (unsigned)op_addr_port(&peer), (unsigned)t->remote_port);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        }
+    }
     if (t->tcp_predict_role == TCP_PREDICT_OPEN || t->tcp_predict_role == TCP_PREDICT_PAIR) {
-        if (op_addr_equal(&peer, &t->peer_addr))
-            for (unsigned i = 0; i < t->tcp_candidate_count; ++i)
-                if (op_addr_port(&peer) == t->tcp_candidate_ports[i]) {
-                    tcp_candidate_connected(t, fd, mono());
-                    return;
-                }
+        if (from_peer) {
+            tcp_candidate_connected(t, fd, mono());
+            return;
+        }
         op_close(fd);
         return;
     }
-    op_addr expected;
-    if (op_addr_from_text(&expected, t->ip, 0) || !op_addr_equal(&peer, &expected) ||
-        op_addr_port(&peer) != t->remote_port) {
+    if (!from_peer) {
         op_close(fd);
         return;
     }
