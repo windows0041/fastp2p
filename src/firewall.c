@@ -63,35 +63,33 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
      * replace, so the rule is deleted before it is added again. The overlay interface is
      * separate: it carries nothing but packets this client wrote into the TUN. */
     snprintf(line, sizeof(line),
-             "netsh advfirewall firewall delete rule name=\"FastP2P TCP %u\"", port);
+             "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P TCP %u\"", port);
     if (append(out, length, line))
         return -1;
     snprintf(line, sizeof(line),
-             "netsh advfirewall firewall add rule name=\"FastP2P TCP %u\" dir=in action=allow "
+             "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P TCP %u\" dir=in action=allow "
              "protocol=TCP localport=%u profile=any enable=yes", port, port);
     if (append(out, length, line))
         return -1;
     if (udp) {
         snprintf(line, sizeof(line),
-                 "netsh advfirewall firewall delete rule name=\"FastP2P UDP %u\"", port);
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P UDP %u\"", port);
         if (append(out, length, line))
             return -1;
         snprintf(line, sizeof(line),
-                 "netsh advfirewall firewall add rule name=\"FastP2P UDP %u\" dir=in action=allow "
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P UDP %u\" dir=in action=allow "
                  "protocol=UDP localport=%u profile=any enable=yes", port, port);
         if (append(out, length, line))
             return -1;
     }
     if (tun && *tun) {
-        snprintf(line, sizeof(line),
-                 "netsh advfirewall firewall delete rule name=\"FastP2P overlay (%%s)\"");
         /* The name carries the interface so two overlays never share a rule. */
         snprintf(line, sizeof(line),
-                 "netsh advfirewall firewall delete rule name=\"FastP2P overlay (%s)\"", tun);
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P overlay (%s)\"", tun);
         if (append(out, length, line))
             return -1;
         snprintf(line, sizeof(line),
-                 "netsh advfirewall firewall add rule name=\"FastP2P overlay (%s)\" dir=in "
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P overlay (%s)\" dir=in "
                  "action=allow interface=\"%s\" profile=any enable=yes", tun, tun);
         if (append(out, length, line))
             return -1;
@@ -198,9 +196,12 @@ static int run_shell(const char *command) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 #else
+/* Start the program named at the beginning of the command line directly. A service has
+ * no console and no shell, and routing netsh through cmd.exe only adds a quoting layer
+ * that fails differently from an interactive run. */
 static int run_command_wide(const wchar_t *command) {
     wchar_t buffer[1024];
-    _snwprintf(buffer, ARRAYSIZE(buffer), L"cmd.exe /c %s", command);
+    _snwprintf(buffer, ARRAYSIZE(buffer), L"%s", command);
     buffer[ARRAYSIZE(buffer) - 1] = 0;
     STARTUPINFOW startup = {0};
     startup.cb = sizeof(startup);
@@ -247,6 +248,7 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
      * the result reports what actually happened: all rules in place, some refused, or
      * nothing at all. */
     unsigned ran = 0, done = 0, failed = 0;
+    int first_failure = 0;
     char scratch[2048];
     size_t used = 0;
     while (commands[used]) {
@@ -270,10 +272,13 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
         int status = run_shell(scratch);
 #endif
         ++ran;
-        if (status == 0)
+        if (status == 0) {
             ++done;
-        else
+        } else {
+            if (!first_failure)
+                first_failure = status;
             ++failed;
+        }
     }
     if (!ran)
         return FP_FIREWALL_ABSENT;
@@ -291,9 +296,10 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
         if (!failed)
             snprintf(detail, detail_length, "allowed (%s)", how);
         else if (done)
-            snprintf(detail, detail_length, "allowed (%s, %u rule(s) refused)", how, failed);
+            snprintf(detail, detail_length, "allowed (%s, %u rule(s) refused, first rc %d)", how,
+                     failed, first_failure);
         else
-            snprintf(detail, detail_length, "refused (%s)", how);
+            snprintf(detail, detail_length, "refused (%s, rc %d)", how, first_failure);
     }
     if (!done)
         return FP_FIREWALL_DENIED;
