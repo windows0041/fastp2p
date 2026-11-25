@@ -67,7 +67,7 @@ def console_is(process, owner):
 
 environment = os.environ.copy()
 environment.pop('FASTP2P_TOKEN', None)
-for option, text in (('--version', b'fastp2p '), ('--help', b'fastp2p install')):
+for option, text in (('--version', b'fastp2p '), ('--help', b'--install')):
     result = subprocess.run([str(client), option], env=environment, capture_output=True, timeout=10)
     assert result.returncode == 0 and text in result.stdout, (option, result.returncode, result.stdout, result.stderr)
 

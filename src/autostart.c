@@ -267,55 +267,12 @@ int fastp2p_runtime_begin(const char *profile, int background) {
 int fastp2p_runtime_stopping(void) { return 0; }
 void fastp2p_runtime_request_stop(void) {}
 void fastp2p_runtime_end(void) {}
-static int execute(char *const arguments[], int quiet) {
-    pid_t child = fork();
-    if (child < 0) return -1;
-    if (!child) {
-        if (quiet) {
-            int output = open("/dev/null", O_WRONLY);
-            if (output < 0 || dup2(output, STDOUT_FILENO) < 0 || dup2(output, STDERR_FILENO) < 0)
-                _exit(127);
-            if (output != STDOUT_FILENO && output != STDERR_FILENO) close(output);
-        }
-        execv(arguments[0], arguments);
-        _exit(127);
-    }
-    int status;
-    while (waitpid(child, &status, 0) < 0) if (errno != EINTR) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-#if defined(__linux__)
-static int openwrt_service(const char *action) {
-    const char *script = "/etc/init.d/fastp2p";
-    struct stat metadata;
-    if (lstat(script, &metadata))
-        return errno == ENOENT ? 0 : -1;
-    if (geteuid() || !S_ISREG(metadata.st_mode) || metadata.st_uid || (metadata.st_mode & 0022))
-        return -1;
-    if (!strcmp(action, "stop")) {
-        char *const status[] = {(char *)script, "status", NULL};
-        if (execute(status, 1) == 3)
-            return 0;
-    }
-    char *const command[] = {(char *)script, (char *)action, NULL};
-    return execute(command, 0);
-}
-#endif
 int fastp2p_stop_installed(const char *profile) {
     (void)profile;
-#ifdef __APPLE__
-    if (geteuid()) return -1;
-    char *const check[] = {"/bin/launchctl", "print", "system/top.fastp2p", NULL};
-    if (execute(check, 1)) return 0;
-    char *const stop[] = {"/bin/launchctl", "bootout", "system/top.fastp2p", NULL};
-    return execute(stop, 0);
-#else
-#if defined(__linux__)
-    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK))
-        return openwrt_service("stop");
-#endif
-    char *const stop[] = {"/usr/local/fastp2p/fastp2p-service", "stop", NULL}; return execute(stop, 0);
-#endif
+    /* The manager is driven directly. Stopping must not depend on a helper file
+     * beside the binary: an upgraded node may not have one any more, and a node
+     * installed by this build never gets one. */
+    return fastp2p_service_stop();
 }
 int fastp2p_remove_autostart(const char *profile) {
     return fastp2p_stop_installed(profile);
@@ -376,6 +333,10 @@ static int delete_installation(int keep_config) {
     if (unlink_managed(FASTP2P_SYSTEM_BINARY ".old") ||
         unlink_managed(FASTP2P_SYSTEM_BINARY))
         return -1;
+    /* Releases before this one kept a management script here. An upgraded node still
+     * has it; it must not survive the uninstall that replaced its job. */
+    if (unlink_managed(FASTP2P_SYSTEM_DIR "/fastp2p-service"))
+        return -1;
 #ifdef __linux__
     char target[4096];
     ssize_t used = readlink("/usr/local/bin/fastp2p", target, sizeof(target) - 1);
@@ -394,29 +355,13 @@ static int delete_installation(int keep_config) {
 
 int fastp2p_posix_uninstall(int keep_config) {
     if (geteuid()) return -1;
-#ifdef __APPLE__
-    const char *lock = "/var/run/fastp2p-macos-install.lock";
+    /* One lock for every platform: two uninstalls at once would race on the unit and
+     * on the profile. The manager teardown and the file removal are separate steps,
+     * so a half-finished uninstall still leaves a truthful error behind. */
+    const char *lock = "/var/run/fastp2p-install.lock";
     if (mkdir(lock, 0700)) return -1;
-    int result = fastp2p_stop_installed(NULL) ||
-                 unlink_managed("/Library/LaunchDaemons/top.fastp2p.plist") ||
-                 delete_installation(keep_config);
+    int result = fastp2p_service_remove() || delete_installation(keep_config);
     return rmdir(lock) ? -1 : result;
-#else
-    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK)) {
-        const char *lock = "/var/run/fastp2p-install.lock";
-        if (mkdir(lock, 0700)) return -1;
-        int result = openwrt_service("stop") || openwrt_service("disable") ||
-                     unlink_managed("/etc/init.d/fastp2p") || delete_installation(keep_config);
-        return rmdir(lock) ? -1 : result;
-    }
-    const char *controller = FASTP2P_SYSTEM_DIR "/fastp2p-service";
-    struct stat script;
-    if (protected_directory(FASTP2P_SYSTEM_DIR) != 1 || lstat(controller, &script) ||
-        !S_ISREG(script.st_mode) || script.st_uid || (script.st_mode & 0022))
-        return -1;
-    char *const command[] = {(char *)controller, "uninstall", keep_config ? "--keep-config" : NULL, NULL};
-    return execute(command, 0);
-#endif
 }
 
 int fastp2p_enable_autostart(const char *profile, const char *ca) {

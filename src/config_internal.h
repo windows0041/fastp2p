@@ -4,6 +4,8 @@
 #include "rule_update.h"
 #include <json-c/json.h>
 int fp_client_tcp_nat_config(fastp2p_client *client, json_object *servers);
+/* Same, at runtime: parsed now, resolved by the step loop. */
+int fp_client_tcp_nat_reconfigure(fastp2p_client *client, json_object *servers);
 /* Public STUN servers used to classify the NAT (network.UDPSTUNServers). */
 int fp_client_stun_config(fastp2p_client *client, json_object *servers);
 /* TCP filtering probe server (network.TCPNatProbe), empty disables it. */

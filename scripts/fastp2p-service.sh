@@ -213,11 +213,9 @@ fi
 }
 mv "$stage/fastp2p" "$binary"
 ln -s "$binary" "$cli"
-if [ "$manager" != procd ]; then
-    cp "$0" "$stage/controller"
-    chmod 755 "$stage/controller"
-    mv "$stage/controller" "$prefix/fastp2p-service"
-fi
+# Nothing is copied beside the executable: the installed client registers itself and
+# uninstalls itself, so the install directory keeps exactly one file. This script only
+# runs from the installer's temporary directory, where the trap above removes it.
 write_unit
 native enable
 native start

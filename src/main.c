@@ -15,6 +15,9 @@
 #include <string.h>
 #include <time.h>
 #include <json-c/json.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 static volatile sig_atomic_t interrupted;
 static int was_online;
@@ -109,23 +112,53 @@ static int integer(const char *s, uint64_t *value) {
     return 0;
 }
 static void usage(void) {
-    puts("fastp2p install --token 16_DIGITS [--no-service] [--service] [--config FILE]\n"
-         "fastp2p uninstall [--keep-config]   (removes service; keep-config prepares a reinstall)\n"
-         "fastp2p service --config FILE   (started by the Windows service manager)\n"
-         "fastp2p install --token-file FILE [--no-service] [--config FILE]\n"
-         "fastp2p run [--config FILE]\n"
-         "fastp2p format [--config FILE]   (rewrite the profile as indented JSON)\n"
-         "fastp2p --check-sdwan (checks Linux TUN or Windows Wintun dependencies)\n"
-         "fastp2p stop [--config FILE]\n"
-         "fastp2p --config FILE [--serverhost HOST] [--node NAME] [--cacert FILE]\n"
-         "          [--port WSS_PORT] [--publicipport PORT] [--run-seconds N]\n"
-         "          [--identity-file FILE] (omitting --node uses this host's name)\n"
-         "FASTP2P_TOKEN overrides network.Token in the JSON configuration.\n"
-         "--version prints the C library and ABI version; --licenses prints complete notices.");
+    puts("fastp2p --version                     print the client and ABI version\n"
+         "fastp2p --install <16-digit token>    verify the gateway, install the client and start it at boot\n"
+         "fastp2p --uninstall [--keep-config]   stop and remove the service (--keep-config keeps the profile)\n"
+         "\n"
+         "The host service manager starts the client; the command line it uses is not\n"
+         "meant to be typed. --licenses prints the bundled open-source notices.");
 }
 static int client_main(int argc, char **argv) {
     optind = 1;
     was_online = 0;
+    /* The operator-facing surface is exactly three commands. Everything further down
+     * exists for the service manager, the self-updater and the download scripts. */
+    if (argc == 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
+        printf("fastp2p %s ABI %u\n", fastp2p_version(), fastp2p_abi_version());
+        return 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--install")) {
+#ifdef _WIN32
+        /* Same path as the double-clicked installer: elevation, service registration
+         * and the progress dialog all live behind this one call. */
+        return fastp2p_service_install_token(argv[2]);
+#else
+        if (geteuid()) {
+            fputs("fastp2p: --install needs root; re-run it with sudo.\n", stderr);
+            return 1;
+        }
+        char *arguments[] = {"fastp2p", "install", "--token", argv[2], "--service", NULL};
+        return fastp2p_install_command(5, arguments);
+#endif
+    }
+    if (argc == 2 && !strcmp(argv[1], "--uninstall")) {
+        char *arguments[] = {"fastp2p", "uninstall", NULL};
+        return fastp2p_uninstall_command(2, arguments);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--uninstall") && !strcmp(argv[2], "--keep-config")) {
+        char *arguments[] = {"fastp2p", "uninstall", "--keep-config", NULL};
+        return fastp2p_uninstall_command(3, arguments);
+    }
+#ifndef _WIN32
+    /* Nothing else is a supported command line for a human: the service manager runs
+     * "run --config ... --background", and an empty invocation used to start a client
+     * from a default profile that may not exist. */
+    if (argc == 1) {
+        usage();
+        return 2;
+    }
+#endif
     if(argc==2&&!strcmp(argv[1],"--installer-abi")) {puts("2");return 0;}
 #ifdef __linux__
     if (argc == 2 && !strcmp(argv[1], "--root-service-abi")) {

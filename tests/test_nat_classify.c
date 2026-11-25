@@ -285,6 +285,97 @@ static void peer_listener_port_conflict(void) {
     free(c);
 }
 
+/* The receiving side sprays from a local socket array: every socket carries its own
+ * external mapping towards a destination-dependent NAT, so sixteen of them offer the
+ * peer sixteen ports to hit. The whole client caps the array so a pair of punching
+ * tunnels cannot open an unbounded number of descriptors. */
+/* The ladder describes one path. A laptop that moves from Wi-Fi to a mobile network, or
+ * a carrier that re-NATs a node, invalidates the mapping, the filter levels, the TCP
+ * mapping and the remembered punch ports in one go - and the relay budget grew to four
+ * direct rounds so a symmetric pair has time to find a predictable step. */
+static void nat_remeasure_follows_the_path(void) {
+    assert(PUBLIC_PUNCH_ROUNDS == 4);
+    fastp2p_client c = {0};
+    snprintf(c.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.7");
+    nat_filter_record(&c.udp_filter, 3, NS);
+    nat_filter_record(&c.tcp_filter, 2, NS);
+    c.punch_ports[0].port = 40000;
+    snprintf(c.punch_ports[0].peer, sizeof(c.punch_ports[0].peer), "%s", "peer-a");
+    c.ws_connected = 1;
+    c.path_recheck_at = UINT64_MAX; /* only a path change may trigger below */
+
+    /* First observation is recorded; nothing is measured again. */
+    watch_network_path(&c, 10 * NS);
+    assert(!strcmp(c.path_public, "203.0.113.7"));
+    assert(!c.tcp_nat_reprepare);
+    /* Same path: no work at all. */
+    watch_network_path(&c, 11 * NS);
+    assert(!c.tcp_nat_reprepare);
+
+    /* The gateway now sees another address: every measurement belongs to the old path. */
+    snprintf(c.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "198.51.100.9");
+    watch_network_path(&c, 20 * NS);
+    assert(c.tcp_nat_reprepare);
+    assert(c.udp_filter.level == 0 && c.tcp_filter.level == 0);
+    assert(c.punch_ports[0].port == 0 && !c.punch_ports[0].peer[0]);
+    assert(!strcmp(c.path_public, "198.51.100.9"));
+
+    /* A second change inside the settle window is ignored (a flapping carrier). */
+    c.tcp_nat_reprepare = 0;
+    snprintf(c.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.8");
+    watch_network_path(&c, 21 * NS);
+    assert(!c.tcp_nat_reprepare);
+    assert(!strcmp(c.path_public, "198.51.100.9"));
+
+    /* The source address of the control connection changing is enough on its own. */
+    op_addr local;
+    assert(!op_addr_from_text(&local, "192.168.60.22", 1234));
+    c.control_local = local;
+    watch_network_path(&c, 40 * NS);
+    assert(c.tcp_nat_reprepare);
+    assert(!strcmp(c.path_local, "192.168.60.22"));
+
+    /* Nothing is measured while the control connection is down. */
+    fastp2p_client offline = {0};
+    snprintf(offline.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.7");
+    watch_network_path(&offline, NS);
+    snprintf(offline.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.99");
+    offline.path_recheck_at = UINT64_MAX;
+    watch_network_path(&offline, 2 * NS);
+    assert(!offline.tcp_nat_reprepare);
+    /* ...and it measures once the connection is back. */
+    offline.ws_connected = 1;
+    watch_network_path(&offline, 40 * NS);
+    assert(offline.tcp_nat_reprepare);
+}
+static void udp_array_width_and_ceiling(void) {
+    assert(UDP_PUNCH_ARRAY == 16);
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    int ti[4], opened = 0;
+    for (int i = 0; i < 4; ++i) {
+        ti[i] = new_tunnel(&c, "peer-node-array", (uint64_t)(i + 1), FASTP2P_TRANSPORT_QUIC, 1);
+        assert(ti[i] >= 0);
+        tunnel *t = &c.tunnels[ti[i]];
+        t->family = OP_FAM_V4;
+        t->udp_punch_kind = 2; /* centred window: the receiver opens the array */
+        t->udp_punch_role = UDP_PUNCH_RECEIVE;
+        t->sym_count = SYM_WINDOW_HARD;
+        open_udp_candidates(&c, t);
+        opened += (int)t->udp_candidate_count;
+    }
+    /* Three concurrent tunnels fill the per-client ceiling (3 x 16 = 48) and the fourth
+     * gets none: the array is bounded per client, not per tunnel. */
+    assert(opened == UDP_PUNCH_CLIENT_ARRAY);
+    assert(c.tunnels[ti[0]].udp_candidate_count == UDP_PUNCH_ARRAY);
+    assert(c.tunnels[ti[2]].udp_candidate_count == UDP_PUNCH_ARRAY);
+    assert(c.tunnels[ti[3]].udp_candidate_count == 0);
+    for (int i = 0; i < 4; ++i) {
+        close_udp_candidates(&c.tunnels[ti[i]]);
+        assert(c.tunnels[ti[i]].udp_candidate_count == 0);
+        close_tunnel(&c, ti[i], NULL);
+    }
+}
 static void udp_punch_uses_winning_socket(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -308,11 +399,11 @@ static void udp_punch_uses_winning_socket(void) {
      * pressure can refuse one: retry a few ticks before insisting on all of them
      * (this failed once on a macOS arm64 runner while every other platform
      * passed). */
-    for (int attempt = 0; attempt < 8 && t->udp_candidate_count < UDP_PUNCH_EXTRA_SOCKETS; ++attempt) {
+    for (int attempt = 0; attempt < 24 && t->udp_candidate_count < UDP_PUNCH_ARRAY; ++attempt) {
         tick_tunnel(c, ti, t->punch_started);
         op_sleep_ms(2);
     }
-    assert(t->udp_candidate_count == UDP_PUNCH_EXTRA_SOCKETS);
+    assert(t->udp_candidate_count == UDP_PUNCH_ARRAY);
     assert(drain(peer, SPRAY_WAIT));
 
     op_socket winner = t->udp_candidates[1], primary = t->fd, other = t->udp_candidates[0];
@@ -808,9 +899,19 @@ static void public_round_budget(void) {
     assert(c->tunnels[a->tunnel_index].ipv4_only && !c->tunnels[a->tunnel_index].lan);
     close_tunnel(c, a->tunnel_index, "test second public failure");
     control_message(c, 7, 1, (const uint8_t *)lookup, sizeof(lookup) - 1);
+    /* The relay is asked for only after PUBLIC_PUNCH_ROUNDS direct rounds; the loop
+     * follows the constant so raising the budget does not silently change the ladder. */
+    for (unsigned rounds = 2; rounds < PUBLIC_PUNCH_ROUNDS; ++rounds) {
+        a->retry = 0;
+        tick_apps(c, mono());
+        assert(!a->relay_requested);
+        assert(a->tunnel_index >= 0 && a->attempts == (int)(rounds + 1));
+        close_tunnel(c, a->tunnel_index, "test extra public round");
+        control_message(c, 7, 1, (const uint8_t *)lookup, sizeof(lookup) - 1);
+    }
     a->retry = 0;
     tick_apps(c, mono());
-    assert(a->relay_requested && a->attempts == 2);
+    assert(a->relay_requested && a->attempts == PUBLIC_PUNCH_ROUNDS);
     op_buffer_clear(&c->ws_tx);
     free(c);
 }
@@ -1377,6 +1478,8 @@ int main(void) {
     tcp_punch_scheduling();
     quic_uses_punch_endpoint();
     peer_listener_port_conflict();
+    nat_remeasure_follows_the_path();
+    udp_array_width_and_ceiling();
     udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();
     public_round_budget();
@@ -1518,6 +1621,23 @@ int main(void) {
     assert(!sym_split_window(40000, 1, &low, &high));
     assert(!sym_split_window(40000, SYM_WINDOW_HARD, NULL, &high));
 
+    /* A destination-dependent peer is reached by covering a random slice of the port
+     * range each round. The slice must stay bounded (no 2048-port march) and must move,
+     * otherwise every round retries the same ports. */
+    {
+        unsigned smallest = 65535, largest = 0, first = tcp_sweep_chunk();
+        int moved = 0;
+        for (int i = 0; i < 200; ++i) {
+            unsigned chunk = tcp_sweep_chunk();
+            if (chunk < smallest) smallest = chunk;
+            if (chunk > largest) largest = chunk;
+            if (chunk != first) moved = 1;
+        }
+        assert(moved);
+        assert(smallest >= TCP_SWEEP_MIN);
+        const char *override = getenv("FASTP2P_TCP_SWEEP");
+        if (!override || !*override) assert(largest <= TCP_SWEEP_MAX);
+    }
     sym_window_wire();
     sym_spray_ports();
     udp_dual_window_wire();

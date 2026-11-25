@@ -15,6 +15,10 @@ int fastp2p_service_profile(char out[4096]);
 #define FASTP2P_LOG_DIR "/tmp/fastp2p"
 #define FASTP2P_LOG_FILE FASTP2P_LOG_DIR "/fastp2p.log"
 int fastp2p_posix_uninstall(int keep_config);
+/* Native service management. The unit text is rendered by src/service_unit.c and the
+ * manager tools are driven directly, so no helper script has to sit beside the
+ * binary: registration, teardown and the stop path all live in the client. */
+int fastp2p_service_stop(void);
 #endif
 json_object *fastp2p_profile_read(const char *path);
 int fastp2p_profile_write(const char *path, const char *text);

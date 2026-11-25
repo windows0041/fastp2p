@@ -86,9 +86,13 @@
 #define TCP_PUNCH_SPRAY 256
 /* How many ports of the ephemeral range one round sweeps when the peer's mapping moves
  * per destination. Nobody can predict that port (the advertised one was measured towards
- * the gateway), so the only way to reach it is to cover the range; each round continues
- * where the previous stopped. */
-#define TCP_SWEEP_CHUNK 2048
+ * the gateway), so the only way to reach it is to cover the range; but covering it in
+ * order cost 2048 SYNs per round and reads as a port scan to every IDS and carrier
+ * policer in the path. Each round takes a random window instead: a fraction of the
+ * traffic, no cursor walking the whole range, and the same cumulative chance over a
+ * long punch. FASTP2P_TCP_SWEEP raises the window ceiling, never the floor. */
+#define TCP_SWEEP_MIN 160
+#define TCP_SWEEP_MAX 540
 /* Allocation samples taken towards the gateway probe port right before a punch:
  * three consecutive allocations are enough to tell a constant step from a random
  * one, and the newest sample is the base the peer's prediction starts from. */
@@ -122,6 +126,13 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define NAT_FILTER_RETRY (30 * NS)
 #define NAT_FILTER_REFRESH (600 * NS)
 #define NAT_FILTER_MAX_AGE (1200 * NS)
+/* The path a client is measured on can change without anything local noticing: a laptop
+ * that moves from Wi-Fi to a mobile network keeps its control connection while the
+ * address the gateway sees becomes another one. Re-measuring the ladder periodically is
+ * the only signal that covers that case, and one probe costs two datagrams. */
+#define NAT_PATH_RECHECK (300 * NS)
+/* A carrier can flap between addresses; one ladder per ten seconds is plenty. */
+#define NAT_PATH_SETTLE (10 * NS)
 /* A peer whose mapping moves with every destination still allocates the next
  * port somewhere near the one it last reported. When the sample says only "it
  * moved a lot" - no direction, no step - the punch offers the peer a window
@@ -141,8 +152,16 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define SYM_SPRAY_GAP (400 * MS)
 #define UDP_PUNCH_READY_WAIT (1500 * MS)
 #define UDP_PUNCH_ACK_WINDOW (2 * NS)
-#define UDP_PUNCH_EXTRA_SOCKETS 7
-#define UDP_PUNCH_CLIENT_EXTRA_SOCKETS 16
+/* Local sockets the receiving side sprays from. A symmetric mapping allocates one
+ * external port per (socket, destination), so N sockets offer the peer N ports to hit
+ * instead of one; 16 is where the extra coverage stops paying for the extra datagrams,
+ * and FASTP2P_UDP_ARRAY (2..64) moves it without a rebuild. */
+#define UDP_PUNCH_ARRAY 16
+#define UDP_PUNCH_ARRAY_LIMIT 64
+/* One punching tunnel may hold this many extra sockets, and the whole client this many:
+ * a hard-symmetric pair punches in both directions at the same time. */
+#define UDP_PUNCH_CLIENT_ARRAY 48
+/* Window ports each extra socket sprays, besides the observed one. */
 #define UDP_PUNCH_EXTRA_WINDOW 4
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
@@ -188,7 +207,7 @@ enum {
     PUSH_ONLINE = 15
 };
 enum { S_NONE, S_HANDSHAKE, S_TUNNEL, S_ACK, S_STREAM, S_UDP, S_CLOSING, S_FLOW };
-/* Address-family bitmaps (SPEC �?). The gateway uses the same two values, so
+/* Address-family bitmaps (SPEC). The gateway uses the same two values, so
  * these numbers are protocol, not local policy. */
 enum { FAM_V4 = 1, FAM_V6 = 2, FAM_BOTH = 3 };
 enum tunnel_state {
@@ -218,7 +237,7 @@ enum { TCP_PREDICT_NONE, TCP_PREDICT_OPEN, TCP_PREDICT_DIAL, TCP_PREDICT_PAIR };
 enum { UDP_PUNCH_LEGACY, UDP_PUNCH_SEND, UDP_PUNCH_RECEIVE };
 /* One address-family mapping probe. A dual-stack client runs the identical
  * sequence once per family, against the gateway's address of that family
- * (SPEC �?); a v4-only client keeps exactly one, which is the old behaviour.
+ * (SPEC); a v4-only client keeps exactly one, which is the old behaviour.
  * The socket in `fd` is the source port the mapping was measured from, so it
  * doubles as the LAN/punch socket of that family until the tunnel adopts it. */
 enum { PROBE_FREE = 0, PROBE_CONNECT, PROBE_READ, PROBE_UDP, PROBE_DONE };
@@ -242,7 +261,7 @@ typedef struct {
 } nat_probe;
 /* Per-family NAT classification state. Running the old single probe sequence
  * once per family is what keeps the IPv4 run byte-identical while letting IPv6
- * be measured the same way (SPEC �?/�?). */
+ * be measured the same way (SPEC). */
 typedef struct {
     int phase, type;
     op_socket fd, fd2;
@@ -319,13 +338,12 @@ typedef struct {
     uint64_t tcp_predict_wait, tcp_predict_until;
     unsigned tcp_candidate_count;
     int udp_seen_logged;
-    /* Sweep cursor over the ephemeral range, for a peer whose mapping moves. */
-    uint16_t sweep_cursor;
     uint16_t tcp_candidate_ports[1 + TCP_PREDICT_PORTS];
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
+
     /* Detached-tunnel reclamation handshake (see TUN_RELEASE). */
     uint64_t release_sent;
     int released;
@@ -341,7 +359,7 @@ typedef struct {
     int udp_punch_order, udp_punch_kind, udp_punch_role, udp_punch_ready;
     int udp_dual_punch, udp_peer_cone;
     unsigned udp_candidate_count;
-    op_socket udp_candidates[UDP_PUNCH_EXTRA_SOCKETS];
+    op_socket udp_candidates[UDP_PUNCH_ARRAY_LIMIT];
     uint64_t udp_punch_ack_until;
     uint64_t active_at;
     /* Endpoint text is canonical address text (no brackets, no %scope) in
@@ -351,7 +369,7 @@ typedef struct {
      * both and the punch may still have to fall back from one to the other. */
     char peer[32], ip[OP_ADDR_TEXT], mapped_ip[OP_ADDR_TEXT], mode[16], probe[96];
     size_t probe_len;
-    /* Peer endpoints and our own mapping observations, by family (SPEC �?). */
+    /* Peer endpoints and our own mapping observations, by family (SPEC). */
     char peer_text[OP_FAM_COUNT][OP_ADDR_TEXT], mapped_text[OP_FAM_COUNT][OP_ADDR_TEXT];
     uint16_t remote_ports[OP_FAM_COUNT], mapped_ports[OP_FAM_COUNT];
     /* 1 when the peer gave us a usable endpoint of that family. */
@@ -405,7 +423,7 @@ typedef struct {
         uint64_t until;
     } relay_failed[4];
     int relay_failed_count;
-    /* The peer's own local address, per family (SPEC �?: same-LAN detection
+    /* The peer's own local address, per family (SPEC: same-LAN detection
      * compares within a family). lanIP stays IPv4 as before; lanIP6 is only
      * filled when the peer reports one, so an old peer looks LAN-less exactly
      * as it did before. */
@@ -485,10 +503,18 @@ struct fastp2p_client {
         uint16_t port;
         unsigned rounds;
     } punch_ports[8];
+    /* The path the ladder was measured on: the local source address of the control
+     * connection and the address the gateway reports. Either changing means every
+     * measurement taken so far describes a path this host is no longer on. */
+    char path_local[OP_ADDR_TEXT], path_public[OP_ADDR_TEXT];
+    uint64_t path_recheck_at, path_remeasure_at;
+    /* 1 when a pushed configuration replaced the TCP mapping servers: their
+     * destinations have to be resolved, which the step loop does outside the callback. */
+    int tcp_nat_reprepare;
     uint64_t sdwan_drop_at;
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
-    /* NAT classification is per family (DUALSTACK-SPEC �?/�?). Index 0 holds
+    /* NAT classification is per family (DUALSTACK-SPEC). Index 0 holds
      * exactly the values the old single fields carried, so a v4-only run
      * reports and logs byte-identical numbers. */
     nat_discovery nat[OP_FAM_COUNT];
@@ -538,7 +564,7 @@ struct fastp2p_client {
     uint64_t tcp_handoff_at;
     int gateway_prefer_v6;
     unsigned gateway_failures;
-    int families_wanted;  /* what we publish: observed �?configured intent */
+    int families_wanted;  /* what we publish: observed or configured intent */
     CURLM *multi;
     CURL *ws;
     struct curl_slist *resolve;
@@ -618,7 +644,7 @@ static int valid_node(const char *s) {
             return 0;
     return 1;
 }
-/* Families bitmap helpers (SPEC �?). `nat` is IPv4-only in the old sense; the
+/* Families bitmap helpers (SPEC). `nat` is IPv4-only in the old sense; the
  * per-family helpers below are what makes a v6 measurement possible without
  * changing any v4 number. */
 static int family_bit(int index) { return index == OP_FAM_V4 ? FAM_V4 : FAM_V6; }
@@ -630,7 +656,7 @@ static int family_index(unsigned bit) { return bit == FAM_V6 ? OP_FAM_V6 : OP_FA
 static int primary_family(const fastp2p_client *c) {
     return family_index((c->families_wanted & FAM_V4) ? FAM_V4 : FAM_V6);
 }
-/* 1 when this client intends to probe/publish `index` (SPEC �?). The default is
+/* 1 when this client intends to probe/publish `index` (SPEC). The default is
  * IPv4-only, so a dual-stack hostname does not silently add v6 latency to a
  * previously working v4 link. */
 static int family_wanted(const fastp2p_client *c, int index) {
@@ -669,7 +695,7 @@ static void address_copy(char out[OP_ADDR_TEXT], const char *text) {
 }
 /* A gateway host is either a name we may look up, or a literal address of
  * either family. Colons belong to IPv6 literals, so a host holding one is only
- * accepted when it really parses as one (SPEC �?). The old check rejected every
+ * accepted when it really parses as one (SPEC). The old check rejected every
  * colon, which made "::1" and "2001:db8::1" unusable as ServerHost. */
 static int valid_gateway_host(const char *host) {
     int colons = 0;
@@ -1158,6 +1184,16 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
 #define FP_DEFAULT_TCP_MAPPING_SERVERS "stun.fastp2p.top:3478"
 #define FP_DEFAULT_TCP_MAPPING_SERVERS_ALT "stun.nextcloud.com:443"
 
+/* Adopt new TCP mapping servers at runtime. Only the parse happens here: the
+ * destinations have to be resolved, and the step loop does that on its next tick so a
+ * pushed configuration never blocks the control channel. Returns FASTP2P_EINVAL for a
+ * server list the parser refuses, in which case the running one is kept. */
+int fp_client_tcp_nat_reconfigure(fastp2p_client *c, json_object *servers) {
+    int rv = fp_client_tcp_nat_config(c, servers);
+    if (!rv && c)
+        c->tcp_nat_reprepare = 1;
+    return rv;
+}
 int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
     if (servers)
         return fp_tcp_nat_configure(&c->tcp_nat, servers) ? FASTP2P_EINVAL : FASTP2P_OK;
@@ -1180,7 +1216,11 @@ static uint64_t punch_interval(uint64_t elapsed) {
     return elapsed < 500 * MS ? 50 * MS : 200 * MS;
 }
 /* Each public round gets a fresh mapping and a new prediction window. */
-enum { PUBLIC_PUNCH_ROUNDS = 2 };
+/* Direct rounds before the relay is asked for. Four rounds cover roughly the first
+ * minute of a moving carrier mapping, which is what a symmetric-to-symmetric pair needs
+ * to find a predictable step; the ladder still backs off, and a pair that never answers
+ * ends up on the relay either way. */
+enum { PUBLIC_PUNCH_ROUNDS = 4 };
 /* Ports to hit when the peer's mapping shifts with every destination.  Returns
  * the first port of the window; the caller walks the span in one direction.
  * Zero span means the peer has no predictable mapping, or the window would run
@@ -1781,7 +1821,7 @@ static int probe_running(const tunnel *t) {
     return 0;
 }
 /* 1 when the peer published a usable endpoint of `family` and we can answer it
- * in that family too �?our side needs either a mapping observation or, for a
+ * in that family too - our side needs either a mapping observation or, for a
  * LAN punch, a local address of the same family. */
 static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
     if (family < 0 || family >= OP_FAM_COUNT)
@@ -1798,7 +1838,7 @@ static int family_usable(const fastp2p_client *c, const tunnel *t, int family) {
         return address_of_family(c->local_ip[family], family);
     return t->mapped_ports[family] && address_of_family(t->mapped_text[family], family);
 }
-/* Which family to punch in (SPEC �?): a shared IPv6 is tried first because it
+/* Which family to punch in (SPEC): a shared IPv6 is tried first because it
  * usually has no NAT in front of it at all, and IPv4 stays the compatibility
  * path an old peer can always answer. An old peer never publishes a v6
  * endpoint, so a mixed pair never leaves the v4 path here. */
@@ -1873,7 +1913,7 @@ static int use_punch_family(fastp2p_client *c, int index, int family) {
     t->local_port = socket_port(t->fd);
     return 0;
 }
-/* Record one endpoint a peer published (SPEC �?). `text` is canonical, so a
+/* Record one endpoint a peer published (SPEC). `text` is canonical, so a
  * v4-only peer only ever fills the v4 slot and every historical decision (the
  * active `ip`/`remote_port`, the punch target) sees the same values it did
  * before. A v6 endpoint is remembered alongside and only becomes active when
@@ -1973,7 +2013,7 @@ static int start_probe(fastp2p_client *c, int index) {
          * LAN.  Going through the public address instead would need NAT
          * hairpin support, which is what made these links fail. The LAN socket
          * is opened in whichever family the two ends actually share, falling
-         * back to IPv4 when only IPv4 is in common �?the old behaviour. */
+         * back to IPv4 when only IPv4 is in common - the old behaviour. */
         int family = family_wanted(c, OP_FAM_V6) &&
                              address_of_family(c->local_ip[OP_FAM_V6], OP_FAM_V6) &&
                              t->peer_ready[OP_FAM_V6]
@@ -2510,7 +2550,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     op_js(j, "from", c->node);
     /* On a LAN punch the peers exchange private addresses and local ports; the
      * gateway-observed address is only meaningful when a NAT is in between.
-     * fromIP/coneNatPort stay strictly the IPv4 observation (SPEC �?): an old
+     * fromIP/coneNatPort stay strictly the IPv4 observation (SPEC): an old
      * peer reads only these two and must see exactly what the old build
      * published. fromIP6/coneNatPort6 are new fields an old peer ignores, and
      * they are only sent when this client actually measured an IPv6 mapping. */
@@ -2526,7 +2566,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     publish_tcp_mapping(c, t, j);
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
-     * old peer reads (SPEC �?). */
+     * old peer reads (SPEC). */
     /* A host whose mapping is its own address has no translation, so the business
      * port *is* the public port. Publishing 0 there - which is what happens when
      * the gateway mapping probe is unreachable - leaves the peer with no port to
@@ -2788,22 +2828,25 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
 }
 
 static unsigned tcp_sweep_chunk(void) {
-    static unsigned chunk;
-    if (chunk)
-        return chunk;
-    chunk = TCP_SWEEP_CHUNK;
-    const char *text = getenv("FASTP2P_TCP_SWEEP");
-    if (text && *text) {
-        unsigned long value = strtoul(text, NULL, 10);
-        if (value >= 256 && value <= 65535)
-            chunk = (unsigned)value;
+    static unsigned ceiling;
+    if (!ceiling) {
+        ceiling = TCP_SWEEP_MAX;
+        const char *text = getenv("FASTP2P_TCP_SWEEP");
+        if (text && *text) {
+            unsigned long value = strtoul(text, NULL, 10);
+            if (value >= TCP_SWEEP_MIN && value <= 65535)
+                ceiling = (unsigned)value;
+        }
     }
-    return chunk;
+    if (ceiling <= TCP_SWEEP_MIN)
+        return TCP_SWEEP_MIN;
+    return TCP_SWEEP_MIN + (unsigned)(random_id() % (ceiling - TCP_SWEEP_MIN + 1));
 }
-/* Walk the ephemeral range. A peer whose mapping moves per destination allocates a port
- * nobody can predict - least of all from the port the gateway measured towards itself -
- * so a window around that number is a lottery against the whole range. Each round covers
- * a chunk and continues where the last one stopped, which is the only way to reach it. */
+/* Walk a random window of the ephemeral range. A peer whose mapping moves per
+ * destination allocates a port nobody can predict - least of all from the port the
+ * gateway measured towards itself - so a window around that number is a lottery
+ * against the whole range. Each round covers a different random slice, which is the
+ * only way to reach it without sending a full-range scan every round. */
 static void tcp_punch_sweep(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
@@ -2812,12 +2855,12 @@ static void tcp_punch_sweep(fastp2p_client *c, int index) {
     const unsigned low = 1024, high = 65535;
     const unsigned span = high - low;
     unsigned chunk = tcp_sweep_chunk();
-    if (t->sweep_cursor < low || t->sweep_cursor > high)
-        t->sweep_cursor = (uint16_t)(low + random_id() % span);
-    unsigned cursor = t->sweep_cursor;
+    if (chunk > span)
+        chunk = span;
+    unsigned start = low + (unsigned)(random_id() % span);
     unsigned sent = 0;
     for (unsigned i = 0; i < chunk; ++i) {
-        unsigned port = low + (cursor - low + i) % span;
+        unsigned port = low + (start - low + i) % span;
         op_addr target = t->peer_addr;
         op_addr_set_port(&target, (uint16_t)port);
         /* Same local port as elsewhere: the mapping the peer has to hit stays put. */
@@ -2828,12 +2871,11 @@ static void tcp_punch_sweep(fastp2p_client *c, int index) {
         op_close(fd); /* the SYN is all that was needed */
         ++sent;
     }
-    t->sweep_cursor = (uint16_t)(low + (cursor - low + chunk) % span);
     if (sent) {
         char note[192];
         snprintf(note, sizeof(note),
-                 "TCP punch swept %u ports from %u (peer mapping moves per destination)",
-                 sent, cursor);
+                 "TCP punch sprayed %u random ports from %u (peer mapping moves per destination)",
+                 sent, start);
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
 }
@@ -3075,7 +3117,7 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
                                    ? "single reported port (peer mapping stable)"
                                : peer_kind == TCP_PEER_MOVES
                                    ? (t->peer_tcp_step ? "predicted window from the peer's measured step"
-                                                       : "walk and window (peer mapping moves per destination)")
+                                                       : "random port windows (peer mapping moves per destination)")
                                    : "walk around the reported port (peer mapping unknown)";
         char note[160];
         snprintf(note, sizeof(note), "TCP punch strategy: %s", strategy);
@@ -4285,7 +4327,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
             c->login_ok = 1;
             c->gateway_failures = 0;
             c->gateway_tcp_probe_v2 = op_integer(j, "tcpProbeV2") == 1;
-            /* SPEC �?: only a V3 gateway brackets an IPv6 echo record; without
+            /* SPEC: only a V3 gateway brackets an IPv6 echo record; without
              * it this client keeps the legacy v4-only echo parsing. */
             c->gateway_tcp_probe_v3 = op_integer(j, "tcpProbeV3") == 1;
             /* A working login means the earlier failures were transient; without
@@ -4312,7 +4354,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         const char *peer_text = op_string(j, "fromIP");
         const char *peer_text6 = op_string(j, "fromIP6");
         op_addr peer_ip;
-        /* SPEC �?: the two families are independent fields. Accept the request
+        /* SPEC: the two families are independent fields. Accept the request
          * when *either* measured endpoint is usable, so a v6-only peer (which
          * has nothing valid for the v4 fields an old peer reads) is no longer
          * rejected by the IPv4-only check. */
@@ -4587,7 +4629,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                     !strcmp(t->peer, peer) && op_addr_equal(&gateway_ip, &t->peer_addr))
                     t->tcp_peer_ip_verified = 1;
             }
-        /* SPEC �?: the gateway's 7/1 answer carries the family bitmap and the
+        /* SPEC: the gateway's 7/1 answer carries the family bitmap and the
          * parallel v6 levels. It has no separate v6 LAN column; `IPv6` is the
          * address observed for the peer, so it is used as the v6 LAN endpoint
          * only when it is a private (ULA) address. A global v6 is a public
@@ -5101,7 +5143,7 @@ static void tunnel_message(fastp2p_client *c, int ti, uint16_t sub, const uint8_
                 o->tunnel_index = ti;
                 o->udp = !strcmp(proto, "udp");
                 o->socks_exit = op_integer(j, "socks5") == 1;
-                /* SPEC �?: a v6/domain destination resolves through the same
+                /* SPEC: a v6/domain destination resolves through the same
                  * helper as everything else and the exit socket binds the
                  * destination's own family. v4 keeps the historical any-address
                  * bind. */
@@ -5321,11 +5363,28 @@ static void send_udp_punch_window(const tunnel *t, op_socket fd, op_addr peer,
     }
 }
 
+/* Local sockets the receiver sprays from. Each one is a separate (socket, destination)
+ * pair for the NAT, so it carries its own external mapping: sixteen of them give the
+ * peer sixteen ports to hit instead of one. */
+static unsigned udp_array_width(void) {
+    static unsigned width;
+    if (width)
+        return width;
+    width = UDP_PUNCH_ARRAY;
+    const char *text = getenv("FASTP2P_UDP_ARRAY");
+    if (text && *text) {
+        unsigned long value = strtoul(text, NULL, 10);
+        if (value >= 2 && value <= UDP_PUNCH_ARRAY_LIMIT)
+            width = (unsigned)value;
+    }
+    return width;
+}
 static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
     unsigned in_use = 0;
     for (int i = 0; i < NT; ++i)
         in_use += c->tunnels[i].udp_candidate_count;
-    while (t->udp_candidate_count < UDP_PUNCH_EXTRA_SOCKETS && in_use < UDP_PUNCH_CLIENT_EXTRA_SOCKETS) {
+    unsigned width = udp_array_width();
+    while (t->udp_candidate_count < width && in_use < UDP_PUNCH_CLIENT_ARRAY) {
         op_socket fd = socket_bound(1, source_text(c, OP_FAM_V4), 0, 0);
         if (fd < 0)
             break;
@@ -5917,6 +5976,23 @@ static void dispatch_udp_listener(fastp2p_client *c, int family, const op_addr *
     t->state = T_QUIC;
 }
 static void tick_port_mapping(fastp2p_client *c) {
+    /* AutoPortMapping can change at runtime through a pushed configuration, so the
+     * worker is started and stopped here as well as in start(). A stop joins that
+     * thread, which must not happen inside the configuration callback, so the callback
+     * only sets the flag and this loop does the work. */
+    if (c->auto_port_mapping && !c->port_mapping && !c->validate_only &&
+        (c->listener[OP_FAM_V4] >= 0 || c->udp_listener[OP_FAM_V4] >= 0)) {
+        c->port_mapping = fp_port_mapping_start(c->listener[OP_FAM_V4] >= 0 ? c->public_port : 0,
+                                                c->udp_listener[OP_FAM_V4] >= 0 ? c->public_port : 0);
+        if (c->port_mapping && c->udp_listener[OP_FAM_V4] >= 0)
+            c->port_mapping_wait_until = mono() + 4 * NS;
+    } else if (!c->auto_port_mapping && c->port_mapping) {
+        fp_port_mapping_stop(c->port_mapping);
+        c->port_mapping = NULL;
+        c->mapped_listener = (fp_mapped_ports){0};
+        c->port_mapping_wait_until = 0;
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "router port mapping stopped by configuration");
+    }
     if (!c->port_mapping)
         return;
     fp_mapped_ports previous = c->mapped_listener;
@@ -6302,7 +6378,7 @@ static void tick_apps(fastp2p_client *c, uint64_t now) {
         }
     }
 }
-/* SPEC �?/�?: the family bitmap and the parallel v6 levels ride on both the
+/* SPEC: the family bitmap and the parallel v6 levels ride on both the
  * registration frame (6/0) and the refresh frame (6/9). IPv4 fields keep their
  * historical names and values; a v4-only run reports families=1 and the v6
  * slots stay at their sentinel values, exactly as an old client read them. */
@@ -6420,6 +6496,9 @@ static void close_gateway(fastp2p_client *c) {
         curl_slist_free_all(c->resolve);
         c->resolve = NULL;
     }
+    /* A new control connection can mean a new path (the laptop moved from Wi-Fi to a
+     * mobile network), so the ladder is measured again as soon as it is up. */
+    c->path_recheck_at = 0;
     c->ws_connected = 0;
     c->gateway_tcp_probe_v2 = 0;
     c->ws_socket = CURL_SOCKET_BAD;
@@ -6488,7 +6567,7 @@ static void connect_gateway(fastp2p_client *c) {
      * before IPv6 came up, a family that lost its route), and the login query
      * is what tells the gateway which families this node speaks. */
     refresh_families(c);
-    /* SPEC �?: a v6 literal host must be bracketed in the URL authority, while
+    /* SPEC: a v6 literal host must be bracketed in the URL authority, while
      * a plain name or v4 literal is unchanged. */
     char urlhost[300];
     const char *tls_host = c->tls_host ? c->tls_host : c->host;
@@ -6517,7 +6596,7 @@ static void connect_gateway(fastp2p_client *c) {
         snprintf(c->path + used, sizeof(c->path) - used, "&deviceid=%s", c->device_id);
     }
     /* One pinned answer per *usable* family, v4 first so the preferred family
-     * keeps the historical order (SPEC �?). A family this host cannot route to
+     * keeps the historical order (SPEC). A family this host cannot route to
      * is deliberately left out: pinning it would let curl start the connection
      * on an address that will never answer and burn the whole connect timeout
      * before it falls back, which is exactly what happens on a host that
@@ -7009,7 +7088,7 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     else if (s->no_nat)
         /* No translation, so the "levels" describe the host firewall instead:
          * reachable from elsewhere is an open internet host, and a path that
-         * answers nothing is a symmetric UDP firewall (RFC 3489 �?). */
+         * answers nothing is a symmetric UDP firewall (RFC 3489). */
         level = (s->port_changed || s->ip_changed) ? 6 : (port_evidence ? 7 : 0);
     else if (!s->mapped_same)
         level = 4;
@@ -7316,6 +7395,86 @@ static int refresh_families(fastp2p_client *c) {
     c->families_wanted = wanted;
     return wanted;
 }
+/* Drop every NAT measurement and start the ladder again. The mapping class, the filter
+ * levels and the TCP mapping all describe one path, so a host that changes path - a
+ * laptop moving from Wi-Fi to a mobile network - has to measure all of them again.
+ * Tunnels are left alone: the next punch round reads the new values, and resetting them
+ * here would drop a link that is still usable. */
+static void nat_remeasure(fastp2p_client *c) {
+    /* The remembered punch ports belong to the old mapping. */
+    memset(c->punch_ports, 0, sizeof(c->punch_ports));
+    c->udp_filter = c->tcp_filter = (nat_filter){0};
+    c->tcp_level.phase = 0;
+    c->tcp_nat_reprepare = 1;
+    if (c->stun.fd >= 0) {
+        op_close(c->stun.fd);
+        c->stun = (nat_stun){.fd = -1};
+    }
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        nat_discovery *n = &c->nat[family];
+        nat_discovery_close(n);
+        n->phase = 0;
+        n->retries = 0;
+        n->type = NAT_UNKNOWN;
+        if (!family_wanted(c, family) || !gateway_has(c, family))
+            continue;
+        n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
+        if (n->fd < 0)
+            continue;
+        n->phase = 1;
+        n->deadline = mono() + 2 * NS;
+        op_addr peer = c->gateway_addr[family];
+        op_addr_set_port(&peer, 27180);
+        (void)udp_packet(n->fd, &peer, 2, 0, NULL);
+    }
+    if (c->nat_override)
+        c->nat[OP_FAM_V4].type = c->nat_override;
+}
+
+/* Watch the path this host is measured on. A Wi-Fi to mobile switch changes the source
+ * address of the control connection at once and the address the gateway sees a moment
+ * later; a carrier that re-NATs us behind the same interface changes only the latter.
+ * Both are watched, and the ladder is re-run every NAT_PATH_RECHECK as well, so a change
+ * that neither signal shows up in still gets measured. */
+static void watch_network_path(fastp2p_client *c, uint64_t now) {
+    char local[OP_ADDR_TEXT] = "";
+    if (c->control_local.len)
+        op_addr_text(&c->control_local, local, sizeof(local));
+    int local_known = local[0] && strcmp(local, "0.0.0.0") && strcmp(local, "::");
+    const char *observed = addr_text_set(c->ip[OP_FAM_V4]) ? c->ip[OP_FAM_V4] : "";
+    /* Learn the first observation, so the next one has something to compare with. */
+    if (!c->path_local[0] && local_known)
+        snprintf(c->path_local, sizeof(c->path_local), "%s", local);
+    if (!c->path_public[0] && *observed)
+        snprintf(c->path_public, sizeof(c->path_public), "%s", observed);
+    const char *why = NULL;
+    if (local_known && c->path_local[0] && strcmp(local, c->path_local))
+        why = "the local source address changed";
+    else if (*observed && c->path_public[0] && strcmp(observed, c->path_public))
+        why = "the address the gateway sees changed";
+    int due = now >= c->path_recheck_at;
+    if (!why && !due)
+        return;
+    /* Without a control connection there is nothing to measure against; the next step
+     * after a reconnect retries. */
+    if (!c->ws_connected)
+        return;
+    /* A carrier can flap: one ladder per ten seconds is enough. */
+    if (now < c->path_remeasure_at)
+        return;
+    c->path_remeasure_at = now + NAT_PATH_SETTLE;
+    c->path_recheck_at = now + NAT_PATH_RECHECK;
+    if (local_known)
+        snprintf(c->path_local, sizeof(c->path_local), "%s", local);
+    if (*observed)
+        snprintf(c->path_public, sizeof(c->path_public), "%s", observed);
+    if (why) {
+        char note[192];
+        snprintf(note, sizeof(note), "%s; measuring the NAT again", why);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    }
+    nat_remeasure(c);
+}
 static void tick_nat(fastp2p_client *c, uint64_t now) {
     /* v4 is driven first so its socket work is identical to the old build; a
      * family that has not been started (fd < 0) is simply not counted. */
@@ -7366,7 +7525,7 @@ int fastp2p_client_create(const fastp2p_config *cfg, fastp2p_client **out) {
         free(c);
         return FASTP2P_EINVAL;
     }
-    /* SPEC �?: a gateway host may now be an IPv6 literal; every other character
+    /* SPEC: a gateway host may now be an IPv6 literal; every other character
      * still has to be a name character, so the old rejection of odd hosts is
      * unchanged. */
     if (!valid_gateway_host(c->host)) {
@@ -8069,7 +8228,7 @@ int fastp2p_client_start(fastp2p_client *c) {
     op_once_run(&curl_once, initialize_curl);
     if (curl_initialization != CURLE_OK)
         return FASTP2P_EIO;
-    /* SPEC �?: resolve both families. Probe every family this host can actually
+    /* SPEC: resolve both families. Probe every family this host can actually
      * reach the gateway on, so a dual-stack pair can negotiate v6, but keep the
      * historical v4 preference for the login and the reply address. */
     int found = resolve_any_families(c->host, c->port, FAM_BOTH, &c->gateway, c->gateway_addr);
@@ -8106,7 +8265,8 @@ int fastp2p_client_start(fastp2p_client *c) {
             snprintf(message, sizeof(message), "Cannot listen on configured TCP peer port %u: %s",
                      (unsigned)c->public_port, strerror(listener_error));
         else
-            snprintf(message, sizeof(message), "Cannot listen on a TCP peer port in 1024�?999: %s",
+            snprintf(message, sizeof(message), "Cannot listen on a TCP peer port in %u-%u: %s",
+                     PEER_PORT_MIN, PEER_PORT_MIN + PEER_PORT_COUNT - 1,
                      strerror(listener_error));
         emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, message);
         fastp2p_client_stop(c);
@@ -8183,6 +8343,10 @@ int fastp2p_client_start(fastp2p_client *c) {
     c->stopping = 0;
     c->reconnect_at = 0;
     c->nat_settled = 0;
+    c->path_local[0] = c->path_public[0] = 0;
+    c->path_recheck_at = mono() + NAT_PATH_RECHECK;
+    c->path_remeasure_at = 0;
+    c->tcp_nat_reprepare = 0;
     snprintf(c->ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "0.0.0.0");
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         c->nat[family].type = NAT_UNKNOWN;
@@ -8234,6 +8398,18 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     }
     uint64_t now = mono();
     tick_nat(c, now);
+    /* The path can change at any time (Wi-Fi to mobile is the common case), and every
+     * measurement below describes the path it was taken on. */
+    watch_network_path(c, now);
+    if (c->tcp_nat_reprepare) {
+        /* A pushed configuration replaced the TCP mapping servers. Resolving their
+         * destinations belongs here rather than in the configuration callback, which
+         * runs inside this loop and must not block it. */
+        c->tcp_nat_reprepare = 0;
+        fp_tcp_nat_close(&c->tcp_nat);
+        fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "TCP probe servers changed; re-measuring the TCP mapping");
+    }
     int tcp_done = fp_tcp_nat_step(&c->tcp_nat, now);
     if (tcp_done) {
         /* One line per family that finished a fresh observation, so the log

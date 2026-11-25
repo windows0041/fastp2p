@@ -72,26 +72,78 @@ static int rollback(void) {
 static int rule_field(const char *key) {
     return !strcmp(key, "apps") || !strcmp(key, "socks5");
 }
-static int unchanged_outside_rules(json_object *a, json_object *b) {
+/* network subkeys the running client can adopt without being rebuilt. TCPSTUNServers is
+ * included: its parser only stores text, and the step loop resolves the destinations on
+ * its next tick, so a pushed change never blocks the control channel. */
+static int hot_network_field(const char *key) {
+    return !strcmp(key, "UDPSTUNServers") || !strcmp(key, "TCPSTUNServers") ||
+           !strcmp(key, "TCPNatProbe") || !strcmp(key, "AutoPortMapping");
+}
+/* Everything the running client can pick up in place: the rules, the overlay section and
+ * a handful of per-machine probes. The remaining fields describe the connection itself
+ * (gateway endpoint, token, node identity, certificate, listener port), so a change
+ * there still has to rebuild the instance. Comparing in both directions catches a key
+ * that one side has and the other does not. */
+static int unchanged_outside_hot(json_object *a, json_object *b) {
     json_object_object_foreach(a, key, value) {
-        json_object *other;
-        if (!rule_field(key) && strcmp(key, META) &&
-            (!json_object_object_get_ex(b, key, &other) || !json_object_equal(value, other)))
+        json_object *other = NULL;
+        if (!strcmp(key, META))
+            continue;
+        if (!strcmp(key, "network")) {
+            /* Inside network only the hot subkeys may differ. */
+            if (!json_object_is_type(value, json_type_object))
+                return 0;
+            json_object_object_get_ex(b, key, &other);
+            json_object_object_foreach(value, name, item) {
+                json_object *theirs = NULL;
+                if (hot_network_field(name))
+                    continue;
+                if (!json_object_is_type(other, json_type_object) ||
+                    !json_object_object_get_ex(other, name, &theirs) ||
+                    !json_object_equal(item, theirs))
+                    return 0;
+            }
+            continue;
+        }
+        if (rule_field(key) || !strcmp(key, "sdwan"))
+            continue;
+        if (!json_object_object_get_ex(b, key, &other) || !json_object_equal(value, other))
             return 0;
     }
     return 1;
 }
-/* True when the only difference between two snapshots is the SD-WAN section: such a
- * push can be applied in place for the same reason rule-only pushes can - the tunnels
- * that are not part of the overlay do not have to be rebuilt. */
-static int unchanged_outside_sdwan(json_object *a, json_object *b) {
-    json_object_object_foreach(a, key, value) {
-        json_object *other;
-        if (strcmp(key, "sdwan") && !rule_field(key) && strcmp(key, META) &&
-            (!json_object_object_get_ex(b, key, &other) || !json_object_equal(value, other)))
-            return 0;
-    }
-    return 1;
+static json_object *section(json_object *root, const char *key) {
+    json_object *value = NULL;
+    if (root)
+        json_object_object_get_ex(root, key, &value);
+    return value;
+}
+/* True when both are absent, or both present and equal. */
+static int section_equal(json_object *a, json_object *b, const char *key) {
+    json_object *left = section(a, key), *right = section(b, key);
+    if (!left || !right)
+        return left == right;
+    return json_object_equal(left, right) ? 1 : 0;
+}
+/* Adopt the probe servers and the router-mapping switch. Each setter only retargets the
+ * next measurement (no sockets are opened here), so applying them cannot leave the
+ * client half-converted; the mapping worker itself is started or stopped by the step
+ * loop, because joining its thread inside this callback would stall the event loop.
+ * Only fields that really changed are touched, so a routine push does no work at all. */
+static void apply_runtime_knobs(fastp2p_client *client, json_object *next, json_object *active) {
+    json_object *network = section(next, "network"), *running = section(active, "network");
+    if (!section_equal(network, running, "UDPSTUNServers") &&
+        fp_client_stun_config(client, section(network, "UDPSTUNServers")))
+        fputs("Gateway UDP STUN servers were refused; keeping the old ones.\n", stderr);
+    if (!section_equal(network, running, "TCPSTUNServers") &&
+        fp_client_tcp_nat_reconfigure(client, section(network, "TCPSTUNServers")))
+        fputs("Gateway TCP STUN servers were refused; keeping the old ones.\n", stderr);
+    if (!section_equal(network, running, "TCPNatProbe") &&
+        fp_client_tcp_level_config(client, section(network, "TCPNatProbe")))
+        fputs("Gateway TCP probe server was refused; keeping the old one.\n", stderr);
+    int mapping = json_object_get_boolean(section(network, "AutoPortMapping"));
+    if (mapping != json_object_get_boolean(section(running, "AutoPortMapping")))
+        fp_client_set_auto_port_mapping(client, mapping);
 }
 static int update_metadata(json_object *root, uint64_t revision, const char *hash, int pending) {
     json_object *meta = metadata(root);
@@ -134,58 +186,65 @@ static int receive(const char *fields,uint64_t revision,void *user) {
     }
     if(json_object_equal(next,sync_state.active)) {result=0;goto done;}
     const char *text = json_object_to_json_string_ext(next, JSON_C_TO_STRING_PLAIN);
-    json_object *field;
-    int has_rules = json_object_object_get_ex(patch, "apps", &field) ||
-                    json_object_object_get_ex(patch, "socks5", &field);
-    /* The gateway can include other, unchanged fields in its full snapshot.
-     * Compare against the file just read, not the startup snapshot: an operator
-     * edit made while the client runs must not demote a rules-only push to a
-     * full reload that drops every tunnel. */
-    json_object *next_sdwan = NULL, *running_sdwan = NULL;
-    int has_sdwan = json_object_object_get_ex(next, "sdwan", &next_sdwan) && next_sdwan &&
-                    json_object_is_type(next_sdwan, json_type_object);
-    (void)json_object_object_get_ex(current, "sdwan", &running_sdwan);
-    if (has_sdwan && sync_state.online && !sync_state.pending &&
-        unchanged_outside_sdwan(next, current) && unchanged_outside_sdwan(current, next) &&
-        (!running_sdwan || !json_object_equal(next_sdwan, running_sdwan))) {
-        char detail[96] = "";
-        if (!fp_client_sdwan_reconfigure(client, next_sdwan, detail, sizeof(detail))) {
-            if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
-                fputs("Gateway SD-WAN section could not be saved; keeping the running one.\n", stderr);
-                result = FASTP2P_EIO;
+    /* A push that only touches what the running client can adopt is applied in place:
+     * the rules, the overlay section, the probe servers and the router-mapping switch.
+     * The gate compares against the file just read, so an operator edit does not demote
+     * a hot push to a full reload; what is actually re-applied is decided against
+     * sync_state.active, which is what runs today. */
+    int hot = sync_state.online && !sync_state.pending &&
+              unchanged_outside_hot(next, current) && unchanged_outside_hot(current, next);
+    json_object *next_sdwan = section(next, "sdwan");
+    int has_sdwan = next_sdwan && json_object_is_type(next_sdwan, json_type_object);
+    int sdwan_changed = has_sdwan && !section_equal(next, sync_state.active, "sdwan");
+    int rules_changed = !section_equal(next, sync_state.active, "apps") ||
+                        !section_equal(next, sync_state.active, "socks5");
+    if (hot) {
+        /* Validate the whole document before adopting any part of it: a field the parser
+         * refuses must not leave the running client half-converted. */
+        result = fp_config_validate_json(text);
+        if (result) {
+            fprintf(stderr, "Gateway configuration validation failed (%d).\n", result);
+            goto done;
+        }
+        apply_runtime_knobs(client, next, sync_state.active);
+        if (rules_changed) {
+            result = fp_client_rules_prepare(client, text, &rules);
+            if (result) {
+                fprintf(stderr, "Gateway rules could not be prepared (%d); keeping current rules.\n", result);
                 goto done;
             }
-            json_object_put(sync_state.active);
-            sync_state.active = json_object_get(next);
-            fprintf(stderr, "Gateway SD-WAN section applied in place (%s).\n", detail);
-            result = FASTP2P_OK;
-            goto done;
         }
-        /* The section was refused: fall through to the reload path, which reports the
-         * rejection the way every other configuration error is reported. */
-        fprintf(stderr, "Gateway SD-WAN section was refused; reloading the instance instead.\n");
-    }
-    if (has_rules && !sync_state.pending && unchanged_outside_rules(next, current) &&
-        unchanged_outside_rules(current, next)) {
-        result = fp_client_rules_prepare(client, text, &rules);
-        if (result) {
-            fprintf(stderr, "Gateway rules could not be prepared (%d); keeping current rules.\n", result);
-            goto done;
+        if (sdwan_changed) {
+            char detail[96] = "";
+            if (fp_client_sdwan_reconfigure(client, next_sdwan, detail, sizeof(detail))) {
+                /* The section was refused: take the reload path, which reports the
+                 * rejection the way every other configuration error is reported. */
+                fprintf(stderr, "Gateway SD-WAN section was refused; reloading the instance instead.\n");
+                goto reload;
+            }
         }
         if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
-            fputs("Gateway rules could not be saved; keeping current rules.\n", stderr);
+            fputs("Gateway configuration could not be saved; keeping the running one.\n", stderr);
             result = FASTP2P_EIO;
             goto done;
         }
         /* All fallible work is done. No step can run between save and commit. */
-        fp_client_rules_commit(rules);
-        rules = NULL;
+        if (rules) {
+            fp_client_rules_commit(rules);
+            rules = NULL;
+        }
         json_object_put(sync_state.active);
         sync_state.active = json_object_get(next);
+        sync_state.revision = revision;
+        snprintf(sync_state.digest, sizeof(sync_state.digest), "%s", hash);
+        fprintf(stderr, "Gateway configuration applied in place (rules=%d, sdwan=%d).\n",
+                rules_changed, sdwan_changed);
         result = FASTP2P_OK;
         goto done;
     }
-    /* Non-rule changes still reload the entire instance. */
+reload:
+    /* A new gateway endpoint, token, node identity, certificate or listener port still
+     * needs a fresh instance, so those reload the whole client. */
     result=fp_config_validate_json(text);
     if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if (update_metadata(next, revision, hash, 1)) {result=FASTP2P_ENOMEM;goto done;}
@@ -213,14 +272,11 @@ done:
 int fp_config_sync_persist_node(const char *node) {
     if (!sync_state.path[0] || !node || !*node)
         return -1;
-    FILE *file = fopen(sync_state.path, "rb");
-    if (!file)
-        return -1;
-    char buffer[1 << 20];
-    size_t length = fread(buffer, 1, sizeof(buffer) - 1, file);
-    fclose(file);
-    buffer[length] = 0;
-    json_object *root = json_tokener_parse(buffer);
+    /* Read through the same helper the writer below uses: a machine-scope Windows
+     * profile is "FPD1" + DPAPI, so a raw fopen + JSON parse only ever saw
+     * ciphertext there and the assigned name was never persisted.  The helper also
+     * keeps the 1 MiB bound this function used to duplicate on the stack. */
+    json_object *root = fastp2p_profile_read(sync_state.path);
     if (!root || !json_object_is_type(root, json_type_object)) {
         if (root)
             json_object_put(root);

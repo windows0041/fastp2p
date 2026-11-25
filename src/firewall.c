@@ -42,8 +42,9 @@ static const char *android_su(void) {
 }
 #endif
 
-/* The macOS application firewall is configured per binary, so the commands need this
- * executable's own path. */
+/* The macOS application firewall is configured per binary and the Windows rule allows the
+ * program itself, so both need this executable's own path. */
+#if defined(_WIN32) || defined(__APPLE__)
 static int current_executable(char *out, size_t length) {
     if (!out || !length)
         return -1;
@@ -68,12 +69,18 @@ static int current_executable(char *out, size_t length) {
     return 0;
 #endif
 }
+#endif
 
-int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, size_t length) {
+int fp_firewall_commands(const char *backend, unsigned port, int udp, const char *tun,
+                         char *out, size_t length) {
     if (!out || !length)
         return -1;
     out[0] = 0;
     char line[256];
+#if !defined(__linux__) || defined(__ANDROID__)
+    /* Only the Linux netfilter rendering has two front ends. */
+    (void)backend;
+#endif
 #if defined(_WIN32)
     /* One idempotent pass: remove only our own leftovers, then create what is missing.
      * A restart that changes nothing must not touch the policy at all - a delete-and-add
@@ -174,46 +181,73 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
             return -1;
     }
 #else
-    /* netfilter: -C makes the insert idempotent, so a restart does not add a rule per
-     * start. Both families are opened because the listener binds both. */
-    enum { kFamilies = 2 };
-    static const char *const tools[kFamilies] = {"iptables", "ip6tables"};
-    for (int family = 0; family < kFamilies; ++family) {
-        char candidate[64];
-        snprintf(candidate, sizeof(candidate), "/usr/sbin/%s", tools[family]);
-        if (access(candidate, X_OK)) {
-            snprintf(candidate, sizeof(candidate), "/sbin/%s", tools[family]);
-            if (access(candidate, X_OK))
-                continue;
-        }
-        snprintf(line, sizeof(line),
-                 "iptables -C INPUT -p tcp --dport %u -j ACCEPT 2>/dev/null || "
-                 "iptables -I INPUT -p tcp --dport %u -j ACCEPT", port, port);
-        if (family)
-            snprintf(line, sizeof(line),
-                     "ip6tables -C INPUT -p tcp --dport %u -j ACCEPT 2>/dev/null || "
-                     "ip6tables -I INPUT -p tcp --dport %u -j ACCEPT", port, port);
+    /* netfilter has two front ends and a host may ship only one of them: iptables (what
+     * this client has always written) and nftables (Debian 12 minimal images, RHEL 9 and
+     * most container base images). Either rendering opens the same kernel, so the caller
+     * picks one and falls back to the other when nothing was accepted.
+     *
+     * nftables owns a private table and chain: a base chain at priority -10 runs before
+     * the distribution's filter chain, so an accept there wins even under a default-drop
+     * policy, and flushing our own chain on every start means a changed port cannot
+     * accumulate rules. Nothing outside that table is touched. */
+    if (backend && !strcmp(backend, "nft")) {
+        if (append(out, length, "nft list table inet fastp2p >/dev/null 2>&1 || "
+                                "nft 'add table inet fastp2p'"))
+            return -1;
+        if (append(out, length, "nft list chain inet fastp2p input >/dev/null 2>&1 || "
+                                "nft 'add chain inet fastp2p input { type filter hook input "
+                                "priority -10; policy accept; }'"))
+            return -1;
+        if (append(out, length, "nft flush chain inet fastp2p input"))
+            return -1;
+        snprintf(line, sizeof(line), "nft add rule inet fastp2p input tcp dport %u accept", port);
         if (append(out, length, line))
             return -1;
         if (udp) {
-            snprintf(line, sizeof(line),
-                     "iptables -C INPUT -p udp --dport %u -j ACCEPT 2>/dev/null || "
-                     "iptables -I INPUT -p udp --dport %u -j ACCEPT", port, port);
-            if (family)
-                snprintf(line, sizeof(line),
-                         "ip6tables -C INPUT -p udp --dport %u -j ACCEPT 2>/dev/null || "
-                         "ip6tables -I INPUT -p udp --dport %u -j ACCEPT", port, port);
+            snprintf(line, sizeof(line), "nft add rule inet fastp2p input udp dport %u accept",
+                     port);
             if (append(out, length, line))
                 return -1;
         }
+        if (tun && *tun) {
+            snprintf(line, sizeof(line),
+                     "nft add rule inet fastp2p input iifname \"%s\" accept", tun);
+            if (append(out, length, line))
+                return -1;
+        }
+        return 0;
     }
-    if (tun && *tun) {
-        snprintf(line, sizeof(line),
-                 "iptables -C INPUT -i %s -j ACCEPT 2>/dev/null || "
-                 "iptables -I INPUT -i %s -j ACCEPT", tun, tun);
-        if (append(out, length, line))
-            return -1;
+    /* iptables: -C makes the insert idempotent, so a restart does not add a rule per
+     * start. Both families are opened because the listener binds both. The rendering does
+     * not probe for the tools: the caller decides which front end to use, and a test has
+     * to see the same text on a host that happens to lack them. */
+    if (!backend || !strcmp(backend, "iptables")) {
+        enum { kFamilies = 2 };
+        for (int family = 0; family < kFamilies; ++family) {
+            const char *tool = family ? "ip6tables" : "iptables";
+            snprintf(line, sizeof(line),
+                     "%s -C INPUT -p tcp --dport %u -j ACCEPT 2>/dev/null || "
+                     "%s -I INPUT -p tcp --dport %u -j ACCEPT", tool, port, tool, port);
+            if (append(out, length, line))
+                return -1;
+            if (udp) {
+                snprintf(line, sizeof(line),
+                         "%s -C INPUT -p udp --dport %u -j ACCEPT 2>/dev/null || "
+                         "%s -I INPUT -p udp --dport %u -j ACCEPT", tool, port, tool, port);
+                if (append(out, length, line))
+                    return -1;
+            }
+        }
+        if (tun && *tun) {
+            snprintf(line, sizeof(line),
+                     "iptables -C INPUT -i %s -j ACCEPT 2>/dev/null || "
+                     "iptables -I INPUT -i %s -j ACCEPT", tun, tun);
+            if (append(out, length, line))
+                return -1;
+        }
+        return 0;
     }
+    return -1;
 #endif
     return 0;
 }
@@ -282,39 +316,16 @@ static int run_command_blob(const char *commands) {
 }
 #endif
 
-int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
-                     size_t detail_length) {
-    if (detail && detail_length)
-        detail[0] = 0;
-    if (!port)
-        return FP_FIREWALL_ABSENT;
-    char commands[2048];
-    if (fp_firewall_commands(port, udp, tun, commands, sizeof(commands)))
-        return FP_FIREWALL_ABSENT;
-#if defined(_WIN32)
-    /* The Windows rules go through PowerShell now, so look for that; checking for netsh
-     * made a working opener report "no rule tool on this host" and never run. */
-    if (strstr(commands, "powershell.exe") == NULL)
-        return FP_FIREWALL_ABSENT;
-#elif defined(__APPLE__)
-    if (access("/usr/libexec/ApplicationFirewall/socketfilterfw", X_OK))
-        return FP_FIREWALL_ABSENT;
-#elif defined(__ANDROID__)
-    if (!android_su())
-        return FP_FIREWALL_ABSENT;
-#else
-    if (access("/usr/sbin/iptables", X_OK) && access("/sbin/iptables", X_OK))
-        return FP_FIREWALL_ABSENT;
-#endif
-    /* A host without an IPv6 filter table, a missing capability for one family, or an
-     * interface that does not exist yet all make single rules fail while the IPv4 port
-     * is open. Counting any failure as "closed" hid a working rule behind a refusal, so
-     * the result reports what actually happened: all rules in place, some refused, or
-     * nothing at all. */
-    unsigned ran = 0, done = 0, failed = 0;
-    int first_failure = 0;
+/* Run every rendered rule and count what happened. A refused rule does not stop the
+ * rest: a host without an IPv6 filter table, a missing capability for one family, or an
+ * overlay interface that does not exist yet all make single rules fail while the peer
+ * port is still open. */
+static void run_rules(const char *commands, unsigned *ran, unsigned *done, unsigned *failed,
+                      int *first_failure) {
     char scratch[2048];
     size_t used = 0;
+    *ran = *done = *failed = 0;
+    *first_failure = 0;
     while (commands[used]) {
         size_t end = used;
         while (commands[end] && commands[end] != '\n')
@@ -326,37 +337,95 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
         scratch[span] = 0;
         used = commands[end] ? end + 1 : end;
 #if defined(_WIN32)
-        wchar_t wide[1024];
-        size_t i = 0;
-        for (; i + 1 < span && i + 1 < ARRAYSIZE(wide); ++i)
-            wide[i] = (wchar_t)(unsigned char)scratch[i];
-        wide[i] = 0;
         int status = run_command_blob(scratch);
 #else
         int status = run_shell(scratch);
 #endif
-        ++ran;
+        ++*ran;
         if (status == 0) {
-            ++done;
+            ++*done;
         } else {
-            if (!first_failure)
-                first_failure = status;
-            ++failed;
+            if (!*first_failure)
+                *first_failure = status;
+            ++*failed;
         }
     }
+}
+
+int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
+                     size_t detail_length) {
+    if (detail && detail_length)
+        detail[0] = 0;
+    if (!port)
+        return FP_FIREWALL_ABSENT;
+    /* Which front end to render: NULL is the platform default. */
+    const char *backend = NULL;
+    const char *how =
+#if defined(_WIN32)
+        "powershell";
+#elif defined(__APPLE__)
+        "application firewall";
+#elif defined(__ANDROID__)
+        "su iptables";
+#else
+        "iptables";
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+    int have_iptables = !access("/usr/sbin/iptables", X_OK) || !access("/sbin/iptables", X_OK);
+    int have_nft = !access("/usr/sbin/nft", X_OK) || !access("/sbin/nft", X_OK);
+    if (!have_iptables && !have_nft)
+        return FP_FIREWALL_ABSENT;
+    /* Debian 12 minimal images, RHEL 9 and most container base images ship nftables
+     * without iptables at all. */
+    if (!have_iptables) {
+        backend = "nft";
+        how = "nft";
+    }
+#endif
+    char commands[2048];
+    if (fp_firewall_commands(backend, port, udp, tun, commands, sizeof(commands)))
+        return FP_FIREWALL_ABSENT;
+#if defined(_WIN32)
+    /* The Windows rules go through PowerShell, so look for that; checking for netsh made
+     * a working opener report "no rule tool on this host" and never run. */
+    if (!strstr(commands, "powershell.exe"))
+        return FP_FIREWALL_ABSENT;
+#elif defined(__APPLE__)
+    if (access("/usr/libexec/ApplicationFirewall/socketfilterfw", X_OK))
+        return FP_FIREWALL_ABSENT;
+#elif defined(__ANDROID__)
+    if (!android_su())
+        return FP_FIREWALL_ABSENT;
+#endif
+    unsigned ran = 0, done = 0, failed = 0;
+    int first_failure = 0;
+    run_rules(commands, &ran, &done, &failed, &first_failure);
+#if defined(__linux__) && !defined(__ANDROID__)
+    /* iptables present but every rule refused - a legacy front end without the kernel
+     * tables, or a container without the capability for it - while nftables works. Retry
+     * there instead of reporting the port closed. */
+    if (!done && !backend && have_nft &&
+        !fp_firewall_commands("nft", port, udp, tun, commands, sizeof(commands))) {
+        unsigned retry_ran = 0, retry_done = 0, retry_failed = 0;
+        int retry_first = 0;
+        run_rules(commands, &retry_ran, &retry_done, &retry_failed, &retry_first);
+        if (retry_done) {
+            ran = retry_ran;
+            done = retry_done;
+            failed = retry_failed;
+            first_failure = retry_first;
+            how = "nft";
+        } else {
+            ran += retry_ran;
+            failed += retry_failed;
+            if (!first_failure)
+                first_failure = retry_first;
+        }
+    }
+#endif
     if (!ran)
         return FP_FIREWALL_ABSENT;
     if (detail && detail_length) {
-        const char *how =
-#if defined(_WIN32)
-            "netsh";
-#elif defined(__APPLE__)
-            "application firewall";
-#elif defined(__ANDROID__)
-            "su iptables";
-#else
-            "iptables";
-#endif
         if (!failed)
             snprintf(detail, detail_length, "allowed (%s)", how);
         else if (done)

@@ -20,9 +20,11 @@ enum {
     FP_FIREWALL_DENIED,      /* the tool refused: not root, policy, Android sandbox */
 };
 
-/* Render the commands the current platform would run. Exposed for tests: the exact
- * arguments are the part that breaks silently when a port or a rule name changes. */
-int fp_firewall_commands(unsigned port, int udp, const char *tun,
+/* Render the commands the current platform would run. On Linux `backend` picks the
+ * netfilter front end ("iptables" or "nft"); NULL means the platform default. Exposed
+ * for tests: the exact arguments are the part that breaks silently when a port or a rule
+ * name changes. */
+int fp_firewall_commands(const char *backend, unsigned port, int udp, const char *tun,
                          char *out, size_t length);
 
 /* Allow inbound peer traffic on `port` (TCP always, UDP when `udp`), then the overlay

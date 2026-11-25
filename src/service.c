@@ -533,8 +533,410 @@ int fastp2p_service_elevate(const char *arguments) {
     return (INT_PTR)result > 32 ? 0 : -1;
 }
 
-#else /* POSIX: services are installed by the platform scripts, not this binary. */
+#else /* POSIX: the client registers itself, so no helper script sits beside it. */
 
+/* Registration is the binary's job on every POSIX platform, the way it already was
+ * on OpenWrt: the installer only downloads and verifies a build, then calls
+ * "--install <token>". The manager-specific text lives in src/service_unit.c so it
+ * can be tested without root. */
+
+#include "service_unit.h"
+#include "update.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int need_root(const char *what) {
+    if (!geteuid())
+        return 0;
+    fprintf(stderr, "fastp2p: %s needs root.\n", what);
+    return -1;
+}
+
+/* Detection runs before anything is written, so it must not fork: the manager has
+ * to be found by looking at the host, not by running its tool and reading a failure. */
+static int tool_in_path(const char *name) {
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    size_t length = strlen(name);
+    for (;;) {
+        const char *end = strchr(path, ':');
+        size_t span = end ? (size_t)(end - path) : strlen(path);
+        if (span && span + length + 2 < 4096) {
+            char candidate[4096];
+            memcpy(candidate, path, span);
+            candidate[span] = '/';
+            memcpy(candidate + span + 1, name, length + 1);
+            if (!access(candidate, X_OK))
+                return 1;
+        }
+        if (!end)
+            return 0;
+        path = end + 1;
+    }
+}
+
+static int manager_detect(void) {
+#ifdef __APPLE__
+    return FP_SERVICE_LAUNCHD;
+#else
+    struct stat status;
+    if (!access("/etc/openwrt_release", F_OK) && !access("/etc/rc.common", X_OK))
+        return FP_SERVICE_PROCD;
+    if (!stat("/run/systemd/system", &status) && S_ISDIR(status.st_mode) && tool_in_path("systemctl"))
+        return FP_SERVICE_SYSTEMD;
+    if (tool_in_path("rc-service") && tool_in_path("rc-update") && !access("/sbin/openrc-run", X_OK))
+        return FP_SERVICE_OPENRC;
+    return FP_SERVICE_NONE;
+#endif
+}
+
+/* Run one manager tool and return its exit status. execvp searches PATH because the
+ * tools live in different places across distributions. */
+static int spawn(char *const arguments[], int quiet) {
+    pid_t child = fork();
+    if (child < 0)
+        return -1;
+    if (!child) {
+        if (quiet) {
+            int output = open("/dev/null", O_WRONLY | O_CLOEXEC);
+            if (output >= 0) {
+                (void)dup2(output, STDOUT_FILENO);
+                (void)dup2(output, STDERR_FILENO);
+                if (output != STDOUT_FILENO && output != STDERR_FILENO)
+                    close(output);
+            }
+        }
+        execvp(arguments[0], arguments);
+        _exit(127);
+    }
+    int status;
+    while (waitpid(child, &status, 0) < 0)
+        if (errno != EINTR)
+            return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int systemd_command(const char *action) {
+    if (!strcmp(action, "status")) {
+        char *query[] = {"systemctl", "is-active", "--quiet", "fastp2p-client.service", NULL};
+        return spawn(query, 1);
+    }
+    char *argv[] = {"systemctl", (char *)action, "fastp2p-client.service", NULL};
+    return spawn(argv, 0);
+}
+
+static int procd_command(const char *action) {
+    const char *unit = fp_service_unit_path(FP_SERVICE_PROCD);
+    struct stat status;
+    if (lstat(unit, &status))
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(status.st_mode))
+        return -1;
+    if (!strcmp(action, "stop")) {
+        /* rc.common answers 3 for "not running", which is not a failure here. */
+        char *query[] = {(char *)unit, "status", NULL};
+        if (spawn(query, 1) == 3)
+            return 0;
+    }
+    char *argv[] = {(char *)unit, (char *)action, NULL};
+    return spawn(argv, 0);
+}
+
+static int openrc_command(const char *action) {
+    if (!strcmp(action, "enable")) {
+        char *argv[] = {"rc-update", "add", "fastp2p", "default", NULL};
+        return spawn(argv, 0);
+    }
+    if (!strcmp(action, "disable")) {
+        char *argv[] = {"rc-update", "del", "fastp2p", "default", NULL};
+        return spawn(argv, 0);
+    }
+    char *argv[] = {"rc-service", "fastp2p", (char *)action, NULL};
+    return spawn(argv, 0);
+}
+
+static int launchd_loaded(void) {
+    char *argv[] = {"launchctl", "print", "system/top.fastp2p", NULL};
+    return spawn(argv, 1) == 0;
+}
+
+static int launchd_command(const char *action) {
+    const char *plist = fp_service_unit_path(FP_SERVICE_LAUNCHD);
+    if (!strcmp(action, "enable") || !strcmp(action, "disable")) {
+        char *argv[] = {"launchctl", (char *)action, "system/top.fastp2p", NULL};
+        return spawn(argv, 0);
+    }
+    if (!strcmp(action, "status"))
+        return launchd_loaded() ? 0 : 3;
+    if (!strcmp(action, "stop")) {
+        if (!launchd_loaded())
+            return 0;
+        char *argv[] = {"launchctl", "bootout", "system/top.fastp2p", NULL};
+        return spawn(argv, 0);
+    }
+    if (!strcmp(action, "start") || !strcmp(action, "restart")) {
+        if (!launchd_loaded()) {
+            char *argv[] = {"launchctl", "bootstrap", "system", (char *)plist, NULL};
+            return spawn(argv, 0);
+        }
+        if (!strcmp(action, "restart")) {
+            char *argv[] = {"launchctl", "kickstart", "-k", "system/top.fastp2p", NULL};
+            return spawn(argv, 0);
+        }
+        char *argv[] = {"launchctl", "kickstart", "system/top.fastp2p", NULL};
+        return spawn(argv, 0);
+    }
+    return -1;
+}
+
+static int manager_command(int kind, const char *action) {
+    switch (kind) {
+    case FP_SERVICE_SYSTEMD: return systemd_command(action);
+    case FP_SERVICE_PROCD: return procd_command(action);
+    case FP_SERVICE_OPENRC: return openrc_command(action);
+    case FP_SERVICE_LAUNCHD: return launchd_command(action);
+    default: return -1;
+    }
+}
+
+static int directory_trusted(const char *path) {
+    struct stat status;
+    if (lstat(path, &status) || !S_ISDIR(status.st_mode))
+        return 0;
+    return status.st_uid == 0 && !(status.st_mode & 0022);
+}
+
+static int ensure_directory(const char *path) {
+    if (mkdir(path, 0755) && errno != EEXIST)
+        return -1;
+    return directory_trusted(path) ? 0 : -1;
+}
+
+/* Copy this executable where the unit starts it from. "fastp2p --install" is run
+ * from the downloaded file, so the running image is the source; a re-enrolment run
+ * from the installed path is a no-op. */
+static int copy_self(const char *target) {
+    char source[4096];
+    if (fp_update_own_path(source, sizeof(source)))
+        return -1;
+    if (!strcmp(source, target))
+        return 0;
+    int input = open(source, O_RDONLY | O_CLOEXEC);
+    if (input < 0)
+        return -1;
+    char temporary[4096];
+    if (snprintf(temporary, sizeof(temporary), "%s.new.%lu", target, (unsigned long)getpid()) >=
+        (int)sizeof(temporary)) {
+        close(input);
+        return -1;
+    }
+    int output = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0755);
+    if (output < 0) {
+        close(input);
+        return -1;
+    }
+    int failed = 0;
+    char buffer[65536];
+    for (;;) {
+        ssize_t taken = read(input, buffer, sizeof(buffer));
+        if (taken < 0) {
+            if (errno == EINTR)
+                continue;
+            failed = 1;
+            break;
+        }
+        if (!taken)
+            break;
+        char *cursor = buffer;
+        while (taken > 0) {
+            ssize_t written = write(output, cursor, (size_t)taken);
+            if (written < 0) {
+                if (errno == EINTR)
+                    continue;
+                failed = 1;
+                break;
+            }
+            cursor += written;
+            taken -= written;
+        }
+        if (failed)
+            break;
+    }
+    close(input);
+    if (!failed && (fsync(output) || fchmod(output, 0755)))
+        failed = 1;
+    if (close(output))
+        failed = 1;
+    if (failed || rename(temporary, target)) {
+        (void)unlink(temporary);
+        return -1;
+    }
+    return 0;
+}
+
+static int install_self(void) {
+    /* /usr/local is checked too: a world-writable one would let somebody plant the
+     * directory this build then trusts. */
+    if (ensure_directory("/usr/local") || ensure_directory(FASTP2P_SYSTEM_DIR)) {
+        fprintf(stderr, "fastp2p: %s must be a root-owned directory nobody else can write.\n",
+                FASTP2P_SYSTEM_DIR);
+        return -1;
+    }
+    if (copy_self(FASTP2P_SYSTEM_BINARY)) {
+        fprintf(stderr, "fastp2p: cannot place the client at %s.\n", FASTP2P_SYSTEM_BINARY);
+        return -1;
+    }
+#ifndef __APPLE__
+    /* The short name is a convenience, not part of the service: a home directory
+     * with an unusual /usr/local/bin must not fail the installation. */
+    const char *link = "/usr/local/bin/fastp2p";
+    char current[4096];
+    ssize_t used = readlink(link, current, sizeof(current) - 1);
+    if (used >= 0) {
+        current[used] = 0;
+        if (strcmp(current, FASTP2P_SYSTEM_BINARY))
+            (void)unlink(link);
+    }
+    if (symlink(FASTP2P_SYSTEM_BINARY, link) && errno != EEXIST)
+        fprintf(stderr, "fastp2p: could not create %s; use the full path.\n", link);
+#endif
+    return 0;
+}
+
+static int write_unit(int kind, const char *profile) {
+    const char *path = fp_service_unit_path(kind);
+    char *text = fp_service_unit_text(kind, FASTP2P_SYSTEM_BINARY, profile);
+    if (!path || !text) {
+        free(text);
+        return -1;
+    }
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s", path) >= (int)sizeof(directory)) {
+        free(text);
+        return -1;
+    }
+    char *slash = strrchr(directory, '/');
+    if (!slash || ensure_directory(slash == directory ? "/" : (*slash = 0, directory))) {
+        free(text);
+        return -1;
+    }
+    char temporary[4096];
+    if (snprintf(temporary, sizeof(temporary), "%s.new", path) >= (int)sizeof(temporary)) {
+        free(text);
+        return -1;
+    }
+    /* An init script is executed by the boot process; a systemd unit and a plist are
+     * read as data. */
+    mode_t mode = kind == FP_SERVICE_PROCD || kind == FP_SERVICE_OPENRC ? 0755 : 0644;
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, mode);
+    if (fd < 0) {
+        free(text);
+        return -1;
+    }
+    size_t length = strlen(text), offset = 0;
+    int failed = 0;
+    while (offset < length) {
+        ssize_t written = write(fd, text + offset, length - offset);
+        if (written <= 0) {
+            if (written < 0 && errno == EINTR)
+                continue;
+            failed = 1;
+            break;
+        }
+        offset += (size_t)written;
+    }
+    free(text);
+    if (!failed && (fsync(fd) || fchmod(fd, mode)))
+        failed = 1;
+    if (close(fd))
+        failed = 1;
+    if (failed || rename(temporary, path)) {
+        (void)unlink(temporary);
+        return -1;
+    }
+    if (kind == FP_SERVICE_SYSTEMD) {
+        char *reload[] = {"systemctl", "daemon-reload", NULL};
+        (void)spawn(reload, 1);
+    }
+    return 0;
+}
+
+int fastp2p_service_install(const char *profile, const char *ca) {
+    (void)ca;
+    if (need_root("installing the service") || !profile || !*profile)
+        return -1;
+    int kind = manager_detect();
+    if (kind == FP_SERVICE_NONE) {
+        fputs("fastp2p: no supported service manager (systemd, OpenRC, procd or launchd) found.\n",
+              stderr);
+        return -1;
+    }
+    if (install_self())
+        return -1;
+    if (write_unit(kind, profile)) {
+        fputs("fastp2p: cannot write the service unit.\n", stderr);
+        return -1;
+    }
+    if (manager_command(kind, "enable"))
+        fprintf(stderr, "fastp2p: the %s manager did not enable the service.\n", fp_service_name(kind));
+    if (manager_command(kind, "start")) {
+        fprintf(stderr, "fastp2p: the %s manager did not start the service.\n", fp_service_name(kind));
+        return -1;
+    }
+    /* Starting is not the same as staying up: the client can refuse to listen or the
+     * profile can be wrong, and the operator must hear about that now rather than
+     * after the next reboot. */
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        sleep(1);
+        if (!manager_command(kind, "status"))
+            continue;
+        fputs("fastp2p: the service did not keep running.\n", stderr);
+        (void)manager_command(kind, "stop");
+        return -1;
+    }
+    return 0;
+}
+
+int fastp2p_service_remove(void) {
+    if (need_root("uninstalling the service"))
+        return -1;
+    int kind = manager_detect();
+    if (kind == FP_SERVICE_NONE)
+        return -1;
+    const char *path = fp_service_unit_path(kind);
+    if (path && access(path, F_OK))
+        return 0; /* nothing registered: nothing to stop or disable */
+    int failed = 0;
+    if (!manager_command(kind, "status"))
+        failed |= manager_command(kind, "stop") != 0;
+    failed |= manager_command(kind, "disable") != 0;
+    if (path && unlink(path) && errno != ENOENT)
+        failed = 1;
+    if (kind == FP_SERVICE_SYSTEMD) {
+        char *reload[] = {"systemctl", "daemon-reload", NULL};
+        (void)spawn(reload, 1);
+    }
+    return failed ? -1 : 0;
+}
+
+int fastp2p_service_stop(void) {
+    int kind = manager_detect();
+    if (kind == FP_SERVICE_NONE)
+        return -1;
+    const char *path = fp_service_unit_path(kind);
+    if (path && access(path, F_OK))
+        return 0; /* not installed, so already down */
+    return manager_command(kind, "stop") ? -1 : 0;
+}
+
+/* Not the Microsoft service controller: the POSIX build has no SCM, and the install
+ * command asks this only to decide which profile layout to use. */
 int fastp2p_service_supported(void) { return 0; }
 int fastp2p_service_dispatch(const char *profile, int argc, char **argv,
                              int (*loop)(int, char **)) {
@@ -544,18 +946,16 @@ int fastp2p_service_dispatch(const char *profile, int argc, char **argv,
     (void)loop;
     return -1;
 }
-int fastp2p_service_installed(void) { return 0; }
+int fastp2p_service_installed(void) {
+    int kind = manager_detect();
+    const char *path = fp_service_unit_path(kind);
+    return kind != FP_SERVICE_NONE && path && !access(path, F_OK);
+}
 int fastp2p_service_prepare(const char *profile) {
-    /* POSIX installs are laid down by the platform unit files; nothing to lock. */
+    /* The manager layouts are fixed paths; nothing to lock before the profile write. */
     (void)profile;
     return 0;
 }
-int fastp2p_service_install(const char *profile, const char *ca) {
-    (void)profile;
-    (void)ca;
-    return -1;
-}
-int fastp2p_service_remove(void) { return -1; }
 int fastp2p_service_cleanup_previous(void) { return 0; }
 int fastp2p_service_purge(void) {
     char profile[4096];

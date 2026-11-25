@@ -541,8 +541,9 @@ int fastp2p_install_command(int argc, char **argv) {
         else return 2;
     }
 #ifndef _WIN32
-    if (machine) return 2;
-    no_service = 1;
+    /* Without --service a CLI install only writes the profile; --service asks for the
+     * boot registration as well, which the client performs itself. */
+    if (!machine) no_service = 1;
 #endif
     return install_token(token, token_file, profile, node, no_service, machine);
 }
@@ -561,7 +562,7 @@ int fastp2p_uninstall_command(int argc, char **argv) {
         fputs("fastp2p removed; an in-use file may need removal after this process exits.\n", stderr);
     }
 #elif defined(__linux__) || defined(__APPLE__)
-    if (geteuid()) { fputs("Run fastp2p uninstall as root.\n", stderr); return 1; }
+    if (geteuid()) { fputs("Run fastp2p --uninstall as root.\n", stderr); return 1; }
     (void)profile;
     return fastp2p_posix_uninstall(keep) ? 1 : 0;
 #else
