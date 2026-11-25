@@ -81,6 +81,18 @@ static int unchanged_outside_rules(json_object *a, json_object *b) {
     }
     return 1;
 }
+/* True when the only difference between two snapshots is the SD-WAN section: such a
+ * push can be applied in place for the same reason rule-only pushes can - the tunnels
+ * that are not part of the overlay do not have to be rebuilt. */
+static int unchanged_outside_sdwan(json_object *a, json_object *b) {
+    json_object_object_foreach(a, key, value) {
+        json_object *other;
+        if (strcmp(key, "sdwan") && !rule_field(key) && strcmp(key, META) &&
+            (!json_object_object_get_ex(b, key, &other) || !json_object_equal(value, other)))
+            return 0;
+    }
+    return 1;
+}
 static int update_metadata(json_object *root, uint64_t revision, const char *hash, int pending) {
     json_object *meta = metadata(root);
     if (!meta)
@@ -129,6 +141,30 @@ static int receive(const char *fields,uint64_t revision,void *user) {
      * Compare against the file just read, not the startup snapshot: an operator
      * edit made while the client runs must not demote a rules-only push to a
      * full reload that drops every tunnel. */
+    json_object *next_sdwan = NULL, *running_sdwan = NULL;
+    int has_sdwan = json_object_object_get_ex(next, "sdwan", &next_sdwan) && next_sdwan &&
+                    json_object_is_type(next_sdwan, json_type_object);
+    (void)json_object_object_get_ex(current, "sdwan", &running_sdwan);
+    if (has_sdwan && sync_state.online && !sync_state.pending &&
+        unchanged_outside_sdwan(next, current) && unchanged_outside_sdwan(current, next) &&
+        (!running_sdwan || !json_object_equal(next_sdwan, running_sdwan))) {
+        char detail[96] = "";
+        if (!fp_client_sdwan_reconfigure(client, next_sdwan, detail, sizeof(detail))) {
+            if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
+                fputs("Gateway SD-WAN section could not be saved; keeping the running one.\n", stderr);
+                result = FASTP2P_EIO;
+                goto done;
+            }
+            json_object_put(sync_state.active);
+            sync_state.active = json_object_get(next);
+            fprintf(stderr, "Gateway SD-WAN section applied in place (%s).\n", detail);
+            result = FASTP2P_OK;
+            goto done;
+        }
+        /* The section was refused: fall through to the reload path, which reports the
+         * rejection the way every other configuration error is reported. */
+        fprintf(stderr, "Gateway SD-WAN section was refused; reloading the instance instead.\n");
+    }
     if (has_rules && !sync_state.pending && unchanged_outside_rules(next, current) &&
         unchanged_outside_rules(current, next)) {
         result = fp_client_rules_prepare(client, text, &rules);

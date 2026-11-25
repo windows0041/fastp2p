@@ -7666,6 +7666,106 @@ static void sdwan_reconcile(fastp2p_client *c) {
     }
 }
 
+/* Apply a pushed SD-WAN section without restarting the client. Everything outside the
+ * overlay is unchanged, so the tunnels that are not part of it must keep running: the
+ * reload path tears the whole instance down, which on Windows blinks every forward rule
+ * and every tunnel just because a branch moved. */
+int fp_client_sdwan_reconfigure(fastp2p_client *c, json_object *config, char *detail,
+                                size_t detail_length) {
+#if defined(__linux__) || defined(_WIN32)
+    if (!c || !config)
+        return FASTP2P_EINVAL;
+    if (!c->running)
+        return fp_client_sdwan_config(c, config);
+    /* No overlay yet is the normal case for the first push after login: the swap below
+     * has nothing to tear down and starts the new one, which fp_client_sdwan_config
+     * alone does not do (startup starts it when the client starts). */
+    fp_sdwan *state = malloc(sizeof(*state));
+    if (!state)
+        return FASTP2P_EIO;
+    char why[192] = "";
+    if (fp_sdwan_parse(state, config, why, sizeof(why))) {
+        sdwan_refusal(c, why[0] ? why : "sdwan configuration rejected");
+        free(state);
+        return FASTP2P_EINVAL;
+    }
+    if (state->central && !strcmp(state->center, c->node))
+        state->center_index = FP_SDWAN_LOCAL;
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        const char *peer = state->peers[i].node;
+        if (!valid_node(peer) || !strcmp(c->node, peer)) {
+            char note[128];
+            snprintf(note, sizeof(note), "sdwan peer name %s is not a valid remote node", peer);
+            sdwan_refusal(c, note);
+            free(state);
+            return FASTP2P_EINVAL;
+        }
+        if (state->central && !strcmp(state->center, peer))
+            state->center_index = (int)i;
+    }
+    unsigned needed = !state->central || state->center_index == FP_SDWAN_LOCAL ? state->peer_count :
+                      state->center_index >= 0 ? 1 : 0;
+    unsigned available = 0;
+    for (int i = 0; i < NA; ++i)
+        available += !c->apps[i].used || c->apps[i].sdwan;
+    if (needed > available) {
+        char note[160];
+        snprintf(note, sizeof(note), "sdwan needs %u rule slots, only %u are free", needed, available);
+        sdwan_refusal(c, note);
+        free(state);
+        return FASTP2P_EINVAL;
+    }
+    /* Everything fallible has been checked; from here the swap cannot be refused. */
+    if (c->sdwan)
+        fp_sdwan_stop(c->sdwan);
+    for (int i = 0; i < NA; ++i) {
+        if (!c->apps[i].used || !c->apps[i].sdwan)
+            continue;
+        if (c->apps[i].fd >= 0)
+            op_close(c->apps[i].fd);
+        memset(&c->apps[i], 0, sizeof(c->apps[i]));
+        c->apps[i].fd = -1;
+        c->apps[i].tunnel_index = -1;
+    }
+    free(c->sdwan);
+    c->sdwan = NULL;
+    int slot = 0;
+    for (unsigned i = 0; i < state->peer_count; ++i) {
+        if (state->central && state->center_index != FP_SDWAN_LOCAL && state->center_index != (int)i)
+            continue;
+        while (slot < NA && c->apps[slot].used)
+            ++slot;
+        if (slot >= NA)
+            break;
+        fp_sdwan_peer *peer = &state->peers[i];
+        peer->app_index = slot;
+        app *a = &c->apps[slot++];
+        *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
+                   .transport = state->transport, .id = random_id()};
+        strcpy(a->peer, peer->node);
+    }
+    c->sdwan = state;
+    sdwan_reconcile(c);
+    const char *error = fp_sdwan_start(c->sdwan);
+    if (error) {
+        emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO, error);
+        return FASTP2P_EIO;
+    }
+    if (detail && detail_length)
+        snprintf(detail, detail_length, "%s transport, %u peers, %s",
+                 state->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic", state->peer_count,
+                 state->central ? "central" : "mesh");
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "SD-WAN section applied without restarting the client");
+    return FASTP2P_OK;
+#else
+    (void)c;
+    (void)config;
+    (void)detail;
+    (void)detail_length;
+    return FASTP2P_EINVAL;
+#endif
+}
+
 int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
 #if defined(__linux__) || defined(_WIN32)
     fp_sdwan *state = malloc(sizeof(*state));

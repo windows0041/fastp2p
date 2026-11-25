@@ -14,6 +14,8 @@ void fp_client_set_ca_pem(fastp2p_client *client, const char *pem);
 void fp_client_set_tls_alias(fastp2p_client *client, const char *hostname, const char *pem);
 void fp_client_set_auto_port_mapping(fastp2p_client *client, int enabled);
 int fp_client_set_node_hint(fastp2p_client *client, const char *hint);
+int fp_client_sdwan_reconfigure(fastp2p_client *client, json_object *section,
+                               char *detail, size_t detail_length);
 void fp_client_validation_mode(fastp2p_client *client);
 void fp_client_mark_profile_rules(fastp2p_client *client);
 int fp_config_validate_json(const char *json);

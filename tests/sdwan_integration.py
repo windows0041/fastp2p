@@ -266,6 +266,12 @@ with socket.create_connection((sys.argv[1], 23456), timeout=6) as stream:
                 assert api(path, {**central, 'center': 'outside-node'})[0] == 400
                 assert api(path, central)[0] == 200
                 wait_for(lambda: links_ready('central', nodes[2], 2), 'The two center links did not come online')
+                # The plan changed under running clients: it must be applied in place, not
+                # by restarting the instance (which would drop every tunnel on Windows).
+                for name in names:
+                    log = (root / (name + '.log')).read_text()
+                    assert 'SD-WAN section applied in place' in log, \
+                        f'{name} applied the plan by restarting the client'
                 assert all(nodes[2] in (link['a'], link['b']) for link in api(path)[1]['links'])
                 reply = output(*ns(names[0], 'ping', '-4', '-c', '1', '-W', '2', '10.3.2.2'))
                 assert 'ttl=63' in reply, reply
