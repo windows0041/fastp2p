@@ -241,7 +241,12 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
     if (access("/usr/sbin/iptables", X_OK) && access("/sbin/iptables", X_OK))
         return FP_FIREWALL_ABSENT;
 #endif
-    int denied = 0, ran = 0;
+    /* A host without an IPv6 filter table, a missing capability for one family, or an
+     * interface that does not exist yet all make single rules fail while the IPv4 port
+     * is open. Counting any failure as "closed" hid a working rule behind a refusal, so
+     * the result reports what actually happened: all rules in place, some refused, or
+     * nothing at all. */
+    unsigned ran = 0, done = 0, failed = 0;
     char scratch[2048];
     size_t used = 0;
     while (commands[used]) {
@@ -265,21 +270,32 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
         int status = run_shell(scratch);
 #endif
         ++ran;
-        if (status != 0)
-            denied = 1;
+        if (status == 0)
+            ++done;
+        else
+            ++failed;
     }
     if (!ran)
         return FP_FIREWALL_ABSENT;
-    if (detail && detail_length)
-        snprintf(detail, detail_length, "%s%s", denied ? "refused" : "allowed",
+    if (detail && detail_length) {
+        const char *how =
 #if defined(_WIN32)
-                 " (netsh)");
+            "netsh";
 #elif defined(__APPLE__)
-                 " (application firewall)");
+            "application firewall";
 #elif defined(__ANDROID__)
-                 " (su iptables)");
+            "su iptables";
 #else
-                 " (iptables)");
+            "iptables";
 #endif
-    return denied ? FP_FIREWALL_DENIED : FP_FIREWALL_OK;
+        if (!failed)
+            snprintf(detail, detail_length, "allowed (%s)", how);
+        else if (done)
+            snprintf(detail, detail_length, "allowed (%s, %u rule(s) refused)", how, failed);
+        else
+            snprintf(detail, detail_length, "refused (%s)", how);
+    }
+    if (!done)
+        return FP_FIREWALL_DENIED;
+    return FP_FIREWALL_OK;
 }
