@@ -83,14 +83,16 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
             return -1;
     }
     if (tun && *tun) {
-        /* The name carries the interface so two overlays never share a rule. */
+        /* netsh has no per-interface rule (only interfacetype=lan|wireless|ras), so the
+         * overlay interface goes through PowerShell, whose InterfaceAlias filter reaches
+         * the Windows Filtering Platform. The rule is removed first so a restart replaces
+         * it instead of stacking a second one. */
         snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P overlay (%s)\" 2>nul", tun);
-        if (append(out, length, line))
-            return -1;
-        snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P overlay (%s)\" dir=in "
-                 "action=allow interface=\"%s\" profile=any enable=yes || exit /b 1", tun, tun);
+                 "powershell.exe -NoProfile -NonInteractive -Command \"Remove-NetFirewallRule "
+                 "-DisplayName 'FastP2P overlay (%s)' -ErrorAction SilentlyContinue; "
+                 "New-NetFirewallRule -DisplayName 'FastP2P overlay (%s)' -Direction Inbound "
+                 "-InterfaceAlias '%s' -Action Allow -Profile Any | Out-Null\" || exit /b 1",
+                 tun, tun, tun);
         if (append(out, length, line))
             return -1;
     }
