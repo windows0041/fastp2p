@@ -4343,6 +4343,24 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 learn_punch_plan(t, j);
                 learn_sym_window(t, j);
                 report_peer_tcp_mapping(c, t, j);
+                /* The peer's private endpoint can arrive on the reply too. Only the
+                 * request side used to read it, so the same pair took the LAN when the
+                 * peer started the round and the public path when we did. */
+                if (op_integer(j, "lan") != 0) {
+                    const char *lan_text = op_string(j, "fromIPLan");
+                    uint64_t lan_port = op_integer(j, "lanPort");
+                    op_addr lan_address;
+                    if (lan_text && *lan_text && lan_port > 0 && lan_port <= 65535 &&
+                        !op_addr_from_text(&lan_address, lan_text, (uint16_t)lan_port) &&
+                        op_family_index(op_addr_family(&lan_address)) == OP_FAM_V4) {
+                        t->lan = 1;
+                        tunnel_learn_peer(t, lan_text, (uint16_t)lan_port);
+                        char note[128];
+                        snprintf(note, sizeof(note), "LAN punch target %s:%llu",
+                                 lan_text, (unsigned long long)lan_port);
+                        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                    }
+                }
                 int family = choose_punch_family(c, t);
                 t->udp_reverse6_supported = family == OP_FAM_V6 && t->udp_reverse_port6 &&
                                             op_integer(j, "udpReverse6Cap") == 1;
