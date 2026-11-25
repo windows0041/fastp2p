@@ -19,6 +19,10 @@ int main(void) {
     assert(strstr(out, "-notcontains"));
     assert(strstr(out, "FastP2P overlay (fastp2p0)"));
     assert(strstr(out, "InterfaceAlias 'fastp2p0'"));
+    /* The punch dials and listens on ephemeral ports, so the program itself has to be
+     * allowed: a rule that only names the service port blocks every punch packet. */
+    assert(strstr(out, "FastP2P program"));
+    assert(strstr(out, "-Program '"));
     assert(strstr(out, "Remove-NetFirewallRule"));
 #elif defined(__APPLE__)
     assert(strstr(out, "socketfilterfw --add"));

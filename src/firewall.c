@@ -88,7 +88,7 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
         char script[1024];
         snprintf(script, sizeof(script),
                  "powershell.exe -NoProfile -NonInteractive -Command \""
-                 "$want=@('FastP2P TCP %u'%s); "
+                 "$want=@('FastP2P TCP %u'%s,'FastP2P program'); "
                  "Get-NetFirewallRule -DisplayName 'FastP2P *' -ErrorAction SilentlyContinue | "
                  "Where-Object { $want -notcontains $_.DisplayName -and "
                  "$_.DisplayName -notlike 'FastP2P overlay*' } | "
@@ -100,6 +100,24 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
                  port, udp_want, protocols, port, port);
         if (append(out, length, script))
             return -1;
+    }
+    {
+        /* The punch dials and listens on ephemeral ports, so a rule that only names the
+         * service port blocks every hole-punch packet that arrives. Allow the program
+         * itself: the ports are chosen by the OS and cannot be known here. */
+        char exe[512];
+        if (current_executable(exe, sizeof(exe)) == 0 && exe[0]) {
+            char script[1400];
+            snprintf(script, sizeof(script),
+                     "powershell.exe -NoProfile -NonInteractive -Command \""
+                     "if (-not (Get-NetFirewallRule -DisplayName 'FastP2P program' "
+                     "-ErrorAction SilentlyContinue)) { New-NetFirewallRule "
+                     "-DisplayName 'FastP2P program' -Direction Inbound "
+                     "-Program '%s' -Action Allow -Profile Any | Out-Null }\" || exit /b 1",
+                     exe);
+            if (append(out, length, script))
+                return -1;
+        }
     }
     if (tun && *tun) {
         char script[512];
