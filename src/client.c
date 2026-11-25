@@ -9,6 +9,7 @@
 #include "tcp_level.h"
 #include "secure.h"
 #include "sdwan.h"
+#include "firewall.h"
 #include "tcp_nat.h"
 #include "config_internal.h"
 #include <ctype.h>
@@ -7818,6 +7819,27 @@ int fastp2p_client_start(fastp2p_client *c) {
     snprintf(peer_port_message, sizeof(peer_port_message), "%s peer listener port: %u",
              has_udp_listener(c) ? "TCP/UDP" : "TCP", (unsigned)c->public_port);
     emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, peer_port_message);
+    /* A hole-punch probe arrives on a port this side never dialled, and a packet written
+     * into the overlay is inbound on its interface: every host firewall drops both until
+     * something allows them, and each platform needs a different command. Best effort -
+     * the client reports once and keeps running either way. */
+    {
+        char detail[64];
+        int opened = fp_firewall_open(c->public_port, has_udp_listener(c), NULL, detail,
+                                      sizeof(detail));
+        if (opened == FP_FIREWALL_OK) {
+            char note[128];
+            snprintf(note, sizeof(note), "firewall: peer port %u open %s",
+                     (unsigned)c->public_port, detail);
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+        } else if (opened == FP_FIREWALL_DENIED) {
+            char note[160];
+            snprintf(note, sizeof(note),
+                     "firewall: peer port %u stays closed %s; peers may fall back to relay",
+                     (unsigned)c->public_port, detail);
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+        }
+    }
     c->multi = curl_multi_init();
     if (!c->multi) {
         fastp2p_client_stop(c);
@@ -7835,6 +7857,15 @@ int fastp2p_client_start(fastp2p_client *c) {
                  c->sdwan->transport == FASTP2P_TRANSPORT_TCP ? "tcp" : "quic",
                  c->sdwan->peer_count, c->sdwan->central ? "central" : "mesh");
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, ready);
+        {
+            char detail[64];
+            if (fp_firewall_open(c->public_port, has_udp_listener(c), "fastp2p0", detail,
+                                 sizeof(detail)) == FP_FIREWALL_OK) {
+                char note[128];
+                snprintf(note, sizeof(note), "firewall: overlay interface open %s", detail);
+                emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+            }
+        }
     }
     c->running = 1;
     if (c->auto_port_mapping && !c->validate_only)
