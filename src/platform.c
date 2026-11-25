@@ -203,6 +203,20 @@ int op_close(op_socket fd) {
     return close((int)fd);
 #endif
 }
+
+int op_close_reset(op_socket fd) {
+    if (fd < 0)
+        return -1;
+#if defined(_WIN32)
+    struct linger option = {1, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, (const char *)&option, sizeof(option));
+    return op_close(fd);
+#else
+    struct linger option = {1, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
+    return op_close(fd);
+#endif
+}
 int op_bind(op_socket fd, const struct sockaddr *address, op_socklen length) {
 #ifdef _WIN32
     return bind((SOCKET)fd, address, length) ? socket_error() : 0;

@@ -123,6 +123,9 @@ void op_sleep_ms(unsigned milliseconds);
 op_socket op_socket_open(int family, int type, int protocol);
 op_socket op_accept(op_socket fd, struct sockaddr *address, op_socklen *length);
 int op_close(op_socket fd);
+/* Close with SO_LINGER=0 so the port leaves no TIME_WAIT behind. The NAT mapping probe
+ * connects from the port the punch will listen on, and a lingering port cannot listen. */
+int op_close_reset(op_socket fd);
 int op_shutdown_write(op_socket fd);
 int op_bind(op_socket fd, const struct sockaddr *address, op_socklen length);
 int op_connect(op_socket fd, const struct sockaddr *address, op_socklen length);

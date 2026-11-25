@@ -1439,8 +1439,15 @@ static void probe_close(nat_probe *p) {
 static void probe_socket_close(tunnel *t) {
     for (int index = 0; index < OP_FAM_COUNT; ++index) {
         op_socket fd = t->probes[index].fd;
-        if (fd >= 0 && fd != t->fd && !t->probes[index].borrowed)
-            op_close(fd);
+        if (fd >= 0 && fd != t->fd && !t->probes[index].borrowed) {
+            /* The probe dialled the gateway from the port the punch will listen on. A
+             * normal close leaves it in TIME_WAIT, and a port in TIME_WAIT cannot be
+             * listened on - the punch then accepted nothing while reporting success. */
+            if (t->transport == FASTP2P_TRANSPORT_TCP)
+                op_close_reset(fd);
+            else
+                op_close(fd);
+        }
         t->probes[index].fd = -1;
     }
 }
