@@ -1342,12 +1342,22 @@ static void sdwan_section_builds_rules(void) {
         free(c);
     }
 }
+/* Pinning keeps the advertised external port valid. A cone NAT that rewrites the port
+ * (external != local) still rewrites it the same way every time, so rotating there
+ * published a new port every round while the peer kept dialling the old one. */
+static void a_stable_mapping_pins_the_local_port_even_when_rewritten(void) {
+    assert(punch_port_keep(52840, 52840, 0));   /* port-preserving */
+    assert(punch_port_keep(28482, 52840, 1));   /* stable mapping, rewritten port */
+    assert(!punch_port_keep(28482, 52840, 0));  /* moves per destination: rotate */
+    assert(!punch_port_keep(0, 52840, 1));      /* unmapped: nothing to pin */
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
     v6_is_skipped_when_the_host_has_no_v6();
     punch_target_family_wins();
     only_a_preserving_mapping_is_pinned();
+    a_stable_mapping_pins_the_local_port_even_when_rewritten();
     sdwan_section_builds_rules();
     target_family_switch_needs_no_mapping();
     punch_port_memory_is_per_peer();

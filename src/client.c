@@ -1673,6 +1673,14 @@ static void punch_port_forget(fastp2p_client *c, const char *peer) {
 static int punch_port_worth_keeping(uint16_t mapped, uint16_t local) {
     return local && mapped == local;
 }
+/* Whether the local port is pinned for the next round. Pinning is what keeps the
+ * advertised external port valid, so it covers two cases: the NAT preserves the port,
+ * or the mapping is destination-independent (it rewrites the port the same way every
+ * time). Only a mapping that moves per destination has to rotate - there no single
+ * external port can be pinned. */
+static int punch_port_keep(uint16_t mapped, uint16_t local, int stable) {
+    return local && (mapped == local || (mapped && stable));
+}
 static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int transport, int initiator) {
     if (!strcmp(peer, c->node))
         return -1;
@@ -2234,11 +2242,24 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     t->mapped_port = t->probes[adopt].mapped_port;
     address_copy(t->mapped_ip, t->probes[adopt].mapped_ip);
     if (adopt == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_TCP && !t->lan) {
-        int keeping = punch_port_worth_keeping(t->mapped_port, t->local_port);
-        char note[160];
+        /* A destination-independent mapping keeps the external port for a given local
+         * port, so pinning the local port is what keeps the advertised port valid across
+         * rounds - even when the external port differs from the local one: a cone NAT
+         * that rewrites the port still rewrites it the same way every time. Rotating in
+         * that case published a new port every round while the peer kept dialling the one
+         * it was told, which is the "listener down" loop.
+         *
+         * Only a mapping that moves per destination has to rotate: there the external
+         * port depends on where the packet goes, so no single port can be pinned. */
+        int preserving = punch_port_worth_keeping(t->mapped_port, t->local_port);
+        int stable = c->tcp_nat.family[adopt].type == FP_NAT_STABLE;
+        int keeping = punch_port_keep(t->mapped_port, t->local_port, stable);
+        char note[176];
         snprintf(note, sizeof(note), "TCP punch local port %u (mapping %u: %s)",
                  (unsigned)t->local_port, (unsigned)t->mapped_port,
-                 keeping ? "port-preserving, keeping it" : "moves, rotating next round");
+                 preserving ? "port-preserving, keeping it"
+                            : keeping ? "mapping stable, keeping the local port"
+                                      : "moves, rotating next round");
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         if (keeping)
             punch_port_note(c, t->peer, t->local_port);
