@@ -7932,6 +7932,15 @@ int fastp2p_client_start(fastp2p_client *c) {
             snprintf(note, sizeof(note), "firewall: peer port %u open %s",
                      (unsigned)c->public_port, detail);
             emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+        } else if (opened == FP_FIREWALL_ABSENT) {
+            /* Say so instead of staying silent: "did the port get opened?" cannot be
+             * answered from the outside, and on Android it is the usual outcome - the
+             * client runs inside a VpnService and only a rooted device owns netfilter. */
+            char note[160];
+            snprintf(note, sizeof(note),
+                     "firewall: no rule tool on this host; peer port %u left as the system allows",
+                     (unsigned)c->public_port);
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
         } else if (opened == FP_FIREWALL_DENIED) {
             char note[160];
             snprintf(note, sizeof(note),

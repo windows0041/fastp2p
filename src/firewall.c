@@ -26,6 +26,22 @@ static int append(char *out, size_t length, const char *text) {
     return written < 0 ? -1 : 0;
 }
 
+#if defined(__ANDROID__)
+/* Magisk and friends put su where they like: /system/bin/su, /system/xbin/su, /sbin/su,
+ * /product/bin/su and /debug_assert/system/bin/su are all in the wild, and the app's PATH
+ * does not necessarily contain the directory. Probing the known places and then naming the
+ * binary in full is what makes the rule reach the device at all. */
+static const char *android_su(void) {
+    static const char *const candidates[] = {
+        "/system/bin/su", "/system/xbin/su", "/sbin/su", "/product/bin/su",
+        "/debug_assert/system/bin/su", "/su/bin/su"};
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); ++i)
+        if (!access(candidates[i], X_OK))
+            return candidates[i];
+    return NULL;
+}
+#endif
+
 /* The macOS application firewall is configured per binary, so the commands need this
  * executable's own path. */
 static int current_executable(char *out, size_t length) {
@@ -116,22 +132,25 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
 #elif defined(__ANDROID__)
     /* The Android client runs inside a VPN service; the host firewall is not the gate,
      * but a rooted device that runs its own netfilter wants the port opened too. */
+    const char *su = android_su();
+    if (!su)
+        return -1;
     snprintf(line, sizeof(line),
-             "su -c 'iptables -C INPUT -p tcp --dport %u -j ACCEPT || "
-             "iptables -I INPUT -p tcp --dport %u -j ACCEPT'", port, port);
+             "%s -c 'iptables -C INPUT -p tcp --dport %u -j ACCEPT || "
+             "iptables -I INPUT -p tcp --dport %u -j ACCEPT'", su, port, port);
     if (append(out, length, line))
         return -1;
     if (udp) {
         snprintf(line, sizeof(line),
-                 "su -c 'iptables -C INPUT -p udp --dport %u -j ACCEPT || "
-                 "iptables -I INPUT -p udp --dport %u -j ACCEPT'", port, port);
+                 "%s -c 'iptables -C INPUT -p udp --dport %u -j ACCEPT || "
+                 "iptables -I INPUT -p udp --dport %u -j ACCEPT'", su, port, port);
         if (append(out, length, line))
             return -1;
     }
     if (tun && *tun) {
         snprintf(line, sizeof(line),
-                 "su -c 'iptables -C INPUT -i %s -j ACCEPT || "
-                 "iptables -I INPUT -i %s -j ACCEPT'", tun, tun);
+                 "%s -c 'iptables -C INPUT -i %s -j ACCEPT || "
+                 "iptables -I INPUT -i %s -j ACCEPT'", su, tun, tun);
         if (append(out, length, line))
             return -1;
     }
@@ -260,7 +279,7 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
     if (access("/usr/libexec/ApplicationFirewall/socketfilterfw", X_OK))
         return FP_FIREWALL_ABSENT;
 #elif defined(__ANDROID__)
-    if (access("/system/bin/su", X_OK) && access("/system/xbin/su", X_OK))
+    if (!android_su())
         return FP_FIREWALL_ABSENT;
 #else
     if (access("/usr/sbin/iptables", X_OK) && access("/sbin/iptables", X_OK))
