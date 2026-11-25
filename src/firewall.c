@@ -63,34 +63,34 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
      * replace, so the rule is deleted before it is added again. The overlay interface is
      * separate: it carries nothing but packets this client wrote into the TUN. */
     snprintf(line, sizeof(line),
-             "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P TCP %u\"", port);
+             "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P TCP %u\" 2>nul", port);
     if (append(out, length, line))
         return -1;
     snprintf(line, sizeof(line),
              "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P TCP %u\" dir=in action=allow "
-             "protocol=TCP localport=%u profile=any enable=yes", port, port);
+             "protocol=TCP localport=%u profile=any enable=yes || exit /b 1", port, port);
     if (append(out, length, line))
         return -1;
     if (udp) {
         snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P UDP %u\"", port);
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P UDP %u\" 2>nul", port);
         if (append(out, length, line))
             return -1;
         snprintf(line, sizeof(line),
                  "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P UDP %u\" dir=in action=allow "
-                 "protocol=UDP localport=%u profile=any enable=yes", port, port);
+                 "protocol=UDP localport=%u profile=any enable=yes || exit /b 1", port, port);
         if (append(out, length, line))
             return -1;
     }
     if (tun && *tun) {
         /* The name carries the interface so two overlays never share a rule. */
         snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P overlay (%s)\"", tun);
+                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P overlay (%s)\" 2>nul", tun);
         if (append(out, length, line))
             return -1;
         snprintf(line, sizeof(line),
                  "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P overlay (%s)\" dir=in "
-                 "action=allow interface=\"%s\" profile=any enable=yes", tun, tun);
+                 "action=allow interface=\"%s\" profile=any enable=yes || exit /b 1", tun, tun);
         if (append(out, length, line))
             return -1;
     }
@@ -199,24 +199,46 @@ static int run_shell(const char *command) {
 /* Start the program named at the beginning of the command line directly. A service has
  * no console and no shell, and routing netsh through cmd.exe only adds a quoting layer
  * that fails differently from an interactive run. */
-static int run_command_wide(const wchar_t *command) {
-    wchar_t buffer[1024];
-    _snwprintf(buffer, ARRAYSIZE(buffer), L"%s", command);
-    buffer[ARRAYSIZE(buffer) - 1] = 0;
+/* netsh parses its own command line, and the quoting that survives an interactive
+ * prompt does not survive CreateProcessW: every rule came back with status 1 while the
+ * same text ran fine from a script. A temporary batch file is the representation both
+ * sides agree on, and a service has no shell to build one itself. */
+static int run_command_blob(const char *commands) {
+    wchar_t directory[MAX_PATH];
+    DWORD used = GetTempPathW(ARRAYSIZE(directory), directory);
+    if (!used || used >= ARRAYSIZE(directory))
+        return -1;
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, ARRAYSIZE(path), L"%sfastp2p-firewall-%lu.cmd", directory,
+               (unsigned long)GetCurrentProcessId());
+    path[ARRAYSIZE(path) - 1] = 0;
+    FILE *file = _wfopen(path, L"wb");
+    if (!file)
+        return -1;
+    fputs("@echo off\r\n", file);
+    fputs(commands, file);
+    fputs("\r\n", file);
+    fclose(file);
+    wchar_t line[MAX_PATH + 16];
+    _snwprintf(line, ARRAYSIZE(line), L"cmd.exe /c \"%s\"", path);
+    line[ARRAYSIZE(line) - 1] = 0;
     STARTUPINFOW startup = {0};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION process = {0};
-    if (!CreateProcessW(NULL, buffer, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
-                        &startup, &process))
-        return -1;
-    WaitForSingleObject(process.hProcess, 15000);
-    DWORD code = 1;
-    GetExitCodeProcess(process.hProcess, &code);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    return (int)code;
+    int status = -1;
+    if (CreateProcessW(NULL, line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
+                       &startup, &process)) {
+        WaitForSingleObject(process.hProcess, 20000);
+        DWORD code = 1;
+        GetExitCodeProcess(process.hProcess, &code);
+        status = (int)code;
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    _wremove(path);
+    return status;
 }
 #endif
 
@@ -267,7 +289,7 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
         for (; i + 1 < span && i + 1 < ARRAYSIZE(wide); ++i)
             wide[i] = (wchar_t)(unsigned char)scratch[i];
         wide[i] = 0;
-        int status = run_command_wide(wide);
+        int status = run_command_blob(scratch);
 #else
         int status = run_shell(scratch);
 #endif
