@@ -318,6 +318,7 @@ typedef struct {
     int tcp_peer_ip_verified;
     uint64_t tcp_predict_wait, tcp_predict_until;
     unsigned tcp_candidate_count;
+    int udp_seen_logged;
     /* Sweep cursor over the ephemeral range, for a peer whose mapping moves. */
     uint16_t sweep_cursor;
     uint16_t tcp_candidate_ports[1 + TCP_PREDICT_PORTS];
@@ -5314,6 +5315,18 @@ static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
     }
 }
 
+/* The punch exchange cares about the host, not the port: a symmetric NAT gives the peer
+ * a different port towards us than the one in the offer, and the offer's port was
+ * measured towards the gateway. Requiring both meant dropping every packet that actually
+ * arrived - the only packets that prove the hole is open. */
+static int same_host(const op_addr *a, const op_addr *b) {
+    if (op_addr_family(a) != op_addr_family(b))
+        return 0;
+    op_addr left = *a, right = *b;
+    op_addr_set_port(&left, 0);
+    op_addr_set_port(&right, 0);
+    return op_addr_equal(&left, &right);
+}
 static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object *message, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     for (unsigned slot = 0; slot <= t->udp_candidate_count; ++slot) {
@@ -5327,8 +5340,28 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
                 break;
             op_addr_normalize(&from);
             if (n < 8 || op_u32(data) != (uint32_t)(n - 8) || op_u16(data + 4) != 4 ||
-                !op_addr_equal(&from, &peer))
+                !same_host(&from, &peer))
                 continue;
+            if (!op_addr_equal(&from, &peer)) {
+                /* Learn the port the peer really uses towards us and answer that: its
+                 * NAT opened exactly this endpoint when the packet left. */
+                uint16_t seen = op_addr_port(&from);
+                uint16_t advertised = op_addr_port(&peer);
+                char text[OP_ADDR_TEXT];
+                op_addr_text(&from, text, sizeof(text));
+                op_addr_set_port(&peer, seen);
+                t->peer_addr = from;
+                if (t->family >= 0)
+                    t->remote_ports[t->family] = seen;
+                if (!t->udp_seen_logged) {
+                    char note[192];
+                    t->udp_seen_logged = 1;
+                    snprintf(note, sizeof(note),
+                             "peer UDP punch source seen %s (advertised %u); answering it",
+                             text, (unsigned)advertised);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
+            }
             uint16_t sub = op_u16(data + 6);
             if (sub > 1 || (t->udp_punch_role == UDP_PUNCH_SEND && sub != 1) ||
                 (t->udp_punch_role == UDP_PUNCH_RECEIVE && sub != 0))
