@@ -1730,8 +1730,9 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
     t->id = id;
     t->peer_id = op_node_id(peer);
     strcpy(t->peer, peer);
-    if (transport == FASTP2P_TRANSPORT_TCP)
-        t->prefer_local_port = punch_port_get(c, peer);
+    /* Both transports pin: a pinned local port keeps the advertised mapping valid, and
+     * that is what lets the peer's packets reach us at all. */
+    t->prefer_local_port = punch_port_get(c, peer);
     /* Every tunnel object starts in T_REPLY; distinguish a stalled tunnel from
      * one that was never created. */
     char born[200];
