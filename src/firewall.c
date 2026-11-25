@@ -274,7 +274,9 @@ int fp_firewall_open(unsigned port, int udp, const char *tun, char *detail,
     if (fp_firewall_commands(port, udp, tun, commands, sizeof(commands)))
         return FP_FIREWALL_ABSENT;
 #if defined(_WIN32)
-    if (strstr(commands, "netsh") == NULL)
+    /* The Windows rules go through PowerShell now, so look for that; checking for netsh
+     * made a working opener report "no rule tool on this host" and never run. */
+    if (strstr(commands, "powershell.exe") == NULL)
         return FP_FIREWALL_ABSENT;
 #elif defined(__APPLE__)
     if (access("/usr/libexec/ApplicationFirewall/socketfilterfw", X_OK))
