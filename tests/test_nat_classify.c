@@ -1140,12 +1140,14 @@ static void punch_port_memory_is_per_peer(void) {
     punch_port_note(c, "peer-b", 41000);
     assert(punch_port_get(c, "peer-a") == 40000 && punch_port_get(c, "peer-b") == 41000);
 
-    /* A new tunnel towards that peer picks the remembered port up, in either role. */
+    /* A new tunnel towards that peer picks the remembered port up, in either role and
+     * on either transport: the pin is what keeps the advertised mapping valid, and a
+     * fresh socket every round moved it away while the peer kept dialling it. */
     int ti = new_tunnel(c, "peer-a", 94, FASTP2P_TRANSPORT_TCP, 0);
     assert(ti >= 0 && c->tunnels[ti].prefer_local_port == 40000);
     close_tunnel(c, ti, NULL);
     int qi = new_tunnel(c, "peer-a", 95, FASTP2P_TRANSPORT_QUIC, 1);
-    assert(qi >= 0 && c->tunnels[qi].prefer_local_port == 0);
+    assert(qi >= 0 && c->tunnels[qi].prefer_local_port == 40000);
     close_tunnel(c, qi, NULL);
 
     /* After the rotation window the port is dropped so a hopeless one is abandoned. */
