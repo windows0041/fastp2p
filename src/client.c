@@ -7741,7 +7741,7 @@ int fp_client_sdwan_reconfigure(fastp2p_client *c, json_object *config, char *de
         peer->app_index = slot;
         app *a = &c->apps[slot++];
         *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
-                   .transport = state->transport, .id = random_id()};
+                   .transport = state->transport, .no_relay = state->no_relay, .id = random_id()};
         strcpy(a->peer, peer->node);
     }
     c->sdwan = state;
@@ -7825,7 +7825,7 @@ int fp_client_sdwan_config(fastp2p_client *c, json_object *config) {
         peer->app_index = slot;
         app *a = &c->apps[slot++];
         *a = (app){.used = 1, .local = 1, .sdwan = 1, .fd = -1, .tunnel_index = -1,
-                   .transport = state->transport, .id = random_id()};
+                   .transport = state->transport, .no_relay = state->no_relay, .id = random_id()};
         strcpy(a->peer, peer->node);
     }
     c->sdwan = state;

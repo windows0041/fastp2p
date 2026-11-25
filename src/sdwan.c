@@ -124,6 +124,12 @@ int fp_sdwan_parse(fp_sdwan *state, json_object *config, char *why, size_t why_l
             return sdwan_reject(why, why_len, "sdwan Transport must be quic, udp or tcp");
         state->transport = strcmp(transport, "tcp") ? FASTP2P_TRANSPORT_QUIC : FASTP2P_TRANSPORT_TCP;
     }
+    if (json_object_object_get_ex(config, "Relay", &value)) {
+        const char *relay = string_value(value);
+        if (!relay || (strcmp(relay, "allow") && strcmp(relay, "forbid")))
+            return sdwan_reject(why, why_len, "sdwan Relay must be allow or forbid");
+        state->no_relay = !strcmp(relay, "forbid");
+    }
     const char *pool = "10.3.2.0/24";
     uint32_t subnet;
     unsigned bits;

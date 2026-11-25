@@ -1294,6 +1294,7 @@ static void sdwan_section_builds_rules(void) {
         json_object_put(cfg);
         assert(c->sdwan && c->sdwan->peer_count == 2);
         assert(c->sdwan->transport == (cases[k].tcp ? FASTP2P_TRANSPORT_TCP : FASTP2P_TRANSPORT_QUIC));
+        assert(!c->sdwan->no_relay);
         unsigned assigned = 0;
         int slot = -1;
         for (unsigned i = 0; i < c->sdwan->peer_count; ++i) {
@@ -1311,6 +1312,33 @@ static void sdwan_section_builds_rules(void) {
         fp_sdwan_stop(c->sdwan);
         free(c->sdwan);
         c->sdwan = NULL;
+        free(c);
+    }
+    /* "Relay": "forbid" must reach the rules the section creates: the branches then keep
+     * retrying direct rounds instead of asking the gateway for a relay node. */
+    {
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+        snprintf(c->node, sizeof(c->node), "%s", "xrwgxserver");
+        char text[512];
+        snprintf(text, sizeof(text),
+                 "{\"Mode\":\"mesh\",\"Relay\":\"forbid\",\"Subnet\":\"10.3.2.0/24\","
+                 "\"Address\":\"10.3.2.30\",\"Peers\":[{\"Node\":\"redmibook\","
+                 "\"Address\":\"10.3.2.10\"}]}");
+        json_object *cfg = json_tokener_parse(text);
+        assert(cfg);
+#if defined(__linux__) || defined(_WIN32)
+        assert(fp_client_sdwan_config(c, cfg) == FASTP2P_OK);
+        assert(c->sdwan->no_relay == 1);
+        assert(c->sdwan->peers[0].app_index >= 0);
+        assert(c->apps[c->sdwan->peers[0].app_index].no_relay == 1);
+        fp_sdwan_stop(c->sdwan);
+        free(c->sdwan);
+        c->sdwan = NULL;
+#else
+        assert(fp_client_sdwan_config(c, cfg) == FASTP2P_EINVAL);
+#endif
+        json_object_put(cfg);
         free(c);
     }
 }

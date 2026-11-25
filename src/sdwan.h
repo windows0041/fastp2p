@@ -32,6 +32,9 @@ typedef struct {
     /* Transport for every rule this section creates: FASTP2P_TRANSPORT_QUIC (UDP punch
      * plus QUIC) unless the operator asks for TCP hole punching instead. */
     int transport;
+    /* Operator chose to forbid the relay for this overlay: the branches keep retrying
+     * direct rounds instead of asking the gateway for a relay node. */
+    int no_relay;
     char center[32];
     uint32_t address;
     fp_sdwan_peer peers[FP_SDWAN_MAX_PEERS];
