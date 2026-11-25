@@ -13,11 +13,13 @@ int main(void) {
     assert(!fp_firewall_commands(1179, 1, "fastp2p0", out, sizeof(out)));
 #if defined(_WIN32)
     assert(strstr(out, "FastP2P TCP 1179"));
-    assert(strstr(out, "protocol=TCP localport=1179"));
     assert(strstr(out, "FastP2P UDP 1179"));
-    assert(strstr(out, "protocol=UDP localport=1179"));
+    assert(strstr(out, "New-NetFirewallRule"));
+    /* Only what is missing gets created, so a restart does not churn the policy. */
+    assert(strstr(out, "-notcontains"));
     assert(strstr(out, "FastP2P overlay (fastp2p0)"));
-    assert(strstr(out, "dir=in"));
+    assert(strstr(out, "InterfaceAlias 'fastp2p0'"));
+    assert(strstr(out, "Remove-NetFirewallRule"));
 #elif defined(__APPLE__)
     assert(strstr(out, "socketfilterfw --add"));
     assert(strstr(out, "socketfilterfw --unblockapp"));

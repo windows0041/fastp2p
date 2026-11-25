@@ -75,41 +75,42 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
     out[0] = 0;
     char line[256];
 #if defined(_WIN32)
-    /* A fixed name per protocol keeps repeated starts from stacking rules; netsh has no
-     * replace, so the rule is deleted before it is added again. The overlay interface is
-     * separate: it carries nothing but packets this client wrote into the TUN. */
-    snprintf(line, sizeof(line),
-             "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P TCP %u\" 2>nul", port);
-    if (append(out, length, line))
-        return -1;
-    snprintf(line, sizeof(line),
-             "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P TCP %u\" dir=in action=allow "
-             "protocol=TCP localport=%u profile=any enable=yes || exit /b 1", port, port);
-    if (append(out, length, line))
-        return -1;
-    if (udp) {
-        snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall delete rule name=\"FastP2P UDP %u\" 2>nul", port);
-        if (append(out, length, line))
-            return -1;
-        snprintf(line, sizeof(line),
-                 "C:\\Windows\\System32\\netsh.exe advfirewall firewall add rule name=\"FastP2P UDP %u\" dir=in action=allow "
-                 "protocol=UDP localport=%u profile=any enable=yes || exit /b 1", port, port);
-        if (append(out, length, line))
+    /* One idempotent pass: remove only our own leftovers, then create what is missing.
+     * A restart that changes nothing must not touch the policy at all - a delete-and-add
+     * cycle on every start churns the rule store and wakes products that watch the
+     * firewall, which then re-ask their own whitelist questions because they saw a change
+     * they cannot attribute. */
+    {
+        char udp_want[48] = "";
+        if (udp)
+            snprintf(udp_want, sizeof(udp_want), ",'FastP2P UDP %u'", port);
+        const char *protocols = udp ? "'TCP','UDP'" : "'TCP'";
+        char script[1024];
+        snprintf(script, sizeof(script),
+                 "powershell.exe -NoProfile -NonInteractive -Command \""
+                 "$want=@('FastP2P TCP %u'%s); "
+                 "Get-NetFirewallRule -DisplayName 'FastP2P *' -ErrorAction SilentlyContinue | "
+                 "Where-Object { $want -notcontains $_.DisplayName -and "
+                 "$_.DisplayName -notlike 'FastP2P overlay*' } | "
+                 "Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+                 "foreach ($p in @(%s)) { $n='FastP2P ' + $p + ' %u'; "
+                 "if (-not (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)) { "
+                 "New-NetFirewallRule -DisplayName $n -Direction Inbound -Protocol $p "
+                 "-LocalPort %u -Action Allow -Profile Any | Out-Null } }\" || exit /b 1",
+                 port, udp_want, protocols, port, port);
+        if (append(out, length, script))
             return -1;
     }
     if (tun && *tun) {
-        /* netsh has no per-interface rule (only interfacetype=lan|wireless|ras), so the
-         * overlay interface goes through PowerShell, whose InterfaceAlias filter reaches
-         * the Windows Filtering Platform. The rule is removed first so a restart replaces
-         * it instead of stacking a second one. */
-        snprintf(line, sizeof(line),
-                 "powershell.exe -NoProfile -NonInteractive -Command \"Remove-NetFirewallRule "
-                 "-DisplayName 'FastP2P overlay (%s)' -ErrorAction SilentlyContinue; "
-                 "New-NetFirewallRule -DisplayName 'FastP2P overlay (%s)' -Direction Inbound "
-                 "-InterfaceAlias '%s' -Action Allow -Profile Any | Out-Null\" || exit /b 1",
+        char script[512];
+        snprintf(script, sizeof(script),
+                 "powershell.exe -NoProfile -NonInteractive -Command \""
+                 "if (-not (Get-NetFirewallRule -DisplayName 'FastP2P overlay (%s)' "
+                 "-ErrorAction SilentlyContinue)) { New-NetFirewallRule "
+                 "-DisplayName 'FastP2P overlay (%s)' -Direction Inbound "
+                 "-InterfaceAlias '%s' -Action Allow -Profile Any | Out-Null }\" || exit /b 1",
                  tun, tun, tun);
-        if (append(out, length, line))
+        if (append(out, length, script))
             return -1;
     }
 #elif defined(__APPLE__)
