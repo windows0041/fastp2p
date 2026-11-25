@@ -2017,7 +2017,7 @@ static int start_probe(fastp2p_client *c, int index) {
         if (preferred_missed) {
             char note[128];
             snprintf(note, sizeof(note),
-                     "TCP punch preferred local port %u unavailable, using %u",
+                     "punch preferred local port %u unavailable, using %u",
                      (unsigned)t->prefer_local_port, (unsigned)socket_port(fd));
             emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         }
@@ -2270,6 +2270,24 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
     t->local_port = t->probes[adopt].local_port;
     t->mapped_port = t->probes[adopt].mapped_port;
     address_copy(t->mapped_ip, t->probes[adopt].mapped_ip);
+    if (adopt == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_QUIC && !t->lan) {
+        /* The same lesson as the TCP branch below, for UDP: the peer keeps sending to the
+         * port we advertised, so a fresh socket every round moves the mapping and its
+         * packets arrive at a port the NAT no longer forwards. A cone mapping is
+         * destination-independent, which makes pinning the local port enough. */
+        int stable = c->nat[adopt].type == NAT_CONE;
+        char note[176];
+        if (stable) {
+            punch_port_note(c, t->peer, t->local_port);
+            snprintf(note, sizeof(note), "UDP punch local port %u (mapping %u: keeping it, mapping is stable)",
+                     (unsigned)t->local_port, (unsigned)t->mapped_port);
+        } else {
+            punch_port_forget(c, t->peer);
+            snprintf(note, sizeof(note), "UDP punch local port %u (mapping %u: moves, rotating next round)",
+                     (unsigned)t->local_port, (unsigned)t->mapped_port);
+        }
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     if (adopt == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_TCP && !t->lan) {
         /* A destination-independent mapping keeps the external port for a given local
          * port, so pinning the local port is what keeps the advertised port valid across
