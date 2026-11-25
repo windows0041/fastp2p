@@ -84,6 +84,11 @@
  * port, and then a listener on our advertised port accepts it. 256 ports each
  * side costs about half a second of SYNs, not a timeout per port. */
 #define TCP_PUNCH_SPRAY 256
+/* How many ports of the ephemeral range one round sweeps when the peer's mapping moves
+ * per destination. Nobody can predict that port (the advertised one was measured towards
+ * the gateway), so the only way to reach it is to cover the range; each round continues
+ * where the previous stopped. */
+#define TCP_SWEEP_CHUNK 2048
 /* Allocation samples taken towards the gateway probe port right before a punch:
  * three consecutive allocations are enough to tell a constant step from a random
  * one, and the newest sample is the base the peer's prediction starts from. */
@@ -313,6 +318,8 @@ typedef struct {
     int tcp_peer_ip_verified;
     uint64_t tcp_predict_wait, tcp_predict_until;
     unsigned tcp_candidate_count;
+    /* Sweep cursor over the ephemeral range, for a peer whose mapping moves. */
+    uint16_t sweep_cursor;
     uint16_t tcp_candidate_ports[1 + TCP_PREDICT_PORTS];
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
     op_socket fd, listen_fd, alternate_fd;
@@ -2759,6 +2766,57 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
         op_close(fd); /* the SYN created the mapping and the filter entry */
     }
 }
+
+static unsigned tcp_sweep_chunk(void) {
+    static unsigned chunk;
+    if (chunk)
+        return chunk;
+    chunk = TCP_SWEEP_CHUNK;
+    const char *text = getenv("FASTP2P_TCP_SWEEP");
+    if (text && *text) {
+        unsigned long value = strtoul(text, NULL, 10);
+        if (value >= 256 && value <= 65535)
+            chunk = (unsigned)value;
+    }
+    return chunk;
+}
+/* Walk the ephemeral range. A peer whose mapping moves per destination allocates a port
+ * nobody can predict - least of all from the port the gateway measured towards itself -
+ * so a window around that number is a lottery against the whole range. Each round covers
+ * a chunk and continues where the last one stopped, which is the only way to reach it. */
+static void tcp_punch_sweep(fastp2p_client *c, int index) {
+    tunnel *t = &c->tunnels[index];
+    int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    if (!t->peer_addr.len)
+        return;
+    const unsigned low = 1024, high = 65535;
+    const unsigned span = high - low;
+    unsigned chunk = tcp_sweep_chunk();
+    if (t->sweep_cursor < low || t->sweep_cursor > high)
+        t->sweep_cursor = (uint16_t)(low + random_id() % span);
+    unsigned cursor = t->sweep_cursor;
+    unsigned sent = 0;
+    for (unsigned i = 0; i < chunk; ++i) {
+        unsigned port = low + (cursor - low + i) % span;
+        op_addr target = t->peer_addr;
+        op_addr_set_port(&target, (uint16_t)port);
+        /* Same local port as elsewhere: the mapping the peer has to hit stays put. */
+        op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+        if (fd < 0)
+            continue;
+        (void)op_connect(fd, &target.u.sa, target.len);
+        op_close(fd); /* the SYN is all that was needed */
+        ++sent;
+    }
+    t->sweep_cursor = (uint16_t)(low + (cursor - low + chunk) % span);
+    if (sent) {
+        char note[192];
+        snprintf(note, sizeof(note),
+                 "TCP punch swept %u ports from %u (peer mapping moves per destination)",
+                 sent, cursor);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
+}
 /* Dial the ports the peer's own allocator is about to use: the step it measured
  * towards the gateway is the step its mapping towards us takes, so each dial
  * opens our filter towards a port it will really appear from. */
@@ -2864,8 +2922,12 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
             int predicted = t->peer_tcp_step != 0;
             if (predicted)
                 tcp_punch_predict(c, index);
-            else
+            else {
+                /* Two bets in one round: the advertised port may still be the right
+                 * one, and if it is not, the sweep is already walking the range. */
                 tcp_punch_spray(c, index);
+                tcp_punch_sweep(c, index);
+            }
             if (tcp_punch_listen(c, index) == 0) {
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, predicted
                      ? "TCP mapping changes per destination; dialled the predicted window and parked listening"
