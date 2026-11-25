@@ -20,6 +20,14 @@ enum {
     FP_FIREWALL_DENIED,      /* the tool refused: not root, policy, Android sandbox */
 };
 
+/* Hole punching listens on a port the operating system picks, so a rule that names the
+ * service port blocks every punch packet that arrives. Linux has no way to allow a
+ * program on the input path (the owner match only exists on output), so the client keeps
+ * its punch sockets inside this range and the firewall allows exactly the range. Windows
+ * gets both a range rule and a program rule; macOS filters per binary already. */
+#define FP_PUNCH_PORT_FIRST 40000
+#define FP_PUNCH_PORT_LAST 40999
+
 /* Render the commands the current platform would run. Exposed for tests: the exact
  * arguments are the part that breaks silently when a port or a rule name changes. */
 int fp_firewall_commands(unsigned port, int udp, const char *tun,

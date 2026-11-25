@@ -23,6 +23,10 @@ int main(void) {
      * allowed: a rule that only names the service port blocks every punch packet. */
     assert(strstr(out, "FastP2P program"));
     assert(strstr(out, "-Program '"));
+    /* Ephemeral punch ports cannot be named, so the range the client binds stays open. */
+    assert(strstr(out, "FastP2P punch TCP"));
+    assert(strstr(out, "FastP2P punch UDP"));
+    assert(strstr(out, "LocalPort 40000-40999"));
     assert(strstr(out, "Remove-NetFirewallRule"));
 #elif defined(__APPLE__)
     assert(strstr(out, "socketfilterfw --add"));
@@ -31,11 +35,15 @@ int main(void) {
     assert(strstr(out, "su -c 'iptables"));
     assert(strstr(out, "--dport 1179"));
     assert(strstr(out, "-i fastp2p0"));
+    assert(strstr(out, "--dport 40000:40999"));
 #else
     assert(strstr(out, "-p tcp --dport 1179 -j ACCEPT"));
     assert(strstr(out, "-p udp --dport 1179 -j ACCEPT"));
     assert(strstr(out, "-i fastp2p0 -j ACCEPT"));
     assert(strstr(out, "ip6tables"));
+    /* The punch listens on kernel-chosen ports, so the range must be open too. */
+    assert(strstr(out, "-p tcp --dport 40000:40999 -j ACCEPT"));
+    assert(strstr(out, "-p udp --dport 40000:40999 -j ACCEPT"));
     /* -C before -I keeps a restart from stacking a rule per start. */
     assert(strstr(out, "-C INPUT"));
 #endif

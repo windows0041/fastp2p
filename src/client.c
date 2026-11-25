@@ -965,6 +965,19 @@ static op_socket socket_bound(int udp, const char *ip, uint16_t port, int reuse)
     memset(&a, 0, sizeof(a));
     if (ip && *ip && op_addr_from_text(&a, ip, port))
         return -1;
+    if (!port) {
+        /* Stay inside the punch range the firewall opens: on Linux the input path has no
+         * way to allow a program, so a punch socket outside the range has its packets
+         * dropped no matter what else is configured. Falling back to any port keeps the
+         * client working when the range is busy. */
+        enum { kPunchPortSpan = FP_PUNCH_PORT_LAST - FP_PUNCH_PORT_FIRST + 1 };
+        for (int attempt = 0; attempt < 24; ++attempt) {
+            uint16_t candidate = (uint16_t)(FP_PUNCH_PORT_FIRST + random_id() % kPunchPortSpan);
+            op_socket fd = socket_bound_addr(udp, a.len ? &a : NULL, candidate, reuse);
+            if (fd >= 0)
+                return fd;
+        }
+    }
     return socket_bound_addr(udp, a.len ? &a : NULL, port, reuse);
 }
 static uint16_t socket_port(op_socket fd) {

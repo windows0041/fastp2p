@@ -88,7 +88,8 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
         char script[1024];
         snprintf(script, sizeof(script),
                  "powershell.exe -NoProfile -NonInteractive -Command \""
-                 "$want=@('FastP2P TCP %u'%s,'FastP2P program'); "
+                 "$want=@('FastP2P TCP %u'%s,'FastP2P program','FastP2P punch TCP',"
+                 "'FastP2P punch UDP'); "
                  "Get-NetFirewallRule -DisplayName 'FastP2P *' -ErrorAction SilentlyContinue | "
                  "Where-Object { $want -notcontains $_.DisplayName -and "
                  "$_.DisplayName -notlike 'FastP2P overlay*' } | "
@@ -118,6 +119,20 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
             if (append(out, length, script))
                 return -1;
         }
+    }
+    {
+        /* The same reason as the port range on the other platforms, spelled out: the punch
+         * sockets stay inside this range, so the range is what the rule can name. */
+        char script[900];
+        snprintf(script, sizeof(script),
+                 "powershell.exe -NoProfile -NonInteractive -Command \""
+                 "foreach ($r in @(@('FastP2P punch TCP','TCP'),@('FastP2P punch UDP','UDP'))) { "
+                 "if (-not (Get-NetFirewallRule -DisplayName $r[0] -ErrorAction SilentlyContinue)) { "
+                 "New-NetFirewallRule -DisplayName $r[0] -Direction Inbound -Protocol $r[1] "
+                 "-LocalPort %d-%d -Action Allow -Profile Any | Out-Null } }\" || exit /b 1",
+                 FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST);
+        if (append(out, length, script))
+            return -1;
     }
     if (tun && *tun) {
         char script[512];
@@ -166,6 +181,23 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
         if (append(out, length, line))
             return -1;
     }
+    /* The punch port is chosen by the kernel, so the range is what has to stay open. */
+    snprintf(line, sizeof(line),
+             "%s -c 'iptables -C INPUT -p tcp --dport %u:%u -j ACCEPT || "
+             "iptables -I INPUT -p tcp --dport %u:%u -j ACCEPT'",
+             su, FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST,
+             FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST);
+    if (append(out, length, line))
+        return -1;
+    if (udp) {
+        snprintf(line, sizeof(line),
+                 "%s -c 'iptables -C INPUT -p udp --dport %u:%u -j ACCEPT || "
+                 "iptables -I INPUT -p udp --dport %u:%u -j ACCEPT'",
+                 su, FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST,
+                 FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST);
+        if (append(out, length, line))
+            return -1;
+    }
     if (tun && *tun) {
         snprintf(line, sizeof(line),
                  "%s -c 'iptables -C INPUT -i %s -j ACCEPT || "
@@ -203,6 +235,24 @@ int fp_firewall_commands(unsigned port, int udp, const char *tun, char *out, siz
                 snprintf(line, sizeof(line),
                          "ip6tables -C INPUT -p udp --dport %u -j ACCEPT 2>/dev/null || "
                          "ip6tables -I INPUT -p udp --dport %u -j ACCEPT", port, port);
+            if (append(out, length, line))
+                return -1;
+        }
+        /* The punch listens on a port the kernel picks; the range is the only thing a
+         * rule can name, so it has to stay open. */
+        snprintf(line, sizeof(line),
+                 "%s -C INPUT -p tcp --dport %u:%u -j ACCEPT 2>/dev/null || "
+                 "%s -I INPUT -p tcp --dport %u:%u -j ACCEPT",
+                 tools[family], FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST,
+                 tools[family], FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST);
+        if (append(out, length, line))
+            return -1;
+        if (udp) {
+            snprintf(line, sizeof(line),
+                     "%s -C INPUT -p udp --dport %u:%u -j ACCEPT 2>/dev/null || "
+                     "%s -I INPUT -p udp --dport %u:%u -j ACCEPT",
+                     tools[family], FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST,
+                     tools[family], FP_PUNCH_PORT_FIRST, FP_PUNCH_PORT_LAST);
             if (append(out, length, line))
                 return -1;
         }
