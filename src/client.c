@@ -413,7 +413,6 @@ typedef struct {
      * The delay doubles per failure and is capped, so a hopeless pair settles down while
      * a transient one still retries quickly. */
     unsigned fail_rounds;
-    uint64_t retry_after;
     /* Only JSON-profile rules can be replaced by a managed update. Retain
      * configured names independently of gateway-driven runtime renames. */
     int profile_rule;
@@ -1491,7 +1490,12 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
             c->apps[i].tunnel_index = -1;
             c->apps[i].synced = 0;
             c->apps[i].link_deadline = 0;
-            c->apps[i].retry = mono() + 2 * NS;
+            /* A failed round backs off instead of starting another one two seconds
+             * later: new sockets, new ports and new log lines every two seconds never
+             * improved the odds, they only churned. The delay doubles per failure up to
+             * fifteen seconds and is cleared when a session comes up. */
+            ++c->apps[i].fail_rounds;
+            c->apps[i].retry = mono() + app_retry_delay(c->apps[i].fail_rounds);
             if (failed_relay[0] && c->apps[i].local && !was_synced) {
                 app *a = &c->apps[i];
                 int k = 0;
@@ -1533,15 +1537,6 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     t->relay_link = -1;
     if (reason)
         emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EIO, reason);
-    /* The app that owned this tunnel waits before starting another round. */
-    for (int ai = 0; ai < NA; ++ai) {
-        app *a = &c->apps[ai];
-        if (!a->used || a->tunnel_index != index)
-            continue;
-        ++a->fail_rounds;
-        a->retry_after = mono() + app_retry_delay(a->fail_rounds);
-    }
-
 }static int hex_value(char ch) {
     if (ch >= '0' && ch <= '9')
         return ch - '0';
@@ -3326,7 +3321,6 @@ static void session_ready(fastp2p_client *c, int index) {
     for (int ai = 0; ai < NA; ++ai)
         if (c->apps[ai].used && c->apps[ai].tunnel_index == index) {
             c->apps[ai].fail_rounds = 0;
-            c->apps[ai].retry_after = 0;
         }
     tunnel *t = &c->tunnels[index];
     if (!tunnel_ready(t))
@@ -3398,8 +3392,6 @@ static uint64_t app_retry_delay(unsigned rounds) {
     return delay > 15 * NS ? 15 * NS : delay;
 }
 static int app_tunnel(fastp2p_client *c, app *a, const char *peer, int transport) {
-    if (a->retry_after && mono() < a->retry_after)
-        return -1;
     int ti = new_tunnel(c, peer, random_id(), transport, 1);
     if (ti < 0)
         return -1;
