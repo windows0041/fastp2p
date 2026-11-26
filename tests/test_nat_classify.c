@@ -1546,8 +1546,20 @@ static void responder_publishes_a_stable_mapping(void) {
     json_object *j = json_object_new_object();
     c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_DEPENDENT;
     publish_tcp_mapping(c, t, j);
-    assert(!op_integer(j, "tcpPunchMap")); /* nothing useful to publish */
+    assert(!op_integer(j, "tcpPunchMap")); /* nothing measured: nothing to say */
     json_object_put(j);
+
+    /* The same dependent client, but this tunnel did measure a port. Publishing it
+     * with the "no step" marker is what lets the peer aim its spray at where our
+     * allocator is now instead of at the port the gateway measured long ago. */
+    t->tcp_last_port = 61531;
+    j = json_object_new_object();
+    publish_tcp_mapping(c, t, j);
+    assert(op_integer(j, "tcpPunchMap") == FP_TCP_MAP_UNPREDICTABLE);
+    assert(op_integer(j, "tcpPunchLastPort") == 61531);
+    assert(!op_integer(j, "tcpPunchStep"));
+    json_object_put(j);
+    t->tcp_last_port = 0;
 
     c->tcp_nat.family[OP_FAM_V4].type = FP_NAT_STABLE;
     j = json_object_new_object();
@@ -1575,7 +1587,71 @@ static void responder_publishes_a_stable_mapping(void) {
     publish_tcp_mapping(c, &c->tunnels[qi], j);
     assert(!op_integer(j, "tcpPunchMap"));
     json_object_put(j);
+
+    /* What the other side does with the marker: accept the port, never mistake it
+     * for a predictable step. */
+    json_object *learned = json_object_new_object();
+    op_ju(learned, "tcpPunchMap", FP_TCP_MAP_UNPREDICTABLE);
+    op_ju(learned, "tcpPunchLastPort", 61531);
+    learn_tcp_mapping(t, learned);
+    assert(t->peer_tcp_mapping == FP_TCP_MAP_UNPREDICTABLE);
+    assert(t->peer_tcp_last_port == 61531);
+    assert(tcp_peer_kind(t) == TCP_PEER_MOVES);
+    assert(tcp_peer_unpredictable(t) == 1);
+    assert(!tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port, 0));
+    json_object_put(learned);
     close_tunnel(c, qi, NULL);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+/* The opener has to aim at where the symmetric side's allocator is *now*. A phone
+ * CGNAT hands ports out monotonically (measured on the live pair: 61307, 61341,
+ * 61381 ... +10..40 per connection), so a window centred on the port it measured
+ * towards the gateway (50566 there) lands thousands of ports behind, and a
+ * symmetric window spends half of its SYNs on ports the allocator already passed. */
+static void spray_aims_ahead_of_an_unpredictable_peer(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "remote-node", 94, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    snprintf(t->mode, sizeof(t->mode), "%s", "tcppunch");
+    t->tcp_v2 = 1;
+    t->family = OP_FAM_V4;
+    t->remote_ports[OP_FAM_V4] = 50566; /* measured towards the gateway */
+    t->remote_port = 50566;
+    assert(!op_addr_from_text(&t->peer_addr, "203.0.113.9", 50566));
+    const char *override = getenv("FASTP2P_TCP_SPRAY");
+    int operator_width = override && *override;
+
+    /* Nothing published by the peer: the advertised port is all there is, and the
+     * window stays the historical symmetric one. */
+    int low = 0, high = 0;
+    assert(tcp_spray_base(t, OP_FAM_V4) == 50566);
+    tcp_spray_window(t, 50566, &low, &high);
+    if (!operator_width)
+        assert(low == 50566 - (int)TCP_PUNCH_SPRAY && high == 50566 + (int)TCP_PUNCH_SPRAY);
+
+    /* The peer published its own last observation: aim there, not at 50566, and
+     * bias the window forward. */
+    t->peer_tcp_mapping = FP_TCP_MAP_UNPREDICTABLE;
+    t->peer_tcp_last_port = 61531;
+    assert(tcp_peer_kind(t) == TCP_PEER_MOVES);
+    assert(tcp_spray_base(t, OP_FAM_V4) == 61531);
+    tcp_spray_window(t, 61531, &low, &high);
+    if (!operator_width) {
+        assert(high - 61531 == (int)TCP_PUNCH_SPRAY_WIDE);
+        assert(61531 - low == (int)TCP_PUNCH_SPRAY_WIDE / 8);
+        assert(TCP_PUNCH_SPRAY_WIDE > TCP_PUNCH_SPRAY);
+    }
+    /* A port we already know is not sprayed again. */
+    assert(low < 61531 && high > 61531);
+
+    /* A measured step still wins: that path predicts the exact next port. */
+    t->peer_tcp_mapping = FP_TCP_MAP_INCREMENT;
+    t->peer_tcp_step = 8;
+    assert(tcp_predict_next_port(t->peer_tcp_mapping, t->peer_tcp_last_port, t->peer_tcp_step) ==
+           61539);
     close_tunnel(c, ti, NULL);
     free(c);
 }
@@ -2159,5 +2235,6 @@ int main(void) {
     tcp_array_width_escalates();
     dialer_array_uses_many_source_ports();
     dialer_array_leaves_undiallable_peers_alone();
+    spray_aims_ahead_of_an_unpredictable_peer();
     return 0;
 }
