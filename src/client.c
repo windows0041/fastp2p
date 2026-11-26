@@ -653,6 +653,9 @@ static int local_is_public(const char *text);
 static void report_nat(fastp2p_client *);
 static int nat_stun_input(fastp2p_client *, const uint8_t *, size_t, const op_addr *, uint64_t);
 static int family_usable(const fastp2p_client *, const tunnel *, int);
+/* Whether this host can still originate traffic of a family: used by the report so a
+ * path that lost IPv6 stops publishing the address it had. */
+static int local_family_routable(const op_addr *, int, char[OP_ADDR_TEXT]);
 static void tick_nat(fastp2p_client *, uint64_t);
 static void close_overlay(fastp2p_client *, int, int);
 static void tunnel_message(fastp2p_client *, int, uint16_t, const uint8_t *, size_t);
@@ -6594,8 +6597,16 @@ static void report_families(const fastp2p_client *c, json_object *j) {
     if (family_wanted(c, OP_FAM_V4) &&
         strcmp(c->ip[OP_FAM_V4], "0.0.0.0") && address_of_family(c->ip[OP_FAM_V4], OP_FAM_V4))
         op_js(j, "IPv4", c->ip[OP_FAM_V4]);
-    op_ju(j, "hasIPv6", family_wanted(c, OP_FAM_V6) ? 1 : 0);
-    if (family_wanted(c, OP_FAM_V6) && address_of_family(c->ip[OP_FAM_V6], OP_FAM_V6))
+    /* "Wanted" is a configuration answer; the report has to say whether this path can
+     * still carry IPv6 *now*. A phone that leaves mobile data for a Wi-Fi without IPv6
+     * kept publishing the mobile address it learned minutes ago, so the gateway showed
+     * an IPv6 endpoint that no packet could reach. */
+    char v6_source[OP_ADDR_TEXT];
+    int v6_live = 0;
+    if (family_wanted(c, OP_FAM_V6) && c->ip[OP_FAM_V6][0] && c->gateway_addr[OP_FAM_V6].len)
+        v6_live = local_family_routable(&c->gateway_addr[OP_FAM_V6], OP_FAM_V6, v6_source);
+    op_ju(j, "hasIPv6", v6_live ? 1 : 0);
+    if (v6_live)
         op_js(j, "IPv6", c->ip[OP_FAM_V6]);
     op_ju(j, "udpNatType6", (uint64_t)c->nat[OP_FAM_V6].type);
     op_ju(j, "tcpNatType6", c->tcp_nat.family[OP_FAM_V6].type);
