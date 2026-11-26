@@ -5563,12 +5563,12 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
                 }
             }
             uint16_t sub = op_u16(data + 6);
-            /* The sender accepts the peer's request (sub 0) too. A symmetric peer can
-             * only reach us after one of its own packets has left, and that packet is
-             * the only place its real source port is visible: ignoring it here left
-             * NAT1 vs NAT4 spraying a window that never contained the right port, while
-             * the answer that would have opened the hole was dropped on the floor. */
-            if (sub > 1 || (t->udp_punch_role == UDP_PUNCH_RECEIVE && sub != 0))
+            /* Either direction is proof the hole is open, so neither role filters by
+             * sub any more. A sender that ignored the peer's request (sub 0) never
+             * learned the real source port; a receiver that ignored the reply (sub 1)
+             * never joined the underlay the sender had already dialled - both sides then
+             * waited out the deadline while every packet they needed lay on the floor. */
+            if (sub > 1)
                 continue;
             json_object *reply = op_json(data + 8, (size_t)n - 8);
             uint64_t id = op_integer(reply, "id");
