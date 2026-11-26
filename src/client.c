@@ -2810,7 +2810,14 @@ static int tcp_punch_listen(fastp2p_client *c, int index) {
         close_tunnel(c, index, "TCP punch fallback listener failed");
         return -1;
     }
-    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP punch fallback listening on the mapped source port");
+    {
+        /* The listener owns the LOCAL port whose mapping the peer dials; calling that
+         * "the mapped source port" sent one debugging session after the wrong number. */
+        char note[160];
+        snprintf(note, sizeof(note), "TCP punch listening on local %u (mapped %u)",
+                 (unsigned)t->local_port, (unsigned)t->mapped_port);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     return 0;
 }
 /* Interleave the walk so the reported port is tried first and the window grows
@@ -3394,6 +3401,16 @@ static void start_underlay(fastp2p_client *c, int index) {
     if (!t->peer_addr.len) {
         close_tunnel(c, index, "invalid peer address");
         return;
+    }
+    /* Which side dials, which listens, and to whom: a punch that completed but never
+     * opened the underlay used to look exactly like a punch that never happened. */
+    {
+        char note[200], where[OP_ADDR_TEXT + 8];
+        op_addr_text(&t->peer_addr, where, sizeof(where));
+        snprintf(note, sizeof(note), "underlay %s: peer=%s:%u transport=%s v2=%d server=%d",
+                 t->server ? "listen" : "dial", where, (unsigned)op_addr_port(&t->peer_addr),
+                 t->transport == FASTP2P_TRANSPORT_QUIC ? "quic" : "tcp", t->tcp_v2, t->server);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     t->deadline = mono() + 10 * NS;
     if (t->tcp_v2) {
@@ -5267,6 +5284,17 @@ static void accept_punch(fastp2p_client *c, int ti) {
      * that actually made it - the one connection that proves the hole is open. Accept it
      * from the peer's address whatever the port; the session secret rejects impostors. */
     int from_peer = !op_addr_from_text(&peer_len_probe, t->ip, 0) && op_addr_equal(&peer, &peer_len_probe);
+    if (!from_peer && !t->inbound_logged) {
+        /* A SYN from an address we did not expect is still evidence the hole is open; a rejected one names the
+         * address the peer really uses, which may differ from the address it published. */
+        char note[200], text[OP_ADDR_TEXT];
+        op_addr_text(&peer, text, sizeof(text));
+        t->inbound_logged = 1;
+        snprintf(note, sizeof(note), "inbound punch SYN from %s:%u (peer %s:%u) %s",
+                 text, (unsigned)op_addr_port(&peer), t->ip, (unsigned)t->remote_port,
+                 from_peer ? "accepted" : "rejected");
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     if (from_peer && t->remote_port && op_addr_port(&peer) != t->remote_port) {
         if (!t->inbound_logged) {
             char note[160];
