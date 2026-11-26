@@ -346,6 +346,10 @@ typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
     uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port, udp_reverse_port6;
+    /* The peer's business port, when it published one: a host behind a default-deny
+     * firewall only has that port open, so dialling it is the one path its filters
+     * already admit. Zero when the peer did not say. */
+    uint16_t peer_direct_port;
     int skip_udp_direct, udp_reverse6_retry, udp_reverse6_supported;
     unsigned tcp_attempts;
     /* Consecutive silent (timed-out) dials: a refused one resets it, because a
@@ -2708,8 +2712,13 @@ static void probe_complete(fastp2p_client *c, int index) {
         op_js(j, "linkMode", t->mode);
         /* Peers that understand the shared listener advertise its port in
          * their reply. Other peers proceed with the existing punch. */
-        if (t->tcp_punch_immediate && c->public_port)
+        if (t->tcp_punch_immediate && c->public_port) {
             op_ju(j, "tcpDirect", 1);
+            /* Name the port, not just the capability: the peer's dial to our
+             * advertised mapping dies at our own firewall (only the business port
+             * is open), while a dial to this port lands on the shared listener. */
+            op_ju(j, "tcpDirectPort", c->public_port);
+        }
         if (t->transport == FASTP2P_TRANSPORT_QUIC && !t->skip_udp_direct &&
             !t->relay_wait && has_udp_listener(c)) {
             op_ju(j, "udpDirect", 1);
@@ -3251,10 +3260,19 @@ static void tcp_array_close(fastp2p_client *c, tunnel *t) {
     t->array_count = 0;
     t->array_until = 0;
 }
-/* Arm one rotation. Returns 0 when at least two sockets are dialling. */
+/* Where one punch dial should go: the peer's business port when it named one,
+ * because that is the port its firewall admits, otherwise the mapping it
+ * published for this family. */
+static uint16_t tcp_dial_target(const tunnel *t) {
+    if (t->peer_direct_port)
+        return t->peer_direct_port;
+    int family = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
+    return t->remote_ports[family];
+}
+/* Arming one rotation. Returns 0 when at least two sockets are dialling. */
 static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     int family = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
-    uint16_t target_port = t->remote_ports[family];
+    uint16_t target_port = tcp_dial_target(t);
     if (!target_port || !t->peer_addr.len)
         return -1;
     unsigned ceiling = tcp_array_config_width();
@@ -3497,7 +3515,10 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
     {
         int walk_family = t->family >= 0 ? t->family : OP_FAM_V4;
         uint16_t reported = t->remote_ports[walk_family];
-        if (reported) {
+        if (t->peer_direct_port) {
+            /* One target, and it is the one the peer's firewall admits: no walk. */
+            op_addr_set_port(&t->peer_addr, t->peer_direct_port);
+        } else if (reported) {
             if (t->tcp_scan && peer_kind != TCP_PEER_STABLE)
                 op_addr_set_port(&t->peer_addr, tcp_scan_port(reported, t->tcp_scan));
             else
@@ -4806,8 +4827,15 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 strcpy(t->mode, mode);
                 t->tcp_v2 = !strcmp(mode, "tcppunch") && op_integer(j, "tcpPunchV2") == 1;
                 t->tcp_punch_immediate = t->tcp_v2 && op_integer(j, "tcpPunchImmediate") == 1;
-                if (t->tcp_punch_immediate && op_integer(j, "tcpDirect") == 1)
+                if (t->tcp_punch_immediate && op_integer(j, "tcpDirect") == 1) {
                     t->tcp_direct_port = c->public_port;
+                    /* The port the initiator's firewall actually admits. Dialling
+                     * its advertised mapping instead is what a default-deny host
+                     * silently drops, so this becomes our preferred target. */
+                    uint64_t peer_direct = op_integer(j, "tcpDirectPort");
+                    if (peer_direct > 0 && peer_direct <= UINT16_MAX)
+                        t->peer_direct_port = (uint16_t)peer_direct;
+                }
                 if (!strcmp(mode, "udppunch") && op_integer(j, "udpDirect") == 1 && has_udp_listener(c))
                     t->udp_direct_port = c->public_port;
                 uint64_t reverse_port = op_integer(j, "udpReversePort");
@@ -6418,11 +6446,20 @@ static void tick_accept(fastp2p_client *c, uint64_t now) {
                 /* A punch that now starts immediately would otherwise leave this
                  * gate behind and drop the initiator's direct connection: the
                  * shared listener may complete the tunnel for as long as the
-                 * punch is still establishing. */
+                 * punch is still establishing. A host whose business port is the
+                 * only one its firewall admits waits on that port for the same
+                 * reason, whether or not it also published a direct port. */
                 int waiting = (t->state == T_TIME || t->state == T_TCP_CONNECT) &&
-                              t->tcp_direct_port && family >= 0 && t->peer_ready[family];
+                              (t->tcp_direct_port || c->public_port) && family >= 0 &&
+                              t->peer_ready[family];
                 const char *wanted = waiting ? t->peer_text[family] : t->ip;
-                if ((waiting || t->state == T_DIRECT) && t->server &&
+                /* Both roles may be completed on the shared listener: whichever side
+                 * opened its business port has the only port a default-deny host
+                 * admits, so the peer's dial arrives here instead of on a punch
+                 * socket. The frame names the tunnel and the source address must
+                 * match the peer, so this cannot be somebody else's connection. */
+                int may_adopt = t->server || c->public_port;
+                if ((waiting || t->state == T_DIRECT) && may_adopt &&
                     !op_addr_from_text(&expected, wanted, 0) &&
                     op_addr_equal(&expected, &p->peer)) {
                     t->fd = p->fd;

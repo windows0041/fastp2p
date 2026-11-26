@@ -2032,6 +2032,25 @@ static void dialer_array_leaves_undiallable_peers_alone(void) {
     free(c);
     op_close(endpoint);
 }
+/* A host behind a default-deny firewall only has its business port open, so a dial
+ * to the peer's advertised mapping dies at that firewall. The published business port
+ * therefore wins over every number derived from a mapping. */
+static void dial_target_prefers_the_peer_business_port(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    int ti = new_tunnel(c, "remote-node", 95, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    t->family = OP_FAM_V4;
+    t->remote_ports[OP_FAM_V4] = 33575; /* the mapping measured towards the gateway */
+    assert(!op_addr_from_text(&t->peer_addr, "203.0.113.9", 33575));
+    assert(tcp_dial_target(t) == 33575);
+    /* Once the peer names its business port, nothing else is dialled. */
+    t->peer_direct_port = 1510;
+    assert(tcp_dial_target(t) == 1510);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2236,5 +2255,6 @@ int main(void) {
     dialer_array_uses_many_source_ports();
     dialer_array_leaves_undiallable_peers_alone();
     spray_aims_ahead_of_an_unpredictable_peer();
+    dial_target_prefers_the_peer_business_port();
     return 0;
 }
