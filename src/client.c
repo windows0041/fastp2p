@@ -385,6 +385,10 @@ typedef struct {
     int udp_peer_kind;
     /* One diagnostic line per tunnel, emitted before its first packet. */
     int punch_logged;
+    /* Diagnostics only: datagrams accepted from the socket, and the first one seen
+     * so a filtered direction can be told apart from one that never sent. */
+    unsigned punch_rx_total;
+    int punch_rx_logged, punch_tx_logged;
     int udp_dual_punch, udp_peer_cone;
     unsigned udp_candidate_count;
     op_socket udp_candidates[UDP_PUNCH_ARRAY_LIMIT];
@@ -5476,6 +5480,21 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
             if (n < 0)
                 break;
             op_addr_normalize(&from);
+            ++t->punch_rx_total;
+            if (!t->punch_rx_logged) {
+                /* Logged before any filter, so "arrived but rejected" is visible: that
+                 * is a different bug from "nothing arrived", and the two used to look
+                 * identical. */
+                t->punch_rx_logged = 1;
+                char note[200], text[OP_ADDR_TEXT];
+                op_addr_text(&from, text, sizeof(text));
+                snprintf(note, sizeof(note),
+                         "punch rx: %zu bytes from %s:%u (peer %s:%u) main=%u sub=%u",
+                         (size_t)n, text, (unsigned)op_addr_port(&from), t->ip,
+                         (unsigned)t->remote_port, n >= 6 ? (unsigned)op_u16(data + 4) : 0,
+                         n >= 8 ? (unsigned)op_u16(data + 6) : 0);
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+            }
             if (n < 8 || op_u32(data) != (uint32_t)(n - 8) || op_u16(data + 4) != 4 ||
                 !same_host(&from, &peer))
                 continue;
@@ -5551,13 +5570,13 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         else
             op_addr_text(&t->peer_addr, where, sizeof(where));
         snprintf(note, sizeof(note),
-                 "punch %s: role=%s peer=%s window=%u%s%s%s",
+                 "punch %s: role=%s peer=%s peerWindow=%u%s%s%s ownWindow=%d",
                  t->mode, t->udp_punch_role == UDP_PUNCH_SEND ? "send"
                           : t->udp_punch_role == UDP_PUNCH_RECEIVE ? "receive" : "legacy",
                  where, (unsigned)t->sym_count,
                  t->udp_peer_kind == 2 ? " split" : "",
                  t->sym_up ? " up" : " down",
-                 t->udp_punch_order ? " ordered" : "");
+                 t->udp_punch_order ? " ordered" : "", t->udp_punch_kind);
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     if (t->udp_punch_role == UDP_PUNCH_SEND && !t->udp_punch_ready &&
@@ -5590,6 +5609,19 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         }
         if (predict_first)
             udp_packet(t->fd, &peer, 4, 0, message);
+        if (first && !t->punch_tx_logged) {
+            /* Name the endpoint with its port and how many sockets carry the spray: a
+             * window spread over candidate sockets sends from ports the peer may have
+             * to learn, so the count matters when nothing arrives. */
+            t->punch_tx_logged = 1;
+            char note[200], text[OP_ADDR_TEXT];
+            op_addr_text(&peer, text, sizeof(text));
+            snprintf(note, sizeof(note), "punch tx: %s to %s:%u peerWindow=%u sockets=%u sub=%d",
+                     t->udp_punch_role == UDP_PUNCH_SEND ? "send" : "receive", text,
+                     (unsigned)op_addr_port(&peer), (unsigned)t->sym_count,
+                     t->udp_candidate_count + 1, 0);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        }
         t->punch_next = now + punch_interval(now - t->punch_started);
         if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE) {
             op_ju(message, "udpPunchReady", 1);
