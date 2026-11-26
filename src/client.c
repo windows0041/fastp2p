@@ -286,6 +286,10 @@ typedef struct {
     op_addr dep_addr;
     /* Which server was asked, so the log says who the verdict rests on. */
     char dep_host[254];
+    /* The endpoint the gateway observed for us. The second-address answer is compared
+     * against the whole of it: a NAT that keeps the port but changes the public address
+     * leaves the peer dialling an address our mapping does not exist on. */
+    op_addr observed;
     uint8_t dep_tid[FP_STUN_NONCE];
     uint64_t dep_deadline;
 } nat_discovery;
@@ -6854,6 +6858,7 @@ static int nat_discovery_open(fastp2p_client *c, int family) {
     n->dep_phase = 0;
     n->dep_attempt = 0;
     n->addr_dep = -1;
+    n->observed.len = 0;
     n->type = NAT_UNKNOWN;
     if (family == OP_FAM_V4 && c->nat_override)
         n->type = c->nat_override;
@@ -6884,6 +6889,17 @@ static int host_under(const char *host, const char *domain) {
     if (!h || !d || h < d || strcmp(host + h - d, domain))
         return 0;
     return h == d || host[h - d - 1] == '.';
+}
+/* A private or loopback address is not a mapping an internet peer can reach. When the
+ * gateway answers with one of these it is inside our own network (a self-hosted gateway
+ * on the office LAN is the normal case), so its observation describes the LAN hop and
+ * comparing it with a public server's answer would classify every such node as
+ * symmetric. */
+static int address_not_translated(const op_addr *a) {
+    /* "Not routable" is the platform's wording for loopback, link-local, ULA and the
+     * private ranges; CGNAT stays routable on purpose, because a carrier peer behind it
+     * is still reachable through its mapping. */
+    return a && a->len && !op_addr_routable(a);
 }
 /* Ask one outside server what our mapping looks like from a second destination
  * address, from the same socket (the same mapping). The gateway's probe ports share
@@ -6935,7 +6951,8 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
         fp_stun_mapped mapped;
         if (op_address_equal(&from->u.sa, from->len, &n->dep_addr.u.sa, n->dep_addr.len) &&
             fp_stun_response(data, length, n->dep_tid, &mapped) && mapped.valid) {
-            int stable = op_addr_port(&mapped.address) == n->port;
+            int stable = op_addr_port(&mapped.address) == n->port &&
+                         (!n->observed.len || same_ip(&mapped.address, &n->observed));
             n->addr_dep = stable ? 0 : 1;
             n->dep_phase = 0;
             /* A mapping that follows the destination address is unpredictable to any
@@ -6966,6 +6983,8 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
     if (accepted) {
         /* Index 0 is exactly what the old `ip` field held. */
         snprintf(c->ip[family], OP_ADDR_TEXT, "%s", text);
+        if (op_addr_from_text(&n->observed, text, (uint16_t)port))
+            n->observed.len = 0;
         if (n->phase == 1) {
             n->port = (uint16_t)port;
             n->phase = 2;
@@ -6983,7 +7002,10 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
                  * verdict over 6/9 a moment later. */
                 n->type = NAT_CONE;
                 n->measured_shared = n->shared;
-                if (!nat_discovery_probe_second_ip(c, family, now))
+                op_addr seen;
+                int comparable = !op_addr_from_text(&seen, c->ip[family], n->port) &&
+                                 !address_not_translated(&seen);
+                if (!comparable || !nat_discovery_probe_second_ip(c, family, now))
                     nat_discovery_finish(c, family);
             } else {
                 /* Different mapping: symmetric. Probe from a second local port to

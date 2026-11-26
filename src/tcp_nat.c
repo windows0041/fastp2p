@@ -122,13 +122,18 @@ static void family_prepare(fp_tcp_family *k, const op_addr *gateway, int index,
     k->target_count = 0;
     if (!gateway || !gateway->len || op_family_index(op_addr_family(gateway)) != index)
         return;
-    for (unsigned i = 0; i < 2; ++i) {
-        memset(&k->targets[i], 0, sizeof(k->targets[i]));
-        op_addr_copy(&k->targets[i].address, gateway);
-        op_addr_set_port(&k->targets[i].address, (uint16_t)(27180 + i));
-        k->targets[i].stun = 0;
+    /* Only a destination the NAT actually translates says anything about the mapping.
+     * A gateway on our own network answers with our untranslated address, and counting
+     * it here made every self-hosted deployment look destination-dependent. */
+    if (op_addr_routable(gateway)) {
+        for (unsigned i = 0; i < 2; ++i) {
+            memset(&k->targets[i], 0, sizeof(k->targets[i]));
+            op_addr_copy(&k->targets[i].address, gateway);
+            op_addr_set_port(&k->targets[i].address, (uint16_t)(27180 + i));
+            k->targets[i].stun = 0;
+        }
+        k->target_count = 2;
     }
-    k->target_count = 2;
     if (index == OP_FAM_V4) {
         for (unsigned i = 0; i < count && k->target_count < FP_TCP_PROBE_MAX; ++i) {
             struct addrinfo hints = {0}, *addresses = NULL;
@@ -152,6 +157,10 @@ static void family_prepare(fp_tcp_family *k, const op_addr *gateway, int index,
                     (fp_tcp_probe_target){.address = resolved, .stun = 1};
         }
     }
+    /* One destination cannot tell whether the mapping follows the destination, so an
+     * unanswerable question stays unmeasured instead of being guessed. */
+    if (k->target_count < 2)
+        return;
     k->prepared = 1;
 }
 void fp_tcp_nat_prepare(fp_tcp_nat *s, const op_addr gateway[OP_FAM_COUNT], int families) {

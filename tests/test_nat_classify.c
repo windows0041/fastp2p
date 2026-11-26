@@ -454,9 +454,11 @@ static void remeasure_waits_for_the_punch(void) {
  * nat_discovery_reply() as the socket loop would. The second address is only a
  * *destination*: binding one would fail on macOS, where lo0 carries 127.0.0.1 alone. */
 
-/* A BINDING success carrying MAPPED-ADDRESS, the only attribute the parser needs. */
-static size_t mapped_answer(const uint8_t transaction[FP_STUN_NONCE], uint16_t port,
-                            uint8_t *out) {
+/* A BINDING success carrying MAPPED-ADDRESS, the only attribute the parser needs.
+ * `ip` is the public address the server reports, which is what the endpoint comparison
+ * looks at besides the port. */
+static size_t mapped_answer_at(const uint8_t transaction[FP_STUN_NONCE], uint16_t port,
+                               const uint8_t ip[4], uint8_t *out) {
     memset(out, 0, 32);
     out[0] = 0x01; /* BINDING success */
     out[1] = 0x01;
@@ -475,11 +477,15 @@ static size_t mapped_answer(const uint8_t transaction[FP_STUN_NONCE], uint16_t p
     out[25] = 0x01;
     out[26] = (uint8_t)(port >> 8);
     out[27] = (uint8_t)(port & 0xff);
-    out[28] = 10;   /* 10.0.0.7 */
-    out[29] = 0;
-    out[30] = 0;
-    out[31] = 7;
+    memcpy(out + 28, ip, 4);
     return 32;
+}
+
+/* The usual witness address, which matches the one the gateway reported. */
+static size_t mapped_answer(const uint8_t transaction[FP_STUN_NONCE], uint16_t port,
+                            uint8_t *out) {
+    static const uint8_t ip[4] = {198, 51, 100, 7};
+    return mapped_answer_at(transaction, port, ip, out);
 }
 
 /* One gateway answer, as the ladder sees it. */
@@ -520,14 +526,63 @@ static void start_second_address_question(fastp2p_client *c, uint16_t mapped_por
     assert(c->nat[OP_FAM_V4].fd >= 0 && !c->nat[OP_FAM_V4].retries);
 }
 
-static void answer_second_address(fastp2p_client *c, uint16_t port, uint64_t now) {
+static void answer_second_address_at(fastp2p_client *c, uint16_t port, const uint8_t ip[4],
+                                     uint64_t now) {
     uint8_t answer[32];
-    size_t length = mapped_answer(c->nat[OP_FAM_V4].dep_tid, port, answer);
+    size_t length = mapped_answer_at(c->nat[OP_FAM_V4].dep_tid, port, ip, answer);
     op_addr from;
     assert(!op_addr_from_text(&from, "127.0.0.2", 3478));
     assert(nat_discovery_reply(c, OP_FAM_V4, answer, length, &from, now));
 }
 
+static void answer_second_address(fastp2p_client *c, uint16_t port, uint64_t now) {
+    static const uint8_t ip[4] = {198, 51, 100, 7};
+    answer_second_address_at(c, port, ip, now);
+}
+
+/* A gateway inside our own network reports the LAN mapping, which is not the mapping an
+ * internet peer would reach. Asking a public server about it would call every
+ * LAN-deployed node symmetric, so the ladder keeps the cone verdict and says nothing. */
+static void private_gateway_address_is_not_comparable(void) {
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    probe_fds_closed(&c);
+    c.udp_listener[OP_FAM_V4] = -1;
+    snprintf(c.stun_host[0], sizeof(c.stun_host[0]), "%s", "127.0.0.2");
+    c.stun_port[0] = 3478;
+    c.stun_count = 1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    /* The gateway answers with a private mapping, as a LAN gateway does. */
+    char body[] = "{\"IP\":\"192.168.60.4\",\"port\":35000}";
+    uint8_t packet[128];
+    op_put32(packet, (uint32_t)(sizeof(body) - 1));
+    op_put16(packet + 4, 2);
+    op_put16(packet + 6, 0);
+    memcpy(packet + 8, body, sizeof(body) - 1);
+    op_addr from;
+    assert(!op_addr_from_text(&from, "127.0.0.1", 27180));
+    assert(nat_discovery_reply(&c, OP_FAM_V4, packet, 8 + sizeof(body) - 1, &from, 1 * NS));
+    assert(c.nat[OP_FAM_V4].phase == 2);
+    assert(!op_addr_from_text(&from, "127.0.0.1", 27181));
+    assert(nat_discovery_reply(&c, OP_FAM_V4, packet, 8 + sizeof(body) - 1, &from, 2 * NS));
+    /* No question, cone verdict, nothing recorded. */
+    assert(c.nat[OP_FAM_V4].dep_phase == 0);
+    assert(c.nat[OP_FAM_V4].type == NAT_CONE);
+    assert(c.nat[OP_FAM_V4].addr_dep == -1);
+    assert(c.nat[OP_FAM_V4].fd < 0);
+    /* The predicate itself: private ranges in, public out. */
+    op_addr probe;
+    assert(!op_addr_from_text(&probe, "10.1.2.3", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "172.20.0.1", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "172.32.0.1", 1) && !address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "192.168.1.1", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "127.0.0.1", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "169.254.1.1", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "120.231.127.124", 1) && !address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "fd00::1", 1) && address_not_translated(&probe));
+    assert(!op_addr_from_text(&probe, "2409:8a55::1", 1) && !address_not_translated(&probe));
+}
 /* A server the project runs itself is the better witness than a public one: the default
  * list leads with stun.miwifi.com, so the choice has to be made on the name, not the
  * order. A gateway configured by address matches no name. */
@@ -563,6 +618,19 @@ static void mapping_stays_a_cone_across_addresses(void) {
     answer_second_address(&c, 35000, 3 * NS); /* the mapping the gateway already saw */
     assert(c.nat[OP_FAM_V4].type == NAT_CONE);
     assert(c.nat[OP_FAM_V4].addr_dep == 0);
+    assert(c.nat[OP_FAM_V4].fd < 0);
+}
+
+/* Same port, another public address: the port is predictable but the endpoint a peer
+ * elsewhere must dial is not, because that peer's packets arrive on an address our
+ * mapping was never created on. Still destination-dependent. */
+static void mapping_depends_on_the_address_only(void) {
+    fastp2p_client c = {0};
+    start_second_address_question(&c, 35000); /* the gateway saw 198.51.100.7:35000 */
+    static const uint8_t other_ip[4] = {203, 0, 113, 9};
+    answer_second_address_at(&c, 35000, other_ip, 3 * NS);
+    assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM);
+    assert(c.nat[OP_FAM_V4].addr_dep == 1);
     assert(c.nat[OP_FAM_V4].fd < 0);
 }
 
@@ -1715,8 +1783,10 @@ int main(void) {
     mapping_reply_comes_through_the_listener();
     remeasure_waits_for_the_punch();
     self_hosted_stun_is_preferred();
+    private_gateway_address_is_not_comparable();
     mapping_follows_the_destination_address();
     mapping_stays_a_cone_across_addresses();
+    mapping_depends_on_the_address_only();
     unanswered_second_address_keeps_the_cone();
     udp_array_width_and_ceiling();
     udp_punch_uses_winning_socket();

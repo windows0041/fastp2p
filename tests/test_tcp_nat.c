@@ -107,8 +107,56 @@ static void real_echo(int changed,int malformed) {
     fp_tcp_nat_close(&state);
     for(unsigned i=0;i<2;++i){if(peers[i]>=0)op_close(peers[i]);op_close(listeners[i]);}
 }
+/* A gateway on our own network is not a mapping destination: its two probe ports were
+ * always first in the target list, and counting them turned every self-hosted deployment
+ * into a destination-dependent ("NAT4") TCP node. */
+static void private_gateway_is_not_a_destination(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    state.servers[0] = (fp_stun_server){.host = "203.0.113.10", .port = 3478};
+    state.servers[1] = (fp_stun_server){.host = "198.51.100.20", .port = 3478};
+    state.server_count = 2;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    int families = 1 << OP_FAM_V4;
+
+    /* A private gateway: only the two public servers remain, both routable. */
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "192.168.60.4", 27183));
+    fp_tcp_nat_prepare(&state, gateway, families);
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->prepared && k->target_count == 2);
+    for (unsigned i = 0; i < k->target_count; ++i) {
+        assert(k->targets[i].stun);
+        assert(op_addr_routable(&k->targets[i].address));
+    }
+    fp_tcp_nat_close(&state);
+
+    /* One destination cannot show whether the mapping follows the destination. */
+    fp_tcp_nat_init(&state);
+    state.servers[0] = (fp_stun_server){.host = "203.0.113.10", .port = 3478};
+    state.server_count = 1;
+    fp_tcp_nat_prepare(&state, gateway, families);
+    assert(!state.family[OP_FAM_V4].prepared);
+    assert(state.family[OP_FAM_V4].target_count == 1);
+    assert(state.family[OP_FAM_V4].type == FP_NAT_UNKNOWN);
+    fp_tcp_nat_close(&state);
+
+    /* A routable gateway keeps the historical list: its two ports first. */
+    fp_tcp_nat_init(&state);
+    state.servers[0] = (fp_stun_server){.host = "203.0.113.10", .port = 3478};
+    state.server_count = 1;
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, families);
+    const fp_tcp_family *public_targets = &state.family[OP_FAM_V4];
+    assert(public_targets->prepared && public_targets->target_count == 3);
+    assert(!public_targets->targets[0].stun && !public_targets->targets[1].stun);
+    assert(op_addr_port(&public_targets->targets[0].address) == 27180);
+    assert(op_addr_port(&public_targets->targets[1].address) == 27181);
+    fp_tcp_nat_close(&state);
+}
+
 int main(void) {
-    assert(!op_platform_init());parser();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
+    assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
     puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling and separate mapping results passed");
     return 0;
 }
