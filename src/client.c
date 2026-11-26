@@ -284,6 +284,8 @@ typedef struct {
      * verdict (1 dependent, 0 stable, -1 unanswered). */
     int dep_phase, dep_attempt, addr_dep;
     op_addr dep_addr;
+    /* Which server was asked, so the log says who the verdict rests on. */
+    char dep_host[254];
     uint8_t dep_tid[FP_STUN_NONCE];
     uint64_t dep_deadline;
 } nat_discovery;
@@ -6872,6 +6874,17 @@ static int nat_discovery_open(fastp2p_client *c, int family) {
     (void)udp_packet(n->fd, &peer, 2, 0, NULL);
     return 1;
 }
+/* Is `host` the gateway's own domain, or a name under it (stun.example.net for a
+ * gateway at example.net)? A server the project runs itself is the better witness for
+ * the second-address question: it is a machine somebody here controls, while a public
+ * one may rate-limit, answer from an unexpected address or vanish. An IP literal
+ * matches nothing, so a numeric server list keeps its plain order. */
+static int host_under(const char *host, const char *domain) {
+    size_t h = host ? strlen(host) : 0, d = domain ? strlen(domain) : 0;
+    if (!h || !d || h < d || strcmp(host + h - d, domain))
+        return 0;
+    return h == d || host[h - d - 1] == '.';
+}
 /* Ask one outside server what our mapping looks like from a second destination
  * address, from the same socket (the same mapping). The gateway's probe ports share
  * one address, so only this can tell a cone from a NAT that keys its mapping on the
@@ -6880,26 +6893,34 @@ static int nat_discovery_probe_second_ip(fastp2p_client *c, int family, uint64_t
     nat_discovery *n = &c->nat[family];
     if (family != OP_FAM_V4 || c->stun_count <= 0)
         return 0;
-    for (int i = 0; i < c->stun_count; ++i) {
-        op_addr address;
-        if (!(resolve_any_families(c->stun_host[i], c->stun_port[i], FAM_V4, &address, NULL) & FAM_V4))
-            continue;
-        /* The gateway's own address would repeat the question already answered, and
-         * the ladder has no socket to spare for a server it cannot reach. */
-        if (same_ip(&address, &c->gateway_addr[family]))
-            continue;
-        for (int t = 0; t < FP_STUN_NONCE; ++t)
-            n->dep_tid[t] = (uint8_t)random_id();
-        uint8_t request[64];
-        size_t length = fp_stun_request(request, sizeof(request), n->dep_tid, 0, 0);
-        if (!length)
-            continue;
-        n->dep_addr = address;
-        n->dep_attempt = 0;
-        n->dep_phase = 1;
-        n->dep_deadline = now + 600 * MS;
-        (void)op_sendto(n->fd, request, length, MSG_DONTWAIT, &address.u.sa, address.len);
-        return 1;
+    /* Two passes: first a server under the gateway's own name, then any whose address
+     * is not the gateway's. The default list puts a public server first, so without
+     * this the question would always be asked of a third party even when the project
+     * runs its own. */
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < c->stun_count; ++i) {
+            if (pass == 0 && !host_under(c->stun_host[i], c->host))
+                continue;
+            op_addr address;
+            if (!(resolve_any_families(c->stun_host[i], c->stun_port[i], FAM_V4, &address, NULL) & FAM_V4))
+                continue;
+            /* The gateway's own address would repeat the question already answered. */
+            if (same_ip(&address, &c->gateway_addr[family]))
+                continue;
+            for (int t = 0; t < FP_STUN_NONCE; ++t)
+                n->dep_tid[t] = (uint8_t)random_id();
+            uint8_t request[64];
+            size_t length = fp_stun_request(request, sizeof(request), n->dep_tid, 0, 0);
+            if (!length)
+                continue;
+            n->dep_addr = address;
+            snprintf(n->dep_host, sizeof(n->dep_host), "%s", c->stun_host[i]);
+            n->dep_attempt = 0;
+            n->dep_phase = 1;
+            n->dep_deadline = now + 600 * MS;
+            (void)op_sendto(n->fd, request, length, MSG_DONTWAIT, &address.u.sa, address.len);
+            return 1;
+        }
     }
     return 0;
 }
@@ -6921,9 +6942,13 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
              * peer at another address, which is exactly what the symmetric class
              * means here: the centred window and the relay filter already cover it. */
             n->type = stable ? NAT_CONE : NAT_HARD_SYM;
-            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
-                 stable ? "UDP mapping holds for a second destination address"
-                        : "UDP mapping follows the destination address; treating it as symmetric");
+            char note[300];
+            snprintf(note, sizeof(note),
+                     stable
+                         ? "UDP mapping holds for a second destination address (%s)"
+                         : "UDP mapping follows the destination address (%s); treating it as symmetric",
+                     n->dep_host[0] ? n->dep_host : "the outside server");
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
             nat_discovery_finish(c, family);
             return 1;
         }
@@ -6951,14 +6976,15 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
         } else if (n->phase == 2) {
             n->second = (uint16_t)port;
             if (n->port == port) {
-                /* Same mapping for a different destination port. A NAT that keys its
-                 * mapping on the destination address looks identical so far, so ask
-                 * an outside server before calling this a cone; without one the
-                 * ladder answers exactly what it used to. */
-                if (!nat_discovery_probe_second_ip(c, family, now)) {
-                    n->type = NAT_CONE;
+                /* Same mapping for a different destination port: this is what a cone
+                 * looks like from one address, and it is published straight away so the
+                 * question below cannot delay the login. A NAT that keys its mapping on
+                 * the destination address answers differently there; that corrects the
+                 * verdict over 6/9 a moment later. */
+                n->type = NAT_CONE;
+                n->measured_shared = n->shared;
+                if (!nat_discovery_probe_second_ip(c, family, now))
                     nat_discovery_finish(c, family);
-                }
             } else {
                 /* Different mapping: symmetric. Probe from a second local port to
                  * see whether the next mapping is predictable. That port is ours,
@@ -7696,7 +7722,9 @@ static void tick_nat(fastp2p_client *c, uint64_t now) {
      * runs afterwards and publishes its result over 6/9, so a blocked UDP probe
      * costs the historical two seconds and never six. */
     const nat_discovery *primary = &c->nat[primary_family(c)];
-    if (primary->fd >= 0 && !primary->retries)
+    /* A pending question about a second destination address is a refinement of a
+     * verdict that is already usable, so it does not hold the login. */
+    if (primary->fd >= 0 && !primary->retries && !primary->dep_phase)
         return;
     c->nat_settled = 1;
     connect_gateway(c);

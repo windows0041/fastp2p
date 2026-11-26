@@ -449,6 +449,21 @@ static void remeasure_waits_for_the_punch(void) {
 }
 /* --- second destination address ------------------------------------------------ */
 
+/* A server the project runs itself is the better witness than a public one: the default
+ * list leads with stun.miwifi.com, so the choice has to be made on the name, not the
+ * order. A gateway configured by address matches no name. */
+static void self_hosted_stun_is_preferred(void) {
+    assert(host_under("stun.fastp2p.top", "fastp2p.top"));
+    assert(host_under("fastp2p.top", "fastp2p.top"));
+    assert(host_under("a.b.fastp2p.top", "fastp2p.top"));
+    /* A shared suffix without the dot is a different domain. */
+    assert(!host_under("evilfastp2p.top", "fastp2p.top"));
+    assert(!host_under("stun.miwifi.com", "fastp2p.top"));
+    assert(!host_under("stun.fastp2p.top", "139.199.4.226"));
+    assert(!host_under("", "fastp2p.top"));
+    assert(!host_under("stun.fastp2p.top", ""));
+}
+
 /* A server standing in for "somewhere else on the internet": it answers a BINDING
  * request with the mapping it was told to report. 127.0.0.2 is a different address from
  * the gateway's 127.0.0.1 without any configuration, which is what the ladder compares. */
@@ -542,7 +557,11 @@ static void mapping_follows_the_destination_address(void) {
     assert(c.nat[OP_FAM_V4].phase == 2);
     feed_mapping_answer(&c, 27181, 35000, 2 * NS); /* same port: cone so far */
     assert(c.nat[OP_FAM_V4].dep_phase == 1);
-    assert(c.nat[OP_FAM_V4].type == NAT_UNKNOWN); /* the question is open */
+    /* The cone verdict is published immediately: the question refines it, it does not
+     * hold it back. This is also exactly the state the login gate now lets through -
+     * socket open, no retry, a question pending. */
+    assert(c.nat[OP_FAM_V4].type == NAT_CONE);
+    assert(c.nat[OP_FAM_V4].fd >= 0 && !c.nat[OP_FAM_V4].retries);
     uint8_t request[128], answer[32];
     size_t request_length = 0;
     assert(fake_stun_take_request(&stun, request, sizeof(request), &request_length));
@@ -1746,6 +1765,7 @@ int main(void) {
     mapping_probe_borrows_the_peer_port();
     mapping_reply_comes_through_the_listener();
     remeasure_waits_for_the_punch();
+    self_hosted_stun_is_preferred();
     mapping_follows_the_destination_address();
     mapping_stays_a_cone_across_addresses();
     unanswered_second_address_keeps_the_cone();
