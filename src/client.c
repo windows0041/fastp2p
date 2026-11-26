@@ -3419,11 +3419,15 @@ static void report_peer_tcp_mapping(fastp2p_client *c, tunnel *t, json_object *j
     unsigned nat = (unsigned)op_integer(j, "tcpNatType");
     if (nat == FP_NAT_DEPENDENT)
         t->peer_tcp_dependent = 1;
-    char note[128];
-    snprintf(note, sizeof(note), "peer TCP mapping: %s, movement %u",
+    char note[160];
+    /* The step and the port it was measured from are the whole answer to "can this
+     * carrier's TCP allocator be predicted": a steady step lets the cone side dial
+     * last_port + step*k exactly, a zero step means the mapping is random and TCP can
+     * only be a lottery. Without these numbers the log only said "movement 0". */
+    snprintf(note, sizeof(note), "peer TCP mapping: %s, movement %u (step %d, last port %u)",
              nat == FP_NAT_STABLE ? "stable"
                                   : nat == FP_NAT_DEPENDENT ? "destination-dependent" : "unknown",
-             t->peer_tcp_mapping);
+             t->peer_tcp_mapping, t->peer_tcp_step, (unsigned)t->peer_tcp_last_port);
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
 }
 static void start_underlay(fastp2p_client *c, int index) {
