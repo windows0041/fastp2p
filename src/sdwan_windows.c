@@ -65,9 +65,46 @@ const char *fp_sdwan_check(void) {
     return NULL;
 }
 
+/* Each run extracts wintun.dll into its own %SystemRoot%\Temp\fastp2p-wintun-* directory
+ * and nothing removed them, so a machine that starts the client often accumulated
+ * hundreds. Only directories with this exact prefix are touched, the delete fails safely
+ * for one still in use, and anything younger than a day is left alone. */
+static void remove_stale_directories(const WCHAR *root) {
+    WCHAR pattern[MAX_PATH];
+    if (swprintf(pattern, MAX_PATH, L"%ls\\Temp\\fastp2p-wintun-*", root) < 0)
+        return;
+    WIN32_FIND_DATAW entry;
+    HANDLE find = FindFirstFileW(pattern, &entry);
+    if (find == INVALID_HANDLE_VALUE)
+        return;
+    FILETIME stamp;
+    GetSystemTimeAsFileTime(&stamp);
+    ULARGE_INTEGER now = {stamp.dwLowDateTime, stamp.dwHighDateTime};
+    do {
+        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        ULARGE_INTEGER written = {entry.ftLastWriteTime.dwLowDateTime,
+                                  entry.ftLastWriteTime.dwHighDateTime};
+        /* FILETIME counts 100 ns ticks: a day is 864000000000 of them. */
+        if (now.QuadPart > written.QuadPart &&
+            now.QuadPart - written.QuadPart < 864000000000ull)
+            continue;
+        WCHAR victim[MAX_PATH], library[MAX_PATH];
+        if (swprintf(victim, MAX_PATH, L"%ls\\Temp\\%ls", root, entry.cFileName) < 0)
+            continue;
+        if (swprintf(library, MAX_PATH, L"%ls\\wintun.dll", victim) < 0)
+            continue;
+        DeleteFileW(library);
+        RemoveDirectoryW(victim);
+    } while (FindNextFileW(find, &entry));
+    FindClose(find);
+}
+
 static DWORD create_private_directory(fp_sdwan_windows *win) {
     WCHAR root[MAX_PATH], path[MAX_PATH];
     UINT length = GetSystemWindowsDirectoryW(root, MAX_PATH);
+    if (length && length < MAX_PATH)
+        remove_stale_directories(root);
     uint32_t nonce[3];
     if (!length || length >= MAX_PATH)
         return ERROR_PATH_NOT_FOUND;

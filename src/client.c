@@ -7816,7 +7816,7 @@ static int nat_remeasure(fastp2p_client *c) {
     memset(c->punch_ports, 0, sizeof(c->punch_ports));
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
-    c->tcp_nat_reprepare = 1;
+    c->tcp_nat_reprepare = 2; /* the path changed, not the servers */
     if (c->stun.fd >= 0) {
         /* The STUN probe may have borrowed the peer listener; a borrowed descriptor
          * is not ours to close. */
@@ -8806,13 +8806,16 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
      * measurement below describes the path it was taken on. */
     watch_network_path(c, now);
     if (c->tcp_nat_reprepare) {
-        /* A pushed configuration replaced the TCP mapping servers. Resolving their
-         * destinations belongs here rather than in the configuration callback, which
-         * runs inside this loop and must not block it. */
+        /* 1 = a pushed configuration replaced the servers, 2 = the path changed and every
+         * measurement has to be retaken. Resolving destinations belongs here rather than
+         * in the configuration callback, which runs inside this loop and must not block. */
+        int reason = c->tcp_nat_reprepare;
         c->tcp_nat_reprepare = 0;
         fp_tcp_nat_close(&c->tcp_nat);
         fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
-        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "TCP probe servers changed; re-measuring the TCP mapping");
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+             reason == 2 ? "path changed; re-measuring the TCP mapping"
+                         : "TCP probe servers changed; re-measuring the TCP mapping");
     }
     int tcp_done = fp_tcp_nat_step(&c->tcp_nat, now);
     if (tcp_done) {
