@@ -271,6 +271,12 @@ typedef struct {
      * reconnections, so an undetermined result is retried instead of being
      * reported as "unknown" on the first timeout. */
     int retries;
+    /* 1 while fd is the shared UDP listener rather than a socket of our own: the
+     * peer port owns it for the rest of the run, so it must never be closed here. */
+    int shared;
+    /* 1 when the last verdict was measured on the peer port, i.e. on the mapping an
+     * operator actually has to open. */
+    int measured_shared;
 } nat_discovery;
 typedef struct {
     int phase; /* 0 idle, 1 plain, 2 change-port, 3 change-ip */
@@ -592,6 +598,10 @@ struct fastp2p_client {
 };
 static void connect_gateway(fastp2p_client *);
 static int nat_level(const fastp2p_client *);
+/* One reply of the mapping ladder. The probe reads its own socket unless it borrowed
+ * the peer listener, in which case the listener loop hands the datagram in. */
+static int nat_discovery_reply(fastp2p_client *, int, const uint8_t *, size_t,
+                               const op_addr *, uint64_t);
 static int tcp_nat_level(const fastp2p_client *);
 static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
@@ -6028,6 +6038,13 @@ static void tick_udp_listeners(fastp2p_client *c, uint64_t now) {
             if (family == OP_FAM_V4 && c->stun.phase && c->stun.shared &&
                 nat_stun_input(c, packet, (size_t)length, &peer, now))
                 continue;
+            /* The mapping ladder borrows the same socket when a listener owns the
+             * peer port, so its answers arrive here too. Each handler validates its
+             * own expectation (peer address, transaction or probe phase), so trying
+             * both in order cannot steal the other's datagram. */
+            if (c->nat[family].fd >= 0 && c->nat[family].shared &&
+                nat_discovery_reply(c, family, packet, (size_t)length, &peer, now))
+                continue;
             dispatch_udp_listener(c, family, &peer, packet, (size_t)length, now);
         }
     }
@@ -6467,6 +6484,9 @@ static void report_nat(fastp2p_client *c) {
     op_ju(j, "tcpNatDestinationIPs", c->tcp_nat.family[OP_FAM_V4].destinations);
     op_ju(j, "natLevel", (uint64_t)nat_level(c));
     op_ju(j, "tcpNatLevel", (uint64_t)tcp_nat_level(c));
+    /* Which port the mapping class describes: the peer port (1) is the mapping an
+     * operator has to open, an ephemeral one (0) is a port no rule can name. */
+    op_ju(j, "natPeerPort", (uint64_t)c->nat[OP_FAM_V4].measured_shared);
     report_families(c, j);
     /* NAT refresh must not replay gateway rules or managed configuration. */
     op_js(j, "IPv4", addr_text_set(c->ip[OP_FAM_V4])
@@ -6781,12 +6801,118 @@ static void service_gateway(fastp2p_client *c) {
 /* Close whatever sockets one family's discovery still owns. The classification
  * already lives in `type`, so nothing else has to survive the close. */
 static void nat_discovery_close(nat_discovery *n) {
-    if (n->fd >= 0)
+    /* A borrowed descriptor is the peer listener: closing it would take every QUIC
+     * connection accepted on it (and every later direct dial) down with it, and
+     * nothing would rebuild it until the next start. */
+    if (n->fd >= 0 && !n->shared)
         op_close(n->fd);
     n->fd = -1;
     if (n->fd2 >= 0)
         op_close(n->fd2);
     n->fd2 = -1;
+}
+static void nat_discovery_finish(fastp2p_client *c, int family) {
+    nat_discovery *n = &c->nat[family];
+    n->measured_shared = n->shared;
+    nat_discovery_close(n);
+    n->shared = 0;
+    if (family == OP_FAM_V4 && c->nat_override)
+        n->type = c->nat_override;
+    /* Say which port the verdict describes: an operator opening the peer port needs to
+     * know it is that mapping being classified, and the console shows the same fact as
+     * natPeerPort. */
+    if (family == OP_FAM_V4 && n->measured_shared && n->type != NAT_UNKNOWN)
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+             "UDP NAT mapping measured from the peer port");
+}
+/* Start the ladder for one family. The peer port is preferred whenever a listener
+ * owns it: the mapping a firewall rule can name is that one, and classifying an
+ * ephemeral port described a mapping nothing can be opened for. */
+static int nat_discovery_open(fastp2p_client *c, int family) {
+    nat_discovery *n = &c->nat[family];
+    nat_discovery_close(n);
+    n->shared = 0;
+    n->phase = 0;
+    n->retries = 0;
+    n->type = NAT_UNKNOWN;
+    if (family == OP_FAM_V4 && c->nat_override)
+        n->type = c->nat_override;
+    if (family == OP_FAM_V4 && c->udp_listener[OP_FAM_V4] >= 0) {
+        n->fd = c->udp_listener[OP_FAM_V4];
+        n->shared = 1;
+    } else {
+        n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
+    }
+    if (n->fd < 0)
+        return 0;
+    n->phase = 1;
+    n->deadline = mono() + 2 * NS;
+    op_addr peer = c->gateway_addr[family];
+    op_addr_set_port(&peer, 27180);
+    /* A send failure is not fatal: the deadline reports it, exactly as the old
+     * single-family discovery did. */
+    (void)udp_packet(n->fd, &peer, 2, 0, NULL);
+    return 1;
+}
+/* One reply of the ladder, from whichever socket delivered it. Returns 1 when the
+ * datagram was this family's answer. */
+static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *data,
+                               size_t length, const op_addr *from, uint64_t now) {
+    nat_discovery *n = &c->nat[family];
+    if (!n->phase || length < 8)
+        return 0;
+    uint16_t expected = n->phase == 3 ? 27180 : (uint16_t)(27179 + n->phase);
+    op_addr expect = c->gateway_addr[family];
+    op_addr_set_port(&expect, expected);
+    if (!op_address_equal(&from->u.sa, from->len, &expect.u.sa, expect.len) ||
+        op_u16(data + 4) != 2 || op_u32(data) != (uint32_t)(length - 8))
+        return 0;
+    json_object *j = op_json(data + 8, length - 8);
+    uint64_t port = op_integer(j, "port");
+    const char *text = op_string(j, "IP");
+    int accepted = port > 0 && port <= 65535 && address_of_family(text, family);
+    if (accepted) {
+        /* Index 0 is exactly what the old `ip` field held. */
+        snprintf(c->ip[family], OP_ADDR_TEXT, "%s", text);
+        if (n->phase == 1) {
+            n->port = (uint16_t)port;
+            n->phase = 2;
+            n->deadline = now + 2 * NS;
+            op_addr peer = c->gateway_addr[family];
+            op_addr_set_port(&peer, 27181);
+            udp_packet(n->fd, &peer, 2, 0, NULL);
+        } else if (n->phase == 2) {
+            n->second = (uint16_t)port;
+            if (n->port == port) {
+                /* Same mapping for a different destination: the NAT keeps the
+                 * port, so a punch from any address reaches us. */
+                n->type = NAT_CONE;
+                nat_discovery_finish(c, family);
+            } else {
+                /* Different mapping: symmetric. Probe from a second local port to
+                 * see whether the next mapping is predictable. That port is ours,
+                 * never the listener, so it is a plain ephemeral socket. */
+                n->fd2 = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
+                if (n->fd2 < 0) {
+                    n->type = NAT_HARD_SYM;
+                    nat_discovery_finish(c, family);
+                } else {
+                    n->phase = 3;
+                    n->deadline = now + 2 * NS;
+                    op_addr peer = c->gateway_addr[family];
+                    op_addr_set_port(&peer, 27180);
+                    udp_packet(n->fd2, &peer, 2, 0, NULL);
+                }
+            }
+        } else {
+            n->port2 = (uint16_t)port;
+            n->type = nat_classify(n->port, n->second, n->port2);
+            nat_discovery_finish(c, family);
+        }
+    }
+    if (j)
+        json_object_put(j);
+    return accepted;
 }
 /* One request/reply step of a family's UDP NAT discovery. This is the old
  * single-family sequence, unchanged: 2/0 to 27180, 2/0 to 27181, then a second
@@ -6796,63 +6922,18 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
     nat_discovery *n = &c->nat[family];
     if (n->fd < 0)
         return;
-    uint8_t data[1024];
-    op_addr from, expect;
-    memset(&from, 0, sizeof(from));
-    from.len = (op_socklen)sizeof(from.u.storage);
-    /* Phase 3 reads from the second socket; phases 1 and 2 share the first. */
-    op_socket fd = n->phase == 3 && n->fd2 >= 0 ? n->fd2 : n->fd;
-    op_ssize received =
-        op_recvfrom(fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
-    uint16_t expected = n->phase == 3 ? 27180 : (uint16_t)(27179 + n->phase);
-    expect = c->gateway_addr[family];
-    op_addr_set_port(&expect, expected);
-    int finish = 0;
-    if (received >= 8 && op_address_equal(&from.u.sa, from.len, &expect.u.sa, expect.len) &&
-        op_u16(data + 4) == 2 && op_u32(data) == (uint32_t)(received - 8)) {
-        json_object *j = op_json(data + 8, (size_t)received - 8);
-        uint64_t port = op_integer(j, "port");
-        const char *text = op_string(j, "IP");
-        if (port > 0 && port <= 65535 && address_of_family(text, family)) {
-            /* Index 0 is exactly what the old `ip` field held. */
-            snprintf(c->ip[family], OP_ADDR_TEXT, "%s", text);
-            if (n->phase == 1) {
-                n->port = (uint16_t)port;
-                n->phase = 2;
-                n->deadline = now + 2 * NS;
-                op_addr peer = c->gateway_addr[family];
-                op_addr_set_port(&peer, 27181);
-                udp_packet(n->fd, &peer, 2, 0, NULL);
-            } else if (n->phase == 2) {
-                n->second = (uint16_t)port;
-                if (n->port == port) {
-                    /* Same mapping for a different destination: the NAT keeps
-                     * the port, so a punch from any address reaches us. */
-                    n->type = NAT_CONE;
-                    finish = 1;
-                } else {
-                    /* Different mapping: symmetric.  Probe from a second local
-                     * port to see whether the next mapping is predictable. */
-                    n->fd2 = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
-                    if (n->fd2 < 0) {
-                        n->type = NAT_HARD_SYM;
-                        finish = 1;
-                    } else {
-                        n->phase = 3;
-                        n->deadline = now + 2 * NS;
-                        op_addr peer = c->gateway_addr[family];
-                        op_addr_set_port(&peer, 27180);
-                        udp_packet(n->fd2, &peer, 2, 0, NULL);
-                    }
-                }
-            } else {
-                n->port2 = (uint16_t)port;
-                n->type = nat_classify(n->port, n->second, n->port2);
-                finish = 1;
-            }
-        }
-        if (j)
-            json_object_put(j);
+    /* Phase 3 always has a socket of its own; phases 1 and 2 read here only when the
+     * probe did not borrow the listener (a borrowed one is read by its own loop). */
+    op_socket fd = n->phase == 3 && n->fd2 >= 0 ? n->fd2 : (n->shared ? -1 : n->fd);
+    if (fd >= 0) {
+        uint8_t data[1024];
+        op_addr from;
+        memset(&from, 0, sizeof(from));
+        from.len = (op_socklen)sizeof(from.u.storage);
+        op_ssize received =
+            op_recvfrom(fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
+        if (received > 0 && nat_discovery_reply(c, family, data, (size_t)received, &from, now))
+            return;
     }
     if (now > n->deadline) {
         /* Retry once from a fresh socket before declaring the mapping unknown:
@@ -6860,9 +6941,14 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
          * says nothing about the NAT. */
         if (n->retries < 2) {
             ++n->retries;
-            nat_discovery_close(n);
+            /* A borrowed socket is not replaced: its mapping is the one the answer is
+             * supposed to describe, and it has no stale state to dodge. Only a probe
+             * that opened its own socket starts over from a fresh port. */
+            if (!n->shared) {
+                nat_discovery_close(n);
+                n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
+            }
             n->phase = 1;
-            n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
             if (n->fd >= 0) {
                 n->deadline = now + 2 * NS;
                 op_addr peer = c->gateway_addr[family];
@@ -6872,18 +6958,13 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
             }
         }
         n->type = NAT_UNKNOWN;
-        finish = 1;
         /* One diagnostic per run, exactly as the old single-family discovery
          * produced, even when v6 was the only family probed. */
         if (family == OP_FAM_V4 || !(c->gateway_families & FAM_V4))
             emit(c, FASTP2P_EVENT_ERROR, 0, FASTP2P_EIO,
                  "UDP NAT discovery unavailable; TCP transport can still be attempted");
+        nat_discovery_finish(c, family);
     }
-    if (!finish)
-        return;
-    if (family == OP_FAM_V4 && c->nat_override)
-        n->type = c->nat_override;
-    nat_discovery_close(n);
 }
 /* --- Public STUN probe ---------------------------------------------------
  * One socket carries every request, so all servers observe the same mapping;
@@ -7400,35 +7481,53 @@ static int refresh_families(fastp2p_client *c) {
  * laptop moving from Wi-Fi to a mobile network - has to measure all of them again.
  * Tunnels are left alone: the next punch round reads the new values, and resetting them
  * here would drop a link that is still usable. */
-static void nat_remeasure(fastp2p_client *c) {
+/* A hop is in flight: the ladder is about to share the peer port with packet traffic
+ * and, on a per-destination NAT, every extra destination perturbs the port sequence
+ * the classification reads. Wait for a quiet moment instead. */
+static int punch_in_flight(const fastp2p_client *c) {
+    for (int i = 0; i < NT; ++i) {
+        switch (c->tunnels[i].state) {
+        case T_PROBE:
+        case T_TCP_SAMPLE:
+        case T_TIME:
+        case T_TCP_CONNECT:
+        case T_TCP_DIRECT_CONNECT:
+        case T_PUNCH:
+        case T_UDP_DIRECT:
+            return 1;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+/* 0 = measured again, 1 = deferred until the hop in flight has settled. */
+static int nat_remeasure(fastp2p_client *c) {
+    if (punch_in_flight(c))
+        return 1;
     /* The remembered punch ports belong to the old mapping. */
     memset(c->punch_ports, 0, sizeof(c->punch_ports));
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
     c->tcp_nat_reprepare = 1;
     if (c->stun.fd >= 0) {
-        op_close(c->stun.fd);
+        /* The STUN probe may have borrowed the peer listener; a borrowed descriptor
+         * is not ours to close. */
+        if (!c->stun.shared)
+            op_close(c->stun.fd);
         c->stun = (nat_stun){.fd = -1};
     }
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
-        nat_discovery *n = &c->nat[family];
-        nat_discovery_close(n);
-        n->phase = 0;
-        n->retries = 0;
-        n->type = NAT_UNKNOWN;
-        if (!family_wanted(c, family) || !gateway_has(c, family))
+        if (!family_wanted(c, family) || !gateway_has(c, family)) {
+            nat_discovery_close(&c->nat[family]);
+            c->nat[family].shared = 0;
+            c->nat[family].phase = 0;
+            c->nat[family].type = NAT_UNKNOWN;
             continue;
-        n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
-        if (n->fd < 0)
-            continue;
-        n->phase = 1;
-        n->deadline = mono() + 2 * NS;
-        op_addr peer = c->gateway_addr[family];
-        op_addr_set_port(&peer, 27180);
-        (void)udp_packet(n->fd, &peer, 2, 0, NULL);
+        }
+        nat_discovery_open(c, family);
     }
-    if (c->nat_override)
-        c->nat[OP_FAM_V4].type = c->nat_override;
+    return 0;
 }
 
 /* Watch the path this host is measured on. A Wi-Fi to mobile switch changes the source
@@ -7462,18 +7561,25 @@ static void watch_network_path(fastp2p_client *c, uint64_t now) {
     /* A carrier can flap: one ladder per ten seconds is enough. */
     if (now < c->path_remeasure_at)
         return;
+    if (why) {
+        char note[192];
+        snprintf(note, sizeof(note), "%s; measuring the NAT again", why);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    }
+    /* A hop that is punching right now gets the measurement postponed: the two would
+     * share the peer port and, on a symmetric NAT, corrupt the port sequence the
+     * classification depends on. Retry shortly instead of skipping the cycle. */
+    if (nat_remeasure(c)) {
+        c->path_recheck_at = now + 2 * NS;
+        c->path_remeasure_at = now + 2 * NS;
+        return;
+    }
     c->path_remeasure_at = now + NAT_PATH_SETTLE;
     c->path_recheck_at = now + NAT_PATH_RECHECK;
     if (local_known)
         snprintf(c->path_local, sizeof(c->path_local), "%s", local);
     if (*observed)
         snprintf(c->path_public, sizeof(c->path_public), "%s", observed);
-    if (why) {
-        char note[192];
-        snprintf(note, sizeof(note), "%s; measuring the NAT again", why);
-        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
-    }
-    nat_remeasure(c);
 }
 static void tick_nat(fastp2p_client *c, uint64_t now) {
     /* v4 is driven first so its socket work is identical to the old build; a
@@ -8365,18 +8471,7 @@ int fastp2p_client_start(fastp2p_client *c) {
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         if (!family_wanted(c, family) || !gateway_has(c, family))
             continue;
-        nat_discovery *n = &c->nat[family];
-        n->fd = socket_bound(1, family == OP_FAM_V4 ? NULL : "::", 0, 0);
-        if (n->fd < 0)
-            continue;
-        n->phase = 1;
-        n->deadline = mono() + 2 * NS;
-        op_addr peer = c->gateway_addr[family];
-        op_addr_set_port(&peer, 27180);
-        /* A send failure is not fatal here: the deadline reports it, exactly as
-         * the old single-family discovery did. */
-        (void)udp_packet(n->fd, &peer, 2, 0, NULL);
-        ++probing;
+        probing += nat_discovery_open(c, family);
     }
     c->nat_settled = probing ? 0 : 1;
     if (!probing)

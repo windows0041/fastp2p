@@ -348,6 +348,105 @@ static void nat_remeasure_follows_the_path(void) {
     watch_network_path(&offline, 40 * NS);
     assert(offline.tcp_nat_reprepare);
 }
+/* A zero-initialised client has descriptor 0 in every slot, and closing slot 0 closes
+ * whatever really holds it. fastp2p_client_create() marks them all closed; these tests
+ * build the struct by hand, so they do the same. */
+static void probe_fds_closed(fastp2p_client *c) {
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        c->nat[family].fd = c->nat[family].fd2 = -1;
+        c->tcp_nat.family[family].fd = -1;
+    }
+    c->stun.fd = -1;
+    c->tcp_level.listener = c->tcp_level.dialer = -1;
+}
+/* The mapping ladder borrows the peer-port listener when one exists: the mapping an
+ * operator has to open is that one, and classifying an ephemeral port described a port
+ * no firewall rule can name. Borrowing must never close it - every QUIC connection
+ * accepted on the shared listener dies with that fd, and nothing rebuilds it until the
+ * next start - and the ladder has to fall back to its own socket when no listener
+ * exists. */
+static void mapping_probe_borrows_the_peer_port(void) {
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    op_socket listener = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(listener >= 0);
+    c.udp_listener[OP_FAM_V4] = listener;
+    probe_fds_closed(&c);
+
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    assert(c.nat[OP_FAM_V4].fd == listener && c.nat[OP_FAM_V4].shared);
+    /* Finishing the ladder leaves the peer port open and records that the verdict
+     * describes it. */
+    c.nat[OP_FAM_V4].type = NAT_CONE;
+    nat_discovery_finish(&c, OP_FAM_V4);
+    assert(!c.nat[OP_FAM_V4].shared && c.nat[OP_FAM_V4].fd < 0);
+    assert(c.nat[OP_FAM_V4].measured_shared);
+    op_addr check;
+    assert(!op_addr_socketname(listener, &check)); /* still open */
+
+    /* Without a listener the ladder owns its socket, and closing it is correct. */
+    c.udp_listener[OP_FAM_V4] = -1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    op_socket owned = c.nat[OP_FAM_V4].fd;
+    assert(owned >= 0 && !c.nat[OP_FAM_V4].shared);
+    nat_discovery_finish(&c, OP_FAM_V4);
+    assert(op_addr_socketname(owned, &check)); /* closed by the ladder */
+    assert(!c.nat[OP_FAM_V4].measured_shared);
+    op_close(listener);
+}
+
+/* A ladder answer arrives on the borrowed listener, not on a socket the probe reads, so
+ * it has to be recognised there; without that the classification never advances on a
+ * host that owns the peer port. */
+static void mapping_reply_comes_through_the_listener(void) {
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    c.udp_listener[OP_FAM_V4] = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(c.udp_listener[OP_FAM_V4] >= 0);
+    probe_fds_closed(&c);
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+
+    const char *body = "{\"IP\":\"198.51.100.7\",\"port\":12345}";
+    size_t body_length = strlen(body);
+    uint8_t packet[256];
+    op_put32(packet, (uint32_t)body_length);
+    op_put16(packet + 4, 2);
+    op_put16(packet + 6, 0);
+    memcpy(packet + 8, body, body_length);
+    op_addr from;
+    assert(!op_addr_from_text(&from, "127.0.0.1", 27180));
+    /* Phase 1 answer: the ladder moves to its second destination on the same socket. */
+    assert(nat_discovery_reply(&c, OP_FAM_V4, packet, 8 + body_length, &from, 5 * NS));
+    assert(c.nat[OP_FAM_V4].phase == 2);
+    assert(c.nat[OP_FAM_V4].fd == c.udp_listener[OP_FAM_V4]);
+    assert(c.nat[OP_FAM_V4].shared);
+    /* The same datagram in phase 2 comes from the wrong port: not our answer. */
+    assert(!nat_discovery_reply(&c, OP_FAM_V4, packet, 8 + body_length, &from, 6 * NS));
+    nat_discovery_close(&c.nat[OP_FAM_V4]);
+    op_close(c.udp_listener[OP_FAM_V4]);
+}
+
+/* Sharing the peer port with a hop that is punching perturbs the port sequence a
+ * per-destination NAT is judged on, so the re-measurement waits for a quiet moment. */
+static void remeasure_waits_for_the_punch(void) {
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    c.families_wanted = c.gateway_families = FAM_V4;
+    probe_fds_closed(&c);
+    int ti = new_tunnel(&c, "peer-punching", 7, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    c.tunnels[ti].state = T_PUNCH;
+    assert(nat_remeasure(&c) == 1); /* deferred */
+    assert(!c.nat[OP_FAM_V4].phase);
+    c.tunnels[ti].state = T_ACTIVE;
+    assert(nat_remeasure(&c) == 0);
+    assert(c.nat[OP_FAM_V4].phase == 1);
+    nat_discovery_close(&c.nat[OP_FAM_V4]);
+    close_tunnel(&c, ti, NULL);
+}
 static void udp_array_width_and_ceiling(void) {
     assert(UDP_PUNCH_ARRAY == 16);
     fastp2p_client c = {0};
@@ -1479,6 +1578,9 @@ int main(void) {
     quic_uses_punch_endpoint();
     peer_listener_port_conflict();
     nat_remeasure_follows_the_path();
+    mapping_probe_borrows_the_peer_port();
+    mapping_reply_comes_through_the_listener();
+    remeasure_waits_for_the_punch();
     udp_array_width_and_ceiling();
     udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();
