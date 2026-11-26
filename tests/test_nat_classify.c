@@ -447,6 +447,171 @@ static void remeasure_waits_for_the_punch(void) {
     nat_discovery_close(&c.nat[OP_FAM_V4]);
     close_tunnel(&c, ti, NULL);
 }
+/* --- second destination address ------------------------------------------------ */
+
+/* A server standing in for "somewhere else on the internet": it answers a BINDING
+ * request with the mapping it was told to report. 127.0.0.2 is a different address from
+ * the gateway's 127.0.0.1 without any configuration, which is what the ladder compares. */
+typedef struct {
+    op_socket fd;
+    uint16_t report_port;
+} fake_stun;
+
+static int fake_stun_open(fake_stun *s, uint16_t report_port) {
+    s->fd = socket_bound(1, "127.0.0.2", 0, 0);
+    s->report_port = report_port;
+    return s->fd >= 0;
+}
+
+/* Copies the ladder's request out of the fake server's queue. */
+static int fake_stun_take_request(fake_stun *s, uint8_t *request, size_t capacity,
+                                  size_t *length) {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        op_addr from;
+        from.len = (op_socklen)sizeof(from.u.storage);
+        op_ssize n = op_recvfrom(s->fd, request, capacity, MSG_DONTWAIT, &from.u.sa, &from.len);
+        if (n >= 20) {
+            *length = (size_t)n;
+            return 1;
+        }
+        op_sleep_ms(2);
+    }
+    return 0;
+}
+
+/* A BINDING success carrying MAPPED-ADDRESS, the only attribute the parser needs. */
+static size_t fake_stun_answer(const fake_stun *s, const uint8_t *request, uint8_t *out) {
+    memset(out, 0, 32);
+    out[0] = 0x01; /* BINDING success */
+    out[1] = 0x01;
+    out[2] = 0x00; /* one MAPPED-ADDRESS attribute: 4-byte header + 8-byte value */
+    out[3] = 0x0c;
+    out[4] = 0x21; /* magic cookie */
+    out[5] = 0x12;
+    out[6] = 0xa4;
+    out[7] = 0x42;
+    memcpy(out + 8, request + 8, FP_STUN_NONCE);
+    out[20] = 0x00; /* MAPPED-ADDRESS */
+    out[21] = 0x01;
+    out[22] = 0x00;
+    out[23] = 0x08;
+    out[24] = 0x00; /* reserved, family IPv4 */
+    out[25] = 0x01;
+    out[26] = (uint8_t)(s->report_port >> 8);
+    out[27] = (uint8_t)(s->report_port & 0xff);
+    out[28] = 10;   /* 10.0.0.7 */
+    out[29] = 0;
+    out[30] = 0;
+    out[31] = 7;
+    return 32;
+}
+
+/* One gateway answer, as the ladder sees it. */
+static void feed_mapping_answer(fastp2p_client *c, uint16_t from_port, uint16_t mapped,
+                                uint64_t now) {
+    char body[64];
+    int body_length = snprintf(body, sizeof(body), "{\"IP\":\"198.51.100.7\",\"port\":%u}",
+                               (unsigned)mapped);
+    assert(body_length > 0);
+    uint8_t packet[128];
+    op_put32(packet, (uint32_t)body_length);
+    op_put16(packet + 4, 2);
+    op_put16(packet + 6, 0);
+    memcpy(packet + 8, body, (size_t)body_length);
+    op_addr from;
+    assert(!op_addr_from_text(&from, "127.0.0.1", from_port));
+    assert(nat_discovery_reply(c, OP_FAM_V4, packet, 8 + (size_t)body_length, &from, now));
+}
+
+/* Every gateway probe port is on one address, so a NAT that keys its mapping on the
+ * destination *address* looks like a cone until a peer elsewhere punches at a port that
+ * was never published. One outside answer settles it, and its verdict must win. */
+static void mapping_follows_the_destination_address(void) {
+    fastp2p_client c = {0};
+    fake_stun stun;
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    probe_fds_closed(&c);
+    c.udp_listener[OP_FAM_V4] = -1;
+    assert(fake_stun_open(&stun, 45123)); /* a different mapping for another address */
+    snprintf(c.stun_host[0], sizeof(c.stun_host[0]), "%s", "127.0.0.2");
+    c.stun_port[0] = socket_port(stun.fd);
+    c.stun_count = 1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    feed_mapping_answer(&c, 27180, 35000, 1 * NS);
+    assert(c.nat[OP_FAM_V4].phase == 2);
+    feed_mapping_answer(&c, 27181, 35000, 2 * NS); /* same port: cone so far */
+    assert(c.nat[OP_FAM_V4].dep_phase == 1);
+    assert(c.nat[OP_FAM_V4].type == NAT_UNKNOWN); /* the question is open */
+    uint8_t request[128], answer[32];
+    size_t request_length = 0;
+    assert(fake_stun_take_request(&stun, request, sizeof(request), &request_length));
+    assert(request[0] == 0x00 && request[1] == 0x01); /* BINDING request */
+    size_t answer_length = fake_stun_answer(&stun, request, answer);
+    op_addr from;
+    assert(!op_addr_from_text(&from, "127.0.0.2", socket_port(stun.fd)));
+    assert(nat_discovery_reply(&c, OP_FAM_V4, answer, answer_length, &from, 3 * NS));
+    assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM);
+    assert(c.nat[OP_FAM_V4].addr_dep == 1);
+    assert(c.nat[OP_FAM_V4].fd < 0); /* ladder finished, nothing left open */
+    op_close(stun.fd);
+}
+
+/* An answer that matches the gateway's mapping confirms the cone and records that the
+ * verdict covers a second address too. */
+static void mapping_stays_a_cone_across_addresses(void) {
+    fastp2p_client c = {0};
+    fake_stun stun;
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    probe_fds_closed(&c);
+    c.udp_listener[OP_FAM_V4] = -1;
+    assert(fake_stun_open(&stun, 35000)); /* the mapping the gateway already saw */
+    snprintf(c.stun_host[0], sizeof(c.stun_host[0]), "%s", "127.0.0.2");
+    c.stun_port[0] = socket_port(stun.fd);
+    c.stun_count = 1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    feed_mapping_answer(&c, 27180, 35000, 1 * NS);
+    feed_mapping_answer(&c, 27181, 35000, 2 * NS);
+    assert(c.nat[OP_FAM_V4].dep_phase == 1);
+    uint8_t request[128], answer[32];
+    size_t request_length = 0;
+    assert(fake_stun_take_request(&stun, request, sizeof(request), &request_length));
+    size_t answer_length = fake_stun_answer(&stun, request, answer);
+    op_addr from;
+    assert(!op_addr_from_text(&from, "127.0.0.2", socket_port(stun.fd)));
+    assert(nat_discovery_reply(&c, OP_FAM_V4, answer, answer_length, &from, 3 * NS));
+    assert(c.nat[OP_FAM_V4].type == NAT_CONE);
+    assert(c.nat[OP_FAM_V4].addr_dep == 0);
+    op_close(stun.fd);
+}
+
+/* A third party that does not answer says nothing about the NAT, so the cone verdict
+ * stays - a silent server must not turn a working mapping into a symmetric one. */
+static void unanswered_second_address_keeps_the_cone(void) {
+    fastp2p_client c = {0};
+    fake_stun stun;
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    probe_fds_closed(&c);
+    c.udp_listener[OP_FAM_V4] = -1;
+    assert(fake_stun_open(&stun, 35000)); /* never answers */
+    snprintf(c.stun_host[0], sizeof(c.stun_host[0]), "%s", "127.0.0.2");
+    c.stun_port[0] = socket_port(stun.fd);
+    c.stun_count = 1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    feed_mapping_answer(&c, 27180, 35000, 1 * NS);
+    feed_mapping_answer(&c, 27181, 35000, 2 * NS);
+    assert(c.nat[OP_FAM_V4].dep_phase == 1);
+    tick_nat_family(&c, OP_FAM_V4, 2 * NS + 700 * MS); /* first deadline: retry */
+    assert(c.nat[OP_FAM_V4].dep_phase == 1 && c.nat[OP_FAM_V4].dep_attempt == 1);
+    tick_nat_family(&c, OP_FAM_V4, 2 * NS + 1400 * MS); /* second: give up quietly */
+    assert(c.nat[OP_FAM_V4].dep_phase == 0);
+    assert(c.nat[OP_FAM_V4].type == NAT_CONE);
+    assert(c.nat[OP_FAM_V4].addr_dep == -1);
+    assert(c.nat[OP_FAM_V4].fd < 0);
+    op_close(stun.fd);
+}
 static void udp_array_width_and_ceiling(void) {
     assert(UDP_PUNCH_ARRAY == 16);
     fastp2p_client c = {0};
@@ -1581,6 +1746,9 @@ int main(void) {
     mapping_probe_borrows_the_peer_port();
     mapping_reply_comes_through_the_listener();
     remeasure_waits_for_the_punch();
+    mapping_follows_the_destination_address();
+    mapping_stays_a_cone_across_addresses();
+    unanswered_second_address_keeps_the_cone();
     udp_array_width_and_ceiling();
     udp_punch_uses_winning_socket();
     lan_punch_public_ipv4();

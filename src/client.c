@@ -277,6 +277,15 @@ typedef struct {
     /* 1 when the last verdict was measured on the peer port, i.e. on the mapping an
      * operator actually has to open. */
     int measured_shared;
+    /* Every gateway probe port lives on one address, so the ladder alone cannot see a
+     * NAT that keys its mapping on the destination *address*: it looks like a cone
+     * until a peer on another address punches at a port we never published. One
+     * outside server settles it. dep_phase 1 = question in flight, addr_dep is the
+     * verdict (1 dependent, 0 stable, -1 unanswered). */
+    int dep_phase, dep_attempt, addr_dep;
+    op_addr dep_addr;
+    uint8_t dep_tid[FP_STUN_NONCE];
+    uint64_t dep_deadline;
 } nat_discovery;
 typedef struct {
     int phase; /* 0 idle, 1 plain, 2 change-port, 3 change-ip */
@@ -602,6 +611,8 @@ static int nat_level(const fastp2p_client *);
  * the peer listener, in which case the listener loop hands the datagram in. */
 static int nat_discovery_reply(fastp2p_client *, int, const uint8_t *, size_t,
                                const op_addr *, uint64_t);
+static int nat_discovery_probe_second_ip(fastp2p_client *, int, uint64_t);
+static int same_ip(const op_addr *, const op_addr *);
 static int tcp_nat_level(const fastp2p_client *);
 static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
@@ -6487,6 +6498,10 @@ static void report_nat(fastp2p_client *c) {
     /* Which port the mapping class describes: the peer port (1) is the mapping an
      * operator has to open, an ephemeral one (0) is a port no rule can name. */
     op_ju(j, "natPeerPort", (uint64_t)c->nat[OP_FAM_V4].measured_shared);
+    /* Whether the mapping also holds for a destination we have not measured is
+     * unknown (-1) rather than assumed, so the console can tell the two apart. */
+    if (c->nat[OP_FAM_V4].addr_dep >= 0)
+        op_ju(j, "natAddrDep", (uint64_t)c->nat[OP_FAM_V4].addr_dep);
     report_families(c, j);
     /* NAT refresh must not replay gateway rules or managed configuration. */
     op_js(j, "IPv4", addr_text_set(c->ip[OP_FAM_V4])
@@ -6834,6 +6849,9 @@ static int nat_discovery_open(fastp2p_client *c, int family) {
     n->shared = 0;
     n->phase = 0;
     n->retries = 0;
+    n->dep_phase = 0;
+    n->dep_attempt = 0;
+    n->addr_dep = -1;
     n->type = NAT_UNKNOWN;
     if (family == OP_FAM_V4 && c->nat_override)
         n->type = c->nat_override;
@@ -6854,6 +6872,37 @@ static int nat_discovery_open(fastp2p_client *c, int family) {
     (void)udp_packet(n->fd, &peer, 2, 0, NULL);
     return 1;
 }
+/* Ask one outside server what our mapping looks like from a second destination
+ * address, from the same socket (the same mapping). The gateway's probe ports share
+ * one address, so only this can tell a cone from a NAT that keys its mapping on the
+ * destination address. Returns 1 when the question is in flight. */
+static int nat_discovery_probe_second_ip(fastp2p_client *c, int family, uint64_t now) {
+    nat_discovery *n = &c->nat[family];
+    if (family != OP_FAM_V4 || c->stun_count <= 0)
+        return 0;
+    for (int i = 0; i < c->stun_count; ++i) {
+        op_addr address;
+        if (!(resolve_any_families(c->stun_host[i], c->stun_port[i], FAM_V4, &address, NULL) & FAM_V4))
+            continue;
+        /* The gateway's own address would repeat the question already answered, and
+         * the ladder has no socket to spare for a server it cannot reach. */
+        if (same_ip(&address, &c->gateway_addr[family]))
+            continue;
+        for (int t = 0; t < FP_STUN_NONCE; ++t)
+            n->dep_tid[t] = (uint8_t)random_id();
+        uint8_t request[64];
+        size_t length = fp_stun_request(request, sizeof(request), n->dep_tid, 0, 0);
+        if (!length)
+            continue;
+        n->dep_addr = address;
+        n->dep_attempt = 0;
+        n->dep_phase = 1;
+        n->dep_deadline = now + 600 * MS;
+        (void)op_sendto(n->fd, request, length, MSG_DONTWAIT, &address.u.sa, address.len);
+        return 1;
+    }
+    return 0;
+}
 /* One reply of the ladder, from whichever socket delivered it. Returns 1 when the
  * datagram was this family's answer. */
 static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *data,
@@ -6861,6 +6910,24 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
     nat_discovery *n = &c->nat[family];
     if (!n->phase || length < 8)
         return 0;
+    if (n->dep_phase) {
+        fp_stun_mapped mapped;
+        if (op_address_equal(&from->u.sa, from->len, &n->dep_addr.u.sa, n->dep_addr.len) &&
+            fp_stun_response(data, length, n->dep_tid, &mapped) && mapped.valid) {
+            int stable = op_addr_port(&mapped.address) == n->port;
+            n->addr_dep = stable ? 0 : 1;
+            n->dep_phase = 0;
+            /* A mapping that follows the destination address is unpredictable to any
+             * peer at another address, which is exactly what the symmetric class
+             * means here: the centred window and the relay filter already cover it. */
+            n->type = stable ? NAT_CONE : NAT_HARD_SYM;
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+                 stable ? "UDP mapping holds for a second destination address"
+                        : "UDP mapping follows the destination address; treating it as symmetric");
+            nat_discovery_finish(c, family);
+            return 1;
+        }
+    }
     uint16_t expected = n->phase == 3 ? 27180 : (uint16_t)(27179 + n->phase);
     op_addr expect = c->gateway_addr[family];
     op_addr_set_port(&expect, expected);
@@ -6884,10 +6951,14 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
         } else if (n->phase == 2) {
             n->second = (uint16_t)port;
             if (n->port == port) {
-                /* Same mapping for a different destination: the NAT keeps the
-                 * port, so a punch from any address reaches us. */
-                n->type = NAT_CONE;
-                nat_discovery_finish(c, family);
+                /* Same mapping for a different destination port. A NAT that keys its
+                 * mapping on the destination address looks identical so far, so ask
+                 * an outside server before calling this a cone; without one the
+                 * ladder answers exactly what it used to. */
+                if (!nat_discovery_probe_second_ip(c, family, now)) {
+                    n->type = NAT_CONE;
+                    nat_discovery_finish(c, family);
+                }
             } else {
                 /* Different mapping: symmetric. Probe from a second local port to
                  * see whether the next mapping is predictable. That port is ours,
@@ -6934,6 +7005,29 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
             op_recvfrom(fd, data, sizeof(data), MSG_DONTWAIT, &from.u.sa, &from.len);
         if (received > 0 && nat_discovery_reply(c, family, data, (size_t)received, &from, now))
             return;
+    }
+    if (n->dep_phase) {
+        if (now <= n->dep_deadline)
+            return;
+        if (!n->dep_attempt) {
+            /* One retry: a lost reply from a third party says nothing about the
+             * mapping we are trying to measure. */
+            n->dep_attempt = 1;
+            n->dep_deadline = now + 600 * MS;
+            uint8_t request[64];
+            size_t length = fp_stun_request(request, sizeof(request), n->dep_tid, 0, 0);
+            if (length)
+                (void)op_sendto(n->fd, request, length, MSG_DONTWAIT, &n->dep_addr.u.sa,
+                                n->dep_addr.len);
+            return;
+        }
+        /* Silence must not turn a working cone into a symmetric verdict, so an
+         * unanswered question leaves the ladder's own answer standing. */
+        n->dep_phase = 0;
+        n->addr_dep = -1;
+        n->type = NAT_CONE;
+        nat_discovery_finish(c, family);
+        return;
     }
     if (now > n->deadline) {
         /* Retry once from a fresh socket before declaring the mapping unknown:
