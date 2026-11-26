@@ -378,6 +378,13 @@ typedef struct {
     int sym_up, sym_sprayed, sym_split;
     uint64_t sym_spray_at;
     int udp_punch_order, udp_punch_kind, udp_punch_role, udp_punch_ready;
+    /* The window the *peer* offered: 1 directional, 2 centred, 0 none. The role
+     * decision needs the peer's shape, not our own - reading udp_punch_kind here
+     * made every cone initiator facing a symmetric peer fall back to the single
+     * packet a symmetric NAT never maps to us. */
+    int udp_peer_kind;
+    /* One diagnostic line per tunnel, emitted before its first packet. */
+    int punch_logged;
     int udp_dual_punch, udp_peer_cone;
     unsigned udp_candidate_count;
     op_socket udp_candidates[UDP_PUNCH_ARRAY_LIMIT];
@@ -1351,12 +1358,15 @@ static void learn_sym_window(tunnel *t, json_object *j) {
     if (width < 2) {
         t->sym_base = t->sym_count = 0;
         t->sym_split = 0;
+        t->udp_peer_kind = 0;
         return;
     }
     t->sym_base = (uint16_t)base;
     t->sym_count = width;
     t->sym_split = split;
     t->sym_up = op_integer(j, "symUp") ? 1 : 0;
+    /* What the peer offered, for the role decision below. */
+    t->udp_peer_kind = split ? 2 : 1;
     if (split && width >= 4 && base == op_integer(j, "coneNatPort") &&
         alt && alt <= UINT16_MAX && abs((int)alt - (int)base) >= 2 * SYM_WINDOW_HARD)
         t->sym_alt_base = (uint16_t)alt;
@@ -2491,6 +2501,9 @@ static int announce_sym_window(fastp2p_client *c, tunnel *t, json_object *j, int
     if (!kind)
         return 0;
     uint16_t alternate = index == OP_FAM_V4 ? udp_alternate_mapping(&t->probes[index]) : 0;
+    /* udp_alternate_mapping() already decides the shape: a second consistent base makes
+     * the window centred around it. Gating the directional form on more evidence here
+     * would make it unreachable, because that helper is the only source of kind 2. */
     if (alternate) {
         kind = 2;
         op_ju(j, "symAltBase", alternate);
@@ -2524,11 +2537,23 @@ static int ordered_udp_role(const fastp2p_client *c, const tunnel *t) {
             udp_alternate_mapping(&t->probes[OP_FAM_V4]))
             return UDP_PUNCH_SEND;
     }
-    if (!t->udp_punch_order || !t->udp_punch_kind || !t->sym_count ||
-        t->sym_base != t->remote_ports[OP_FAM_V4] || (t->udp_punch_kind == 2 && t->sym_split))
+    /* The side that published a window is the one that waits to be found; the other one
+     * sprays it. An offer is only usable when it names our own advertised port. */
+    int mine = t->udp_punch_kind;
+    /* A peer that publishes symBase without udpPunchOrder predates the ordered punch;
+     * keep the single-endpoint behaviour for it. */
+    int theirs = t->udp_punch_order && t->udp_peer_kind && t->sym_count &&
+                 t->sym_base == t->remote_ports[OP_FAM_V4] ? t->udp_peer_kind : 0;
+    if (!mine && !theirs)
         return UDP_PUNCH_LEGACY;
-    int receiver = t->udp_punch_kind == 2 || (!t->sym_split && !t->initiator);
-    return receiver ? UDP_PUNCH_RECEIVE : UDP_PUNCH_SEND;
+    if (!mine)
+        return UDP_PUNCH_SEND;   /* only the peer published: spray it */
+    if (!theirs)
+        return UDP_PUNCH_RECEIVE; /* only we published: they spray ours */
+    /* Both published: the side whose mapping is more predictable does the walking. */
+    if (mine != theirs)
+        return mine == 1 ? UDP_PUNCH_SEND : UDP_PUNCH_RECEIVE;
+    return t->initiator ? UDP_PUNCH_SEND : UDP_PUNCH_RECEIVE;
 }
 
 /* The allocated port is valid on the router's WAN address. An outer NAT
@@ -2732,12 +2757,16 @@ static void probe_complete(fastp2p_client *c, int index) {
             op_ju(j, "tcpDirectPort", t->tcp_direct_port);
         if (t->udp_direct_port && !reverse_port)
             op_ju(j, "udpDirectPort", t->udp_direct_port);
-        t->udp_punch_role = ordered_udp_role(c, t);
-        if (t->udp_punch_role) {
+        /* A symmetric responder has to publish its window as well: it used to be the
+         * only role that did, then the call moved into the request builder and the
+         * responder silently stopped offering one, which left a cone initiator with
+         * nothing to spray. */
+        t->udp_punch_kind = announce_sym_window(c, t, j, family);
+        if (t->udp_punch_kind)
             op_ju(j, "udpPunchOrder", 1);
-            if (t->udp_dual_punch)
-                op_ju(j, "udpPunchDual", 1);
-        }
+        t->udp_punch_role = ordered_udp_role(c, t);
+        if (t->udp_punch_role && t->udp_dual_punch)
+            op_ju(j, "udpPunchDual", 1);
         push(c, t->peer, 2, j);
         /* The v2 punch starts immediately: the ladder paces the retries and the
          * initiator may still reach our shared listener in parallel. */
@@ -4544,8 +4573,11 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
                 }
                 t->udp_dual_punch = op_integer(j, "udpPunchDual") == 1;
                 t->udp_peer_cone = op_integer(j, "udpNatType") == NAT_CONE;
-                if (op_integer(j, "udpPunchOrder") == 1)
-                    t->udp_punch_role = ordered_udp_role(c, t);
+                /* The reply carries the window the responder will honour; without
+                 * this the initiator had nothing to spray even when it was offered. */
+                t->udp_punch_order = op_integer(j, "udpPunchOrder") == 1;
+                learn_sym_window(t, j);
+                t->udp_punch_role = ordered_udp_role(c, t);
                 int64_t delay = 0;
                 if (!t->tcp_punch_immediate && !t->udp_punch_role) {
                     uint64_t ts = op_integer(j, "punchts"), local = wall();
@@ -5503,6 +5535,27 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
 
 static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
+    if (!t->punch_logged) {
+        /* One line per tunnel, before the first packet: without it a pair that never
+         * sends anything is indistinguishable from one whose packets are dropped, and
+         * that is exactly what a NAT1 vs NAT4 failure used to look like. */
+        t->punch_logged = 1;
+        char note[200], where[OP_ADDR_TEXT + 8];
+        where[0] = 0;
+        if (!t->peer_addr.len)
+            snprintf(where, sizeof(where), "none");
+        else
+            op_addr_text(&t->peer_addr, where, sizeof(where));
+        snprintf(note, sizeof(note),
+                 "punch %s: role=%s peer=%s window=%u%s%s%s",
+                 t->mode, t->udp_punch_role == UDP_PUNCH_SEND ? "send"
+                          : t->udp_punch_role == UDP_PUNCH_RECEIVE ? "receive" : "legacy",
+                 where, (unsigned)t->sym_count,
+                 t->udp_peer_kind == 2 ? " split" : "",
+                 t->sym_up ? " up" : " down",
+                 t->udp_punch_order ? " ordered" : "");
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
     if (t->udp_punch_role == UDP_PUNCH_SEND && !t->udp_punch_ready &&
         now - t->punch_started < UDP_PUNCH_READY_WAIT)
         return;
@@ -5521,6 +5574,8 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
             ++t->sym_sprayed;
             t->sym_spray_at = now + SYM_SPRAY_GAP;
             send_udp_punch_window(t, t->fd, peer, message, t->sym_count);
+            /* Spreading our receivers over several ports only makes sense when the
+             * window we published is the centred one. */
             if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE && t->udp_punch_kind == 2)
                 open_udp_candidates(c, t);
             uint16_t count = t->sym_count < UDP_PUNCH_EXTRA_WINDOW ? t->sym_count : UDP_PUNCH_EXTRA_WINDOW;

@@ -818,6 +818,75 @@ static void sym_spray_ports(void) {
  * What it publishes instead is a window to spray. These checks pin the shape of
  * that window: directional and narrow when the step is measurable, centred and
  * wider when it is not, and nothing at all for a mapping that does not move. */
+/* The offer has to survive the round trip. It did not: the responder never built one,
+ * the initiator never stored it, and the role read our own class instead of the peer's,
+ * so a cone initiator facing a symmetric peer fell back to one packet at a port that NAT
+ * never maps to us - NAT1 vs NAT4 could not punch. */
+static void window_offer_decides_the_role(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    snprintf(c->local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    c->families_wanted = c->gateway_families = FAM_V4;
+    int ti = new_tunnel(c, "peer", 81, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    snprintf(t->mode, sizeof(t->mode), "%s", "udppunch");
+    t->family = OP_FAM_V4;
+    t->mapped_port = 40000;
+    t->mapped_ports[OP_FAM_V4] = 40000;
+    t->remote_ports[OP_FAM_V4] = 41000;
+    t->peer_ready[OP_FAM_V4] = 1;
+    snprintf(t->peer_text[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.9");
+    snprintf(t->mapped_text[OP_FAM_V4], OP_ADDR_TEXT, "%s", "198.51.100.7");
+    c->nat[OP_FAM_V4].type = NAT_CONE;
+
+    /* The peer's request carries udpPunchOrder together with its window. */
+    t->udp_punch_order = 1;
+    /* A directional window from a symmetric peer: the cone side must spray it. */
+    json_object *offer = json_tokener_parse(
+        "{\"symBase\":41000,\"symCount\":50,\"symUp\":1,\"udpNatType\":3}");
+    learn_sym_window(t, offer);
+    json_object_put(offer);
+    assert(t->udp_peer_kind == 1);
+    assert(t->sym_base == 41000 && t->sym_count == SYM_WINDOW_MAX);
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_SEND);
+
+    /* A centred window is sprayed the same way: the side without a window of its own
+     * always sends. */
+    offer = json_tokener_parse(
+        "{\"symBase\":41000,\"symCount\":128,\"symSplit\":1,\"udpNatType\":2}");
+    learn_sym_window(t, offer);
+    json_object_put(offer);
+    assert(t->udp_peer_kind == 2);
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_SEND);
+
+    /* When only we published a window, we are the side that waits to be found. */
+    t->udp_punch_kind = 1;
+    t->udp_punch_order = 1;
+    offer = json_tokener_parse("{\"udpNatType\":1}");
+    learn_sym_window(t, offer);
+    json_object_put(offer);
+    assert(t->udp_peer_kind == 0);
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_RECEIVE);
+    /* Both windows, ours predictable and theirs centred: we do the walking. */
+    t->udp_punch_kind = 1;
+    t->udp_peer_kind = 2;
+    t->sym_base = t->remote_ports[OP_FAM_V4];
+    t->sym_count = SYM_WINDOW_HARD;
+    t->sym_split = 1;
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_SEND);
+    t->udp_punch_kind = 0;
+
+    /* No offer at all keeps the legacy single-endpoint punch. */
+    offer = json_tokener_parse("{\"udpNatType\":1}");
+    learn_sym_window(t, offer);
+    json_object_put(offer);
+    assert(t->udp_peer_kind == 0 && !t->sym_count);
+    assert(ordered_udp_role(c, t) == UDP_PUNCH_LEGACY);
+    close_tunnel(c, ti, NULL);
+    free(c);
+}
+
 static void sym_window_wire(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -1947,6 +2016,7 @@ int main(void) {
         const char *override = getenv("FASTP2P_TCP_SWEEP");
         if (!override || !*override) assert(largest <= TCP_SWEEP_MAX);
     }
+    window_offer_decides_the_role();
     sym_window_wire();
     sym_spray_ports();
     udp_dual_window_wire();
