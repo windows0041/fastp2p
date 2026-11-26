@@ -5468,6 +5468,22 @@ static int same_host(const op_addr *a, const op_addr *b) {
     op_addr_set_port(&right, 0);
     return op_addr_equal(&left, &right);
 }
+/* A carrier NAT can hand out a different public address per destination, so the address a
+ * peer announced (measured towards the gateway) is not always the one its packets arrive
+ * from: 223.104.85.219 and .223 were seen for the same phone. Accepting only an exact host
+ * match dropped every packet of exactly the pair that needed punching. IPv4 therefore
+ * matches within one /24 - the pools observed in the field stay inside one - while IPv6
+ * stays strict. The packet still has to carry our tunnel id, and the underlay handshake
+ * authenticates the peer, so a stranger gains nothing but a probe. */
+static int peer_host_matches(const op_addr *from, const op_addr *peer) {
+    if (same_host(from, peer))
+        return 1;
+    if (op_addr_family(from) != AF_INET || op_addr_family(peer) != AF_INET)
+        return 0;
+    uint32_t a = ntohl(from->u.in.sin_addr.s_addr);
+    uint32_t b = ntohl(peer->u.in.sin_addr.s_addr);
+    return (a & 0xFFFFFF00u) == (b & 0xFFFFFF00u);
+}
 static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object *message, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     for (unsigned slot = 0; slot <= t->udp_candidate_count; ++slot) {
@@ -5496,7 +5512,7 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
             }
             if (n < 8 || op_u32(data) != (uint32_t)(n - 8) || op_u16(data + 4) != 4 ||
-                !same_host(&from, &peer))
+                !peer_host_matches(&from, &peer))
                 continue;
             if (!op_addr_equal(&from, &peer)) {
                 /* Learn the port the peer really uses towards us and answer that: its

@@ -822,6 +822,23 @@ static void sym_spray_ports(void) {
  * the initiator never stored it, and the role read our own class instead of the peer's,
  * so a cone initiator facing a symmetric peer fell back to one packet at a port that NAT
  * never maps to us - NAT1 vs NAT4 could not punch. */
+/* The announced address and the address a peer's packets arrive from can differ inside a
+ * carrier pool: 223.104.85.219 answered a peer that had announced .223, and an exact host
+ * match dropped every packet. IPv4 compares within one /24; IPv6 stays strict. */
+static void punch_accepts_the_carrier_pool(void) {
+    op_addr from, peer;
+    assert(!op_addr_from_text(&from, "223.104.85.219", 42814));
+    assert(!op_addr_from_text(&peer, "223.104.85.223", 57390));
+    assert(peer_host_matches(&from, &peer));
+    /* Same host still matches, another /24 does not. */
+    assert(!op_addr_from_text(&from, "223.104.85.223", 1) ? peer_host_matches(&from, &peer) : 0);
+    assert(!op_addr_from_text(&from, "223.104.86.219", 1) ? !peer_host_matches(&from, &peer) : 0);
+    assert(!op_addr_from_text(&from, "120.231.127.124", 1) ? !peer_host_matches(&from, &peer) : 0);
+    /* IPv6 is never relaxed. */
+    assert(!op_addr_from_text(&from, "2409:895a:f1d5:ca7e::1", 1));
+    assert(!op_addr_from_text(&peer, "2409:895a:f1d5:ca7e::2", 1));
+    assert(!peer_host_matches(&from, &peer));
+}
 static void window_offer_decides_the_role(void) {
     fastp2p_client *c = calloc(1, sizeof(*c));
     assert(c);
@@ -2016,6 +2033,7 @@ int main(void) {
         const char *override = getenv("FASTP2P_TCP_SWEEP");
         if (!override || !*override) assert(largest <= TCP_SWEEP_MAX);
     }
+    punch_accepts_the_carrier_pool();
     window_offer_decides_the_role();
     sym_window_wire();
     sym_spray_ports();
