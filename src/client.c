@@ -3272,8 +3272,10 @@ static uint16_t tcp_dial_target(const tunnel *t) {
 /* Arming one rotation. Returns 0 when at least two sockets are dialling. */
 static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     int family = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
-    uint16_t target_port = tcp_dial_target(t);
-    if (!target_port || !t->peer_addr.len)
+    uint16_t business = t->peer_direct_port;
+    uint16_t mapping = t->remote_ports[family];
+    uint16_t primary = tcp_dial_target(t);
+    if (!primary || !t->peer_addr.len)
         return -1;
     unsigned ceiling = tcp_array_config_width();
     unsigned width = t->array_width ? t->array_width : tcp_array_next_width(0, ceiling);
@@ -3288,10 +3290,18 @@ static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     op_socket *fds = calloc(width, sizeof(*fds));
     if (!fds)
         return -1;
-    op_addr target = t->peer_addr;
-    op_addr_set_port(&target, target_port);
     unsigned opened = 0;
     for (unsigned i = 0; i < width; ++i) {
+        /* Half the sockets dial the peer's business port and half dial the port its
+         * own spray sources from. A host whose firewall admits the business port
+         * answers the first half; a host behind a cloud that drops everything
+         * inbound can only be met by the second half, because its spray leaves from
+         * that same port and our dial is what opens the peer's filter towards it. */
+        uint16_t port = (business && (i & 1u)) ? business : mapping;
+        if (!port)
+            port = primary;
+        op_addr target = t->peer_addr;
+        op_addr_set_port(&target, port);
         /* A fresh local port per socket is the mechanism itself: each one gets its
          * own mapping, hence its own external port for the peer to answer. */
         op_socket fd = socket_bound(0, source_text(c, family), 0, BIND_REUSE_PORT);
@@ -3318,10 +3328,12 @@ static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     /* One line per round, not per rotation: a refused rotation turns over in tens
      * of milliseconds and would otherwise bury the log. */
     if (t->tcp_attempts <= 1) {
-        char where[OP_ADDR_TEXT + 8], note[192];
-        op_addr_text(&target, where, sizeof(where));
-        snprintf(note, sizeof(note), "TCP punch array: %u source ports dial %s:%u (next %u)", opened,
-                 where, (unsigned)target_port, tcp_array_next_width(width, ceiling));
+        char where[OP_ADDR_TEXT + 8], note[224];
+        op_addr_text(&t->peer_addr, where, sizeof(where));
+        snprintf(note, sizeof(note),
+                 "TCP punch array: %u source ports dial %s:%u and %s:%u (next %u)", opened,
+                 where, (unsigned)(business ? business : mapping), where, (unsigned)mapping,
+                 tcp_array_next_width(width, ceiling));
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     return 0;
