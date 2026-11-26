@@ -2938,11 +2938,41 @@ static void tcp_punch_sweep(fastp2p_client *c, int index) {
         op_close(fd); /* the SYN is all that was needed */
         ++sent;
     }
-    if (sent) {
-        char note[192];
+    /* A carrier hands out its public address from a pool as well: the address the peer
+     * announced (measured towards the gateway) is not always the one it uses towards us
+     * - 223.104.85.219 answered a peer that had announced .223. A NAT that filters an
+     * address it has not talked to answers the peer's SYN with an RST, which is exactly
+     * the "Connection refused (listener down)" loop. One SYN per address of the peer's
+     * /24, at the advertised port and from the same local port, teaches our NAT to let
+     * that address back in; the peer's own SYN then reaches the listener we park next. */
+    unsigned swept = 0;
+    if (family == OP_FAM_V4 && t->remote_ports[OP_FAM_V4]) {
+        uint32_t advertised = ntohl(t->peer_addr.u.in.sin_addr.s_addr);
+        uint32_t base = advertised & 0xFFFFFF00u;
+        uint16_t port = t->remote_ports[OP_FAM_V4];
+        for (unsigned host = 1; host <= 254; ++host) {
+            uint32_t address = base | host;
+            if (address == advertised)
+                continue;
+            op_addr target;
+            memset(&target, 0, sizeof(target));
+            target.u.in.sin_family = AF_INET;
+            target.u.in.sin_addr.s_addr = htonl(address);
+            target.u.in.sin_port = htons(port);
+            target.len = (op_socklen)sizeof(target.u.in);
+            op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+            if (fd < 0)
+                continue;
+            (void)op_connect(fd, &target.u.sa, target.len);
+            op_close(fd);
+            ++swept;
+        }
+    }
+    if (sent || swept) {
+        char note[224];
         snprintf(note, sizeof(note),
-                 "TCP punch sprayed %u random ports from %u (peer mapping moves per destination)",
-                 sent, start);
+                 "TCP punch sprayed %u ports from %u and swept %u addresses of the peer's /24",
+                 sent, start, swept);
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
 }
