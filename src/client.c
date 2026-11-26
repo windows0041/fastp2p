@@ -107,6 +107,19 @@
 /* Ports dialled from the peer's measured step; each one opens our filter towards
  * exactly the port its own allocator is about to use. */
 #define TCP_PUNCH_PREDICT_PORTS 20
+/* Source-port array for the dialling side. A mapping that changes per destination
+ * allocates one external port per (socket, destination) pair, so a single local
+ * port gives the peer exactly one port to hit while the cone side's spray has to
+ * land on that one - a lottery against 64511 ports. N local ports give the peer
+ * N, and the spray only has to cover any of them. The first rotation uses
+ * TCP_PUNCH_ARRAY ports and every spent rotation doubles that up to the ceiling,
+ * because a wider array costs only descriptors and SYNs and only while the round
+ * is already known to be missing. FASTP2P_TCP_ARRAY moves the ceiling (1..512) for
+ * hosts that cannot afford the descriptors or the SYNs. */
+#define TCP_PUNCH_ARRAY 64u
+#define TCP_PUNCH_ARRAY_LIMIT 512u
+/* Descriptors the whole client may hold for source-port arrays at once. */
+#define TCP_ARRAY_CLIENT_LIMIT 512u
 /* Who sprays and who keeps dialling. A cone mapping has one reachable port, so
  * that side opens the window; a destination-dependent mapping cannot be dialled,
  * so that side keeps dialling the cone's stable port for the whole window. */
@@ -361,6 +374,12 @@ typedef struct {
     int udp_seen_logged;
     uint16_t tcp_candidate_ports[1 + TCP_PREDICT_PORTS];
     op_socket tcp_candidates[1 + TCP_PREDICT_PORTS];
+    /* Dialler-side source-port array: one socket per local port, all dialling the
+     * peer's one stable endpoint. `array_slots` is what the client-wide budget was
+     * charged, so closing the array returns exactly that. */
+    op_socket *array;
+    unsigned array_count, array_slots, array_width;
+    uint64_t array_until;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
@@ -611,6 +630,8 @@ struct fastp2p_client {
     void *config_user;
     fastp2p_restart_handler restart_handler;
     void *restart_user;
+    /* Descriptors held by every tunnel's TCP source-port array right now. */
+    unsigned tcp_array_used;
     int validate_only;
     void *user;
     fp_sdwan *sdwan;
@@ -634,6 +655,7 @@ static int tcp_nat_level(const fastp2p_client *);
 static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
+static void tcp_array_close(fastp2p_client *, tunnel *);
 static uint64_t app_retry_delay(unsigned);
 static void release_relay(fastp2p_client *, int);
 static void bind_pending_key(fastp2p_client *, int);
@@ -1622,6 +1644,7 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     if (t->alternate_fd >= 0)
         op_close(t->alternate_fd);
     close_tcp_candidates(t);
+    tcp_array_close(c, t);
     close_udp_candidates(t);
     fp_tcp_punch_sample_free(t->tcp_sample);
     op_buffer_clear(&t->rx);
@@ -3118,6 +3141,212 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
         t->tcp_retry_at = now + (TCP_PUNCH_RETRY_MS + random_id() % TCP_PUNCH_RETRY_JITTER_MS) * MS;
 }
 
+/* --- Dialler-side source-port array (TCP, destination-dependent peer) ------
+ * The peer publishes one stable endpoint we may dial, but its NAT rewrites our
+ * source port per destination, so which of our external ports it will accept is
+ * not something it can tell us. Opening N local ports at once makes N candidate
+ * external ports: the cone side's spray then only has to cover any one of them,
+ * and a hit is a completed connection on whichever socket it landed on. Only the
+ * dialling side builds one - the opener's job is the opposite (open its own
+ * filter and listen). */
+/* Ceiling for one tunnel's array: FASTP2P_TCP_ARRAY (1..512) or the built-in
+ * maximum, so the ladder can widen by itself on a host nobody configured. */
+static unsigned tcp_array_config_width(void) {
+    static unsigned width;
+    if (width)
+        return width;
+    width = TCP_PUNCH_ARRAY_LIMIT;
+    const char *text = getenv("FASTP2P_TCP_ARRAY");
+    if (text && *text) {
+        unsigned long value = strtoul(text, NULL, 10);
+        if (value >= 1 && value <= TCP_PUNCH_ARRAY_LIMIT)
+            width = (unsigned)value;
+    }
+    return width;
+}
+/* Width of the next rotation: double, never past the configured ceiling. Zero
+ * current width asks for the starting width, which is the smaller of the default
+ * and the ceiling so a lowered ceiling still applies immediately. */
+static unsigned tcp_array_next_width(unsigned width, unsigned ceiling) {
+    if (!ceiling)
+        return 0;
+    if (!width)
+        return ceiling < TCP_PUNCH_ARRAY ? ceiling : TCP_PUNCH_ARRAY;
+    if (width >= ceiling)
+        return ceiling;
+    unsigned next = width * 2;
+    return next > ceiling ? ceiling : next;
+}
+static void tcp_array_close(fastp2p_client *c, tunnel *t) {
+    if (t->array) {
+        for (unsigned i = 0; i < t->array_count; ++i)
+            if (t->array[i] >= 0)
+                op_close(t->array[i]);
+        free(t->array);
+        t->array = NULL;
+    }
+    if (t->array_slots) {
+        c->tcp_array_used = c->tcp_array_used > t->array_slots ? c->tcp_array_used - t->array_slots : 0;
+        t->array_slots = 0;
+    }
+    t->array_count = 0;
+    t->array_until = 0;
+}
+/* Arm one rotation. Returns 0 when at least two sockets are dialling. */
+static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
+    int family = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
+    uint16_t target_port = t->remote_ports[family];
+    if (!target_port || !t->peer_addr.len)
+        return -1;
+    unsigned ceiling = tcp_array_config_width();
+    unsigned width = t->array_width ? t->array_width : tcp_array_next_width(0, ceiling);
+    if (width > ceiling)
+        width = ceiling;
+    if (c->tcp_array_used >= TCP_ARRAY_CLIENT_LIMIT)
+        return -1;
+    if (width > TCP_ARRAY_CLIENT_LIMIT - c->tcp_array_used)
+        width = TCP_ARRAY_CLIENT_LIMIT - c->tcp_array_used;
+    if (width < 2)
+        return -1;
+    op_socket *fds = calloc(width, sizeof(*fds));
+    if (!fds)
+        return -1;
+    op_addr target = t->peer_addr;
+    op_addr_set_port(&target, target_port);
+    unsigned opened = 0;
+    for (unsigned i = 0; i < width; ++i) {
+        /* A fresh local port per socket is the mechanism itself: each one gets its
+         * own mapping, hence its own external port for the peer to answer. */
+        op_socket fd = socket_bound(0, source_text(c, family), 0, BIND_REUSE_PORT);
+        if (fd < 0)
+            break;
+        if (op_connect(fd, &target.u.sa, target.len) && errno != EINPROGRESS) {
+            op_close(fd);
+            continue;
+        }
+        fds[opened++] = fd;
+    }
+    if (opened < 2) {
+        for (unsigned i = 0; i < opened; ++i)
+            op_close(fds[i]);
+        free(fds);
+        return -1;
+    }
+    t->array = fds;
+    t->array_count = opened;
+    t->array_slots = opened;
+    t->array_width = width;
+    c->tcp_array_used += opened;
+    t->array_until = now + TCP_PUNCH_ATTEMPT_MS * MS;
+    /* One line per round, not per rotation: a refused rotation turns over in tens
+     * of milliseconds and would otherwise bury the log. */
+    if (t->tcp_attempts <= 1) {
+        char where[OP_ADDR_TEXT + 8], note[176];
+        op_addr_text(&target, where, sizeof(where));
+        snprintf(note, sizeof(note), "TCP punch array: %u source ports dial %s (next %u)", opened,
+                 where, tcp_array_next_width(width, ceiling));
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
+    return 0;
+}
+/* Adopt the socket that connected: the rest of the rotation is worthless and the
+ * tunnel continues exactly as it does after a single successful dial. */
+static void tcp_array_adopt(fastp2p_client *c, int index, op_socket fd, uint64_t now) {
+    tunnel *t = &c->tunnels[index];
+    for (unsigned i = 0; i < t->array_count; ++i)
+        if (t->array[i] == fd) {
+            t->array[i] = -1; /* keep the winner out of the close sweep */
+            break;
+        }
+    tcp_array_close(c, t);
+    if (t->fd >= 0 && t->fd != fd)
+        op_close(t->fd);
+    t->fd = fd;
+    t->state = T_HANDSHAKE;
+    t->deadline = now + 10 * NS;
+    /* Same ownership rule as a single dial: the winner owns the link, so a
+     * listener still parked for the other direction is closed. */
+    if (!t->server && t->listen_fd >= 0) {
+        op_close(t->listen_fd);
+        t->listen_fd = -1;
+    }
+    uint8_t id[8];
+    op_put64(id, t->id);
+    tframe(t, TUN_HELLO, id, sizeof(id));
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP punch array connected on one of its source ports");
+}
+/* Poll the armed rotation. 1 = adopted, -1 = rotation spent (the ordinary attempt
+ * bookkeeping has run), 0 = still dialling. */
+static int tcp_array_tick(fastp2p_client *c, int index, uint64_t now) {
+    tunnel *t = &c->tunnels[index];
+    if (!t->array || !t->array_count)
+        return 0;
+    int refused = 0, live = 0, done = 0;
+    /* One poll per chunk of 64 sockets instead of one getsockopt per socket: an
+     * armed rotation of 512 sockets is polled every step, and on a phone that is
+     * the difference between eight syscalls and five hundred. A socket that a
+     * connect legitimately dropped reports itself here as refused. */
+    op_pollfd fds[64];
+    unsigned slots[64];
+    for (unsigned base = 0; base < t->array_count && !done; base += 64) {
+        unsigned n = 0;
+        for (unsigned i = base; i < t->array_count && n < 64; ++i) {
+            if (t->array[i] < 0)
+                continue;
+            fds[n].fd = t->array[i];
+            fds[n].events = POLLOUT;
+            fds[n].revents = 0;
+            slots[n++] = i;
+        }
+        if (!n)
+            continue;
+        if (op_poll(fds, n, 0) < 0) {
+            /* A failed poll says nothing about the sockets themselves: keep them
+             * and let the rotation deadline decide. */
+            live += (int)n;
+            continue;
+        }
+        for (unsigned k = 0; k < n; ++k) {
+            op_socket fd = t->array[slots[k]];
+            if (!fds[k].revents) {
+                ++live;
+                continue;
+            }
+            int ready = connect_ready(fd);
+            if (ready > 0) {
+                tcp_array_adopt(c, index, fd, now);
+                done = 1;
+                break;
+            }
+            if (ready < 0) {
+                /* One refusal is enough to know the peer's endpoint is live;
+                 * silence means filtered, and the two lead to different retries. */
+                if (errno == ECONNREFUSED)
+                    refused = 1;
+                op_close(fd);
+                t->array[slots[k]] = -1;
+                continue;
+            }
+            ++live;
+        }
+    }
+    if (done)
+        return 1;
+    if (live && now < t->array_until)
+        return 0;
+    unsigned ceiling = tcp_array_config_width();
+    unsigned wider = tcp_array_next_width(t->array_width, ceiling);
+    tcp_array_close(c, t);
+    if (wider > t->array_width) {
+        char note[128];
+        snprintf(note, sizeof(note), "TCP punch array widened to %u source ports", wider);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        t->array_width = wider;
+    }
+    errno = refused ? ECONNREFUSED : ETIMEDOUT;
+    tcp_punch_failed(c, index, now);
+    return -1;
+}
 /* 1 when this host can actually open a socket in `family`; a host with no IPv6
  * address must never punch there, however dual-stack the peer looks. */
 static int punch_family_available(const fastp2p_client *c, int family) {
@@ -3214,6 +3443,26 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
                 op_addr_set_port(&t->peer_addr, tcp_scan_port(reported, t->tcp_scan));
             else
                 op_addr_set_port(&t->peer_addr, reported);
+        }
+    }
+    /* A peer with one stable published port is what the source-port array is for:
+     * the destination is known, it is our own external port that has to land inside
+     * the set its filter admits. Only the assigned dialling role builds one: the
+     * opener must keep its listener for the peer's SYN, and a round where both ends
+     * dial (cone to cone) is already covered by the shared-listener path. */
+    if (peer_kind == TCP_PEER_STABLE && t->punch_role == TCP_PUNCH_DIALER && t->tcp_v2 &&
+        !t->lan && !t->relay_wait && tcp_array_config_width() > 1) {
+        if (t->fd >= 0) {
+            op_close(t->fd);
+            t->fd = -1;
+        }
+        if (t->listen_fd >= 0) {
+            op_close(t->listen_fd);
+            t->listen_fd = -1;
+        }
+        if (tcp_array_open(c, t, now) == 0) {
+            t->tcp_attempt_deadline = t->array_until;
+            return;
         }
     }
     if (t->tcp_attempts == 1) {
@@ -5900,6 +6149,12 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     }
     if (t->state == T_TCP_CONNECT && t->tcp_predict_role)
         tcp_predict_tick(c, ti, now);
+    /* The dialler's source-port array owns the attempt while it is armed. */
+    if (t->state == T_TCP_CONNECT && t->array_count) {
+        (void)tcp_array_tick(c, ti, now);
+        if (!t->state)
+            return;
+    }
     if (t->state == T_TCP_CONNECT) {
         if (t->state && t->tcp_v2 && t->fd < 0 && t->tcp_retry_at && now >= t->tcp_retry_at)
             tcp_punch_dial(c, ti, now);
