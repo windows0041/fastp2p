@@ -1840,6 +1840,122 @@ static void a_stable_mapping_pins_the_local_port_even_when_rewritten(void) {
     assert(!punch_port_keep(28482, 52840, 0));  /* moves per destination: rotate */
     assert(!punch_port_keep(0, 52840, 1));      /* unmapped: nothing to pin */
 }
+/* The dialler's source-port array is the only mechanism that answers "which of our
+ * external ports will the peer's filter admit": N local ports, N external ports,
+ * and the cone side's spray only has to cover one of them. The width doubles after
+ * every spent rotation, so a round that keeps missing spends progressively more
+ * SYNs instead of repeating the same lottery. */
+static void tcp_array_width_escalates(void) {
+    /* The ladder with the built-in ceiling: 64 -> 128 -> 256 -> 512, then it stays. */
+    assert(tcp_array_next_width(0, TCP_PUNCH_ARRAY_LIMIT) == TCP_PUNCH_ARRAY);
+    assert(tcp_array_next_width(TCP_PUNCH_ARRAY, TCP_PUNCH_ARRAY_LIMIT) == 128);
+    assert(tcp_array_next_width(128, TCP_PUNCH_ARRAY_LIMIT) == 256);
+    assert(tcp_array_next_width(256, TCP_PUNCH_ARRAY_LIMIT) == 512);
+    assert(tcp_array_next_width(512, TCP_PUNCH_ARRAY_LIMIT) == 512);
+    /* A lowered ceiling applies at once instead of starting at the default. */
+    assert(tcp_array_next_width(0, 16) == 16);
+    assert(tcp_array_next_width(16, 16) == 16);
+    assert(tcp_array_next_width(0, 0) == 0);
+    /* FASTP2P_TCP_ARRAY moves the ceiling only; the ladder still starts below it. */
+    unsigned ceiling = tcp_array_config_width();
+    assert(ceiling >= 1 && ceiling <= TCP_PUNCH_ARRAY_LIMIT);
+    const char *override = getenv("FASTP2P_TCP_ARRAY");
+    if (!override || !*override)
+        assert(ceiling == TCP_PUNCH_ARRAY_LIMIT);
+    assert(tcp_array_next_width(0, ceiling) ==
+           (ceiling < TCP_PUNCH_ARRAY ? ceiling : TCP_PUNCH_ARRAY));
+    /* The per-client ceiling is a descriptor budget large enough for one full array. */
+    assert(TCP_ARRAY_CLIENT_LIMIT >= TCP_PUNCH_ARRAY_LIMIT);
+}
+static void dialer_array_uses_many_source_ports(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    snprintf(c->local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    uint16_t remote = 0;
+    op_socket endpoint = bound_port(&remote);
+    assert(!op_listen(endpoint, 8));
+    int ti = new_tunnel(c, "array-target", 90210, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    snprintf(t->mode, sizeof(t->mode), "%s", "tcppunch");
+    t->tcp_v2 = 1;
+    t->family = OP_FAM_V4;
+    t->state = T_TCP_CONNECT;
+    t->deadline = mono() + 5 * NS;
+    t->punch_role = TCP_PUNCH_DIALER;
+    /* The peer published one stable endpoint: exactly the case the array is for. */
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    t->remote_ports[OP_FAM_V4] = t->remote_port = remote;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", remote));
+    tcp_punch_dial(c, ti, mono());
+    assert(t->array_count >= 2);
+    assert(t->array_width == tcp_array_next_width(0, tcp_array_config_width()));
+    assert(c->tcp_array_used == t->array_count);
+    assert(t->fd < 0); /* the attempt is the array, not a single dial */
+    uint64_t until = mono() + 3 * NS;
+    while (t->state == T_TCP_CONNECT && mono() < until) {
+        tick_tunnel(c, ti, mono());
+        op_sleep_ms(2);
+    }
+    /* One of the source ports connected; the rest of the rotation is gone and the
+     * client-wide descriptor budget is returned. */
+    assert(t->state == T_HANDSHAKE && t->fd >= 0);
+    assert(t->array == NULL && t->array_count == 0 && c->tcp_array_used == 0);
+    op_addr peer;
+    memset(&peer, 0, sizeof(peer));
+    op_socket accepted = -1;
+    for (int attempt = 0; attempt < 50 && accepted < 0; ++attempt) {
+        peer.len = (op_socklen)sizeof(peer.u.storage);
+        accepted = op_accept(endpoint, &peer.u.sa, &peer.len);
+        if (accepted < 0)
+            op_sleep_ms(2);
+    }
+    assert(accepted >= 0);
+    op_close(accepted);
+    close_tunnel(c, ti, NULL);
+    assert(c->tcp_array_used == 0);
+    free(c);
+    op_close(endpoint);
+}
+static void dialer_array_leaves_undiallable_peers_alone(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    snprintf(c->local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    uint16_t remote = 0;
+    op_socket endpoint = bound_port(&remote);
+    assert(!op_listen(endpoint, 8));
+    int ti = new_tunnel(c, "array-target", 90211, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    snprintf(t->mode, sizeof(t->mode), "%s", "tcppunch");
+    t->tcp_v2 = 1;
+    t->family = OP_FAM_V4;
+    t->state = T_TCP_CONNECT;
+    t->deadline = mono() + 5 * NS;
+    t->punch_role = TCP_PUNCH_AUTO;
+    /* A peer whose mapping moves per destination cannot be dialled on any fixed
+     * port, so a fleet of source ports buys nothing: the destination axis is the
+     * one missing there. */
+    t->peer_tcp_mapping = FP_TCP_MAP_INCREMENT;
+    t->remote_ports[OP_FAM_V4] = t->remote_port = remote;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", remote));
+    tcp_punch_dial(c, ti, mono());
+    assert(t->array == NULL && t->array_count == 0 && c->tcp_array_used == 0);
+    /* The opener's job is the opposite (open our own filter and listen), so it must
+     * not build a fleet of dialling sockets either. */
+    if (t->fd >= 0) {
+        op_close(t->fd);
+        t->fd = -1;
+    }
+    t->punch_role = TCP_PUNCH_OPENER;
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    t->tcp_attempts = 0;
+    tcp_punch_dial(c, ti, mono());
+    assert(t->array == NULL && c->tcp_array_used == 0);
+    close_tunnel(c, ti, NULL);
+    free(c);
+    op_close(endpoint);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2040,5 +2156,8 @@ int main(void) {
     udp_dual_window_wire();
     udp_dual_window_packets();
     ipv6_reverse_quic();
+    tcp_array_width_escalates();
+    dialer_array_uses_many_source_ports();
+    dialer_array_leaves_undiallable_peers_alone();
     return 0;
 }
