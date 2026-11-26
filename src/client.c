@@ -2481,7 +2481,11 @@ static void learn_tcp_mapping(tunnel *t, json_object *j) {
     uint64_t mapping = op_integer(j, "tcpPunchMap");
     uint64_t port = op_integer(j, "tcpPunchLastPort");
     int64_t step = op_integer(j, "tcpPunchStep");
-    if (t->tcp_punch_immediate && mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_DECREMENT &&
+    /* The peer publishes the step its own allocator showed whether or not we asked for an
+     * immediate punch. Gating the read on that flag threw the numbers away, so the punch
+     * strategy could never pick the predicted window and every symmetric peer fell back to
+     * random spraying - a lottery against 65535 ports. */
+    if (mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_DECREMENT &&
         port > 0 && port <= 65535) {
         t->peer_tcp_mapping = (unsigned)mapping;
         t->peer_tcp_last_port = (uint16_t)port;
