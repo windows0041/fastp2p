@@ -84,6 +84,12 @@
  * port, and then a listener on our advertised port accepts it. 256 ports each
  * side costs about half a second of SYNs, not a timeout per port. */
 #define TCP_PUNCH_SPRAY 256
+/* Window for a peer that published "moves, no step": its allocator is monotone, so
+ * the useful ports are ahead of the observation, and the peers own array consumes
+ * thousands of them per rotation. 8192 ahead is what FASTP2P_TCP_SPRAY allows an
+ * operator anyway; this is only the default it replaces when the peer is
+ * unpredictable. */
+#define TCP_PUNCH_SPRAY_WIDE 8192u
 /* How many ports of the ephemeral range one round sweeps when the peer's mapping moves
  * per destination. Nobody can predict that port (the advertised one was measured towards
  * the gateway), so the only way to reach it is to cover the range; but covering it in
@@ -2476,10 +2482,19 @@ static void publish_tcp_mapping(const fastp2p_client *c, const tunnel *t, json_o
     }
     if (t->transport != FASTP2P_TRANSPORT_TCP || !t->mapped_port)
         return;
-    if (c->tcp_nat.family[OP_FAM_V4].type != FP_NAT_STABLE)
+    if (c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_STABLE) {
+        op_ju(j, "tcpPunchMap", FP_TCP_MAP_STABLE);
+        op_ju(j, "tcpPunchLastPort", t->mapped_port);
         return;
-    op_ju(j, "tcpPunchMap", FP_TCP_MAP_STABLE);
-    op_ju(j, "tcpPunchLastPort", t->mapped_port);
+    }
+    /* The mapping moves and no step could be measured. Publish the observation
+     * anyway: the peer cannot compute our next port from it, but its spray can
+     * start there. Staying silent left it aiming at the port the gateway measured,
+     * which a monotone allocator passed thousands of ports ago. */
+    if (t->tcp_last_port) {
+        op_ju(j, "tcpPunchMap", FP_TCP_MAP_UNPREDICTABLE);
+        op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
+    }
 }
 /* Time left until the gateway's shared start instant, in nanoseconds; zero when it
  * sent none or the instant has already passed. */
@@ -2511,7 +2526,7 @@ static void learn_tcp_mapping(tunnel *t, json_object *j) {
      * immediate punch. Gating the read on that flag threw the numbers away, so the punch
      * strategy could never pick the predicted window and every symmetric peer fell back to
      * random spraying - a lottery against 65535 ports. */
-    if (mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_DECREMENT &&
+    if (mapping >= FP_TCP_MAP_STABLE && mapping <= FP_TCP_MAP_UNPREDICTABLE &&
         port > 0 && port <= 65535) {
         t->peer_tcp_mapping = (unsigned)mapping;
         t->peer_tcp_last_port = (uint16_t)port;
@@ -2890,11 +2905,46 @@ static unsigned tcp_spray_width(void) {
 enum { TCP_PEER_UNKNOWN, TCP_PEER_STABLE, TCP_PEER_MOVES };
 static int tcp_peer_kind(const tunnel *t) {
     if (t->peer_tcp_dependent || t->peer_tcp_mapping == FP_TCP_MAP_INCREMENT ||
-        t->peer_tcp_mapping == FP_TCP_MAP_DECREMENT)
+        t->peer_tcp_mapping == FP_TCP_MAP_DECREMENT ||
+        t->peer_tcp_mapping == FP_TCP_MAP_UNPREDICTABLE)
         return TCP_PEER_MOVES;
     if (t->peer_tcp_mapping == FP_TCP_MAP_STABLE)
         return TCP_PEER_STABLE;
     return TCP_PEER_UNKNOWN;
+}
+/* 1 when the peer said its mapping moves but published no step: the only usable
+ * number it gave us is where its allocator was when it measured. */
+static int tcp_peer_unpredictable(const tunnel *t) {
+    return t->peer_tcp_mapping == FP_TCP_MAP_UNPREDICTABLE;
+}
+/* Aim the spray at the freshest port the peer published: its own last observation
+ * when it sent one, otherwise the port it measured towards the gateway. */
+static uint16_t tcp_spray_base(const tunnel *t, int family) {
+    if (tcp_peer_unpredictable(t) && t->peer_tcp_last_port)
+        return t->peer_tcp_last_port;
+    uint16_t advertised = t->remote_ports[family];
+    return advertised ? advertised : (uint16_t)op_addr_port(&t->peer_addr);
+}
+/* How many ports each side of the aim this pass dials. The operator's
+ * FASTP2P_TCP_SPRAY always wins; without it an unpredictable peer gets the wide
+ * default, because its fresh ports can be thousands of ports past its observation
+ * and a 256-port window then lands entirely behind them. */
+static unsigned tcp_spray_width_for(const tunnel *t) {
+    if (getenv("FASTP2P_TCP_SPRAY"))
+        return tcp_spray_width();
+    return tcp_peer_unpredictable(t) ? TCP_PUNCH_SPRAY_WIDE : tcp_spray_width();
+}
+/* Window bounds for one spray pass, relative to the aim. An unpredictable peer
+ * allocates its next ports monotonically, so the window is biased forward: a
+ * symmetric window spends half of its SYNs on ports the allocator has already
+ * passed. Everything else keeps the historical symmetric window, which is what a
+ * port-preserving peer needs. */
+static void tcp_spray_window(const tunnel *t, int base, int *low, int *high) {
+    unsigned width = tcp_spray_width_for(t);
+    int ahead = (int)width;
+    int behind = tcp_peer_unpredictable(t) ? (int)width / 8 : (int)width;
+    *low = base - behind;
+    *high = base + ahead;
 }
 /* Open our own NAT towards the ports a destination-dependent peer may use, then
  * listen: the peer's SYN arrives from its real mapping, which is inside the
@@ -2902,15 +2952,14 @@ static int tcp_peer_kind(const tunnel *t) {
 static void tcp_punch_spray(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
-    uint16_t base = t->remote_ports[family];
-    if (!base)
-        base = (uint16_t)op_addr_port(&t->peer_addr);
+    uint16_t base = tcp_spray_base(t, family);
     if (!base || !t->peer_addr.len)
         return;
-    int width = (int)tcp_spray_width();
-    for (int step = -width; step <= width; ++step) {
-        int port = (int)base + step;
-        if (!step || port < 1 || port > 65535)
+    int low = 0, high = 0;
+    tcp_spray_window(t, (int)base, &low, &high);
+    unsigned sent = 0;
+    for (int port = low; port <= high; ++port) {
+        if (port == (int)base || port < 1 || port > 65535)
             continue;
         op_addr target = t->peer_addr;
         op_addr_set_port(&target, (uint16_t)port);
@@ -2921,6 +2970,16 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
             continue;
         (void)op_connect(fd, &target.u.sa, target.len);
         op_close(fd); /* the SYN created the mapping and the filter entry */
+        ++sent;
+    }
+    /* Name the window: "sprayed 8192 ports" alone cannot tell an aimed window from
+     * one that started thousands of ports behind the peer. */
+    if (sent) {
+        char note[176];
+        snprintf(note, sizeof(note), "TCP punch sprayed %u ports in %d-%d around the peer's %s %u",
+                 sent, low, high, tcp_peer_unpredictable(t) ? "last observed port" : "advertised port",
+                 (unsigned)base);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
 }
 
@@ -3241,10 +3300,10 @@ static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     /* One line per round, not per rotation: a refused rotation turns over in tens
      * of milliseconds and would otherwise bury the log. */
     if (t->tcp_attempts <= 1) {
-        char where[OP_ADDR_TEXT + 8], note[176];
+        char where[OP_ADDR_TEXT + 8], note[192];
         op_addr_text(&target, where, sizeof(where));
-        snprintf(note, sizeof(note), "TCP punch array: %u source ports dial %s (next %u)", opened,
-                 where, tcp_array_next_width(width, ceiling));
+        snprintf(note, sizeof(note), "TCP punch array: %u source ports dial %s:%u (next %u)", opened,
+                 where, (unsigned)target_port, tcp_array_next_width(width, ceiling));
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     return 0;
@@ -3469,8 +3528,11 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         const char *strategy = peer_kind == TCP_PEER_STABLE
                                    ? "single reported port (peer mapping stable)"
                                : peer_kind == TCP_PEER_MOVES
-                                   ? (t->peer_tcp_step ? "predicted window from the peer's measured step"
-                                                       : "random port windows (peer mapping moves per destination)")
+                                   ? (t->peer_tcp_step
+                                          ? "predicted window from the peer's measured step"
+                                      : tcp_peer_unpredictable(t) && t->peer_tcp_last_port
+                                          ? "spraying ahead of the peer's last observed port"
+                                          : "random port windows (peer mapping moves per destination)")
                                    : "walk around the reported port (peer mapping unknown)";
         char note[160];
         snprintf(note, sizeof(note), "TCP punch strategy: %s", strategy);

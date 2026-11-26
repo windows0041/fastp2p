@@ -5,7 +5,14 @@
 
 /* These are mapping observations, never a claim about inbound filtering. */
 enum { FP_NAT_STABLE = 1, FP_NAT_DEPENDENT = 2, FP_NAT_UNKNOWN = 314 };
-enum { FP_TCP_MAP_NONE, FP_TCP_MAP_STABLE, FP_TCP_MAP_INCREMENT, FP_TCP_MAP_DECREMENT };
+/* FP_TCP_MAP_UNPREDICTABLE says "my mapping moves per destination and no constant
+ * step was measurable, but the port I just measured is where my allocator is now".
+ * It exists so the other side can aim its spray at a recent observation instead of
+ * at the port the gateway measured minutes ago, which on a monotone allocator is
+ * thousands of ports behind. Older peers reject the value and keep treating the
+ * peer as unknown, which is exactly what they do today. */
+enum { FP_TCP_MAP_NONE, FP_TCP_MAP_STABLE, FP_TCP_MAP_INCREMENT, FP_TCP_MAP_DECREMENT,
+       FP_TCP_MAP_UNPREDICTABLE };
 #define FP_TCP_STUN_MAX 4
 #define FP_TCP_PROBE_MAX (2 + FP_TCP_STUN_MAX)
 typedef struct {
