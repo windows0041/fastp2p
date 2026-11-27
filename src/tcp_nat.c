@@ -556,7 +556,10 @@ static void slot_launch(fp_tcp_family *k, int family, uint64_t now) {
         s->request_length = 1;
     }
     s->sent = s->received = 0;
-    s->deadline = now + (k->source.len ? PUNCH_SAMPLE_TIMEOUT : 2 * SECOND);
+    uint64_t timeout = k->slot_timeout_ns
+                           ? k->slot_timeout_ns
+                           : (k->source.len ? PUNCH_SAMPLE_TIMEOUT : 2 * SECOND);
+    s->deadline = now + timeout;
     s->target = (int)index;
     s->phase = 2;
     ++k->inflight;
@@ -648,6 +651,19 @@ static void cycle_finish(fp_tcp_family *k, uint64_t now) {
     }
     k->inflight = 0;
     k->phase = 0;
+    k->measured_at = now;
+    k->addr_only_dep = 0;
+    for (unsigned i = 0; i < k->collected && !k->addr_only_dep; ++i) {
+        for (unsigned j = i + 1; j < k->collected; ++j) {
+            if (op_addr_equal(&k->target_used[i], &k->target_used[j]) &&
+                op_addr_port(&k->target_used[i]) != op_addr_port(&k->target_used[j])) {
+                if (op_addr_equal(&k->mapped[i], &k->mapped[j]) &&
+                    op_addr_port(&k->mapped[i]) == op_addr_port(&k->mapped[j]))
+                    k->addr_only_dep = 1;
+                break;
+            }
+        }
+    }
     k->next_cycle = now + (k->type == FP_NAT_UNKNOWN ? 30 : 3600) * SECOND;
 }
 int fp_tcp_echo_response(const uint8_t *p, size_t n, op_addr *out) {
@@ -711,9 +727,11 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
         k->next_target = k->inflight = k->peak_inflight = k->held_count = 0;
         memset(k->cycle_ok, 0, sizeof(k->cycle_ok));
     }
-    while (k->next_target < k->target_count && slot_free(k)) slot_launch(k, family, now);
+    while (k->next_target < k->target_count && slot_free(k) && (!k->sequential || k->inflight == 0))
+        slot_launch(k, family, now);
     for (unsigned i = 0; i < FP_TCP_PROBE_SLOTS; ++i) slot_step(k, family, &k->slots[i], now);
-    while (k->next_target < k->target_count && slot_free(k)) slot_launch(k, family, now);
+    while (k->next_target < k->target_count && slot_free(k) && (!k->sequential || k->inflight == 0))
+        slot_launch(k, family, now);
     if (k->next_target == k->target_count && k->inflight == 0) {
         cycle_finish(k, now);
         return 1;
@@ -833,6 +851,142 @@ int fp_tcp_alloc_delta(const op_addr *mapped, unsigned count, int *step, uint16_
     return 1;
 }
 
+#define FP_EPHEMERAL_MIN 1024u
+#define FP_EPHEMERAL_MAX 65535u
+#define FP_DRIFT_MAX_JUMP 64
+#define FP_DRIFT_ERR_MIN 8
+#define FP_DRIFT_ERR_MAX 64
+#define FP_PBA_MAX_SPAN 2048u
+
+static void sort_i32(int32_t *a, size_t n) {
+    for (size_t i = 1; i < n; ++i) {
+        int32_t key = a[i];
+        size_t j = i;
+        while (j > 0 && a[j - 1] > key) {
+            a[j] = a[j - 1];
+            --j;
+        }
+        a[j] = key;
+    }
+}
+
+static int16_t clamp_i16(int32_t v, int16_t lo, int16_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return (int16_t)v;
+}
+
+int fp_tcp_classify_ports(const uint16_t *ports, size_t n, uint8_t addr_only_dep,
+                          fp_tcp_port_model *out) {
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->kind = FP_TCP_MAP_UNPREDICTABLE;
+    out->addr_only_dep = addr_only_dep;
+    if (!ports || n < 3 || n > FP_TCP_PROBE_MAX)
+        return -1;
+    out->base_port = ports[n - 1];
+    int32_t diffs[FP_TCP_PROBE_MAX];
+    size_t dn = n - 1;
+    uint16_t min_p = ports[0], max_p = ports[0];
+    int all_equal = 1, all_zero = 1;
+    size_t pos_cnt = 0, neg_cnt = 0, zero_cnt = 0;
+    int32_t max_abs_diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (ports[i] < min_p) min_p = ports[i];
+        if (ports[i] > max_p) max_p = ports[i];
+        if (i < dn) {
+            int32_t d = (int32_t)ports[i + 1] - (int32_t)ports[i];
+            diffs[i] = d;
+            if (d != diffs[0]) all_equal = 0;
+            if (d != 0) all_zero = 0;
+            if (d > 0) ++pos_cnt;
+            else if (d < 0) ++neg_cnt;
+            else ++zero_cnt;
+            int32_t ad = d < 0 ? -d : d;
+            if (ad > max_abs_diff) max_abs_diff = ad;
+        }
+    }
+    /* Stage 1: strict stable or strict arithmetic progression */
+    if (all_zero) {
+        out->kind = FP_TCP_MAP_STABLE;
+        out->confidence = 95;
+        return 0;
+    }
+    if (all_equal && diffs[0] >= -4096 && diffs[0] <= 4096) {
+        out->kind = diffs[0] > 0 ? FP_TCP_MAP_INCREMENT : FP_TCP_MAP_DECREMENT;
+        out->step = diffs[0];
+        out->confidence = 90;
+        return 0;
+    }
+    /* Stage 2: monotone drift with background noise */
+    int mono_inc = (neg_cnt == 0 && pos_cnt >= 2 && zero_cnt <= 1);
+    int mono_dec = (pos_cnt == 0 && neg_cnt >= 2 && zero_cnt <= 1);
+    if ((mono_inc || mono_dec) && max_abs_diff <= FP_DRIFT_MAX_JUMP) {
+        int32_t sorted[FP_TCP_PROBE_MAX];
+        memcpy(sorted, diffs, dn * sizeof(int32_t));
+        sort_i32(sorted, dn);
+        int32_t med = sorted[dn / 2];
+        int16_t err = clamp_i16(max_abs_diff * 2 + 4, FP_DRIFT_ERR_MIN, FP_DRIFT_ERR_MAX);
+        out->kind = FP_TCP_MAP_DRIFT;
+        out->step = med != 0 ? med : (mono_inc ? 1 : -1);
+        if (mono_inc) {
+            out->err_lo = 0;
+            out->err_hi = err;
+        } else {
+            out->err_lo = (int16_t)(-err);
+            out->err_hi = 0;
+        }
+        out->confidence = n >= 5 ? 85 : 70;
+        return 0;
+    }
+    /* Stage 3: CGNAT aligned PBA block */
+    uint32_t span = (uint32_t)max_p - (uint32_t)min_p;
+    static const uint16_t pba_sizes[] = {64, 128, 256, 512, 1024, 2048, 4096};
+    if (n >= 4) {
+        for (size_t k = 0; k < sizeof(pba_sizes) / sizeof(pba_sizes[0]); ++k) {
+            uint16_t B = pba_sizes[k];
+            uint32_t lo = (uint32_t)min_p & ~((uint32_t)B - 1u);
+            uint32_t hi = lo + (uint32_t)B - 1u;
+            if (lo >= FP_EPHEMERAL_MIN && hi <= FP_EPHEMERAL_MAX && max_p <= hi) {
+                if (n < 6 && span < (uint32_t)(B / 3u) &&
+                    k + 1 < sizeof(pba_sizes) / sizeof(pba_sizes[0])) {
+                    uint16_t B2 = pba_sizes[k + 1];
+                    uint32_t lo2 = (uint32_t)min_p & ~((uint32_t)B2 - 1u);
+                    uint32_t hi2 = lo2 + (uint32_t)B2 - 1u;
+                    if (lo2 >= FP_EPHEMERAL_MIN && hi2 <= FP_EPHEMERAL_MAX) {
+                        B = B2;
+                        lo = lo2;
+                        hi = hi2;
+                    }
+                }
+                out->kind = FP_TCP_MAP_PBA_BLOCK;
+                out->block_lo = (uint16_t)lo;
+                out->block_hi = (uint16_t)hi;
+                out->block_size = B;
+                out->confidence = n >= 6 ? 85 : 70;
+                return 0;
+            }
+        }
+        if (span <= FP_PBA_MAX_SPAN) {
+            uint32_t pad = span / 2u < 64u ? 64u : span / 2u;
+            uint32_t lo = min_p > FP_EPHEMERAL_MIN + pad ? (uint32_t)min_p - pad : FP_EPHEMERAL_MIN;
+            uint32_t hi = (uint32_t)max_p + pad <= FP_EPHEMERAL_MAX ? (uint32_t)max_p + pad
+                                                                     : FP_EPHEMERAL_MAX;
+            out->kind = FP_TCP_MAP_PBA_BLOCK;
+            out->block_lo = (uint16_t)lo;
+            out->block_hi = (uint16_t)hi;
+            out->block_size = (uint16_t)(hi - lo + 1u);
+            out->confidence = 60;
+            return 0;
+        }
+    }
+    /* Stage 4: unpredictable */
+    out->kind = FP_TCP_MAP_UNPREDICTABLE;
+    out->confidence = 20;
+    return 0;
+}
+
 fp_tcp_family *fp_tcp_alloc_sample_start(const op_addr *gateway, unsigned count) {
     if (!gateway || !gateway->len || count < 3 || count > FP_TCP_PROBE_MAX)
         return NULL;
@@ -847,6 +1001,8 @@ fp_tcp_family *fp_tcp_alloc_sample_start(const op_addr *gateway, unsigned count)
         sample->slots[i].target = -1;
     }
     sample->fresh_source = 1;
+    sample->sequential = 1;
+    sample->slot_timeout_ns = PUNCH_SAMPLE_TIMEOUT;
     for (unsigned i = 0; i < count; ++i) {
         sample->targets[i].address = *gateway;
         op_addr_set_port(&sample->targets[i].address, 27180);
@@ -861,9 +1017,90 @@ int fp_tcp_alloc_sample_step(fp_tcp_family *sample, uint64_t now, int *step, uin
     *step = 0;
     if (!family_step(sample, OP_FAM_V4, now))
         return 0;
-    if (sample->samples >= 3)
+    if (sample->samples >= 3) {
         fp_tcp_alloc_delta(sample->mapped, sample->samples, step, port);
+        if (*step == 0) {
+            uint16_t ports[FP_TCP_PROBE_MAX];
+            unsigned n = sample->samples < FP_TCP_PROBE_MAX ? sample->samples : FP_TCP_PROBE_MAX;
+            for (unsigned i = 0; i < n; ++i)
+                ports[i] = op_addr_port(&sample->mapped[i]);
+            fp_tcp_port_model model;
+            if (!fp_tcp_classify_ports(ports, n, sample->addr_only_dep, &model) &&
+                model.kind == FP_TCP_MAP_DRIFT && model.step != 0) {
+                *step = model.step;
+                *port = model.base_port;
+            }
+        }
+    }
     return 1;
+}
+
+fp_tcp_family *fp_tcp_blade_sample_start(const fp_tcp_family *catalog, unsigned max_blades) {
+    if (!catalog || catalog->samples < 2 || max_blades < 2)
+        return NULL;
+    if (max_blades > FP_TCP_PROBE_MAX)
+        max_blades = FP_TCP_PROBE_MAX;
+    op_addr seen_ips[FP_TCP_PROBE_MAX];
+    fp_tcp_probe_target targets[FP_TCP_PROBE_MAX];
+    unsigned count = 0;
+    unsigned limit = catalog->samples < FP_TCP_PROBE_MAX ? catalog->samples : FP_TCP_PROBE_MAX;
+    for (unsigned i = 0; i < limit && count < max_blades; ++i) {
+        const op_addr *mapped = &catalog->mapped[i];
+        const op_addr *dest = &catalog->target_used[i];
+        if (!mapped->len || !op_addr_port(mapped) || !dest->len || !op_addr_port(dest))
+            continue;
+        int duplicate = 0;
+        for (unsigned j = 0; j < count; ++j) {
+            if (op_addr_equal(mapped, &seen_ips[j])) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        int is_stun = op_addr_port(dest) != 27180 && op_addr_port(dest) != 27181;
+        for (unsigned t = 0; t < catalog->target_count && t < FP_TCP_PROBE_MAX; ++t) {
+            if (op_addr_equal(dest, &catalog->targets[t].address) &&
+                op_addr_port(dest) == op_addr_port(&catalog->targets[t].address)) {
+                is_stun = catalog->targets[t].stun;
+                break;
+            }
+        }
+        seen_ips[count] = *mapped;
+        targets[count].address = *dest;
+        targets[count].stun = is_stun;
+        ++count;
+    }
+    if (count < 2)
+        return NULL;
+    fp_tcp_family *sample = calloc(1, sizeof(*sample));
+    if (!sample)
+        return NULL;
+    sample->fd = -1;
+    for (unsigned i = 0; i < FP_TCP_PROBE_MAX; ++i)
+        sample->held[i] = -1;
+    for (unsigned i = 0; i < FP_TCP_PROBE_SLOTS; ++i) {
+        sample->slots[i].fd = -1;
+        sample->slots[i].target = -1;
+    }
+    sample->fresh_source = 1;
+    sample->slot_timeout_ns = 900 * UINT64_C(1000000);
+    memcpy(sample->targets, targets, count * sizeof(targets[0]));
+    sample->target_count = count;
+    sample->prepared = sample->phase = 1;
+    return sample;
+}
+
+int fp_tcp_blade_sample_step(fp_tcp_family *sample, uint64_t now) {
+    if (!sample)
+        return 1;
+    return family_step(sample, OP_FAM_V4, now);
+}
+
+void fp_tcp_blade_sample_finish(fp_tcp_family *sample, uint64_t now) {
+    if (!sample || !sample->phase)
+        return;
+    cycle_finish(sample, now);
 }
 
 void fp_tcp_punch_sample_free(fp_tcp_family *sample) {

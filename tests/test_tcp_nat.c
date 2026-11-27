@@ -552,12 +552,92 @@ static void step_stats_record_a_slow_step(void) {
     fp_tcp_nat_close(&state);
 }
 
+static void waterfall_port_model_and_blade_sampling(void) {
+    fp_tcp_port_model model;
+    uint16_t stable[] = {42000, 42000, 42000, 42000};
+    assert(fp_tcp_classify_ports(stable, 4, 1, &model) == 0);
+    assert(model.kind == FP_TCP_MAP_STABLE && model.addr_only_dep == 1);
+
+    uint16_t inc[] = {40000, 40008, 40016, 40024};
+    assert(fp_tcp_classify_ports(inc, 4, 0, &model) == 0);
+    assert(model.kind == FP_TCP_MAP_INCREMENT && model.step == 8);
+
+    uint16_t drift[] = {50000, 50001, 50002, 50004, 50005};
+    assert(fp_tcp_classify_ports(drift, 5, 0, &model) == 0);
+    assert(model.kind == FP_TCP_MAP_DRIFT && model.step == 1 && model.err_hi >= 8);
+
+    uint16_t pba[] = {40200, 40310, 40255, 40412};
+    assert(fp_tcp_classify_ports(pba, 4, 0, &model) == 0);
+    assert(model.kind == FP_TCP_MAP_PBA_BLOCK && model.block_lo <= 40200 && model.block_hi >= 40412);
+
+    uint16_t randp[] = {12000, 48000, 19000, 59000};
+    assert(fp_tcp_classify_ports(randp, 4, 0, &model) == 0);
+    assert(model.kind == FP_TCP_MAP_UNPREDICTABLE);
+
+    /* Blade sampler picks one witness target per distinct mapped public IP in catalog. */
+    op_socket listeners[3] = {-1, -1, -1}, peers[3] = {-1, -1, -1};
+    fp_tcp_family catalog = {0};
+    catalog.samples = 4;
+    catalog.target_count = 4;
+    for (unsigned i = 0; i < 3; ++i) {
+        listeners[i] = op_socket_open(AF_INET, SOCK_STREAM, 0);
+        assert(listeners[i] >= 0);
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)}};
+        assert(!op_bind(listeners[i], (struct sockaddr *)&addr, sizeof(addr)) && !op_listen(listeners[i], 4));
+        op_socklen length = sizeof(addr);
+        assert(!op_getsockname(listeners[i], (struct sockaddr *)&addr, &length));
+        memset(&catalog.targets[i].address, 0, sizeof(op_addr));
+        memcpy(&catalog.targets[i].address.u.storage, &addr, sizeof(addr));
+        catalog.targets[i].address.len = (op_socklen)sizeof(addr);
+        catalog.targets[i].stun = 0;
+        catalog.target_used[i] = catalog.targets[i].address;
+    }
+    catalog.targets[3] = catalog.targets[2];
+    catalog.target_used[3] = catalog.target_used[2];
+    assert(!op_addr_from_text(&catalog.mapped[0], "223.104.85.223", 43843));
+    assert(!op_addr_from_text(&catalog.mapped[1], "223.104.85.222", 37800));
+    assert(!op_addr_from_text(&catalog.mapped[2], "223.104.85.223", 43844)); /* dup IP skipped */
+    assert(!op_addr_from_text(&catalog.mapped[3], "223.104.72.211", 41067));
+    fp_tcp_family *sample = fp_tcp_blade_sample_start(&catalog, 8);
+    assert(sample && sample->target_count == 3);
+    uint64_t deadline = op_monotonic_ns() + UINT64_C(3000000000);
+    int done = 0;
+    unsigned served[3] = {0};
+    while (op_monotonic_ns() < deadline && !done) {
+        done = fp_tcp_blade_sample_step(sample, op_monotonic_ns());
+        for (unsigned i = 0; i < 3; ++i) {
+            if (peers[i] < 0) {
+                struct sockaddr_in peer;
+                op_socklen length = sizeof(peer);
+                peers[i] = op_accept(listeners[i], (struct sockaddr *)&peer, &length);
+            }
+            if (peers[i] >= 0 && !served[i]) {
+                char marker;
+                if (op_recv(peers[i], &marker, 1, MSG_DONTWAIT) == 1) {
+                    const char *reply = i == 0 ? "223.104.85.223:45148\n"
+                                               : i == 1 ? "223.104.85.222:39033\n"
+                                                        : "223.104.72.211:41994\n";
+                    assert(op_send(peers[i], reply, strlen(reply), MSG_NOSIGNAL) == (op_ssize)strlen(reply));
+                    served[i] = 1;
+                }
+            }
+        }
+        op_sleep_ms(2);
+    }
+    assert(done == 1 && sample->samples == 3 && sample->destinations == 1);
+    fp_tcp_punch_sample_free(sample);
+    for (unsigned i = 0; i < 3; ++i) {
+        if (peers[i] >= 0) op_close(peers[i]);
+        if (listeners[i] >= 0) op_close(listeners[i]);
+    }
+}
+
 int main(void) {
     assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
     six_probes_at_once();samples_keep_target_order();one_failed_target_still_completes_the_batch();
     resolver_worker_starts_by_default();resolver_answers_keep_order_and_drop_duplicates();
     slow_resolver_does_not_block_the_step_loop();reconfigure_does_not_wait_for_a_lookup();
-    step_stats_record_a_slow_step();
+    step_stats_record_a_slow_step();waterfall_port_model_and_blade_sampling();
     witness_resolution_is_spread_over_the_step_loop();unresolvable_witness_is_skipped();
     witness_walk_keeps_order_and_drops_duplicates();
     puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling, "

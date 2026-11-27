@@ -2362,6 +2362,62 @@ static void pool_aggregates_every_measured_address(void) {
     assert(tcp_pool_addrs_from(seen, nseen, t.pool_addrs, TCP_POOL_ADDR_MAX) == 1);
 }
 
+/* Ephemeral wraparound, per-blade velocity tracking, tcpPoolBlades wire round-trip,
+ * and pigeonhole intersection against a 256-port dialer block on a 6-blade moving CGNAT. */
+static void blade_velocity_and_pigeonhole_comb(void) {
+    assert(tcp_port_wrap_add(65530, 10) == 1028);
+    assert(tcp_port_wrap_add(1026, -5) == 65533);
+    assert(tcp_port_fwd_diff(1028, 65530) == 10);
+
+    static const char *ips[] = {"223.104.85.223", "223.104.85.222", "223.104.85.219",
+                                "223.104.85.217", "223.104.72.211", "223.104.72.209"};
+    static const uint16_t t0_ports[] = {43843, 37800, 50459, 41695, 41067, 42334};
+    static const uint16_t t1_ports[] = {45043, 39000, 51459, 42895, 41967, 43234}; /* +200, +200, +167... over 6s */
+    tcp_blade tracker[TCP_POOL_ADDR_MAX] = {0};
+    unsigned tracker_count = 0;
+    op_addr sample0[6], sample1[6];
+    for (unsigned i = 0; i < 6; ++i) {
+        assert(!op_addr_from_text(&sample0[i], ips[i], t0_ports[i]));
+        assert(!op_addr_from_text(&sample1[i], ips[i], t1_ports[i]));
+    }
+    uint64_t t0 = UINT64_C(10000000000);
+    uint64_t t1 = t0 + 6 * NS;
+    tcp_blades_update(tracker, &tracker_count, sample0, 6, t0);
+    tcp_blades_update(tracker, &tracker_count, sample1, 6, t1);
+    assert(tracker_count == 6);
+    assert(tracker[0].port == 45043 && tracker[0].rate == 200);
+    assert(tracker[5].port == 43234 && tracker[5].rate == 150);
+
+    fastp2p_client client = {0};
+    client.tcp_nat.family[OP_FAM_V4].type = FP_NAT_DEPENDENT;
+    tunnel pub = {0};
+    pub.transport = FASTP2P_TRANSPORT_TCP;
+    pub.pool_blade_count = tcp_blades_export(tracker, tracker_count, t1, pub.pool_blades, TCP_POOL_ADDR_MAX);
+    assert(pub.pool_blade_count == 6);
+    json_object *wire = json_object_new_object();
+    assert(wire);
+    publish_tcp_pool(&client, &pub, wire);
+    tunnel sub = {0};
+    learn_tcp_mapping(&sub, wire);
+    json_object_put(wire);
+    assert(sub.peer_blade_count == 6 && sub.peer_pool_addr_count == 6);
+    assert(sub.peer_blades[0].port == 45043 && sub.peer_blades[0].rate == 200);
+
+    /* Simulate 1.8s elapsed plus +250-port background traffic jitter when dialer opens a 256-port wall. */
+    double elapsed_s = 1.8;
+    uint16_t target_blade_base = tcp_port_wrap_add(sub.peer_blades[2].port,
+                                                   (int32_t)(sub.peer_blades[2].rate * elapsed_s) + 250);
+    unsigned hits = 0;
+    for (unsigned s = 0; s < 64; ++s) {
+        uint16_t p = tcp_blade_comb_port(&sub.peer_blades[2], elapsed_s, 0, s, 64);
+        uint16_t diff = tcp_port_fwd_diff(p, target_blade_base);
+        if (diff < 256u)
+            ++hits;
+    }
+    printf("blade comb pigeonhole hits on 256-port dialer block: %u\n", hits);
+    assert(hits >= 7);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2606,5 +2662,6 @@ int main(void) {
     mapping_pool_is_derived_from_the_samples();
     pool_aggregates_every_measured_address();
     pool_spray_covers_the_published_product();
+    blade_velocity_and_pigeonhole_comb();
     return 0;
 }

@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 #include <curl/curl.h>
 #include <openssl/rand.h>
 
@@ -138,14 +141,22 @@
  * created was gone again by the time the opener's spray (or its retransmit) reached
  * it. A little over a second lets one retransmit fire and keeps the mappings alive
  * across the opener's spray pass. */
-#define TCP_ARRAY_HOLD_MS 1200u
+#define TCP_ARRAY_HOLD_MS 2500u
 /* Opener spray sockets held in SYN_SENT per pass, how long a pass is held, and how
- * many passes a round may make. Each pass sprays the whole published pool again and
- * holds a different slice of it, so the peer's rotating array keeps meeting fresh
- * live tuples on our side for most of the parked window. */
+ * many passes a round may make. Each pass sprays across all blades and holds
+ * a strided comb in SYN_SENT, with paced injection and FD-budget clamping. */
 #define TCP_SPRAY_HOLD_MAX 384u
-#define TCP_SPRAY_HOLD_MS 3000u
-#define TCP_SPRAY_PASSES 8u
+#define TCP_SPRAY_HOLD_MS 2500u
+#define TCP_SPRAY_PASSES 10u
+#define TCP_SPRAY_FD_RESERVE 256u
+#define TCP_SPRAY_BURST_TICK 48u
+#define TCP_BLADE_STRIDE 32u
+#define TCP_BLADE_RATE_MAX 2000u
+#define TCP_BLADE_RATE_MIN_DT_MS 500u
+#define TCP_BLADE_RATE_MAX_DT_S 150u
+#define TCP_BLADE_SAMPLE_DEADLINE_MS 1200u
+#define TCP_BLADE_DIALER_START 256u
+#define TCP_BLADE_OPENER_DEFER_MS 150u
 /* Descriptors the whole client may hold for source-port arrays at once. */
 #define TCP_ARRAY_CLIENT_LIMIT 512u
 /* Pool publishing for a peer whose mapping moves. A carrier NAT hands a mapping out of
@@ -397,6 +408,16 @@ typedef struct {
     uint64_t measured_at, next_at;
 } nat_filter;
 typedef struct {
+    op_addr addr;
+    uint16_t port;
+    uint16_t rate;
+    uint64_t at;
+} tcp_blade;
+typedef struct {
+    op_socket fd;
+    uint64_t born_ns;
+} tcp_spray_slot;
+typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
     uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port, udp_reverse_port6;
@@ -416,7 +437,7 @@ typedef struct {
     uint64_t tcp_attempt_deadline, tcp_retry_at;
     fp_tcp_family *tcp_sample;
     /* 1 while tcp_sample measures allocations rather than destinations. */
-    int tcp_sample_alloc;
+    int tcp_sample_alloc, tcp_sample_blades;
     unsigned tcp_mapping, peer_tcp_mapping;
     /* Signed port step of our own / the peer's allocator; 0 when no constant
      * step was observed (random allocation), which is the NAT4 case we cannot
@@ -431,6 +452,8 @@ typedef struct {
     unsigned pool_addr_count;
     uint16_t pool_lo[TCP_POOL_SPAN_MAX], pool_hi[TCP_POOL_SPAN_MAX];
     unsigned pool_span_count;
+    tcp_blade pool_blades[TCP_POOL_ADDR_MAX];
+    unsigned pool_blade_count;
     /* The pool a peer with a moving mapping published: the addresses it was seen at and
      * the port intervals those observations cluster into. Empty means it published none
      * (an older build, or a mapping stable enough not to need one). */
@@ -438,6 +461,9 @@ typedef struct {
     unsigned peer_pool_addr_count;
     uint16_t peer_pool_lo[TCP_POOL_SPAN_MAX], peer_pool_hi[TCP_POOL_SPAN_MAX];
     unsigned peer_pool_span_count;
+    tcp_blade peer_blades[TCP_POOL_ADDR_MAX];
+    unsigned peer_blade_count;
+    uint64_t peer_blades_at;
     /* How far the dial has walked around the port the peer reported. A carrier NAT
      * allocates the mapping for a new destination from a pool, so the port that is
      * reachable from this side is near, but not equal to, the reported one. */
@@ -459,9 +485,12 @@ typedef struct {
      * left nothing to answer the peer's simultaneous-open SYN-ACK: the kernel sent an
      * RST and the peer saw its array socket connect and die in the same instant.
      * Charged against the same client-wide budget as the dialler array. */
-    op_socket *spray;
-    unsigned spray_count, spray_slots, spray_passes;
+    tcp_spray_slot *spray;
+    unsigned spray_count, spray_cap, spray_slots, spray_passes;
     uint64_t spray_until;
+    int spray_deferred;
+    unsigned spray_plan_total, spray_plan_cursor, spray_plan_per_blade, spray_plan_pass;
+    double spray_plan_elapsed_s;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
@@ -677,6 +706,8 @@ struct fastp2p_client {
      * the login goes out with a complete picture rather than half-way. */
     int nat_settled;
     fp_tcp_nat tcp_nat;
+    tcp_blade tcp_blades[TCP_POOL_ADDR_MAX];
+    unsigned tcp_blade_count;
     int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
     int nat_override; /* FASTP2P_NAT_TYPE diagnostic switch, 0 = use the probe */
     /* Curl writes the detailed TLS reason here; the short error code alone
@@ -2598,18 +2629,27 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
             op_addr_equal(&source, &bind_address) &&
             !op_addr_from_text(&mapped, t->mapped_ip, t->mapped_port)) {
             if (c->tcp_nat.family[adopt].type == FP_NAT_DEPENDENT) {
-                /* This endpoint's mapping moves per destination, so its peer has to
-                 * guess the port. Measure how its allocator steps so that the guess
-                 * becomes a computed window instead of a blind one. */
-                t->tcp_sample = fp_tcp_alloc_sample_start(&c->gateway_addr[adopt], TCP_ALLOC_SAMPLES);
-                t->tcp_sample_alloc = t->tcp_sample != NULL;
+                /* Prefer fresh parallel per-blade sampling when the NAT uses multiple
+                 * public IP blades; fall back to sequential allocation-step sampling
+                 * for single-IP NAT4. */
+                t->tcp_sample = fp_tcp_blade_sample_start(&c->tcp_nat.family[adopt], TCP_POOL_ADDR_MAX);
+                if (t->tcp_sample) {
+                    t->tcp_sample_blades = 1;
+                    t->tcp_sample_alloc = 0;
+                } else {
+                    t->tcp_sample = fp_tcp_alloc_sample_start(&c->gateway_addr[adopt], TCP_ALLOC_SAMPLES);
+                    t->tcp_sample_alloc = t->tcp_sample != NULL;
+                    t->tcp_sample_blades = 0;
+                }
             } else {
                 t->tcp_sample = fp_tcp_punch_sample_start(&c->tcp_nat.family[adopt], &source, &mapped);
+                t->tcp_sample_alloc = 0;
+                t->tcp_sample_blades = 0;
             }
         }
         if (t->tcp_sample) {
             t->state = T_TCP_SAMPLE;
-            t->deadline = now + 2 * NS;
+            t->deadline = now + (t->tcp_sample_blades ? TCP_BLADE_SAMPLE_DEADLINE_MS * MS : 2 * NS);
             return 0;
         }
     }
@@ -2724,6 +2764,119 @@ static unsigned tcp_pool_spans(const fp_tcp_family *f, uint16_t *lo, uint16_t *h
 /* Keep the product inside the spray budget by halving every interval around its centre.
  * A pool above the budget is narrowed, never published as it stands: the spray is a burst
  * on a shared link and the peer has no way to refuse it. */
+static unsigned tcp_spray_budget_cap(void) {
+    unsigned cap = TCP_SPRAY_HOLD_MAX;
+#if !defined(_WIN32)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        if (rl.rlim_cur <= TCP_SPRAY_FD_RESERVE + 64u) {
+            cap = 64u;
+        } else {
+            unsigned avail = (unsigned)(rl.rlim_cur - TCP_SPRAY_FD_RESERVE);
+            if (avail < cap)
+                cap = avail;
+        }
+    }
+#else
+    if (cap > 256u)
+        cap = 256u;
+#endif
+    return cap;
+}
+static uint16_t tcp_port_wrap_add(uint16_t base, int32_t delta) {
+    if (base >= 1024u) {
+        const int32_t span = 64512;
+        int32_t off = ((int32_t)base - 1024 + delta) % span;
+        if (off < 0)
+            off += span;
+        return (uint16_t)(1024 + off);
+    }
+    int32_t port = (int32_t)base + delta;
+    if (port < 1)
+        port = 1;
+    if (port > 65535)
+        port = 65535;
+    return (uint16_t)port;
+}
+static uint16_t tcp_port_fwd_diff(uint16_t newer, uint16_t older) {
+    if (newer >= 1024u && older >= 1024u)
+        return newer >= older ? (uint16_t)(newer - older)
+                              : (uint16_t)(64512u - (unsigned)(older - newer));
+    return newer >= older ? (uint16_t)(newer - older) : 0u;
+}
+static void tcp_blades_update(tcp_blade *blades, unsigned *count, const op_addr *mapped,
+                              unsigned n, uint64_t now) {
+    if (!blades || !count || !mapped)
+        return;
+    for (unsigned i = 0; i < n; ++i) {
+        uint16_t port = op_addr_port(&mapped[i]);
+        if (!mapped[i].len || !port)
+            continue;
+        unsigned k;
+        for (k = 0; k < *count; ++k)
+            if (op_addr_equal(&blades[k].addr, &mapped[i]))
+                break;
+        if (k == *count) {
+            if (*count >= TCP_POOL_ADDR_MAX)
+                continue;
+            memset(&blades[k], 0, sizeof(blades[k]));
+            blades[k].addr = mapped[i];
+            op_addr_set_port(&blades[k].addr, port);
+            blades[k].port = port;
+            blades[k].rate = 0;
+            blades[k].at = now;
+            ++(*count);
+            continue;
+        }
+        if (now > blades[k].at) {
+            uint64_t dt_ns = now - blades[k].at;
+            if (dt_ns >= (uint64_t)TCP_BLADE_RATE_MIN_DT_MS * MS &&
+                dt_ns <= (uint64_t)TCP_BLADE_RATE_MAX_DT_S * NS) {
+                uint16_t diff = tcp_port_fwd_diff(port, blades[k].port);
+                if (diff <= 32256u) {
+                    unsigned r = (unsigned)((double)diff * (double)NS / (double)dt_ns + 0.5);
+                    if (r > TCP_BLADE_RATE_MAX)
+                        r = TCP_BLADE_RATE_MAX;
+                    if (r == 0)
+                        blades[k].rate = 0;
+                    else
+                        blades[k].rate = blades[k].rate
+                                             ? (uint16_t)((blades[k].rate + r) / 2u)
+                                             : (uint16_t)r;
+                }
+            }
+        }
+        op_addr_set_port(&blades[k].addr, port);
+        blades[k].port = port;
+        blades[k].at = now;
+    }
+}
+static unsigned tcp_blades_export(const tcp_blade *src, unsigned src_count, uint64_t now,
+                                  tcp_blade *out, unsigned max) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < src_count && n < max; ++i) {
+        if (!src[i].addr.len || !src[i].port)
+            continue;
+        out[n] = src[i];
+        if (now > src[i].at && src[i].rate > 0 && now - src[i].at <= 60 * NS) {
+            int32_t drift = (int32_t)((double)src[i].rate * (double)(now - src[i].at) / (double)NS + 0.5);
+            out[n].port = tcp_port_wrap_add(src[i].port, drift);
+            op_addr_set_port(&out[n].addr, out[n].port);
+        }
+        out[n].at = now;
+        ++n;
+    }
+    return n;
+}
+static uint16_t tcp_blade_comb_port(const tcp_blade *blade, double elapsed_s, unsigned pass,
+                                    unsigned slot_idx, unsigned slots_per_blade) {
+    (void)slots_per_blade;
+    const uint32_t stride = TCP_BLADE_STRIDE;
+    int32_t lead = blade->rate > 0 ? -512 : -128;
+    int32_t drift = blade->rate > 0 ? (int32_t)((double)blade->rate * elapsed_s + 0.5) : 0;
+    int32_t phase = (int32_t)((pass * 7u) % stride);
+    return tcp_port_wrap_add(blade->port, drift + lead + phase + (int32_t)(slot_idx * stride));
+}
 static void tcp_pool_narrow(unsigned addr_count, uint16_t *lo, uint16_t *hi, unsigned spans) {    if (!addr_count || !spans)
         return;
     for (;;) {
@@ -2784,6 +2937,23 @@ static void publish_tcp_pool(const fastp2p_client *c, const tunnel *t, json_obje
         return;
     if (t->tcp_mapping == FP_TCP_MAP_STABLE || c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_STABLE)
         return; /* one reachable address: the port is the only question, already published */
+    if (t->pool_blade_count) {
+        json_object *blades = json_object_new_array();
+        if (blades) {
+            for (unsigned i = 0; i < t->pool_blade_count && i < TCP_POOL_ADDR_MAX; ++i) {
+                char text[OP_ADDR_TEXT];
+                if (!t->pool_blades[i].port || op_addr_text(&t->pool_blades[i].addr, text, sizeof(text)))
+                    continue;
+                json_object_array_add(blades, json_object_new_string(text));
+                json_object_array_add(blades, json_object_new_int((int32_t)t->pool_blades[i].port));
+                json_object_array_add(blades, json_object_new_int((int32_t)t->pool_blades[i].rate));
+            }
+            if (json_object_array_length(blades) >= 3)
+                json_object_object_add(j, "tcpPoolBlades", blades);
+            else
+                json_object_put(blades);
+        }
+    }
     if (!t->pool_addr_count || !t->pool_span_count)
         return;
     json_object *list = json_object_new_array();
@@ -2847,38 +3017,99 @@ static void learn_tcp_mapping(tunnel *t, json_object *j) {
     }
     /* The pool the peer measured for itself. Anything malformed is dropped whole rather
      * than half-read: a spray aimed at half a pool is a burst nobody benefits from. */
+    t->peer_blade_count = 0;
+    t->peer_blades_at = 0;
+    json_object *blades = json_object_object_get(j, "tcpPoolBlades");
+    if (blades && json_object_is_type(blades, json_type_array)) {
+        unsigned nb = (unsigned)json_object_array_length(blades);
+        if (nb >= 3 && (nb % 3u) == 0 && nb / 3u <= TCP_POOL_ADDR_MAX) {
+            unsigned count = nb / 3u;
+            tcp_blade parsed[TCP_POOL_ADDR_MAX] = {0};
+            int valid = 1;
+            for (unsigned i = 0; i < count; ++i) {
+                json_object *ip_j = json_object_array_get_idx(blades, i * 3u);
+                json_object *port_j = json_object_array_get_idx(blades, i * 3u + 1u);
+                json_object *rate_j = json_object_array_get_idx(blades, i * 3u + 2u);
+                const char *text = ip_j ? json_object_get_string(ip_j) : NULL;
+                int64_t bport = port_j ? json_object_get_int64(port_j) : 0;
+                int64_t brate = rate_j ? json_object_get_int64(rate_j) : -1;
+                if (!text || bport < 1 || bport > 65535 || brate < 0 ||
+                    brate > (int64_t)TCP_BLADE_RATE_MAX ||
+                    op_addr_from_text(&parsed[i].addr, text, (uint16_t)bport)) {
+                    valid = 0;
+                    break;
+                }
+                parsed[i].port = (uint16_t)bport;
+                parsed[i].rate = (uint16_t)brate;
+            }
+            if (valid) {
+                uint64_t now = mono();
+                for (unsigned i = 0; i < count; ++i) {
+                    parsed[i].at = now;
+                    t->peer_blades[i] = parsed[i];
+                }
+                t->peer_blade_count = count;
+                t->peer_blades_at = now;
+            }
+        }
+    }
     t->peer_pool_addr_count = 0;
     t->peer_pool_span_count = 0;
     json_object *addrs = json_object_object_get(j, "tcpPoolAddr");
     json_object *spans = json_object_object_get(j, "tcpPoolSpan");
     if (!addrs || !spans || !json_object_is_type(addrs, json_type_array) ||
-        !json_object_is_type(spans, json_type_array))
+        !json_object_is_type(spans, json_type_array)) {
+        for (unsigned i = 0; i < t->peer_blade_count; ++i)
+            t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[i].addr;
         return;
+    }
     unsigned na = (unsigned)json_object_array_length(addrs);
     unsigned ns = (unsigned)json_object_array_length(spans);
-    if (!na || na > TCP_POOL_ADDR_MAX || ns < 2 || (ns & 1u) || ns / 2 > TCP_POOL_SPAN_MAX)
+    if (!na || na > TCP_POOL_ADDR_MAX || ns < 2 || (ns & 1u) || ns / 2 > TCP_POOL_SPAN_MAX) {
+        for (unsigned i = 0; i < t->peer_blade_count; ++i)
+            t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[i].addr;
         return;
+    }
     for (unsigned i = 0; i < na; ++i) {
         const char *text = json_object_get_string(json_object_array_get_idx(addrs, i));
-        if (!text || op_addr_from_text(&t->peer_pool_addrs[i], text, 1))
+        if (!text || op_addr_from_text(&t->peer_pool_addrs[i], text, 1)) {
+            for (unsigned b = 0; b < t->peer_blade_count; ++b)
+                t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[b].addr;
             return;
+        }
     }
     unsigned total = 0;
     for (unsigned s = 0; s < ns / 2; ++s) {
         int64_t lo = json_object_get_int64(json_object_array_get_idx(spans, s * 2));
         int64_t hi = json_object_get_int64(json_object_array_get_idx(spans, s * 2 + 1));
-        if (lo < 1 || hi > 65535 || lo > hi)
+        if (lo < 1 || hi > 65535 || lo > hi) {
+            for (unsigned b = 0; b < t->peer_blade_count; ++b)
+                t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[b].addr;
             return;
+        }
         t->peer_pool_lo[s] = (uint16_t)lo;
         t->peer_pool_hi[s] = (uint16_t)hi;
         total += (unsigned)(hi - lo + 1);
     }
     /* A peer that publishes more than the budget gets the budget, not the pool: the spray
      * is a burst on a shared link and cannot be refused once started. */
-    if (total * na > TCP_POOL_TARGET_MAX)
+    if (total * na > TCP_POOL_TARGET_MAX) {
+        for (unsigned b = 0; b < t->peer_blade_count; ++b)
+            t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[b].addr;
         return;
+    }
     t->peer_pool_addr_count = na;
     t->peer_pool_span_count = ns / 2;
+    for (unsigned b = 0; b < t->peer_blade_count && t->peer_pool_addr_count < TCP_POOL_ADDR_MAX; ++b) {
+        int seen = 0;
+        for (unsigned i = 0; i < t->peer_pool_addr_count; ++i)
+            if (same_host(&t->peer_pool_addrs[i], &t->peer_blades[b].addr)) {
+                seen = 1;
+                break;
+            }
+        if (!seen)
+            t->peer_pool_addrs[t->peer_pool_addr_count++] = t->peer_blades[b].addr;
+    }
 }
 /* Offer the peer a window to spray when our own mapping shifts per destination.
  * Both roles publish it: the responder used to be the only one, which left a
@@ -3327,8 +3558,8 @@ static int tcp_pool_target(const tunnel *t, unsigned index, op_addr *out) {
 static void tcp_spray_close(fastp2p_client *c, tunnel *t) {
     if (t->spray) {
         for (unsigned i = 0; i < t->spray_count; ++i)
-            if (t->spray[i] >= 0)
-                op_close(t->spray[i]);
+            if (t->spray[i].fd >= 0)
+                op_close(t->spray[i].fd);
         free(t->spray);
         t->spray = NULL;
     }
@@ -3337,37 +3568,105 @@ static void tcp_spray_close(fastp2p_client *c, tunnel *t) {
         t->spray_slots = 0;
     }
     t->spray_count = 0;
+    t->spray_cap = 0;
     t->spray_until = 0;
+    t->spray_plan_total = 0;
+    t->spray_plan_cursor = 0;
+    t->spray_plan_per_blade = 0;
+    t->spray_plan_pass = 0;
 }
 /* Keep a spray socket in SYN_SENT when the budget allows, otherwise close it: the SYN
  * has left either way, but only a kept socket can complete a simultaneous open. */
-static void tcp_spray_keep(fastp2p_client *c, tunnel *t, op_socket fd) {
-    if (!t->spray && c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT)
-        t->spray = calloc(TCP_SPRAY_HOLD_MAX, sizeof(*t->spray));
-    if (!t->spray || t->spray_count >= TCP_SPRAY_HOLD_MAX ||
+static void tcp_spray_keep(fastp2p_client *c, tunnel *t, op_socket fd, uint64_t now) {
+    unsigned cap = tcp_spray_budget_cap();
+    if (!t->spray && cap && c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT) {
+        t->spray = calloc(cap, sizeof(*t->spray));
+        if (t->spray)
+            t->spray_cap = cap;
+    }
+    if (!t->spray || t->spray_count >= t->spray_cap ||
         c->tcp_array_used >= TCP_ARRAY_CLIENT_LIMIT) {
         op_close(fd);
         return;
     }
-    t->spray[t->spray_count++] = fd;
+    t->spray[t->spray_count].fd = fd;
+    t->spray[t->spray_count].born_ns = now;
+    ++t->spray_count;
     ++t->spray_slots;
     ++c->tcp_array_used;
+}
+static void tcp_spray_inject_batch(fastp2p_client *c, tunnel *t, uint64_t now) {
+    if (!t->peer_blade_count || t->spray_plan_cursor >= t->spray_plan_total)
+        return;
+    int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    unsigned cap = t->spray_cap ? t->spray_cap : tcp_spray_budget_cap();
+    unsigned injected = 0;
+    while (injected < TCP_SPRAY_BURST_TICK && t->spray_plan_cursor < t->spray_plan_total &&
+           t->spray_count < cap && c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT) {
+        unsigned idx = t->spray_plan_cursor++;
+        unsigned b = idx % t->peer_blade_count;
+        unsigned s = idx / t->peer_blade_count;
+        uint16_t port = tcp_blade_comb_port(&t->peer_blades[b], t->spray_plan_elapsed_s,
+                                            t->spray_plan_pass, s, t->spray_plan_per_blade);
+        op_addr target = t->peer_blades[b].addr;
+        op_addr_set_port(&target, port);
+        op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+        if (fd < 0) {
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS)
+                break;
+            continue;
+        }
+        if (op_connect(fd, &target.u.sa, target.len) && errno != EINPROGRESS) {
+            op_close(fd);
+            continue;
+        }
+        tcp_spray_keep(c, t, fd, now);
+        ++injected;
+    }
 }
 static void tcp_punch_spray(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
     tcp_spray_close(c, t);
     unsigned pass = t->spray_passes++;
-    t->spray_until = mono() + TCP_SPRAY_HOLD_MS * MS;
+    uint64_t now = mono();
+    t->spray_until = now + TCP_SPRAY_HOLD_MS * MS;
+    if (t->peer_blade_count > 0) {
+        unsigned avail = c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT
+                             ? TCP_ARRAY_CLIENT_LIMIT - c->tcp_array_used
+                             : 0;
+        unsigned cap = tcp_spray_budget_cap();
+        unsigned budget = avail < cap ? avail : cap;
+        unsigned per_blade = budget / t->peer_blade_count;
+        if (per_blade < 1u)
+            per_blade = 1u;
+        double elapsed_s = (t->peer_blades_at && now > t->peer_blades_at)
+                               ? (double)(now - t->peer_blades_at) / (double)NS
+                               : 0.0;
+        t->spray_plan_per_blade = per_blade;
+        t->spray_plan_total = per_blade * t->peer_blade_count;
+        t->spray_plan_cursor = 0;
+        t->spray_plan_pass = pass;
+        t->spray_plan_elapsed_s = elapsed_s;
+        tcp_spray_inject_batch(c, t, now);
+        char note[224];
+        snprintf(note, sizeof(note),
+                 "TCP punch blade comb spray: planning %u held SYNs across %u blades (%u/blade, stride %u, elapsed %.2fs, pass %u)",
+                 t->spray_plan_total, t->peer_blade_count, per_blade, TCP_BLADE_STRIDE, elapsed_s,
+                 pass + 1);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        return;
+    }
     /* A peer that published its pool is reachable at any of (addresses x intervals); the
      * product covers exactly the space it told us about, which is a few thousand SYNs
      * instead of a lottery against the whole port range. */
     unsigned pool = tcp_pool_target_count(t);
     if (pool) {
         unsigned sent = 0;
+        unsigned cap = tcp_spray_budget_cap();
         /* Every pass sprays the whole pool but holds a different slice of it, so the
          * kept sockets walk across all addresses over the passes. */
-        unsigned start = (pass * TCP_SPRAY_HOLD_MAX) % pool;
+        unsigned start = (pass * cap) % pool;
         for (unsigned i = 0; i < pool; ++i) {
             op_addr target;
             if (tcp_pool_target(t, (start + i) % pool, &target))
@@ -3379,7 +3678,7 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
                 op_close(fd);
                 continue;
             }
-            tcp_spray_keep(c, t, fd);
+            tcp_spray_keep(c, t, fd, now);
             ++sent;
         }
         if (sent) {
@@ -3413,7 +3712,7 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
         }
         /* The SYN created the mapping and the filter entry; a kept socket can also
          * complete a simultaneous open with the peer's own SYN. */
-        tcp_spray_keep(c, t, fd);
+        tcp_spray_keep(c, t, fd, now);
         ++sent;
     }
     /* Name the window: "sprayed 8192 ports" alone cannot tell an aimed window from
@@ -3866,8 +4165,8 @@ static int tcp_array_tick(fastp2p_client *c, int index, uint64_t now) {
 static void tcp_spray_adopt(fastp2p_client *c, int index, op_socket fd, uint64_t now) {
     tunnel *t = &c->tunnels[index];
     for (unsigned i = 0; i < t->spray_count; ++i)
-        if (t->spray[i] == fd)
-            t->spray[i] = -1;
+        if (t->spray[i].fd == fd)
+            t->spray[i].fd = -1;
     tcp_spray_close(c, t);
     tcp_array_close(c, t);
     if (t->fd >= 0 && t->fd != fd)
@@ -3895,9 +4194,9 @@ static int tcp_spray_tick(fastp2p_client *c, int index, uint64_t now) {
     for (unsigned base = 0; t->spray && base < t->spray_count; base += 64) {
         unsigned n = 0;
         for (unsigned i = base; i < t->spray_count && i < base + 64; ++i) {
-            if (t->spray[i] < 0)
+            if (t->spray[i].fd < 0)
                 continue;
-            fds[n].fd = t->spray[i];
+            fds[n].fd = t->spray[i].fd;
             fds[n].events = POLLOUT;
             fds[n].revents = 0;
             slots[n++] = i;
@@ -3907,7 +4206,7 @@ static int tcp_spray_tick(fastp2p_client *c, int index, uint64_t now) {
         for (unsigned k = 0; k < n; ++k) {
             if (!fds[k].revents)
                 continue;
-            op_socket fd = t->spray[slots[k]];
+            op_socket fd = t->spray[slots[k]].fd;
             int ready = connect_ready(fd);
             if (ready > 0) {
                 tcp_spray_adopt(c, index, fd, now);
@@ -3915,16 +4214,36 @@ static int tcp_spray_tick(fastp2p_client *c, int index, uint64_t now) {
             }
             if (ready < 0) {
                 op_close(fd);
-                t->spray[slots[k]] = -1;
+                t->spray[slots[k]].fd = -1;
             }
         }
     }
+    for (unsigned i = 0; t->spray && i < t->spray_count;) {
+        int dead = t->spray[i].fd < 0;
+        int expired = !dead && t->spray[i].born_ns && now > t->spray[i].born_ns &&
+                      now - t->spray[i].born_ns >= (uint64_t)TCP_SPRAY_HOLD_MS * MS;
+        if (dead || expired) {
+            if (t->spray[i].fd >= 0)
+                op_close(t->spray[i].fd);
+            t->spray[i] = t->spray[--t->spray_count];
+            if (t->spray_slots)
+                --t->spray_slots;
+            if (c->tcp_array_used)
+                --c->tcp_array_used;
+            continue;
+        }
+        ++i;
+    }
+    if (t->spray_plan_cursor < t->spray_plan_total)
+        tcp_spray_inject_batch(c, t, now);
+    if (t->spray_plan_cursor < t->spray_plan_total || (t->spray_count && now < t->spray_until))
+        return 0;
     if (now < t->spray_until)
         return 0;
     tcp_spray_close(c, t);
-    /* A pool spray is bounded by TCP_POOL_TARGET_MAX; a window spray can be thousands
-     * of SYNs, so it gets one repeat at most. */
-    unsigned passes = tcp_pool_target_count(t) ? TCP_SPRAY_PASSES : 2u;
+    /* A pool or blade comb spray stays bounded by TCP_SPRAY_HOLD_MAX; a blind window
+     * spray can be thousands of SYNs, so it gets two passes at most. */
+    unsigned passes = (t->peer_blade_count || tcp_pool_target_count(t)) ? TCP_SPRAY_PASSES : 2u;
     if (t->spray_passes < passes && now + TCP_SPRAY_HOLD_MS * MS < t->deadline)
         tcp_punch_spray(c, index);
     return 0;
@@ -4041,6 +4360,10 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
         if (t->listen_fd >= 0) {
             op_close(t->listen_fd);
             t->listen_fd = -1;
+        }
+        if (t->pool_blade_count > 0 && !t->array_width) {
+            unsigned ceiling = tcp_array_config_width();
+            t->array_width = ceiling < TCP_BLADE_DIALER_START ? ceiling : TCP_BLADE_DIALER_START;
         }
         if (tcp_array_open(c, t, now) == 0) {
             t->tcp_attempt_deadline = t->array_until;
@@ -4270,6 +4593,16 @@ static void report_peer_tcp_mapping(fastp2p_client *c, tunnel *t, json_object *j
                                   : nat == FP_NAT_DEPENDENT ? "destination-dependent" : "unknown",
              t->peer_tcp_mapping, t->peer_tcp_step, (unsigned)t->peer_tcp_last_port);
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    if (t->peer_blade_count > 0) {
+        char first[OP_ADDR_TEXT] = "";
+        op_addr_text(&t->peer_blades[0].addr, first, sizeof(first));
+        char bnote[192];
+        snprintf(bnote, sizeof(bnote),
+                 "peer TCP blade pool: %u blades (first %s:%u rate %u/s)",
+                 t->peer_blade_count, first, (unsigned)t->peer_blades[0].port,
+                 (unsigned)t->peer_blades[0].rate);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
+    }
 }
 static void start_underlay(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
@@ -4302,7 +4635,7 @@ static void start_underlay(fastp2p_client *c, int index) {
          * punch is running (tick_accept matches on it). */
         if (t->initiator)
             t->tcp_direct_port = 0;
-        if (t->initiator && direct_port) {
+        if (t->initiator && direct_port && !t->peer_tcp_dependent) {
             op_addr endpoint = t->peer_addr;
             op_addr_set_port(&endpoint, direct_port);
             int family = op_family_index(op_addr_family(&endpoint));
@@ -4349,6 +4682,13 @@ static void start_underlay(fastp2p_client *c, int index) {
                 ws_json(c, 7, 0, j);
                 json_object_put(j);
             }
+            return;
+        }
+        if (t->punch_role == TCP_PUNCH_OPENER && t->peer_blade_count > 0) {
+            t->spray_deferred = 1;
+            t->tcp_retry_at = now + TCP_BLADE_OPENER_DEFER_MS * MS;
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+                 "TCP punch strategy: paced strided held-SYN blade comb (deferring 150 ms for dialer burst)");
             return;
         }
         tcp_punch_dial(c, index, now);
@@ -6589,67 +6929,98 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     if (!t->state)
         return;
     if (t->state == T_TCP_SAMPLE && t->tcp_sample) {
-        int sampled = t->tcp_sample_alloc
-                          ? fp_tcp_alloc_sample_step(t->tcp_sample, now, &t->tcp_step, &t->tcp_last_port)
-                          : fp_tcp_punch_sample_step(t->tcp_sample, now, &t->tcp_mapping, &t->tcp_last_port);
+        int sampled = t->tcp_sample_blades
+                          ? fp_tcp_blade_sample_step(t->tcp_sample, now)
+                          : t->tcp_sample_alloc
+                                ? fp_tcp_alloc_sample_step(t->tcp_sample, now, &t->tcp_step, &t->tcp_last_port)
+                                : fp_tcp_punch_sample_step(t->tcp_sample, now, &t->tcp_mapping, &t->tcp_last_port);
         int expired = now >= t->deadline;
         if (!sampled && !expired)
             sampled = -1; /* still running: keep the probe state and fall through */
         if (sampled >= 0) {
-            if (t->tcp_sample_alloc) {
-                /* Name the outcome: "no movement" in the peer's log can mean a
-                 * random allocator or a sample that never completed, and the two
-                 * call for different next steps. */
-                unsigned samples = t->tcp_sample->samples;
-                char note[128];
-                if (t->tcp_step)
-                    snprintf(note, sizeof(note), "TCP allocation samples: %u, step %+d (prediction possible)",
-                             samples, t->tcp_step);
-                else
-                    snprintf(note, sizeof(note), "TCP allocation samples: %u, no constant step (%s)",
-                             samples, samples < 3 ? "too few answers" : "random allocation");
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
-                /* A measured step is also a movement: publish it so the peer dials
-                 * the computed port instead of a blind window. */
-                t->tcp_mapping = t->tcp_step > 0 ? FP_TCP_MAP_INCREMENT
-                                 : t->tcp_step < 0 ? FP_TCP_MAP_DECREMENT : FP_TCP_MAP_NONE;
-            }
-            /* The sample probed every distinct destination from one local port, which is
-             * exactly the view a pool needs: the addresses this host is published on, and
-             * the ports it was given towards each of them. Derive it here, before the
-             * probe state goes, and log the pairs so the pool can be checked against what
-             * the witnesses actually reported. */
-            /* The pool has to cover every address this measurement saw, not the one a single
-             * destination happened to return: a carrier publishes out of a small set (six
-             * addresses on the mobile network we measured), and the peer's mapping may land on
-             * any of them. The catalog is the measurement; the per-tunnel sample only adds its
-             * own view. */
-            op_addr seen[FP_TCP_PROBE_MAX];
-            unsigned nseen = tcp_pool_collect(&c->tcp_nat.family[t->family], t->tcp_sample, seen);
-            t->pool_addr_count = tcp_pool_addrs_from(seen, nseen, t->pool_addrs, TCP_POOL_ADDR_MAX);
-            t->pool_span_count = tcp_pool_spans_from(seen, nseen, t->pool_lo, t->pool_hi,
-                                                     TCP_POOL_SPAN_MAX);
-            tcp_pool_narrow(t->pool_addr_count, t->pool_lo, t->pool_hi, t->pool_span_count);
-            for (unsigned i = 0; i < t->tcp_sample->samples && i < FP_TCP_PROBE_MAX; ++i) {
-                char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[256];
-                op_addr_text(&t->tcp_sample->target_used[i], via, sizeof(via));
-                op_addr_text(&t->tcp_sample->mapped[i], seen, sizeof(seen));
-                snprintf(note, sizeof(note), "TCP mapping via %s:%u -> %s:%u", via,
-                         (unsigned)op_addr_port(&t->tcp_sample->target_used[i]), seen,
-                         (unsigned)op_addr_port(&t->tcp_sample->mapped[i]));
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
-            }
-            if (t->pool_addr_count && t->pool_span_count) {
-                char note[224];
-                snprintf(note, sizeof(note),
-                         "TCP pool: %u addresses x %u port spans (first %u-%u)",
-                         t->pool_addr_count, t->pool_span_count, (unsigned)t->pool_lo[0],
-                         (unsigned)t->pool_hi[0]);
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+            if (t->tcp_sample_blades) {
+                if (expired && !sampled)
+                    fp_tcp_blade_sample_finish(t->tcp_sample, now);
+                const fp_tcp_family *cat = &c->tcp_nat.family[t->family];
+                if (!c->tcp_blade_count && cat->collected)
+                    tcp_blades_update(c->tcp_blades, &c->tcp_blade_count, cat->mapped,
+                                      cat->samples, cat->measured_at ? cat->measured_at : now);
+                if (t->tcp_sample->samples)
+                    tcp_blades_update(c->tcp_blades, &c->tcp_blade_count, t->tcp_sample->mapped,
+                                      t->tcp_sample->samples, now);
+                t->pool_blade_count = tcp_blades_export(c->tcp_blades, c->tcp_blade_count, now,
+                                                        t->pool_blades, TCP_POOL_ADDR_MAX);
+                op_addr fresh_seen[TCP_POOL_ADDR_MAX];
+                for (unsigned i = 0; i < t->pool_blade_count; ++i)
+                    fresh_seen[i] = t->pool_blades[i].addr;
+                t->pool_addr_count = tcp_pool_addrs_from(fresh_seen, t->pool_blade_count,
+                                                         t->pool_addrs, TCP_POOL_ADDR_MAX);
+                t->pool_span_count = tcp_pool_spans_from(fresh_seen, t->pool_blade_count,
+                                                         t->pool_lo, t->pool_hi, TCP_POOL_SPAN_MAX);
+                tcp_pool_narrow(t->pool_addr_count, t->pool_lo, t->pool_hi, t->pool_span_count);
+                if (t->tcp_sample->samples)
+                    t->tcp_last_port = op_addr_port(&t->tcp_sample->mapped[t->tcp_sample->samples - 1]);
+                else if (t->pool_blade_count)
+                    t->tcp_last_port = t->pool_blades[0].port;
+                if (t->pool_blade_count) {
+                    char first[OP_ADDR_TEXT] = "";
+                    op_addr_text(&t->pool_blades[0].addr, first, sizeof(first));
+                    char bnote[224];
+                    snprintf(bnote, sizeof(bnote),
+                             "TCP blade pool: %u blades (%u fresh; first %s:%u rate %u/s)",
+                             t->pool_blade_count, t->tcp_sample->samples, first,
+                             (unsigned)t->pool_blades[0].port, (unsigned)t->pool_blades[0].rate);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
+                }
+            } else {
+                if (t->tcp_sample_alloc) {
+                    /* Name the outcome: "no movement" in the peer's log can mean a
+                     * random allocator or a sample that never completed, and the two
+                     * call for different next steps. */
+                    unsigned samples = t->tcp_sample->samples;
+                    char note[128];
+                    if (t->tcp_step)
+                        snprintf(note, sizeof(note), "TCP allocation samples: %u, step %+d (prediction possible)",
+                                 samples, t->tcp_step);
+                    else
+                        snprintf(note, sizeof(note), "TCP allocation samples: %u, no constant step (%s)",
+                                 samples, samples < 3 ? "too few answers" : "random allocation");
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                    /* A measured step is also a movement: publish it so the peer dials
+                     * the computed port instead of a blind window. */
+                    t->tcp_mapping = t->tcp_step > 0 ? FP_TCP_MAP_INCREMENT
+                                     : t->tcp_step < 0 ? FP_TCP_MAP_DECREMENT : FP_TCP_MAP_NONE;
+                }
+                /* The pool has to cover every address this measurement saw, not the one a single
+                 * destination happened to return. */
+                op_addr seen[FP_TCP_PROBE_MAX];
+                unsigned nseen = tcp_pool_collect(&c->tcp_nat.family[t->family], t->tcp_sample, seen);
+                t->pool_addr_count = tcp_pool_addrs_from(seen, nseen, t->pool_addrs, TCP_POOL_ADDR_MAX);
+                t->pool_span_count = tcp_pool_spans_from(seen, nseen, t->pool_lo, t->pool_hi,
+                                                         TCP_POOL_SPAN_MAX);
+                tcp_pool_narrow(t->pool_addr_count, t->pool_lo, t->pool_hi, t->pool_span_count);
+                for (unsigned i = 0; i < t->tcp_sample->samples && i < FP_TCP_PROBE_MAX; ++i) {
+                    char via[OP_ADDR_TEXT], seen_text[OP_ADDR_TEXT], note[256];
+                    op_addr_text(&t->tcp_sample->target_used[i], via, sizeof(via));
+                    op_addr_text(&t->tcp_sample->mapped[i], seen_text, sizeof(seen_text));
+                    snprintf(note, sizeof(note), "TCP mapping via %s:%u -> %s:%u", via,
+                             (unsigned)op_addr_port(&t->tcp_sample->target_used[i]), seen_text,
+                             (unsigned)op_addr_port(&t->tcp_sample->mapped[i]));
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
+                if (t->pool_addr_count && t->pool_span_count) {
+                    char note[224];
+                    snprintf(note, sizeof(note),
+                             "TCP pool: %u addresses x %u port spans (first %u-%u)",
+                             t->pool_addr_count, t->pool_span_count, (unsigned)t->pool_lo[0],
+                             (unsigned)t->pool_hi[0]);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
             }
             fp_tcp_punch_sample_free(t->tcp_sample);
             t->tcp_sample = NULL;
             t->tcp_sample_alloc = 0;
+            t->tcp_sample_blades = 0;
             probe_complete(c, ti);
             if (!t->state)
                 return;
@@ -6809,7 +7180,21 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             return;
     }
     if (t->state == T_TCP_CONNECT) {
-        if (t->state && t->tcp_v2 && t->fd < 0 && t->tcp_retry_at && now >= t->tcp_retry_at)
+        if (t->spray_deferred && t->tcp_retry_at && now >= t->tcp_retry_at) {
+            t->spray_deferred = 0;
+            t->tcp_retry_at = 0;
+            tcp_punch_spray(c, ti);
+            if (tcp_punch_listen(c, ti) == 0) {
+                t->deadline = now + 30 * NS;
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
+                     "TCP blade spray launched and parked listening");
+            } else {
+                close_tunnel(c, ti, "TCP punch listener failed");
+                return;
+            }
+        }
+        if (t->state && t->tcp_v2 && !t->spray_deferred && t->fd < 0 && t->tcp_retry_at &&
+            now >= t->tcp_retry_at)
             tcp_punch_dial(c, ti, now);
         if (!t->state) return;
         /* Completion first, deadline second: a connect that finishes as the window
@@ -9971,6 +10356,7 @@ int fastp2p_client_start(fastp2p_client *c) {
      * session is authenticated. */
     c->tcp_nat_reprepare = 3;
     c->tcp_nat_reprepare_at = 0;
+    c->tcp_blade_count = 0;
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
     c->tcp_handoff_at = 0;
@@ -10031,6 +10417,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
          * inside this loop and must not block. */
         int reason = c->tcp_nat_reprepare;
         c->tcp_nat_reprepare = 0;
+        c->tcp_blade_count = 0;
         fp_tcp_nat_close(&c->tcp_nat);
         fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
@@ -10096,6 +10483,9 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
                          (unsigned)op_addr_port(&f->mapped[i]));
                 emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
             }
+            if (family == OP_FAM_V4)
+                tcp_blades_update(c->tcp_blades, &c->tcp_blade_count, f->mapped, f->samples,
+                                  f->measured_at ? f->measured_at : now);
         }
         if (c->ws_connected)
             report_nat(c);
@@ -10164,6 +10554,16 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     tick_overlays(c, now);
     if (wait_ms > 10)
         wait_ms = 10;
+    if (wait_ms > 2) {
+        for (int i = 0; i < NT; ++i) {
+            const tunnel *t = &c->tunnels[i];
+            if (t->state == T_PUNCH ||
+                (t->state == T_TCP_CONNECT && (t->spray_until || t->spray_deferred || t->array_count))) {
+                wait_ms = 2;
+                break;
+            }
+        }
+    }
     if (wait_ms) {
         struct curl_waitfd extra[2] = {{0}};
         unsigned count = 0;
@@ -10201,6 +10601,7 @@ int fastp2p_client_stop(fastp2p_client *c) {
     c->mapped_listener = (fp_mapped_ports){0};
     c->port_mapping_wait_until = 0;
     fp_tcp_nat_close(&c->tcp_nat);
+    c->tcp_blade_count = 0;
     if (c->stun.fd >= 0)
         op_close(c->stun.fd);
     c->stun = (nat_stun){.fd = -1};

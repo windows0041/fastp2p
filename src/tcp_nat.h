@@ -12,7 +12,19 @@ enum { FP_NAT_STABLE = 1, FP_NAT_DEPENDENT = 2, FP_NAT_UNKNOWN = 314 };
  * thousands of ports behind. Older peers reject the value and keep treating the
  * peer as unknown, which is exactly what they do today. */
 enum { FP_TCP_MAP_NONE, FP_TCP_MAP_STABLE, FP_TCP_MAP_INCREMENT, FP_TCP_MAP_DECREMENT,
-       FP_TCP_MAP_UNPREDICTABLE };
+       FP_TCP_MAP_UNPREDICTABLE, FP_TCP_MAP_DRIFT, FP_TCP_MAP_PBA_BLOCK };
+typedef struct {
+    int kind;
+    uint8_t addr_only_dep;
+    uint8_t confidence;
+    uint16_t base_port;
+    int32_t step;
+    int16_t err_lo;
+    int16_t err_hi;
+    uint16_t block_lo;
+    uint16_t block_hi;
+    uint16_t block_size;
+} fp_tcp_port_model;
 #define FP_TCP_STUN_MAX 32
 #define FP_TCP_PROBE_MAX (2 + FP_TCP_STUN_MAX)
 typedef struct {
@@ -79,6 +91,10 @@ typedef struct {
     unsigned next_target, inflight, peak_inflight, held_count;
     op_addr cycle_mapped[FP_TCP_PROBE_MAX];
     unsigned char cycle_ok[FP_TCP_PROBE_MAX];
+    uint64_t measured_at;
+    uint64_t slot_timeout_ns;
+    int sequential;
+    uint8_t addr_only_dep;
 } fp_tcp_family;
 typedef struct {
     fp_stun_server servers[FP_TCP_STUN_MAX];
@@ -122,6 +138,15 @@ fp_tcp_family *fp_tcp_alloc_sample_start(const op_addr *gateway, unsigned count)
 int fp_tcp_alloc_sample_step(fp_tcp_family *sample, uint64_t now, int *step, uint16_t *port);
 /* -1 no usable sample, 0 no constant step, 1 constant step found. */
 int fp_tcp_alloc_delta(const op_addr *mapped, unsigned count, int *step, uint16_t *port);
+/* Four-stage waterfall classifier (stable, constant step, monotone drift, PBA block). */
+int fp_tcp_classify_ports(const uint16_t *ports, size_t n, uint8_t addr_only_dep,
+                          fp_tcp_port_model *out);
+/* Fresh parallel probe across each distinct mapped public IP (blade) seen in catalog. */
+fp_tcp_family *fp_tcp_blade_sample_start(const fp_tcp_family *catalog, unsigned max_blades);
+/* 0 while running, 1 on completion. */
+int fp_tcp_blade_sample_step(fp_tcp_family *sample, uint64_t now);
+/* Harvest any partial responses and close all held sockets on an early deadline. */
+void fp_tcp_blade_sample_finish(fp_tcp_family *sample, uint64_t now);
 /* -1 malformed, 0 incomplete, 1 complete. Exposed only to internal tests. */
 int fp_tcp_stun_response(const uint8_t *data, size_t length, const uint8_t transaction[12],
                          struct sockaddr_in *mapped);
