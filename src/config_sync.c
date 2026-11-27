@@ -154,6 +154,15 @@ static void log_save_failure(fastp2p_client *client, const char *path, int error
     fprintf(stderr, "%s\n", note);
     fp_client_event(client, note);
 }
+/* The verdict of the document check, right where it happens: "the push arrived and nothing
+ * followed" has to be readable as either a refusal or a bug in the path. */
+static void log_validate(fastp2p_client *client, uint64_t revision, int result) {
+    char note[128];
+    snprintf(note, sizeof(note), "config: validate result=%d revision=%llu", result,
+             (unsigned long long)revision);
+    fprintf(stderr, "%s\n", note);
+    fp_client_event(client, note);
+}
 static json_object *section(json_object *root, const char *key) {    json_object *value = NULL;
     if (root)
         json_object_object_get_ex(root, key, &value);
@@ -206,7 +215,29 @@ static int update_metadata(json_object *root, uint64_t revision, const char *has
 }
 static int receive(const char *fields,uint64_t revision,void *user) {
     fastp2p_client *client = user;
-    if(!sync_state.path[0]||!sync_state.active||sync_state.reload||strlen(fields)>65536)return FASTP2P_ESTATE;
+    {
+        /* Entry record. A push that arrives and then leaves no line is indistinguishable from
+         * one that never arrived, which is how a node kept the old settings while the console
+         * showed the new list. bytes is the payload as sent, before any merge. */
+        char note[192];
+        snprintf(note, sizeof(note), "config: push received revision=%llu bytes=%llu",
+                 (unsigned long long)revision, (unsigned long long)strlen(fields));
+        fprintf(stderr, "%s\n", note);
+        fp_client_event(client, note);
+    }
+    if(!sync_state.path[0]||!sync_state.active||sync_state.reload||strlen(fields)>65536) {
+        /* The branch that used to be silent: a client whose sync never bound - no profile path,
+         * or a profile that could not be read - drops every push right here. */
+        char note[192];
+        snprintf(note, sizeof(note), "config: push dropped (%s) revision=%llu",
+                 !sync_state.path[0] ? "no profile path" :
+                 !sync_state.active ? "no running profile" :
+                 sync_state.reload ? "reload pending" : "payload too large",
+                 (unsigned long long)revision);
+        fprintf(stderr, "%s\n", note);
+        fp_client_event(client, note);
+        return FASTP2P_ESTATE;
+    }
     json_object *patch=json_tokener_parse(fields),*current=fastp2p_profile_read(sync_state.path),*next=NULL;
     fp_rule_update *rules = NULL;
     int result=FASTP2P_EINVAL;char hash[65];digest(fields,hash);
@@ -229,6 +260,12 @@ static int receive(const char *fields,uint64_t revision,void *user) {
     if(json_object_equal(next,sync_state.active)) {
         /* Nothing to do, but say so: a push that produces no line at all was indistinguishable
          * from a platform where the profile cannot be written. */
+        char note[192];
+        snprintf(note, sizeof(note),
+                 "config: push ignored (identical to running state) revision=%llu",
+                 (unsigned long long)revision);
+        fprintf(stderr, "%s\n", note);
+        fp_client_event(client, note);
         log_applied(client, revision, strlen(text), 1, next);
         result=0;
         goto done;
@@ -249,6 +286,7 @@ static int receive(const char *fields,uint64_t revision,void *user) {
         /* Validate the whole document before adopting any part of it: a field the parser
          * refuses must not leave the running client half-converted. */
         result = fp_config_validate_json(text);
+        log_validate(client, revision, result);
         if (result) {
             fprintf(stderr, "Gateway configuration validation failed (%d).\n", result);
             goto done;
@@ -303,6 +341,7 @@ reload:
     /* A new gateway endpoint, token, node identity, certificate or listener port still
      * needs a fresh instance, so those reload the whole client. */
     result=fp_config_validate_json(text);
+    log_validate(client, revision, result);
     if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if (update_metadata(next, revision, hash, 1)) {result=FASTP2P_ENOMEM;goto done;}
     if(save(sync_state.previous,current) || save(sync_state.path,next)) {
