@@ -5,6 +5,7 @@
 #include "install.h"
 #include "platform.h"
 #include <openssl/evp.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +135,25 @@ static void log_applied(fastp2p_client *client, uint64_t revision, size_t bytes,
              list_count(network, "UDPSTUNServers"), list_count(network, "TCPSTUNServers"));
     fp_client_event(client, note);
 }
+/* A profile that could not be written used to be silent here while the acknowledgement still
+ * said "applied": the gateway then stopped resending the revision and the node kept running the
+ * old settings - on Android, where the private directory is not always writable by the service,
+ * that is exactly what happened. The failure is named once (last path component only) and the
+ * caller turns it into a failed acknowledgement. */
+static void log_save_failure(fastp2p_client *client, const char *path, int error) {
+    const char *leaf = path ? path : "";
+    const char *slash = strrchr(leaf, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(leaf, '\\');
+    if (!slash || (backslash && backslash > slash))
+        slash = backslash;
+#endif
+    char note[192];
+    snprintf(note, sizeof(note), "config: save failed errno=%d path=%s", error,
+             slash ? slash + 1 : leaf);
+    fprintf(stderr, "%s\n", note);
+    fp_client_event(client, note);
+}
 static json_object *section(json_object *root, const char *key) {    json_object *value = NULL;
     if (root)
         json_object_object_get_ex(root, key, &value);
@@ -205,8 +225,14 @@ static int receive(const char *fields,uint64_t revision,void *user) {
        (!json_object_is_type(product,json_type_string)||strcmp(json_object_get_string(product),"fastp2p"))) {
         fputs("Gateway configuration product mismatch.\n",stderr);goto done;
     }
-    if(json_object_equal(next,sync_state.active)) {result=0;goto done;}
     const char *text = json_object_to_json_string_ext(next, JSON_C_TO_STRING_PLAIN);
+    if(json_object_equal(next,sync_state.active)) {
+        /* Nothing to do, but say so: a push that produces no line at all was indistinguishable
+         * from a platform where the profile cannot be written. */
+        log_applied(client, revision, strlen(text), 1, next);
+        result=0;
+        goto done;
+    }
     /* A push that only touches what the running client can adopt is applied in place:
      * the rules, the overlay section, the probe servers and the router-mapping switch.
      * The gate compares against the file just read, so an operator edit does not demote
@@ -244,23 +270,32 @@ static int receive(const char *fields,uint64_t revision,void *user) {
                 goto reload;
             }
         }
-        if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
-            fputs("Gateway configuration could not be saved; keeping the running one.\n", stderr);
-            result = FASTP2P_EIO;
-            goto done;
-        }
-        /* All fallible work is done. No step can run between save and commit. */
+        /* The running client has the pushed settings from here on: the probe servers, the
+         * mapping switch, the rules and the overlay section were all handed over above. The
+         * acknowledgement and the log say that before persistence is attempted, because a
+         * profile that cannot be written is a durability problem, not an application one - and
+         * reporting it as "applied" is what let the gateway stop resending a revision the node
+         * was only running in memory. */
         if (rules) {
             fp_client_rules_commit(rules);
             rules = NULL;
         }
+        log_applied(client, revision, strlen(text), 1, next);
+        if (update_metadata(next, revision, hash, 0) || save(sync_state.path, next)) {
+            int error = errno;
+            log_save_failure(client, sync_state.path, error);
+            /* Nothing is remembered as applied: the next push of this revision re-applies it,
+             * which is idempotent, and the gateway is told the truth. */
+            result = FASTP2P_EIO;
+            goto done;
+        }
+        /* All fallible work is done. No step can run between save and commit. */
         json_object_put(sync_state.active);
         sync_state.active = json_object_get(next);
         sync_state.revision = revision;
         snprintf(sync_state.digest, sizeof(sync_state.digest), "%s", hash);
         fprintf(stderr, "Gateway configuration applied in place (rules=%d, sdwan=%d).\n",
                 rules_changed, sdwan_changed);
-        log_applied(client, revision, strlen(text), 1, next);
         result = FASTP2P_OK;
         goto done;
     }
@@ -270,7 +305,12 @@ reload:
     result=fp_config_validate_json(text);
     if(result) {fprintf(stderr,"Gateway configuration validation failed (%d).\n",result);goto done;}
     if (update_metadata(next, revision, hash, 1)) {result=FASTP2P_ENOMEM;goto done;}
-    if(save(sync_state.previous,current) || save(sync_state.path,next)) {result=FASTP2P_EIO;goto done;}
+    if(save(sync_state.previous,current) || save(sync_state.path,next)) {
+        int error = errno;
+        log_save_failure(client, sync_state.path, error);
+        result=FASTP2P_EIO;
+        goto done;
+    }
     if(sync_state.rollback)json_object_put(sync_state.rollback);
     sync_state.rollback=json_object_get(current);sync_state.revision=revision;
     snprintf(sync_state.digest,sizeof(sync_state.digest),"%s",hash);

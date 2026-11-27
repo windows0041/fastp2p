@@ -2167,6 +2167,16 @@ static void pool_spray_covers_the_published_product(void) {
     assert(tcp_pool_target_count(&none) == 0);
     assert(tcp_pool_target(&none, 0, &beyond) == -1);
 }
+/* The acknowledgement must not claim success for a configuration that did not take effect.
+ * An "applied" ack stops the gateway from resending the revision, which is how a node ended up
+ * running settings nobody could see - the running client kept the old witnesses while the console
+ * showed the new list. */
+static void config_ack_says_failed_when_nothing_was_applied(void) {
+    assert(!strcmp(fp_config_ack_state(FASTP2P_OK), "applied"));
+    assert(!strcmp(fp_config_ack_state(1), "saved")); /* a reload was scheduled, not applied */
+    assert(!strcmp(fp_config_ack_state(FASTP2P_EIO), "failed"));
+    assert(!strcmp(fp_config_ack_state(FASTP2P_EINVAL), "failed"));
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2403,6 +2413,7 @@ int main(void) {
     dialer_array_leaves_undiallable_peers_alone();
     spray_aims_ahead_of_an_unpredictable_peer();
     address_axis_is_separate_from_the_port_axis();
+    config_ack_says_failed_when_nothing_was_applied();
     mapping_pool_is_derived_from_the_samples();
     pool_spray_covers_the_published_product();
     return 0;

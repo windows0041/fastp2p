@@ -5417,7 +5417,7 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         json_object *ack=json_object_new_object();
         json_object_object_add(ack,"revision",json_object_new_uint64(revision));
         json_object_object_add(ack,"error",json_object_new_int(result<0));
-        json_object_object_add(ack,"state",json_object_new_string(result<0?"failed":result?"saved":"applied"));
+        json_object_object_add(ack,"state",json_object_new_string(fp_config_ack_state(result)));
         {
             /* What goes back to the gateway is this acknowledgement and nothing else: it names
              * the revision and the outcome, so an oversized configuration cannot inflate the
