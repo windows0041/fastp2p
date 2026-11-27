@@ -2224,7 +2224,10 @@ int main(void) {
         assert(probes.tcp_nat.servers[1].port == 443);
         assert(fp_client_stun_config(&probes, NULL) == FASTP2P_OK);
         assert(probes.stun_count == 2);
-        assert(!strcmp(probes.stun_host[0], "stun.miwifi.com") && probes.stun_port[0] == 3478);
+        /* The UDP ladder's built-in witness is the project's own server too: it answers
+         * STUN and it answers a change-request from another address, so a deployment that
+         * has no witness list still gets a verdict. Everything else is pushed. */
+        assert(!strcmp(probes.stun_host[0], "stun.fastp2p.top") && probes.stun_port[0] == 3478);
         assert(!strcmp(probes.stun_host[1], "stun.fastp2p.top") && probes.stun_port[1] == 3478);
         /* An explicit empty array still opts out of leaving the host. */
         json_object *none = json_object_new_array();

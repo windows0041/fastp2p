@@ -148,6 +148,12 @@
 #define TCP_POOL_TARGET_MAX 4096
 #define TCP_POOL_GAP 256
 #define TCP_POOL_PAD 8
+/* How long a re-measurement of the TCP mapping waits after being requested. Resolving
+ * the witness names blocks the loop, so it is deferred to a moment when the control
+ * channel has just been served: a gateway that misses a heartbeat closes the session,
+ * and a closed session asks for another re-measurement - a loop that looks like the
+ * node being kicked every couple of seconds. */
+#define TCP_REPREPARE_DELAY_MS 5000u
 /* Who sprays and who keeps dialling. A cone mapping has one reachable port, so
  * that side opens the window; a destination-dependent mapping cannot be dialled,
  * so that side keeps dialling the cone's stable port for the whole window. */
@@ -611,6 +617,12 @@ struct fastp2p_client {
     /* 1 when a pushed configuration replaced the TCP mapping servers: their
      * destinations have to be resolved, which the step loop does outside the callback. */
     int tcp_nat_reprepare;
+    /* Resolving a witness list blocks (it is name resolution, not a socket operation), and
+     * blocking inside this single-threaded loop starves the control channel: a gateway that
+     * expects a heartbeat closes the connection, which is exactly what a reconnect loop
+     * looks like from outside. The re-measurement therefore waits for a quiet moment after
+     * the login every time it is requested. */
+    uint64_t tcp_nat_reprepare_at;
     uint64_t sdwan_drop_at;
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
@@ -1301,7 +1313,12 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
  * The UDP entry pairs a nearby server with the project's own: the filter verdict
  * needs an answer from a *different address*, so one unreachable probe would leave
  * the level unmeasured rather than merely slow. */
-#define FP_DEFAULT_STUN_SERVERS "stun.miwifi.com:3478"
+/* The project runs its own witness, and it is the only one a deployment can count on:
+ * it answers STUN over both transports, and it answers a change-request from another
+ * address, which is what the filter verdict needs. Everything else comes from the
+ * gateway: an operator lists the extra witnesses they trust and the console pushes them,
+ * so a deployment is never stuck with a public server that disappeared. */
+#define FP_DEFAULT_STUN_SERVERS "stun.fastp2p.top:3478"
 #define FP_DEFAULT_STUN_SERVERS_ALT "stun.fastp2p.top:3478"
 /* TCP filtering needs a callback probe server; the project's own host, dedicated
  * port. It answers a plain-text "mapped <ip> <port>" line, not STUN. */
@@ -1330,8 +1347,10 @@ static const char *const FP_DEFAULT_TCP_MAPPING_POOL[] = {
  * server list the parser refuses, in which case the running one is kept. */
 int fp_client_tcp_nat_reconfigure(fastp2p_client *c, json_object *servers) {
     int rv = fp_client_tcp_nat_config(c, servers);
-    if (!rv && c)
+    if (!rv && c) {
         c->tcp_nat_reprepare = 1;
+        c->tcp_nat_reprepare_at = mono() + TCP_REPREPARE_DELAY_MS * MS;
+    }
     return rv;
 }
 int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
@@ -8508,6 +8527,7 @@ static int nat_remeasure(fastp2p_client *c) {
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
     c->tcp_nat_reprepare = 2; /* the path changed, not the servers */
+    c->tcp_nat_reprepare_at = mono() + TCP_REPREPARE_DELAY_MS * MS;
     if (c->stun.fd >= 0) {
         /* The STUN probe may have borrowed the peer listener; a borrowed descriptor
          * is not ours to close. */
@@ -9445,7 +9465,12 @@ int fastp2p_client_start(fastp2p_client *c) {
                                                 c->udp_listener[OP_FAM_V4] >= 0 ? c->public_port : 0);
     if (c->port_mapping && c->udp_listener[OP_FAM_V4] >= 0)
         c->port_mapping_wait_until = mono() + 4 * NS;
-    fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
+    /* Sampling waits for the login: resolving and probing the witnesses blocks this
+     * single-threaded loop, and doing it while the control channel is still handshaking
+     * starves the heartbeat the gateway expects. The step loop starts the probe once the
+     * session is authenticated. */
+    c->tcp_nat_reprepare = 1;
+    c->tcp_nat_reprepare_at = 0;
     c->stopping = 0;
     c->reconnect_at = 0;
     c->nat_settled = 0;
@@ -9496,7 +9521,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     /* The path can change at any time (Wi-Fi to mobile is the common case), and every
      * measurement below describes the path it was taken on. */
     watch_network_path(c, now);
-    if (c->tcp_nat_reprepare) {
+    if (c->tcp_nat_reprepare && c->ws && c->login_ok && now >= c->tcp_nat_reprepare_at) {
         /* 1 = a pushed configuration replaced the servers, 2 = the path changed and every
          * measurement has to be retaken. Resolving destinations belongs here rather than
          * in the configuration callback, which runs inside this loop and must not block. */
