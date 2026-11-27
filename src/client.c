@@ -626,6 +626,9 @@ struct fastp2p_client {
     uint64_t sdwan_drop_at;
     fastp2p_state state;
     int running, stopping, in_callback, stepping, report_ok, login_ok, reconnect_attempt;
+    /* When this client started: a disconnect line carries it so a session the gateway closed
+     * can be placed on the same timeline as a stalled step. */
+    uint64_t started_mono;
     /* NAT classification is per family (DUALSTACK-SPEC). Index 0 holds
      * exactly the values the old single fields carried, so a v4-only run
      * reports and logs byte-identical numbers. */
@@ -7344,6 +7347,7 @@ static CURLcode curl_initialization;
 static void initialize_curl(void) {
     curl_initialization = curl_global_init(CURL_GLOBAL_DEFAULT);
 }
+static void emit_step_context(fastp2p_client *c);
 static void close_gateway(fastp2p_client *c) {
     if (c->ws) {
         curl_multi_remove_handle(c->multi, c->ws);
@@ -7370,10 +7374,29 @@ static void close_gateway(fastp2p_client *c) {
         unsigned shift = c->reconnect_attempt < 5 ? (unsigned)c->reconnect_attempt++ : 5;
         c->reconnect_at = mono() + ((uint64_t)1 << shift) * NS;
         set_state(c, FASTP2P_RECONNECTING, "gateway disconnected; retry scheduled");
+        emit_step_context(c);
     }
 }
-static void gateway_retry_next_family(fastp2p_client *c) {
-    if (++c->gateway_failures < 2)
+/* One line next to every disconnect: the tick timing and how long this process has been up.
+ * A step that blocks and a session the gateway closes are the same event seen from two
+ * sides, and this is the half only the client can put a number on. The peak is cleared here
+ * so one stall produces one line instead of one per reconnect. */
+static void emit_step_context(fastp2p_client *c) {
+    uint64_t last = 0, max = 0, now = mono();
+    unsigned slow = 0;
+    fp_tcp_nat_step_stats(&c->tcp_nat, &last, &max, &slow);
+    uint64_t uptime = c->started_mono && now > c->started_mono ? (now - c->started_mono) / NS : 0;
+    char note[224];
+    snprintf(note, sizeof(note),
+             "last step %llu ms, max %llu ms, targets=%u, resolver=%s, uptime=%llu s",
+             (unsigned long long)(last / (NS / 1000)), (unsigned long long)(max / (NS / 1000)),
+             c->tcp_nat.family[OP_FAM_V4].target_count,
+             fp_tcp_nat_resolver_running(&c->tcp_nat) ? "worker" : "inline",
+             (unsigned long long)uptime);
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    fp_tcp_nat_step_stats_reset(&c->tcp_nat);
+}
+static void gateway_retry_next_family(fastp2p_client *c) {    if (++c->gateway_failures < 2)
         return;
     c->gateway_failures = 0;
     if (c->gateway_dual)
@@ -9452,6 +9475,7 @@ int fastp2p_client_start(fastp2p_client *c) {
         }
     }
     c->running = 1;
+    c->started_mono = mono();
     if (c->auto_port_mapping && !c->validate_only)
         c->port_mapping = fp_port_mapping_start(c->listener[OP_FAM_V4] >= 0 ? c->public_port : 0,
                                                 c->udp_listener[OP_FAM_V4] >= 0 ? c->public_port : 0);
@@ -9524,8 +9548,32 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
              reason == 2 ? "path changed; re-measuring the TCP mapping"
                          : "TCP probe servers changed; re-measuring the TCP mapping");
+        {
+            /* Which way the names are resolved matters when reading a disconnect: with the
+             * worker a slow lookup costs the loop nothing, without it the walk blocks it. */
+            char note[176];
+            snprintf(note, sizeof(note), "TCP mapping probe: resolving %u witnesses (resolver=%s)",
+                     c->tcp_nat.server_count,
+                     fp_tcp_nat_resolver_running(&c->tcp_nat) ? "worker" : "inline fallback");
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+        }
     }
     int tcp_done = fp_tcp_nat_step(&c->tcp_nat, now);
+    {
+        /* One line per stall, not per tick: the peak is read and cleared here. */
+        uint64_t step_last = 0, step_max = 0;
+        unsigned step_slow = 0;
+        fp_tcp_nat_step_stats(&c->tcp_nat, &step_last, &step_max, &step_slow);
+        if (step_max > FP_TCP_STEP_SLOW_NS) {
+            char note[192];
+            snprintf(note, sizeof(note), "TCP mapping probe: step %llu ms (targets=%u, resolver=%s)",
+                     (unsigned long long)(step_max / (NS / 1000)),
+                     c->tcp_nat.family[OP_FAM_V4].target_count,
+                     fp_tcp_nat_resolver_running(&c->tcp_nat) ? "worker" : "inline");
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+            fp_tcp_nat_step_stats_reset(&c->tcp_nat);
+        }
+    }
     if (tcp_done) {
         /* One line per family that finished a fresh observation, so the log
          * reads the same as before for a v4-only client and gains a v6 line

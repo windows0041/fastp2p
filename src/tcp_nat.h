@@ -90,6 +90,11 @@ typedef struct {
     fp_tcp_resolver *resolver;
     fp_tcp_resolve_fn resolve;   /* NULL keeps the platform lookup */
     int inline_resolution;       /* tests only: exercise the fallback walk */
+    /* How long the step call took. A tick that blocks and a session the gateway closes are
+     * the same story told from two sides, and only the client can put a number on its half:
+     * the peak and the count of slow calls go into the log next to a disconnect. */
+    uint64_t step_last_ns, step_max_ns;
+    unsigned step_slow;
 } fp_tcp_nat;
 
 void fp_tcp_nat_init(fp_tcp_nat *state);
@@ -127,4 +132,11 @@ int fp_tcp_echo_response(const uint8_t *data, size_t length, op_addr *mapped);
 void fp_tcp_nat_set_resolver(fp_tcp_nat *state, fp_tcp_resolve_fn resolve);
 void fp_tcp_nat_set_inline_resolution(fp_tcp_nat *state, int on);
 int fp_tcp_nat_resolver_running(const fp_tcp_nat *state);
+/* Step timing for the log: the latest call, the longest since the last reset, and how many
+ * calls exceeded FP_TCP_STEP_SLOW_NS. Any pointer may be NULL. */
+void fp_tcp_nat_step_stats(const fp_tcp_nat *state, uint64_t *last_ns, uint64_t *max_ns,
+                           unsigned *slow);
+/* Clears the peak and the counter, so one stall produces one log line. */
+void fp_tcp_nat_step_stats_reset(fp_tcp_nat *state);
+#define FP_TCP_STEP_SLOW_NS (200 * UINT64_C(1000000))
 #endif

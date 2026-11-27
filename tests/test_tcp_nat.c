@@ -515,15 +515,53 @@ static void reconfigure_does_not_wait_for_a_lookup(void) {
     fp_tcp_nat_close(&state);
 }
 
+/* The step timing is what a disconnect line is read against, so it has to record a slow call
+ * and clear the peak without losing the last value. Forcing the fallback walk with an injected
+ * slow resolver puts the 300 ms lookup inside the step call on purpose. */
+static int slow_step_resolve(const char *host, uint16_t port, op_addr *out) {
+    (void)host;
+    op_sleep_ms(300);
+    return op_addr_from_text(out, "203.0.113.9", port) ? -1 : 0;
+}
+
+static void step_stats_record_a_slow_step(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_resolver(&state, slow_step_resolve);
+    fp_tcp_nat_set_inline_resolution(&state, 1);
+    state.servers[0] = (fp_stun_server){.host = "slowstep", .port = 3478};
+    state.server_count = 1;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    uint64_t last = 1, max = 1;
+    unsigned slow = 1;
+    fp_tcp_nat_step_stats(&state, &last, &max, &slow);
+    assert(last == 0 && max == 0 && slow == 0);
+    fp_tcp_nat_step(&state, op_monotonic_ns()); /* resolves one name inline: ~300 ms */
+    fp_tcp_nat_step_stats(&state, &last, &max, &slow);
+    printf("step stats: last %.1f ms, max %.1f ms, slow=%u\n", (double)last * 1e-6,
+           (double)max * 1e-6, slow);
+    assert(last > FP_TCP_STEP_SLOW_NS && max >= last && slow == 1);
+    fp_tcp_nat_step_stats_reset(&state);
+    fp_tcp_nat_step_stats(&state, &last, &max, &slow);
+    assert(max == 0 && slow == 0);
+    /* The peak is cleared, the latest observation is not: it describes the last call. */
+    assert(last > FP_TCP_STEP_SLOW_NS);
+    fp_tcp_nat_close(&state);
+}
+
 int main(void) {
     assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
     six_probes_at_once();samples_keep_target_order();one_failed_target_still_completes_the_batch();
     resolver_worker_starts_by_default();resolver_answers_keep_order_and_drop_duplicates();
     slow_resolver_does_not_block_the_step_loop();reconfigure_does_not_wait_for_a_lookup();
+    step_stats_record_a_slow_step();
     witness_resolution_is_spread_over_the_step_loop();unresolvable_witness_is_skipped();
     witness_walk_keeps_order_and_drops_duplicates();
     puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling, "
-         "separate mapping results, six parallel probes, a resolver worker that never blocks the loop "
-         "and an incremental fallback walk passed");
+         "separate mapping results, six parallel probes, a resolver worker that never blocks the loop, "
+         "an incremental fallback walk and step timing stats passed");
     return 0;
 }

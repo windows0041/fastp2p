@@ -365,6 +365,8 @@ int fp_tcp_nat_configure(fp_tcp_nat *s, json_object *servers) {
     return 0;
 }
 void fp_tcp_nat_close(fp_tcp_nat *s) {
+    s->step_last_ns = s->step_max_ns = 0;
+    s->step_slow = 0;
     resolver_stop(s, 1);
     for (int f = 0; f < OP_FAM_COUNT; ++f)
         family_close(&s->family[f]);
@@ -447,7 +449,7 @@ static void family_apply_answers(fp_tcp_family *k, const fp_tcp_resolve_answer *
  * spacing widens to whatever the last lookup took, which keeps a slow resolver's share of
  * the loop bounded instead of letting it take the whole call. */
 static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_server *servers,
-                                unsigned count, uint64_t now) {
+                                unsigned count, uint64_t now, fp_tcp_resolve_fn resolve) {
     if (!k->resolving || now < k->next_resolve_at)
         return;
     if (k->resolve_index < count) {
@@ -455,7 +457,7 @@ static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_serve
         uint64_t started = op_monotonic_ns();
         op_addr resolved;
         memset(&resolved, 0, sizeof(resolved));
-        if (!platform_resolve(server->host, server->port, &resolved))
+        if (!resolve(server->host, server->port, &resolved))
             family_add_target(k, &resolved, server->port);
         ++k->resolved;
         k->resolve_cost = op_monotonic_ns() - started;
@@ -721,6 +723,7 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
 int fp_tcp_nat_step(fp_tcp_nat *s, uint64_t now) {
     /* Answers first: the worker has been resolving in parallel with everything else, and the
      * drain is a try-lock plus a bounded copy, so this call never waits for it. */
+    uint64_t entered = op_monotonic_ns();
     fp_tcp_resolve_answer batch[FP_TCP_RESOLVE_QUEUE];
     unsigned answered = resolver_drain(s, batch, FP_TCP_RESOLVE_QUEUE);
     if (answered)
@@ -729,10 +732,34 @@ int fp_tcp_nat_step(fp_tcp_nat *s, uint64_t now) {
     for (int f = 0; f < OP_FAM_COUNT; ++f) {
         /* The fallback walk still resolves at most one name per call, and the probe ladder
          * only runs once the family is prepared. */
-        family_resolve_step(&s->family[f], f, s->servers, s->server_count, now);
+        family_resolve_step(&s->family[f], f, s->servers, s->server_count, now,
+                            s->resolve ? s->resolve : platform_resolve);
         if (family_step(&s->family[f], f, now)) done |= 1 << f;
     }
+    /* What the caller needs to correlate a stalled tick with a closed session. Two clock
+     * reads per step are nothing next to a socket operation. */
+    uint64_t spent = op_monotonic_ns() - entered;
+    s->step_last_ns = spent;
+    if (spent > s->step_max_ns)
+        s->step_max_ns = spent;
+    if (spent > FP_TCP_STEP_SLOW_NS)
+        ++s->step_slow;
     return done;
+}
+void fp_tcp_nat_step_stats(const fp_tcp_nat *s, uint64_t *last_ns, uint64_t *max_ns,
+                           unsigned *slow) {
+    if (last_ns)
+        *last_ns = s ? s->step_last_ns : 0;
+    if (max_ns)
+        *max_ns = s ? s->step_max_ns : 0;
+    if (slow)
+        *slow = s ? s->step_slow : 0;
+}
+void fp_tcp_nat_step_stats_reset(fp_tcp_nat *s) {
+    if (!s)
+        return;
+    s->step_max_ns = 0;
+    s->step_slow = 0;
 }
 
 fp_tcp_family *fp_tcp_punch_sample_start(const fp_tcp_family *catalog, const op_addr *source,
