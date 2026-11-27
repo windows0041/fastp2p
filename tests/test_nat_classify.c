@@ -2218,10 +2218,9 @@ int main(void) {
          * destination-dependent host publishes is built from what they observe. */
         assert(probes.tcp_nat.server_count ==
                sizeof(FP_DEFAULT_TCP_MAPPING_POOL) / sizeof(FP_DEFAULT_TCP_MAPPING_POOL[0]));
+        /* Only the project's own witness is built in; everything else an operator pushes. */
         assert(!strcmp(probes.tcp_nat.servers[0].host, "stun.fastp2p.top"));
         assert(probes.tcp_nat.servers[0].port == 3478);
-        assert(!strcmp(probes.tcp_nat.servers[1].host, "stun.nextcloud.com"));
-        assert(probes.tcp_nat.servers[1].port == 443);
         assert(fp_client_stun_config(&probes, NULL) == FASTP2P_OK);
         assert(probes.stun_count == 2);
         /* The UDP ladder's built-in witness is the project's own server too: it answers

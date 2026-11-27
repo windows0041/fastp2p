@@ -1323,22 +1323,14 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
 /* TCP filtering needs a callback probe server; the project's own host, dedicated
  * port. It answers a plain-text "mapped <ip> <port>" line, not STUN. */
 #define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
-/* TCP mapping needs two destinations on *different addresses*: the gateway's own
- * probe ports are one address, so a mapping that depends on the destination could
- * otherwise never be told apart from a stable one, and the port prediction that
- * symmetric-to-symmetric punching relies on would never enable. */
-#define FP_DEFAULT_TCP_MAPPING_SERVERS "stun.fastp2p.top:3478"
-#define FP_DEFAULT_TCP_MAPPING_SERVERS_ALT "stun.nextcloud.com:443"
-/* The mapping verdict needs destinations on different addresses, and the pool a
- * destination-dependent host publishes is only as good as the witnesses it sampled: a
- * single outside address cannot show a carrier's set. These are spread over separate
- * networks, picked so that their observed addresses cover the pool measured on a mobile
- * CGNAT (five distinct addresses out of six; the sixth comes from the gateway's own probe
- * ports), and a missing one costs a few seconds of probe time rather than the verdict. */
+/* The built-in witness for every ladder is the project's own server. The TCP mapping
+ * verdict still has two destinations to compare - the gateway's own probe ports are one
+ * address and this witness is another - so a mapping that depends on the destination is
+ * told apart from a stable one even before an operator pushes anything. Everything else
+ * is an operator decision: the console sends network.TCPSTUNServers, and a deployment
+ * behind a filter can name a witness it can actually reach. */
 static const char *const FP_DEFAULT_TCP_MAPPING_POOL[] = {
-    "stun.fastp2p.top:3478", "stun.nextcloud.com:443", "stun.sip.us:3478",
-    "stun.diallog.com:3478", "stun.signalwire.com:3478", "stun.tula.nu:3478",
-    "stun.freeswitch.org:3478", "stun.fitauto.ru:3478",
+    "stun.fastp2p.top:3478",
 };
 
 /* Adopt new TCP mapping servers at runtime. Only the parse happens here: the
