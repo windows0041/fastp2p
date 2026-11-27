@@ -2051,6 +2051,43 @@ static void dial_target_prefers_the_peer_business_port(void) {
     close_tunnel(c, ti, NULL);
     free(c);
 }
+/* Punching from the business port: the shared listener has to give the port up, the
+ * tunnel that borrowed it must be the only owner, and the port must come back when
+ * that tunnel ends - otherwise every other rule on this node loses its listener. */
+static void punch_borrows_the_business_port(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    snprintf(c->local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    c->running = 1;
+    c->public_port = 45122; /* a high port: the test must not fight CI for 1510 */
+    assert(!bind_peer_listeners(c, c->public_port, 0));
+    assert(c->listener[OP_FAM_V4] >= 0);
+    int a = new_tunnel(c, "peer-a", 960, FASTP2P_TRANSPORT_TCP, 1);
+    int b = new_tunnel(c, "peer-b", 961, FASTP2P_TRANSPORT_TCP, 1);
+    assert(a >= 0 && b >= 0);
+    c->tunnels[a].family = OP_FAM_V4;
+    c->tunnels[b].family = OP_FAM_V4;
+    c->tunnels[a].local_port = 40000;
+    c->tunnels[b].local_port = 40001;
+
+    assert(punch_take_business_port(c, &c->tunnels[a], a) == 1);
+    assert(c->punch_port_taken == 1 && c->punch_port_owner == a);
+    assert(c->tunnels[a].local_port == c->public_port);
+    assert(c->listener[OP_FAM_V4] < 0); /* the spray needs the port */
+    /* A second tunnel may not steal a port somebody else is spraying from. */
+    assert(punch_take_business_port(c, &c->tunnels[b], b) == 0);
+    assert(c->tunnels[b].local_port == 40001);
+
+    punch_release_business_port(c, b); /* not the owner: nothing changes */
+    assert(c->punch_port_taken == 1);
+    punch_release_business_port(c, a);
+    assert(c->punch_port_taken == 0 && c->punch_port_owner == -1);
+    assert(c->listener[OP_FAM_V4] >= 0); /* shared listener is back */
+    close_peer_listeners(c->listener);
+    close_tunnel(c, a, NULL);
+    close_tunnel(c, b, NULL);
+    free(c);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2256,5 +2293,6 @@ int main(void) {
     dialer_array_leaves_undiallable_peers_alone();
     spray_aims_ahead_of_an_unpredictable_peer();
     dial_target_prefers_the_peer_business_port();
+    punch_borrows_the_business_port();
     return 0;
 }

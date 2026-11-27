@@ -642,6 +642,14 @@ struct fastp2p_client {
     void *restart_user;
     /* Descriptors held by every tunnel's TCP source-port array right now. */
     unsigned tcp_array_used;
+    /* 1 while a punch round owns the business port for its spray, and which tunnel
+     * owns it. The shared listener gives the port up for that window. */
+    int punch_port_taken, punch_port_owner;
+    /* Connections accepted on the business port or a punch listener since start:
+     * the only evidence a client can gather about whether the path in front of it
+     * returns anything at all. Zero after a full punch window means the cloud (or
+     * carrier) never delivers inbound, so spraying there is pointless. */
+    unsigned inbound_seen;
     int validate_only;
     void *user;
     fp_sdwan *sdwan;
@@ -666,6 +674,7 @@ static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
 static void tcp_array_close(fastp2p_client *, tunnel *);
+static void punch_release_business_port(fastp2p_client *, int);
 static uint64_t app_retry_delay(unsigned);
 static void release_relay(fastp2p_client *, int);
 static void bind_pending_key(fastp2p_client *, int);
@@ -1069,6 +1078,18 @@ static op_socket socket_bound(int udp, const char *ip, uint16_t port, int reuse)
 static uint16_t socket_port(op_socket fd) {
     op_addr a;
     return op_addr_socketname(fd, &a) ? 0 : op_addr_port(&a);
+}
+/* One line per accepted inbound connection, throttled: it is the only evidence a
+ * client can collect about whether the path in front of it returns anything. */
+static void note_inbound(fastp2p_client *c, const op_addr *peer, const char *where) {
+    ++c->inbound_seen;
+    if (c->inbound_seen > 10 && c->inbound_seen % 50 != 0)
+        return;
+    char note[208], text[OP_ADDR_TEXT];
+    op_addr_text(peer, text, sizeof(text));
+    snprintf(note, sizeof(note), "%s accepted a connection from %s:%u (inbound total %u)", where,
+             text, (unsigned)op_addr_port(peer), c->inbound_seen);
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
 }
 static void close_peer_listeners(op_socket listeners[OP_FAM_COUNT]) {
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
@@ -1669,6 +1690,9 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     t->relay_link = -1;
     if (reason)
         emit(c, FASTP2P_EVENT_ERROR, id, FASTP2P_EIO, reason);
+    /* Give the business port back after this tunnel's own sockets are gone, so the
+     * shared listener can have it again. */
+    punch_release_business_port(c, index);
 }static int hex_value(char ch) {
     if (ch >= '0' && ch <= '9')
         return ch - '0';
@@ -2874,6 +2898,53 @@ static int tcp_punch_listen(fastp2p_client *c, int index) {
     }
     return 0;
 }
+/* --- Punching from the business port ---------------------------------------
+ * A node behind a carrier or cloud NAT that forwards nothing inbound cannot be
+ * dialled on any port it merely listens on. What it *can* do is dial out from the
+ * one port its own firewall admits: the NAT then holds a session for
+ * (business port -> peer), and a peer that dials that same public port is part of a
+ * tuple the NAT already knows. The spray therefore leaves from the business port
+ * and the port is handed back to the shared listener afterwards.
+ *
+ * Established tunnels are untouched: they own their own sockets, and accept()ed
+ * connections do not depend on the listening socket. Only new connections that
+ * arrive at the business port during this window are refused, and the window is
+ * the length of one spray. */
+static int punch_take_business_port(fastp2p_client *c, tunnel *t, int index) {
+    if (!c->public_port || t->lan || t->relay_wait || t->local_port == c->public_port)
+        return 1;
+    if (c->punch_port_taken)
+        return c->punch_port_owner == index; /* one owner at a time */
+    close_peer_listeners(c->listener);
+    t->local_port = c->public_port;
+    /* The mapping is port preserving, so the port the peer dials is this one. */
+    t->mapped_port = c->public_port;
+    c->punch_port_taken = 1;
+    c->punch_port_owner = index;
+    char note[160];
+    snprintf(note, sizeof(note),
+             "TCP punch takes business port %u for the spray (shared listener parked)",
+             (unsigned)c->public_port);
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    return 1;
+}
+/* Give the port back once the tunnel that borrowed it is gone. */
+static void punch_release_business_port(fastp2p_client *c, int index) {
+    if (!c->punch_port_taken || c->punch_port_owner != index)
+        return;
+    c->punch_port_taken = 0;
+    c->punch_port_owner = -1;
+    if (!c->running || !c->public_port || c->listener[OP_FAM_V4] >= 0)
+        return;
+    if (bind_peer_listeners(c, c->public_port, 0))
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
+             "business port could not be restored after the punch");
+    else {
+        char note[128];
+        snprintf(note, sizeof(note), "business port %u restored", (unsigned)c->public_port);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    }
+}
 /* Interleave the walk so the reported port is tried first and the window grows
  * evenly on both sides: 0, +1, -1, +2, -2, ... */
 static uint16_t tcp_scan_port(uint16_t base, int step) {
@@ -3173,6 +3244,11 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
                                                       : TCP_PUNCH_STALE_ATTEMPTS;
     if (t->tcp_timeouts >= limit) {
         if (peer_kind == TCP_PEER_MOVES) {
+            /* Spray from the business port when the peer is expected to dial it: the
+             * cloud in front of this host only returns a packet whose tuple it already
+             * has a session for, and that session has to be created from the port the
+             * peer dials. */
+            (void)punch_take_business_port(c, t, index);
             /* Open our filter before parking: a listener cannot bind next to the
              * spray sockets, so the spray has to go first. With a measured step
              * the window is the ones the peer will really use. */
@@ -3189,6 +3265,16 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, predicted
                      ? "TCP mapping changes per destination; dialled the predicted window and parked listening"
                      : "TCP mapping changes per destination; sprayed its port range and parked listening");
+                {
+                    /* The number that decides whether waiting is worth anything: zero
+                     * inbound for a whole window means the path in front of this host
+                     * never returns anything, so no amount of spraying will help. */
+                    char note[192];
+                    snprintf(note, sizeof(note),
+                             "punch parked on port %u; inbound connections so far: %u",
+                             (unsigned)t->local_port, c->inbound_seen);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
                 t->tcp_retry_at = 0;
                 t->tcp_timeouts = 0;
                 /* Cover the peer's whole dial window, not the rest of ours. */
@@ -5670,6 +5756,7 @@ static void accept_punch(fastp2p_client *c, int ti) {
     if (fd < 0)
         return;
     op_addr_normalize(&peer);
+    note_inbound(c, &peer, "punch listener");
     /* Connect-back: the port in the offer is what the gateway measured, i.e. the peer's
      * mapping *towards the gateway*. Towards us a destination-dependent NAT allocates
      * something else, so requiring the advertised port here rejected every inbound SYN
@@ -6426,6 +6513,7 @@ static void tick_accept(fastp2p_client *c, uint64_t now) {
         if (fd < 0)
             break;
         op_addr_normalize(&peer);
+        note_inbound(c, &peer, "business port");
         int i;
         for (i = 0; i < NP; ++i)
             if (c->pending[i].fd < 0)
@@ -9246,7 +9334,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
          * dropped and the verdict would describe a port nobody can open. Release
          * the TCP listener for the probe window and rebuild it below. */
         c->tcp_relisten = 0;
-        if (c->public_port && c->listener[OP_FAM_V4] >= 0 &&
+        if (c->public_port && c->listener[OP_FAM_V4] >= 0 && !c->punch_port_taken &&
             now - c->tcp_handoff_at >= NAT_FILTER_REFRESH) {
             close_peer_listeners(c->listener);
             c->tcp_relisten = 1;
