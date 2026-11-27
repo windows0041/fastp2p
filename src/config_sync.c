@@ -112,8 +112,29 @@ static int unchanged_outside_hot(json_object *a, json_object *b) {
     }
     return 1;
 }
-static json_object *section(json_object *root, const char *key) {
-    json_object *value = NULL;
+/* How many entries a witness list holds after the merge: the number an oversized list shows up
+ * as in the applied-configuration line below. */
+static unsigned list_count(json_object *network, const char *key) {
+    json_object *list = get(network, key);
+    return list && json_object_is_type(list, json_type_array)
+               ? (unsigned)json_object_array_length(list) : 0;
+}
+/* One line per applied push. A push that only touched hot knobs is applied in place and keeps
+ * the session; anything else reloads the instance. Which of the two happened, how big the
+ * document was and how many witnesses it asked for are what a reconnect loop has to be read
+ * against. */
+static void log_applied(fastp2p_client *client, uint64_t revision, size_t bytes, int hot,
+                        json_object *next) {
+    if (!client)
+        return;
+    json_object *network = get(next, "network");
+    char note[192];
+    snprintf(note, sizeof(note), "config: applied revision=%llu bytes=%llu hot=%d udp=%u tcp=%u",
+             (unsigned long long)revision, (unsigned long long)bytes, hot,
+             list_count(network, "UDPSTUNServers"), list_count(network, "TCPSTUNServers"));
+    fp_client_event(client, note);
+}
+static json_object *section(json_object *root, const char *key) {    json_object *value = NULL;
     if (root)
         json_object_object_get_ex(root, key, &value);
     return value;
@@ -239,6 +260,7 @@ static int receive(const char *fields,uint64_t revision,void *user) {
         snprintf(sync_state.digest, sizeof(sync_state.digest), "%s", hash);
         fprintf(stderr, "Gateway configuration applied in place (rules=%d, sdwan=%d).\n",
                 rules_changed, sdwan_changed);
+        log_applied(client, revision, strlen(text), 1, next);
         result = FASTP2P_OK;
         goto done;
     }
@@ -255,6 +277,7 @@ reload:
     sync_state.pending=sync_state.reload=1;sync_state.online=0;
     sync_state.reload_at=op_monotonic_ns()+UINT64_C(200000000);
     sync_state.deadline=op_monotonic_ns()+UINT64_C(25000000000);
+    log_applied(client, revision, strlen(text), 0, next);
     result=1;
 done:
     if (rules) fp_client_rules_abort(rules);

@@ -12,6 +12,7 @@
 #include "firewall.h"
 #include "tcp_nat.h"
 #include "config_internal.h"
+#include "config_sync.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -1006,6 +1007,10 @@ static void emit(fastp2p_client *c, fastp2p_event_type type, uint64_t id, int co
         c->callback(c, &e, c->user);
         c->in_callback = 0;
     }
+}
+void fp_client_event(fastp2p_client *c, const char *message) {
+    if (c && message)
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
 }
 static void set_state(fastp2p_client *c, fastp2p_state s, const char *msg) {
     if (c->state != s) {
@@ -5413,7 +5418,18 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
         json_object_object_add(ack,"revision",json_object_new_uint64(revision));
         json_object_object_add(ack,"error",json_object_new_int(result<0));
         json_object_object_add(ack,"state",json_object_new_string(result<0?"failed":result?"saved":"applied"));
-        ws_json(c,6,8,ack);json_object_put(ack);
+        {
+            /* What goes back to the gateway is this acknowledgement and nothing else: it names
+             * the revision and the outcome, so an oversized configuration cannot inflate the
+             * reply - the line says so with a number instead of an assumption. */
+            const char *text = json_object_to_json_string_ext(ack, JSON_C_TO_STRING_PLAIN);
+            char note[128];
+            snprintf(note, sizeof(note), "config: reported revision=%llu bytes=%llu",
+                     (unsigned long long)revision,
+                     (unsigned long long)(text ? strlen(text) : 0));
+            ws_json(c,6,8,ack);json_object_put(ack);
+            fp_client_event(c, note);
+        }
         if(result<0){
             /* The handler's reason lives in the CLI layer, so publish the code and the
              * revision: EINVAL means the payload was refused, EIO that it could not be
