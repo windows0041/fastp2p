@@ -121,6 +121,17 @@ static void real_echo(int changed,int malformed) {
     fp_tcp_nat_close(&state);
     for(unsigned i=0;i<2;++i){if(peers[i]>=0)op_close(peers[i]);op_close(listeners[i]);}
 }
+/* The witness walk resolves at most one name per step call, so a test that wants the final
+ * target list has to drive it - with the clock moved past the throttle window each time. */
+static void walk_witness_list(fp_tcp_nat *state) {
+    uint64_t now = op_monotonic_ns();
+    for (unsigned i = 0; i < 64 && state->family[OP_FAM_V4].resolving; ++i) {
+        now += UINT64_C(300000000);
+        fp_tcp_nat_step(state, now);
+    }
+    assert(!state->family[OP_FAM_V4].resolving);
+}
+
 /* A gateway on our own network is not a mapping destination: its two probe ports were
  * always first in the target list, and counting them turned every self-hosted deployment
  * into a destination-dependent ("NAT4") TCP node. */
@@ -137,6 +148,7 @@ static void private_gateway_is_not_a_destination(void) {
     /* A private gateway: only the two public servers remain, both routable. */
     assert(!op_addr_from_text(&gateway[OP_FAM_V4], "192.168.60.4", 27183));
     fp_tcp_nat_prepare(&state, gateway, families);
+    walk_witness_list(&state);
     const fp_tcp_family *k = &state.family[OP_FAM_V4];
     assert(k->prepared && k->target_count == 2);
     for (unsigned i = 0; i < k->target_count; ++i) {
@@ -150,6 +162,7 @@ static void private_gateway_is_not_a_destination(void) {
     state.servers[0] = (fp_stun_server){.host = "203.0.113.10", .port = 3478};
     state.server_count = 1;
     fp_tcp_nat_prepare(&state, gateway, families);
+    walk_witness_list(&state);
     assert(!state.family[OP_FAM_V4].prepared);
     assert(state.family[OP_FAM_V4].target_count == 1);
     assert(state.family[OP_FAM_V4].type == FP_NAT_UNKNOWN);
@@ -161,6 +174,7 @@ static void private_gateway_is_not_a_destination(void) {
     state.server_count = 1;
     assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
     fp_tcp_nat_prepare(&state, gateway, families);
+    walk_witness_list(&state);
     const fp_tcp_family *public_targets = &state.family[OP_FAM_V4];
     assert(public_targets->prepared && public_targets->target_count == 3);
     assert(!public_targets->targets[0].stun && !public_targets->targets[1].stun);
@@ -296,10 +310,92 @@ static void one_failed_target_still_completes_the_batch(void) {
     fp_tcp_nat_close(&state);
 }
 
+/* Resolving a witness list must not happen inside one call: a blocked step loop stops
+ * feeding the control channel, which is how a node with ten configured witnesses ended up
+ * being disconnected a second after every login. One name per step, spaced out, and the
+ * ladder waits for the whole list. */
+static void witness_resolution_is_spread_over_the_step_loop(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    for (unsigned i = 0; i < 8; ++i) {
+        snprintf(state.servers[i].host, sizeof(state.servers[i].host), "127.0.0.%u", i + 1);
+        state.servers[i].port = 3478;
+    }
+    state.server_count = 8;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    /* Nothing resolved synchronously: only the gateway's own two ports are ready. */
+    assert(k->prepared == 0 && k->resolving == 1 && k->resolved == 0 && k->target_count == 2);
+    uint64_t now = op_monotonic_ns();
+    fp_tcp_nat_step(&state, now);
+    assert(k->resolved == 1);
+    /* A second call inside the throttle window resolves nothing. */
+    fp_tcp_nat_step(&state, now);
+    assert(k->resolved == 1 && k->target_count == 3);
+    for (unsigned i = 1; i < 8; ++i) {
+        now += UINT64_C(300000000); /* past the 200 ms spacing */
+        fp_tcp_nat_step(&state, now);
+        assert(k->resolved == i + 1);
+        assert(k->target_count == 2 + i + 1);
+    }
+    assert(k->resolving == 0 && k->prepared == 1 && k->target_count == 10);
+    fp_tcp_nat_close(&state);
+}
+
+/* A name that cannot be resolved is skipped; the rest of the list still forms the target
+ * set. "127.0.0.256" is not an address, so it fails without touching the network. */
+static void unresolvable_witness_is_skipped(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    state.servers[0] = (fp_stun_server){.host = "127.0.0.1", .port = 3478};
+    state.servers[1] = (fp_stun_server){.host = "127.0.0.256", .port = 3478};
+    state.servers[2] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
+    state.server_count = 3;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    walk_witness_list(&state);
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->resolved == 3 && k->prepared == 1);
+    assert(k->target_count == 4); /* two gateway ports + the two resolvable witnesses */
+    fp_tcp_nat_close(&state);
+}
+
+/* The walk keeps the configured order and drops a name that resolves to an address already
+ * in the list, so the final target list is the one the old synchronous version built. */
+static void witness_walk_keeps_order_and_drops_duplicates(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    state.servers[0] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
+    state.servers[1] = (fp_stun_server){.host = "127.0.0.1", .port = 3478};
+    state.servers[2] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
+    state.server_count = 3;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    walk_witness_list(&state);
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->target_count == 4 && k->resolved == 3);
+    assert(op_addr_port(&k->targets[0].address) == 27180 && !k->targets[0].stun);
+    assert(op_addr_port(&k->targets[1].address) == 27181 && !k->targets[1].stun);
+    assert(k->targets[2].stun && k->targets[3].stun);
+    char text[OP_ADDR_TEXT];
+    assert(!op_addr_text(&k->targets[2].address, text, sizeof(text)) && !strcmp(text, "127.0.0.2"));
+    assert(!op_addr_text(&k->targets[3].address, text, sizeof(text)) && !strcmp(text, "127.0.0.1"));
+    fp_tcp_nat_close(&state);
+}
+
 int main(void) {
     assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
     six_probes_at_once();samples_keep_target_order();one_failed_target_still_completes_the_batch();
+    witness_resolution_is_spread_over_the_step_loop();unresolvable_witness_is_skipped();
+    witness_walk_keeps_order_and_drops_duplicates();
     puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling, "
-         "separate mapping results and six parallel probes passed");
+         "separate mapping results, six parallel probes and an incremental witness walk passed");
     return 0;
 }

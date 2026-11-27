@@ -57,6 +57,13 @@ typedef struct {
     int fresh_source;
     int phase, prepared;
     uint64_t next_cycle;
+    /* Witness names are resolved one per step call, spaced out: a lookup blocks this
+     * single-threaded loop, and the loop also carries the control channel. prepared stays 0
+     * until the walk is done, so the probe ladder never starts on a half-built target list.
+     * resolve_cost is how long the last lookup took, which widens the spacing. */
+    int resolving;
+    unsigned resolve_index, resolved;
+    uint64_t next_resolve_at, resolve_cost;
     /* Parallel probing. Results are kept per target and appended in target order when the
      * batch ends, so neither the verdict nor the step calculation depends on the order the
      * replies happen to arrive in. inflight/peak_inflight are also the observable a test

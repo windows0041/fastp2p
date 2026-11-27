@@ -6,6 +6,9 @@
 
 #define SECOND UINT64_C(1000000000)
 #define PUNCH_SAMPLE_TIMEOUT UINT64_C(450000000)
+/* Spacing between two witness lookups. Long enough that several resolutions cannot pile up
+ * into one stalled tick, short enough that ten witnesses are ready in about two seconds. */
+#define TCP_RESOLVE_INTERVAL (200 * SECOND / 1000)
 static uint16_t be16(const uint8_t *p) { return (uint16_t)((unsigned)p[0] << 8 | p[1]); }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 
@@ -71,6 +74,7 @@ static void family_close(fp_tcp_family *k) {
     }
     k->inflight = 0;
     k->phase = 0;
+    k->resolving = 0;
     k->prepared = 0;
 }
 void fp_tcp_nat_init(fp_tcp_nat *s) {
@@ -123,15 +127,27 @@ void fp_tcp_nat_close(fp_tcp_nat *s) {
     for (int f = 0; f < OP_FAM_COUNT; ++f)
         family_close(&s->family[f]);
 }
-/* One family's target list: the two gateway probe ports of that family, plus
- * the configured STUN servers for IPv4 only (their text syntax is v4). */
-static void family_prepare(fp_tcp_family *k, const op_addr *gateway, int index,
-                           const fp_stun_server *servers, unsigned count) {
+/* One family's target list: the two gateway probe ports of that family, plus the configured
+ * STUN servers for IPv4 only (their text syntax is v4).
+ *
+ * The gateway's own two ports need no name resolution, so they are ready at once. The
+ * configured witnesses are not: resolving a list of foreign names is the one blocking call
+ * left in this file, and it runs inside the loop that also drives the control channel. Ten
+ * names resolved back to back kept that loop busy for seconds, the gateway stopped seeing
+ * heartbeats and closed the session - a reconnect loop that looked like the node being
+ * kicked. The list is therefore walked one name per step call (see family_resolve_step);
+ * prepared stays 0 until the walk is done. */
+static void family_begin(fp_tcp_family *k, const op_addr *gateway, int index,
+                         const fp_stun_server *servers, unsigned count) {
     k->samples = k->destinations = 0;
     k->next_cycle = 0;
     k->type = FP_NAT_UNKNOWN;
     k->prepared = 0;
     k->target_count = 0;
+    k->resolving = 0;
+    k->resolve_index = k->resolved = 0;
+    k->next_resolve_at = 0;
+    k->resolve_cost = 0;
     if (!gateway || !gateway->len || op_family_index(op_addr_family(gateway)) != index)
         return;
     /* Only a destination the NAT actually translates says anything about the mapping.
@@ -146,11 +162,29 @@ static void family_prepare(fp_tcp_family *k, const op_addr *gateway, int index,
         }
         k->target_count = 2;
     }
-    if (index == OP_FAM_V4) {
-        for (unsigned i = 0; i < count && k->target_count < FP_TCP_PROBE_MAX; ++i) {
-            struct addrinfo hints = {0}, *addresses = NULL;
-            hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-            if (getaddrinfo(servers[i].host, NULL, &hints, &addresses)) continue;
+    if (index == OP_FAM_V4 && count) {
+        k->resolving = 1; /* the walk below fills the rest, one name per tick */
+        return;
+    }
+    /* One destination cannot tell whether the mapping follows the destination, so an
+     * unanswerable question stays unmeasured instead of being guessed. */
+    if (k->target_count >= 2)
+        k->prepared = 1;
+}
+/* Resolve one more witness, at most once per interval. The interval widens to twice the
+ * time the previous lookup actually took: a resolver that needs a second per name then
+ * spends one second in the loop, not ten names' worth in one call. */
+static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_server *servers,
+                                unsigned count, uint64_t now) {
+    if (!k->resolving || now < k->next_resolve_at)
+        return;
+    if (k->resolve_index < count) {
+        const fp_stun_server *server = &servers[k->resolve_index++];
+        uint64_t started = op_monotonic_ns();
+        struct addrinfo hints = {0}, *addresses = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (!getaddrinfo(server->host, NULL, &hints, &addresses)) {
             op_addr resolved;
             memset(&resolved, 0, sizeof(resolved));
             resolved.len = (op_socklen)addresses->ai_addrlen;
@@ -158,22 +192,25 @@ static void family_prepare(fp_tcp_family *k, const op_addr *gateway, int index,
                 resolved.len = (op_socklen)sizeof(resolved.u.storage);
             memcpy(&resolved.u.storage, addresses->ai_addr, resolved.len);
             freeaddrinfo(addresses);
-            op_addr_set_port(&resolved, servers[i].port);
+            op_addr_set_port(&resolved, server->port);
             int duplicate = 0;
             for (unsigned q = 0; q < k->target_count; ++q)
                 if (op_addr_equal(&resolved, &k->targets[q].address) &&
                     op_addr_port(&resolved) == op_addr_port(&k->targets[q].address))
                     duplicate = 1;
-            if (!duplicate)
+            if (!duplicate && k->target_count < FP_TCP_PROBE_MAX)
                 k->targets[k->target_count++] =
                     (fp_tcp_probe_target){.address = resolved, .stun = 1};
         }
+        ++k->resolved;
+        k->resolve_cost = op_monotonic_ns() - started;
+        uint64_t wait = k->resolve_cost > TCP_RESOLVE_INTERVAL ? k->resolve_cost : TCP_RESOLVE_INTERVAL;
+        k->next_resolve_at = now + wait;
     }
-    /* One destination cannot tell whether the mapping follows the destination, so an
-     * unanswerable question stays unmeasured instead of being guessed. */
-    if (k->target_count < 2)
-        return;
-    k->prepared = 1;
+    if (k->resolve_index >= count)
+        k->resolving = 0;
+    if (!k->resolving && k->target_count >= 2)
+        k->prepared = 1;
 }
 void fp_tcp_nat_prepare(fp_tcp_nat *s, const op_addr gateway[OP_FAM_COUNT], int families) {
     fp_tcp_nat_close(s);
@@ -181,7 +218,7 @@ void fp_tcp_nat_prepare(fp_tcp_nat *s, const op_addr gateway[OP_FAM_COUNT], int 
         fp_tcp_family *k = &s->family[f];
         if (!(families & (1 << f)))
             continue;
-        family_prepare(k, &gateway[f], f, s->servers, s->server_count);
+        family_begin(k, &gateway[f], f, s->servers, s->server_count);
     }
 }
 static int connected(op_socket fd) {
@@ -417,8 +454,12 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
 }
 int fp_tcp_nat_step(fp_tcp_nat *s, uint64_t now) {
     int done = 0;
-    for (int f = 0; f < OP_FAM_COUNT; ++f)
+    for (int f = 0; f < OP_FAM_COUNT; ++f) {
+        /* One name per call at most, and none at all while the throttle window is open: the
+         * step loop also carries the control channel, and a lookup blocks it. */
+        family_resolve_step(&s->family[f], f, s->servers, s->server_count, now);
         if (family_step(&s->family[f], f, now)) done |= 1 << f;
+    }
     return done;
 }
 
