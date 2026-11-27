@@ -9269,10 +9269,15 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
              * destination leaves it nothing to aim at, and the verdict above cannot say
              * which of the two a NAT is. */
             for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i) {
-                char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[224];
+                char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[256];
                 op_addr_text(&f->target_used[i], via, sizeof(via));
                 op_addr_text(&f->mapped[i], seen, sizeof(seen));
-                snprintf(note, sizeof(note), "TCP mapping via %s -> %s", via, seen);
+                /* Address *and* port on both sides: the port a witness sees is what a peer
+                 * has to aim at, and it is allocated per destination, so a line without it
+                 * says nothing about the axis that matters. */
+                snprintf(note, sizeof(note), "TCP mapping via %s:%u -> %s:%u", via,
+                         (unsigned)op_addr_port(&f->target_used[i]), seen,
+                         (unsigned)op_addr_port(&f->mapped[i]));
                 emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
             }
         }
