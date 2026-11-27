@@ -369,6 +369,9 @@ static int client_main(int argc, char **argv) {
         return 2;
     }
     fp_config_sync_bind(client,managed_config?config_file:NULL,root);
+    /* Tell the client which profile a pushed configuration belongs to: it logs the binding, and
+     * an embedder that registers no handler of its own still gets the built-in applier. */
+    fastp2p_client_set_config_path(client,managed_config?config_file:NULL);
     int restart_requested = 0;
     if (!verify_start)
         fastp2p_client_set_restart_handler(client, request_restart, &restart_requested);

@@ -52,6 +52,17 @@ typedef void (*fastp2p_event_fn)(fastp2p_client *, const fastp2p_event *, void *
  * never writes configuration files; the embedding host owns persistence. */
 typedef int (*fastp2p_config_handler)(const char *fields_json, uint64_t revision, void *user);
 FASTP2P_API int fastp2p_client_set_config_handler(fastp2p_client *, fastp2p_config_handler, void *user);
+/* Where a pushed configuration may be persisted, and whether this client accepts one at all.
+ * Both are optional for an embedder and deliberately so: a client that reports "no configuration
+ * push support" is never sent a configuration, so an embedding layer that forgets to register a
+ * handler leaves the running client on the settings it was built with - which is how a phone kept
+ * the single built-in witness while the console showed six. The client therefore binds itself:
+ * set_config_path binds the embedder's binder when one is registered and the built-in applier
+ * otherwise, and start() binds the built-in applier if nothing was registered at all. */
+typedef int (*fastp2p_config_binder)(fastp2p_client *client, const char *path, void *user);
+FASTP2P_API void fastp2p_client_set_config_binder(fastp2p_config_binder binder, void *user);
+FASTP2P_API int fastp2p_client_set_config_path(fastp2p_client *client, const char *path);
+FASTP2P_API int fastp2p_client_config_push_supported(const fastp2p_client *client);
 /* Install before start to accept restart requests from the authenticated gateway.
  * The handler runs on the owning thread. Schedule the restart after step
  * returns and leave the current instance untouched in the handler. */

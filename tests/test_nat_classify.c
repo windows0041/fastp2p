@@ -2177,6 +2177,32 @@ static void config_ack_says_failed_when_nothing_was_applied(void) {
     assert(!strcmp(fp_config_ack_state(FASTP2P_EIO), "failed"));
     assert(!strcmp(fp_config_ack_state(FASTP2P_EINVAL), "failed"));
 }
+static void print_event(fastp2p_client *c, const fastp2p_event *e, void *user) {
+    (void)c;
+    (void)user;
+    if (e && e->message)
+        printf("[event] %s\n", e->message);
+}
+
+/* An embedder that forgets to register a configuration handler leaves the node on the settings it
+ * was built with, because the login frame advertises configPush from that handler and the gateway
+ * only pushes to clients that advertised it. The client therefore binds itself - with a profile
+ * path when it has one, with none otherwise. */
+static void config_push_is_bound_without_an_embedder(void) {
+    fastp2p_client c = {0};
+    c.callback = print_event;
+    assert(!fp_client_config_push_supported(&c)); /* the state a phone was stuck in */
+    assert(!fastp2p_client_set_config_path(&c, "/data/user/0/top.fastp2p/files/fastp2p.json"));
+    assert(fp_client_config_push_supported(&c));
+    /* And with no path at all: the built-in applier takes the push in memory. */
+    fastp2p_client d = {0};
+    d.callback = print_event;
+    assert(!fastp2p_client_set_config_path(&d, NULL));
+    assert(fp_client_config_push_supported(&d));
+    printf("config_push_supported: bound=%d unbound_path=%d\n",
+           fp_client_config_push_supported(&c), fp_client_config_push_supported(&d));
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2414,6 +2440,7 @@ int main(void) {
     spray_aims_ahead_of_an_unpredictable_peer();
     address_axis_is_separate_from_the_port_axis();
     config_ack_says_failed_when_nothing_was_applied();
+    config_push_is_bound_without_an_embedder();
     mapping_pool_is_derived_from_the_samples();
     pool_spray_covers_the_published_product();
     return 0;

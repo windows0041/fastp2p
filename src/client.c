@@ -630,6 +630,9 @@ struct fastp2p_client {
     /* When this client started: a disconnect line carries it so a session the gateway closed
      * can be placed on the same timeline as a stalled step. */
     uint64_t started_mono;
+    /* The profile a pushed configuration is persisted into, and the binder that does it. Empty
+     * means "nothing to persist": the built-in applier then takes the push in memory. */
+    char config_path[4096];
     /* NAT classification is per family (DUALSTACK-SPEC). Index 0 holds
      * exactly the values the old single fields carried, so a v4-only run
      * reports and logs byte-identical numbers. */
@@ -8759,6 +8762,110 @@ int fastp2p_client_set_config_handler(fastp2p_client *c,fastp2p_config_handler h
     if(!c || c->running || c->in_callback)return FASTP2P_ESTATE;
     c->config_handler=handler;c->config_user=user;return FASTP2P_OK;
 }
+/* --- configuration push ---------------------------------------------------------------
+ * The login frame advertises configPush from the presence of a handler, and the gateway only
+ * pushes to clients that advertised it. An embedder that never registers one therefore never
+ * receives anything - the console shows a witness list the node has never seen. So the client
+ * binds itself: the built-in applier below adopts what it can without help (the witness lists,
+ * the callback probe setting, the router-mapping switch), and an embedder that wants persistence
+ * registers a binder instead. */
+static fastp2p_config_binder config_binder;
+static void *config_binder_user;
+static int client_config_apply(const char *fields, uint64_t revision, void *user) {
+    fastp2p_client *c = user;
+    json_object *patch = json_tokener_parse(fields);
+    char note[192];
+    snprintf(note, sizeof(note), "config: push received revision=%llu bytes=%llu",
+             (unsigned long long)revision, (unsigned long long)(fields ? strlen(fields) : 0));
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    if (!patch) {
+        emit(c, FASTP2P_EVENT_ERROR, revision, FASTP2P_EINVAL,
+             "config: push rejected (not a JSON document)");
+        return FASTP2P_EINVAL;
+    }
+    int result = FASTP2P_OK;
+    unsigned udp = 0, tcp = 0;
+    json_object *network = NULL;
+    if (json_object_object_get_ex(patch, "network", &network) &&
+        json_object_is_type(network, json_type_object)) {
+        json_object *list = NULL;
+        if (json_object_object_get_ex(network, "UDPSTUNServers", &list) && list) {
+            udp = json_object_is_type(list, json_type_array)
+                      ? (unsigned)json_object_array_length(list) : 0;
+            if (fp_client_stun_config(c, list))
+                result = FASTP2P_EINVAL;
+        }
+        if (!result && json_object_object_get_ex(network, "TCPSTUNServers", &list) && list) {
+            tcp = json_object_is_type(list, json_type_array)
+                      ? (unsigned)json_object_array_length(list) : 0;
+            if (fp_client_tcp_nat_reconfigure(c, list))
+                result = FASTP2P_EINVAL;
+        }
+        if (!result && json_object_object_get_ex(network, "TCPNatProbe", &list) && list &&
+            fp_client_tcp_level_config(c, list))
+            result = FASTP2P_EINVAL;
+        if (!result && json_object_object_get_ex(network, "AutoPortMapping", &list) && list)
+            fp_client_set_auto_port_mapping(c, json_object_get_boolean(list) ? 1 : 0);
+    }
+    if (result) {
+        emit(c, FASTP2P_EVENT_ERROR, revision, result, "config: push rejected by the running client");
+    } else {
+        snprintf(note, sizeof(note), "config: applied revision=%llu bytes=%llu hot=1 udp=%u tcp=%u",
+                 (unsigned long long)revision,
+                 (unsigned long long)(fields ? strlen(fields) : 0), udp, tcp);
+        emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    }
+    json_object_put(patch);
+    return result;
+}
+static int client_config_report(fastp2p_client *c, const char *path, int error) {
+    const char *leaf = path && *path ? path : "builtin";
+    const char *slash = strrchr(leaf, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(leaf, '\\');
+    if (!slash || (backslash && backslash > slash))
+        slash = backslash;
+#endif
+    char note[192];
+    if (error)
+        snprintf(note, sizeof(note), "config: sync bind failed path=%s errno=%d",
+                 slash ? slash + 1 : leaf, error);
+    else
+        snprintf(note, sizeof(note), "config: sync bound path=%s", slash ? slash + 1 : leaf);
+    emit(c, error ? FASTP2P_EVENT_ERROR : FASTP2P_EVENT_TUNNEL, 0, 0, note);
+    return error ? -1 : 0;
+}
+/* Bind once per client: an embedder binder wins, otherwise the built-in applier is installed.
+ * A handler that is already registered is left alone (the CLI registers its own before start),
+ * and the call is idempotent so every path that knows the profile can call it. */
+static int client_config_bind(fastp2p_client *c, const char *path) {
+    if (!c)
+        return -1;
+    snprintf(c->config_path, sizeof(c->config_path), "%s", path ? path : "");
+    if (config_binder) {
+        int error = config_binder(c, path, config_binder_user);
+        return client_config_report(c, path, error ? errno : 0);
+    }
+    if (!c->config_handler) {
+        int error = fastp2p_client_set_config_handler(c, client_config_apply, c);
+        if (error)
+            return client_config_report(c, path, error);
+    }
+    return client_config_report(c, path, 0);
+}
+void fastp2p_client_set_config_binder(fastp2p_config_binder binder, void *user) {
+    config_binder = binder;
+    config_binder_user = user;
+}
+int fastp2p_client_set_config_path(fastp2p_client *c, const char *path) {
+    return client_config_bind(c, path);
+}
+int fastp2p_client_config_push_supported(const fastp2p_client *c) {
+    return c && c->config_handler != NULL;
+}
+int fp_client_config_push_supported(const fastp2p_client *c) {
+    return fastp2p_client_config_push_supported(c);
+}
 int fastp2p_client_set_restart_handler(fastp2p_client *c, fastp2p_restart_handler handler, void *user) {
     if (!c || c->running || c->in_callback)
         return FASTP2P_ESTATE;
@@ -9382,6 +9489,11 @@ static void tick_sdwan(fastp2p_client *c) {
 int fastp2p_client_start(fastp2p_client *c) {
     if (!c || c->in_callback || c->running || c->multi)
         return FASTP2P_ESTATE;
+    /* Before the session exists: a client that advertises no configuration support is never sent
+     * a configuration, so this is what turns the console's witness list into something the node
+     * can actually receive. Binding here means an embedder cannot forget it. */
+    if (!c->config_handler)
+        client_config_bind(c, c->config_path[0] ? c->config_path : NULL);
     op_once_run(&curl_once, initialize_curl);
     if (curl_initialization != CURLE_OK)
         return FASTP2P_EIO;
