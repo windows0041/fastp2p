@@ -351,6 +351,12 @@ typedef struct {
     int phase; /* 0 idle, 1 plain, 2 change-port, 3 change-ip */
     int server, count;
     op_addr addr[FP_STUN_MAX_SERVERS];
+    /* The witness addresses are resolved one per tick into addr[] before the ladder starts:
+     * eleven built-in names are eleven lookups, and a lookup blocks the loop the control
+     * channel runs in, so the ladder waits instead of the loop stalling. */
+    unsigned scan;
+    uint64_t scan_at;
+    int scanning, scan_done;
     op_socket fd;
     uint8_t tid[FP_STUN_NONCE];
     uint64_t deadline;
@@ -1330,6 +1336,9 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
  * than pushed: a node has to be able to measure itself before (and without) any console. */
 #define FP_DEFAULT_STUN_SERVERS_COUNT \
     (sizeof(FP_DEFAULT_STUN_SERVERS) / sizeof(FP_DEFAULT_STUN_SERVERS[0]))
+/* Spacing between two witness lookups. One name per tick, and a lookup that took longer than
+ * this widens the next gap, so the ladder's start-up cost never lands on the control channel. */
+#define UDP_WITNESS_INTERVAL (200 * MS)
 /* TCP filtering needs a callback probe server; the project's own host, dedicated
  * port. It answers a plain-text "mapped <ip> <port>" line, not STUN. */
 #define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
@@ -8123,6 +8132,10 @@ static int stun_entry(fastp2p_client *c, const char *text, int count) {
                 ++count;
         }
         c->stun_count = count;
+        c->stun.scan = 0;
+        c->stun.scan_at = 0;
+        c->stun.scanning = 0;
+        c->stun.scan_done = 0;
         return count ? FASTP2P_OK : FASTP2P_EINVAL;
     }
     if (!json_object_is_type(servers, json_type_array) ||
@@ -8138,6 +8151,10 @@ static int stun_entry(fastp2p_client *c, const char *text, int count) {
         ++count;
     }
     c->stun_count = count;
+    c->stun.scan = 0;
+    c->stun.scan_at = 0;
+    c->stun.scanning = 0;
+    c->stun.scan_done = 0;
     return FASTP2P_OK;
 }
 
@@ -8233,6 +8250,11 @@ static void nat_stun_finish(fastp2p_client *c, uint64_t now) {
     s->shared = 0;
     s->fd = -1;
     s->phase = 0;
+    /* A later attempt (a new session, a changed list) walks the witnesses again. */
+    s->scan = 0;
+    s->scan_at = 0;
+    s->scanning = 0;
+    s->scan_done = 0;
     /* Same mapping from every destination -> cone; anything else is a
      * per-destination mapping, which is symmetric by definition.
      *
@@ -8305,19 +8327,36 @@ static void nat_stun_start(fastp2p_client *c, uint64_t now) {
         return;
     if (c->nat[OP_FAM_V4].type != NAT_CONE && c->nat[OP_FAM_V4].type != NAT_UNKNOWN)
         return; /* symmetric is already NAT4, no stranger test needed */
-    *s = (nat_stun){.fd = -1, .mapped_same = 1};
-    int resolved = 0;
-    for (int i = 0; i < c->stun_count; ++i) {
-        op_addr address;
-        if (!(resolve_any_families(c->stun_host[i], c->stun_port[i], FAM_V4, &address, NULL) & FAM_V4))
-            continue;
-        s->addr[resolved++] = address;
+    if (!s->scanning && !s->scan_done) {
+        *s = (nat_stun){.fd = -1, .mapped_same = 1};
+        s->scanning = 1;
     }
-    if (!resolved) {
+    if (s->scanning) {
+        /* One lookup per call, spaced out; the spacing widens to whatever the last lookup
+         * actually cost so a slow resolver cannot take the whole loop. */
+        if (now < s->scan_at)
+            return;
+        if ((int)s->scan >= c->stun_count) {
+            s->scanning = 0;
+            s->scan_done = 1;
+        } else {
+            op_addr address;
+            uint64_t started = op_monotonic_ns();
+            if ((resolve_any_families(c->stun_host[s->scan], c->stun_port[s->scan], FAM_V4, &address,
+                                      NULL) & FAM_V4) &&
+                s->count < FP_STUN_MAX_SERVERS)
+                s->addr[s->count++] = address;
+            ++s->scan;
+            uint64_t spent = op_monotonic_ns() - started;
+            uint64_t wait = spent > UDP_WITNESS_INTERVAL ? spent : UDP_WITNESS_INTERVAL;
+            s->scan_at = now + wait;
+            return;
+        }
+    }
+    if (!s->count) {
         nat_stun_finish(c, mono());
         return;
     }
-    s->count = resolved;
     /* Now that a server address exists, ask the kernel which source address it
      * would use towards it: with an IPv6-only control path local_ip[v4] is
      * otherwise empty and the open-host comparison has nothing to compare. */
