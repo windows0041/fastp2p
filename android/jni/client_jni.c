@@ -21,6 +21,9 @@ typedef struct {
 
 enum { STEP_RESTART_REQUESTED = 1 };
 
+/* Defined below; create() binds before the client can ever be started. */
+static int bind_config(JNIEnv *env, binding *b);
+
 static void request_restart(void *user) {
     binding *b = user;
     b->restart_requested = 1;
@@ -130,15 +133,22 @@ JNIEXPORT jlong JNICALL Java_top_fastp2p_cclient_NativeClient_create(JNIEnv *env
         return 0;
     }
     fastp2p_client_set_restart_handler(b->client, request_restart, b);
+    /* Earliest point that has both the client and the listener: from here on the session
+     * advertises configuration support no matter which Java path created it. */
+    (void)bind_config(env, b);
     return (jlong)(intptr_t)b;
 }
 
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_start(JNIEnv *env, jclass cls,
                                                                       jlong handle) {
-    (void)env;
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
-    return b ? fastp2p_client_start(b->client) : FASTP2P_EINVAL;
+    if (!b)
+        return FASTP2P_EINVAL;
+    /* Last chance before the login frame is built: a Java path that skipped create-time binding
+     * (or a listener whose method appeared late) still ends up advertising support. */
+    (void)bind_config(env, b);
+    return fastp2p_client_start(b->client);
 }
 
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_attachSdwanTun(
@@ -149,17 +159,44 @@ JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_attachSdwanTun(
     return b ? fastp2p_client_attach_sdwan_tun(b->client, fd) : FASTP2P_EINVAL;
 }
 
+/* Bind the configuration channel. It has to happen before start(): the login frame advertises
+ * configPush from the presence of a handler, and the gateway only pushes to clients that
+ * advertised it - so registering after start (or not at all) leaves the node on the witness
+ * list it was built with while the console shows the pushed one. Idempotent on purpose: create,
+ * the explicit enableConfigPush call and start all run it. */
+static int bind_config(JNIEnv *env, binding *b) {
+    if (!b || !b->client)
+        return FASTP2P_EINVAL;
+    if (!b->config_callback && b->listener) {
+        jclass listener = (*env)->GetObjectClass(env, b->listener);
+        if (listener) {
+            b->config_callback = (*env)->GetMethodID(env, listener, "onGatewayConfig", "(J[BJ)I");
+            (*env)->DeleteLocalRef(env, listener);
+        }
+    }
+    if (b->config_callback &&
+        fastp2p_client_set_config_handler(b->client, receive_config, b) == FASTP2P_OK) {
+        /* The Java layer applies and persists through SecretStore, so there is no C-side profile
+         * to hand over; the label says where the document really lives, and the binding line in
+         * the log is the one a support session looks for. */
+        (void)fastp2p_client_set_config_path(b->client, "secretstore");
+        return FASTP2P_OK;
+    }
+    /* This listener cannot take a configuration (an embedder without onGatewayConfig): the
+     * library's built-in applier takes the hot knobs in memory instead of nothing at all. */
+    b->config_callback = NULL;
+    return fastp2p_client_set_config_path(b->client, NULL);
+}
+
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_enableConfigPush(
     JNIEnv *env, jclass cls, jlong handle) {
     (void)cls;
     binding *b = (binding *)(intptr_t)handle;
     if (!b)
         return FASTP2P_EINVAL;
-    jclass listener = (*env)->GetObjectClass(env, b->listener);
-    b->config_callback = (*env)->GetMethodID(env, listener, "onGatewayConfig", "(J[BJ)I");
-    (*env)->DeleteLocalRef(env, listener);
-    return b->config_callback ? fastp2p_client_set_config_handler(b->client, receive_config, b)
-                              : FASTP2P_EINVAL;
+    int result = bind_config(env, b);
+    return result < 0 ? result : fastp2p_client_config_push_supported(b->client) ? FASTP2P_OK
+                                                                                 : FASTP2P_ESTATE;
 }
 JNIEXPORT jint JNICALL Java_top_fastp2p_cclient_NativeClient_prepareGatewayRules(
     JNIEnv *env, jclass cls, jlong handle, jbyteArray json) {
