@@ -308,8 +308,14 @@ typedef struct {
      * NAT that keys its mapping on the destination *address*: it looks like a cone
      * until a peer on another address punches at a port we never published. One
      * outside server settles it. dep_phase 1 = question in flight, addr_dep is the
-     * verdict (1 dependent, 0 stable, -1 unanswered). */
-    int dep_phase, dep_attempt, addr_dep;
+     * verdict (1 the address follows the destination, 0 it holds, -1 unanswered).
+     *
+     * The question is asked for a symmetric mapping too, not only for a cone: "the
+     * ports move" and "the address moves" are separate facts, and a pair that has to
+     * collide ports can only do it while the address a peer sees is the one we
+     * publish. ladder_done says the ladder itself has finished, so a late answer
+     * knows whether it is filling in a verdict or completing one. */
+    int dep_phase, dep_attempt, addr_dep, ladder_done;
     op_addr dep_addr;
     /* Which server was asked, so the log says who the verdict rests on. */
     char dep_host[254];
@@ -7396,6 +7402,7 @@ static int nat_discovery_open(fastp2p_client *c, int family) {
     n->dep_phase = 0;
     n->dep_attempt = 0;
     n->addr_dep = -1;
+    n->ladder_done = 0;
     n->observed.len = 0;
     n->type = NAT_UNKNOWN;
     if (family == OP_FAM_V4 && c->nat_override)
@@ -7438,6 +7445,17 @@ static int address_not_translated(const op_addr *a) {
      * private ranges; CGNAT stays routable on purpose, because a carrier peer behind it
      * is still reachable through its mapping. */
     return a && a->len && !op_addr_routable(a);
+}
+/* One mapping observation, split into the two axes a punch plan cares about: a mapping
+ * that keeps its public address and moves only its port still leaves a peer a
+ * one-dimensional search, while a mapping whose address follows the destination leaves
+ * it nothing to aim at. */
+static void nat_mapping_axes(const op_addr *mapped, const op_addr *observed,
+                             uint16_t measured_port, int *address_stable, int *port_stable) {
+    if (address_stable)
+        *address_stable = !observed->len || same_ip(mapped, observed);
+    if (port_stable)
+        *port_stable = op_addr_port(mapped) == measured_port;
 }
 /* Ask one outside server what our mapping looks like from a second destination
  * address, from the same socket (the same mapping). The gateway's probe ports share
@@ -7489,22 +7507,40 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
         fp_stun_mapped mapped;
         if (op_address_equal(&from->u.sa, from->len, &n->dep_addr.u.sa, n->dep_addr.len) &&
             fp_stun_response(data, length, n->dep_tid, &mapped) && mapped.valid) {
-            int stable = op_addr_port(&mapped.address) == n->port &&
-                         (!n->observed.len || same_ip(&mapped.address, &n->observed));
-            n->addr_dep = stable ? 0 : 1;
+            int address_stable = 0, port_stable = 0;
+            nat_mapping_axes(&mapped.address, &n->observed, n->port, &address_stable, &port_stable);
+            n->addr_dep = address_stable ? 0 : 1;
             n->dep_phase = 0;
-            /* A mapping that follows the destination address is unpredictable to any
-             * peer at another address, which is exactly what the symmetric class
-             * means here: the centred window and the relay filter already cover it. */
-            n->type = stable ? NAT_CONE : NAT_HARD_SYM;
+            /* Only a ladder that called itself a cone can be corrected here: when the
+             * ports already moved, the ladder's own class stands and this answer fills
+             * in the address axis alone. */
+            int was_cone = n->type == NAT_CONE;
+            if (was_cone && !(address_stable && port_stable))
+                n->type = NAT_HARD_SYM;
             char note[300];
-            snprintf(note, sizeof(note),
-                     stable
-                         ? "UDP mapping holds for a second destination address (%s)"
-                         : "UDP mapping follows the destination address (%s); treating it as symmetric",
-                     n->dep_host[0] ? n->dep_host : "the outside server");
+            if (was_cone) {
+                snprintf(note, sizeof(note),
+                         (address_stable && port_stable)
+                             ? "UDP mapping holds for a second destination address (%s)"
+                             : "UDP mapping follows the destination address (%s); treating it as symmetric",
+                         n->dep_host[0] ? n->dep_host : "the outside server");
+            } else {
+                /* Ports were already known to move; what this answer adds is whether the
+                 * address a peer sees stays the one we publish, which is the difference
+                 * between a one-dimensional search and none at all. */
+                snprintf(note, sizeof(note),
+                         address_stable
+                             ? "UDP address holds while the ports move (%s); only the port axis is unpredictable"
+                             : "UDP address follows the destination too (%s); nothing about the mapping is predictable",
+                         n->dep_host[0] ? n->dep_host : "the outside server");
+            }
             emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
-            nat_discovery_finish(c, family);
+            /* Publish the new field as soon as there is one: the login may already have
+             * carried the verdict from before this answer arrived. */
+            if (c->ws && c->login_ok)
+                report_nat(c);
+            if (n->ladder_done)
+                nat_discovery_finish(c, family);
             return 1;
         }
     }
@@ -7545,7 +7581,19 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
                                  !address_not_translated(&seen);
                 if (!comparable || !nat_discovery_probe_second_ip(c, family, now))
                     nat_discovery_finish(c, family);
+                else
+                    n->ladder_done = 1;
             } else {
+                /* Ports move with the destination port. The address axis is still worth
+                 * asking: a plan that has to collide ports on both sides only works while
+                 * the address a peer sees is the one we publish, so "address holds, ports
+                 * move" and "both move" are different situations and only the first is
+                 * worth spending a window on. Asked from the ladder socket, whose mapping
+                 * is the one being described, while the second socket finishes the ladder. */
+                op_addr seen;
+                if (!op_addr_from_text(&seen, c->ip[family], n->port) &&
+                    !address_not_translated(&seen))
+                    (void)nat_discovery_probe_second_ip(c, family, now);
                 /* Different mapping: symmetric. Probe from a second local port to
                  * see whether the next mapping is predictable. That port is ours,
                  * never the listener, so it is a plain ephemeral socket. */
@@ -7564,7 +7612,12 @@ static int nat_discovery_reply(fastp2p_client *c, int family, const uint8_t *dat
         } else {
             n->port2 = (uint16_t)port;
             n->type = nat_classify(n->port, n->second, n->port2);
-            nat_discovery_finish(c, family);
+            n->ladder_done = 1;
+            /* The address question may still be in flight; its answer belongs to the
+             * verdict, so the finish waits for it (one retry, so at most another 1.2 s
+             * on a run that has already spent seconds in the ladder). */
+            if (!n->dep_phase)
+                nat_discovery_finish(c, family);
         }
     }
     if (j)
@@ -7607,12 +7660,15 @@ static void tick_nat_family(fastp2p_client *c, int family, uint64_t now) {
                                 n->dep_addr.len);
             return;
         }
-        /* Silence must not turn a working cone into a symmetric verdict, so an
-         * unanswered question leaves the ladder's own answer standing. */
+        /* Silence must not turn a working cone into a symmetric verdict, and it must not
+         * overwrite a class the ladder already reached, so an unanswered question leaves
+         * the ladder's own answer standing. */
         n->dep_phase = 0;
         n->addr_dep = -1;
-        n->type = NAT_CONE;
-        nat_discovery_finish(c, family);
+        if (n->type == NAT_UNKNOWN)
+            n->type = NAT_CONE;
+        if (n->ladder_done)
+            nat_discovery_finish(c, family);
         return;
     }
     if (now > n->deadline) {

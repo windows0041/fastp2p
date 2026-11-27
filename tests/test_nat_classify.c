@@ -600,14 +600,59 @@ static void self_hosted_stun_is_preferred(void) {
 
 /* Every gateway probe port is on one address, so a NAT that keys its mapping on the
  * destination *address* looks like a cone until a peer elsewhere punches at a port that
- * was never published. One outside answer settles it, and its verdict must win. */
+ * was never published. One outside answer settles it, and its verdict must win.
+ *
+ * The answer here moves the port and keeps the address: the mapping is symmetric, but
+ * the address a peer sees is still the one we publish, so the address axis holds. */
+static void mapping_moves_its_port_but_keeps_its_address(void) {
+    fastp2p_client c = {0};
+    start_second_address_question(&c, 35000);
+    answer_second_address(&c, 45123, 3 * NS); /* a different port, the same address */
+    assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM);
+    assert(c.nat[OP_FAM_V4].addr_dep == 0);
+    assert(c.nat[OP_FAM_V4].fd < 0); /* ladder finished, nothing left open */
+}
+
+/* The address itself moves: nothing about the mapping is predictable to a peer on
+ * another address, which is the case that makes a port-collision plan pointless. */
 static void mapping_follows_the_destination_address(void) {
     fastp2p_client c = {0};
     start_second_address_question(&c, 35000);
-    answer_second_address(&c, 45123, 3 * NS); /* a different mapping */
+    static const uint8_t elsewhere[4] = {203, 0, 113, 9};
+    answer_second_address_at(&c, 35000, elsewhere, 3 * NS);
     assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM);
     assert(c.nat[OP_FAM_V4].addr_dep == 1);
-    assert(c.nat[OP_FAM_V4].fd < 0); /* ladder finished, nothing left open */
+    assert(c.nat[OP_FAM_V4].fd < 0);
+}
+
+/* A symmetric mapping is asked the address question too, because the two axes are
+ * separate facts: "the ports move" does not answer "does the address move". The answer
+ * fills in the field and leaves the ladder's own class standing, and the ladder's
+ * verdict waits for it rather than closing the socket underneath it. */
+static void symmetric_mapping_still_answers_the_address_question(void) {
+    fastp2p_client c = {0};
+    snprintf(c.local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    assert(!op_addr_from_text(&c.gateway_addr[OP_FAM_V4], "127.0.0.1", 27180));
+    probe_fds_closed(&c);
+    c.udp_listener[OP_FAM_V4] = -1;
+    snprintf(c.stun_host[0], sizeof(c.stun_host[0]), "%s", "127.0.0.2");
+    c.stun_port[0] = 3478;
+    c.stun_count = 1;
+    assert(nat_discovery_open(&c, OP_FAM_V4) == 1);
+    feed_mapping_answer(&c, 27180, 35000, 1 * NS);
+    feed_mapping_answer(&c, 27181, 36000, 2 * NS); /* ports differ: symmetric branch */
+    assert(c.nat[OP_FAM_V4].phase == 3);
+    /* Asked from the ladder socket while the second socket finishes the ladder. */
+    assert(c.nat[OP_FAM_V4].dep_phase == 1);
+    feed_mapping_answer(&c, 27180, 46000, 3 * NS); /* no constant step */
+    assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM);
+    /* The ladder is done but the socket stays open: the answer still belongs to it. */
+    assert(c.nat[OP_FAM_V4].fd >= 0);
+    static const uint8_t elsewhere[4] = {203, 0, 113, 9};
+    answer_second_address_at(&c, 46000, elsewhere, 4 * NS);
+    assert(c.nat[OP_FAM_V4].addr_dep == 1);
+    assert(c.nat[OP_FAM_V4].type == NAT_HARD_SYM); /* the ladder's class stands */
+    assert(c.nat[OP_FAM_V4].fd < 0 && c.nat[OP_FAM_V4].fd2 < 0);
 }
 
 /* An answer that matches the gateway's mapping confirms the cone and records that the
@@ -2032,6 +2077,35 @@ static void dialer_array_leaves_undiallable_peers_alone(void) {
     free(c);
     op_close(endpoint);
 }
+/* "The ports move" and "the address moves" are different answers, and the second one
+ * is what decides whether a symmetric pair is worth a port-collision window at all: a
+ * mapping that keeps its address and only moves its port still leaves the peer one
+ * dimension to search, while one that follows the destination address leaves nothing to
+ * aim at. The ladder used to stop after the port axis and never ask, so the field stayed
+ * unpublished for every symmetric node. */
+static void address_axis_is_separate_from_the_port_axis(void) {
+    op_addr seen, mapped;
+    assert(!op_addr_from_text(&seen, "203.0.113.7", 40000));
+    int address_stable = -1, port_stable = -1;
+    /* Same address, different port: only the port axis moved. */
+    assert(!op_addr_from_text(&mapped, "203.0.113.7", 51234));
+    nat_mapping_axes(&mapped, &seen, 40000, &address_stable, &port_stable);
+    assert(address_stable == 1);
+    assert(port_stable == 0);
+    /* Both equal: a cone, as before. */
+    assert(!op_addr_from_text(&mapped, "203.0.113.7", 40000));
+    nat_mapping_axes(&mapped, &seen, 40000, &address_stable, &port_stable);
+    assert(address_stable == 1 && port_stable == 1);
+    /* Different address: the peer would dial an address our mapping does not exist on. */
+    assert(!op_addr_from_text(&mapped, "198.51.100.9", 40000));
+    nat_mapping_axes(&mapped, &seen, 40000, &address_stable, &port_stable);
+    assert(address_stable == 0 && port_stable == 1);
+    /* The gateway recorded no mapping at all: there is nothing to contradict, which is
+     * how the cone branch has always read it. */
+    op_addr empty = {0};
+    nat_mapping_axes(&mapped, &empty, 40000, &address_stable, &port_stable);
+    assert(address_stable == 1 && port_stable == 1);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2062,7 +2136,9 @@ int main(void) {
     remeasure_waits_for_the_punch();
     self_hosted_stun_is_preferred();
     private_gateway_address_is_not_comparable();
+    mapping_moves_its_port_but_keeps_its_address();
     mapping_follows_the_destination_address();
+    symmetric_mapping_still_answers_the_address_question();
     mapping_stays_a_cone_across_addresses();
     mapping_depends_on_the_address_only();
     unanswered_second_address_keeps_the_cone();
@@ -2236,5 +2312,6 @@ int main(void) {
     dialer_array_uses_many_source_ports();
     dialer_array_leaves_undiallable_peers_alone();
     spray_aims_ahead_of_an_unpredictable_peer();
+    address_axis_is_separate_from_the_port_axis();
     return 0;
 }
