@@ -169,8 +169,135 @@ static void private_gateway_is_not_a_destination(void) {
     fp_tcp_nat_close(&state);
 }
 
+/* ---- parallel probing ------------------------------------------------------------
+ * The probe used to run one socket at a time. These tests drive a batch of targets on
+ * loopback and check the two things that make the parallel version correct: the probes must
+ * really overlap, and the samples must still be recorded in target order whatever order the
+ * answers arrive in. */
+
+/* Answer one probe: the plain-text echo, or a STUN binding success carrying the same
+ * transaction id the request used. Returns 0 while the probe has not been answered yet. */
+static unsigned serve_probe(op_socket peer, unsigned index, int stun, int vary) {
+    if (!stun) {
+        char marker;
+        if (op_recv(peer, &marker, 1, MSG_DONTWAIT) != 1) return 0;
+        assert(marker == '2');
+        char line[64];
+        int n = snprintf(line, sizeof(line), "203.0.113.7:%u\n", 45678u + (vary ? index : 0));
+        assert(op_send(peer, line, (size_t)n, MSG_NOSIGNAL) == (op_ssize)n);
+        return 1;
+    }
+    uint8_t request[20];
+    size_t got = 0;
+    while (got < sizeof(request)) {
+        op_ssize r = op_recv(peer, request + got, sizeof(request) - got, MSG_DONTWAIT);
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    uint8_t response[32];
+    stun_packet(response, request + 8);
+    put16(response + 26, (45678u + (vary ? index : 0)) ^ 0x2112);
+    assert(op_send(peer, response, sizeof(response), MSG_NOSIGNAL) == (op_ssize)sizeof(response));
+    return 1;
+}
+
+/* One full cycle against `count` loopback targets, each answering with its own index.
+ * `dead` (>= 0) turns that target into a closed port so the batch has to survive a refusal.
+ * Returns 1 when the cycle completed. */
+static int run_probe_cycle(fp_tcp_nat *state, unsigned count, int stun, int dead, int vary) {
+    enum { MAX = 16 };
+    assert(count <= MAX);
+    fp_tcp_family *k = &state->family[OP_FAM_V4];
+    k->prepared = 1;
+    k->target_count = count;
+    op_socket listeners[MAX], peers[MAX];
+    unsigned served[MAX];
+    for (unsigned i = 0; i < MAX; ++i) { listeners[i] = -1; peers[i] = -1; served[i] = 0; }
+    for (unsigned i = 0; i < count; ++i) {
+        op_socket l = op_socket_open(AF_INET, SOCK_STREAM, 0);
+        assert(l >= 0);
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)}};
+        assert(!op_bind(l, (struct sockaddr *)&addr, sizeof(addr)) && !op_listen(l, 16));
+        op_socklen length = sizeof(addr);
+        assert(!op_getsockname(l, (struct sockaddr *)&addr, &length));
+        memset(&k->targets[i].address, 0, sizeof(op_addr));
+        memcpy(&k->targets[i].address.u.storage, &addr, sizeof(addr));
+        k->targets[i].address.len = (op_socklen)sizeof(addr);
+        k->targets[i].stun = stun;
+        if ((int)i == dead) { op_close(l); continue; } /* nothing listens: the connect fails */
+        listeners[i] = l;
+    }
+    uint64_t deadline = op_monotonic_ns() + UINT64_C(5000000000);
+    int done = 0;
+    while (op_monotonic_ns() < deadline && !done) {
+        done = fp_tcp_nat_step(state, op_monotonic_ns());
+        for (unsigned i = 0; i < count; ++i) {
+            if (listeners[i] < 0) continue;
+            if (peers[i] < 0) {
+                struct sockaddr_in peer;
+                op_socklen length = sizeof(peer);
+                peers[i] = op_accept(listeners[i], (struct sockaddr *)&peer, &length);
+            }
+            if (peers[i] >= 0 && !served[i] && serve_probe(peers[i], i, stun, vary)) served[i] = 1;
+        }
+        op_sleep_ms(2);
+    }
+    for (unsigned i = 0; i < MAX; ++i) {
+        if (peers[i] >= 0) op_close(peers[i]);
+        if (listeners[i] >= 0) op_close(listeners[i]);
+    }
+    return done;
+}
+
+/* Six STUN probes at the same time: the batch must not wait for one answer before starting
+ * the next probe. `peak_inflight` is the high-water mark the probe loop keeps, so this is
+ * the concurrency itself, not a proxy for it. */
+static void six_probes_at_once(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    assert(run_probe_cycle(&state, FP_TCP_PROBE_SLOTS, 1, -1, 0));
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->peak_inflight == FP_TCP_PROBE_SLOTS);
+    assert(k->samples == FP_TCP_PROBE_SLOTS && k->destinations == 1);
+    assert(k->type == FP_NAT_STABLE);
+    fp_tcp_nat_close(&state);
+}
+
+/* Answers arrive in whatever order the sockets finish, but the samples have to stay in
+ * target order: the step calculation reads mapped[i] - mapped[i-1]. */
+static void samples_keep_target_order(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    assert(run_probe_cycle(&state, FP_TCP_PROBE_SLOTS, 1, -1, 1));
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->samples == FP_TCP_PROBE_SLOTS);
+    for (unsigned i = 0; i < k->samples; ++i)
+        assert(op_addr_port(&k->mapped[i]) == 45678u + i);
+    /* Six distinct ports on one address: destination-dependent, and the batch order did not
+     * turn that into six separate destinations. */
+    assert(k->type == FP_NAT_DEPENDENT && k->destinations == 1);
+    fp_tcp_nat_close(&state);
+}
+
+/* A refused target must not stall the batch: the other five still complete, and the cycle
+ * ends well inside the deadline instead of waiting for the timeout. */
+static void one_failed_target_still_completes_the_batch(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    uint64_t started = op_monotonic_ns();
+    assert(run_probe_cycle(&state, FP_TCP_PROBE_SLOTS, 1, 2, 0));
+    uint64_t elapsed = op_monotonic_ns() - started;
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->samples == FP_TCP_PROBE_SLOTS - 1 && k->destinations == 1);
+    assert(k->type == FP_NAT_STABLE);
+    assert(elapsed < UINT64_C(2000000000)); /* finished, did not sit out the 2 s timeout */
+    fp_tcp_nat_close(&state);
+}
+
 int main(void) {
     assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
-    puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling and separate mapping results passed");
+    six_probes_at_once();samples_keep_target_order();one_failed_target_still_completes_the_batch();
+    puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling, "
+         "separate mapping results and six parallel probes passed");
     return 0;
 }

@@ -23,6 +23,21 @@ typedef struct {
     op_addr address;
     int stun;
 } fp_tcp_probe_target;
+/* How many probes may be in flight at once. Each one costs a TCP handshake to a different
+ * witness, and the batch is what a witness list needs: six in parallel finish in the time
+ * one used to take, without ever blocking the step loop that also drives the control
+ * channel. */
+#define FP_TCP_PROBE_SLOTS 6
+/* One in-flight probe: the same four stages the single-socket probe ran, per slot. */
+typedef struct {
+    op_socket fd;
+    int target;                 /* index into targets[], -1 when the slot is free */
+    int phase;                  /* 2 connecting, 3 sending, 4 receiving */
+    uint8_t request[20];
+    uint8_t response[1024];
+    size_t request_length, sent, received;
+    uint64_t deadline;
+} fp_tcp_slot;
 /* One family's TCP mapping discovery. DUALSTACK-SPEC §3/§4: the identical
  * sequence runs once per family, against that family's gateway probe ports, so
  * the IPv4 slot holds exactly the values the old single-family state did. */
@@ -41,9 +56,15 @@ typedef struct {
      * differences between the observed ports are the allocator's own step. */
     int fresh_source;
     int phase, prepared;
-    uint64_t deadline, next_cycle;
-    uint8_t request[20], response[1024];
-    size_t sent, request_length, received;
+    uint64_t next_cycle;
+    /* Parallel probing. Results are kept per target and appended in target order when the
+     * batch ends, so neither the verdict nor the step calculation depends on the order the
+     * replies happen to arrive in. inflight/peak_inflight are also the observable a test
+     * uses to prove the probes really do overlap. */
+    fp_tcp_slot slots[FP_TCP_PROBE_SLOTS];
+    unsigned next_target, inflight, peak_inflight, held_count;
+    op_addr cycle_mapped[FP_TCP_PROBE_MAX];
+    unsigned char cycle_ok[FP_TCP_PROBE_MAX];
 } fp_tcp_family;
 typedef struct {
     fp_stun_server servers[FP_TCP_STUN_MAX];
