@@ -4635,7 +4635,8 @@ static void start_underlay(fastp2p_client *c, int index) {
          * punch is running (tick_accept matches on it). */
         if (t->initiator)
             t->tcp_direct_port = 0;
-        if (t->initiator && direct_port && !t->peer_tcp_dependent) {
+        if (t->initiator && direct_port &&
+            (!t->peer_tcp_dependent || t->lan || peer_is_local(&t->peer_addr))) {
             op_addr endpoint = t->peer_addr;
             op_addr_set_port(&endpoint, direct_port);
             int family = op_family_index(op_addr_family(&endpoint));
@@ -4684,7 +4685,8 @@ static void start_underlay(fastp2p_client *c, int index) {
             }
             return;
         }
-        if (t->punch_role == TCP_PUNCH_OPENER && t->peer_blade_count > 0) {
+        if (t->punch_role == TCP_PUNCH_OPENER && t->peer_blade_count > 0 &&
+            !t->lan && !peer_is_local(&t->peer_addr)) {
             t->spray_deferred = 1;
             t->tcp_retry_at = now + TCP_BLADE_OPENER_DEFER_MS * MS;
             emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
