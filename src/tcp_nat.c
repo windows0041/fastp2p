@@ -3,12 +3,252 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <process.h>
+#endif
 
 #define SECOND UINT64_C(1000000000)
 #define PUNCH_SAMPLE_TIMEOUT UINT64_C(450000000)
-/* Spacing between two witness lookups. Long enough that several resolutions cannot pile up
- * into one stalled tick, short enough that ten witnesses are ready in about two seconds. */
+/* Spacing between two witness lookups in the fallback walk. Long enough that several
+ * resolutions cannot pile up into one stalled tick, short enough that ten witnesses are
+ * ready in about two seconds. The worker below does not use it: it resolves back to back. */
 #define TCP_RESOLVE_INTERVAL (200 * SECOND / 1000)
+/* How often the worker looks for work. A lookup happens seconds apart, so a poll is cheaper
+ * than a condition variable and keeps the platform surface to a thread and a lock. */
+#define RESOLVE_POLL_MS 10
+
+/* --- one resolver thread ---------------------------------------------------------------
+ * getaddrinfo is the only call in this file that can block for as long as the resolver's
+ * timeout - seconds, when the resolver is unreachable. It used to run inside the loop that
+ * also carries the control channel: ten witnesses meant ten lookups, a stalled loop, and a
+ * gateway that closed the session. Now one worker does the lookups and the loop only pushes
+ * names and drains answers, taking the lock with a try-lock it never waits on. */
+typedef struct {
+    char host[254];
+    uint16_t port;
+} fp_tcp_resolve_job;
+typedef struct {
+    op_addr address;
+    uint16_t port;
+    int ok;
+} fp_tcp_resolve_answer;
+struct fp_tcp_resolver {
+#ifdef _WIN32
+    HANDLE thread;
+    SRWLOCK lock;
+#else
+    pthread_t thread;
+    pthread_mutex_t lock;
+#endif
+    int started, stopping, orphan;
+    fp_tcp_resolve_fn resolve;
+    fp_tcp_resolve_job jobs[FP_TCP_RESOLVE_QUEUE];
+    unsigned job_head, job_count;
+    fp_tcp_resolve_answer answers[FP_TCP_RESOLVE_QUEUE];
+    unsigned answer_head, answer_count;
+};
+
+static void resolver_lock(fp_tcp_resolver *r) {
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&r->lock);
+#else
+    pthread_mutex_lock(&r->lock);
+#endif
+}
+static void resolver_unlock(fp_tcp_resolver *r) {
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&r->lock);
+#else
+    pthread_mutex_unlock(&r->lock);
+#endif
+}
+/* A try-lock: the step loop must never wait for the worker, so a busy lock simply means the
+ * answers are drained on a later call. */
+static int resolver_trylock(fp_tcp_resolver *r) {
+#ifdef _WIN32
+    return TryAcquireSRWLockExclusive(&r->lock) ? 1 : 0;
+#else
+    return pthread_mutex_trylock(&r->lock) ? 0 : 1;
+#endif
+}
+/* The default lookup. WSAStartup is the client's job (op_platform_init) and has already run
+ * by the time a probe is prepared. */
+static int platform_resolve(const char *host, uint16_t port, op_addr *out) {
+    struct addrinfo hints = {0}, *addresses = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &addresses) || !addresses)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->len = (op_socklen)addresses->ai_addrlen;
+    if (out->len > (op_socklen)sizeof(out->u.storage))
+        out->len = (op_socklen)sizeof(out->u.storage);
+    memcpy(&out->u.storage, addresses->ai_addr, out->len);
+    freeaddrinfo(addresses);
+    op_addr_set_port(out, port);
+    return 0;
+}
+#ifdef _WIN32
+static unsigned __stdcall resolver_worker(void *arg) {
+#else
+static void *resolver_worker(void *arg) {
+#endif
+    fp_tcp_resolver *r = arg;
+    for (;;) {
+        char host[254];
+        uint16_t port = 0;
+        int have = 0, stop = 0;
+        resolver_lock(r);
+        if (r->job_count) {
+            memcpy(host, r->jobs[r->job_head].host, sizeof(host));
+            port = r->jobs[r->job_head].port;
+            r->job_head = (r->job_head + 1) % FP_TCP_RESOLVE_QUEUE;
+            --r->job_count;
+            have = 1;
+        }
+        stop = r->stopping;
+        resolver_unlock(r);
+        if (!have) {
+            if (stop) break;
+            op_sleep_ms(RESOLVE_POLL_MS);
+            continue;
+        }
+        fp_tcp_resolve_answer answer;
+        memset(&answer, 0, sizeof(answer));
+        answer.port = port;
+        answer.ok = r->resolve && !r->resolve(host, port, &answer.address);
+        resolver_lock(r);
+        if (r->answer_count < FP_TCP_RESOLVE_QUEUE) {
+            r->answers[(r->answer_head + r->answer_count) % FP_TCP_RESOLVE_QUEUE] = answer;
+            ++r->answer_count;
+        }
+        resolver_unlock(r);
+    }
+    /* The owner let this struct go on a reconfigure: reclaim it here, because nothing else
+     * may touch it once the reference is dropped. */
+    resolver_lock(r);
+    int orphan = r->orphan;
+    resolver_unlock(r);
+    if (orphan) {
+#ifndef _WIN32
+        pthread_mutex_destroy(&r->lock);
+#endif
+        free(r);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+static int resolver_start(fp_tcp_nat *s) {
+    if (s->resolver)
+        return 1;
+    fp_tcp_resolver *r = calloc(1, sizeof(*r));
+    if (!r)
+        return 0;
+    r->resolve = s->resolve ? s->resolve : platform_resolve;
+#ifdef _WIN32
+    InitializeSRWLock(&r->lock);
+    r->thread = (HANDLE)_beginthreadex(NULL, 0, resolver_worker, r, 0, NULL);
+    if (!r->thread) {
+        free(r);
+        return 0;
+    }
+#else
+    if (pthread_mutex_init(&r->lock, NULL)) {
+        free(r);
+        return 0;
+    }
+    if (pthread_create(&r->thread, NULL, resolver_worker, r)) {
+        pthread_mutex_destroy(&r->lock);
+        free(r);
+        return 0;
+    }
+#endif
+    r->started = 1;
+    s->resolver = r;
+    return 1;
+}
+static void resolver_stop(fp_tcp_nat *s, int wait) {
+    fp_tcp_resolver *r = s->resolver;
+    if (!r)
+        return;
+    resolver_lock(r);
+    r->stopping = 1;
+    /* wait == 0 is the reconfigure path: this call runs inside the step loop, so it must not
+     * wait for the lookup the worker is in the middle of. The worker owns the struct from here
+     * and frees it when it exits. */
+    if (!wait)
+        r->orphan = 1;
+    resolver_unlock(r);
+    s->resolver = NULL;
+    if (!wait) {
+#ifdef _WIN32
+        CloseHandle(r->thread);
+#else
+        pthread_detach(r->thread);
+#endif
+        return;
+    }
+    /* Shutdown waits for the worker, which is that poll plus the lookup it is inside - at
+     * worst one resolver timeout, and this is the only place in the file that waits at all. */
+#ifdef _WIN32
+    WaitForSingleObject(r->thread, INFINITE);
+    CloseHandle(r->thread);
+#else
+    pthread_join(r->thread, NULL);
+    pthread_mutex_destroy(&r->lock);
+#endif
+    free(r);
+}
+/* Queue every name of the list. False means "no worker, or the queue would not take them":
+ * the caller falls back to the incremental walk and nothing is lost. */
+static int resolver_submit(fp_tcp_nat *s, const fp_stun_server *servers, unsigned count) {
+    fp_tcp_resolver *r = s->resolver;
+    if (!r || count > FP_TCP_RESOLVE_QUEUE)
+        return 0;
+    if (!resolver_trylock(r))
+        return 0;
+    int room = r->job_count + count <= FP_TCP_RESOLVE_QUEUE;
+    for (unsigned i = 0; room && i < count; ++i) {
+        unsigned slot = (r->job_head + r->job_count) % FP_TCP_RESOLVE_QUEUE;
+        snprintf(r->jobs[slot].host, sizeof(r->jobs[slot].host), "%s", servers[i].host);
+        r->jobs[slot].port = servers[i].port;
+        ++r->job_count;
+    }
+    resolver_unlock(r);
+    return room;
+}
+static unsigned resolver_drain(fp_tcp_nat *s, fp_tcp_resolve_answer *out, unsigned max) {
+    fp_tcp_resolver *r = s->resolver;
+    if (!r || !max)
+        return 0;
+    if (!resolver_trylock(r))
+        return 0;
+    unsigned n = 0;
+    while (n < max && r->answer_count) {
+        out[n].address = r->answers[r->answer_head].address;
+        out[n].port = r->answers[r->answer_head].port;
+        out[n].ok = r->answers[r->answer_head].ok;
+        ++n;
+        r->answer_head = (r->answer_head + 1) % FP_TCP_RESOLVE_QUEUE;
+        --r->answer_count;
+    }
+    resolver_unlock(r);
+    return n;
+}
+void fp_tcp_nat_set_resolver(fp_tcp_nat *s, fp_tcp_resolve_fn resolve) {
+    if (s)
+        s->resolve = resolve;
+}
+void fp_tcp_nat_set_inline_resolution(fp_tcp_nat *s, int on) {
+    if (s)
+        s->inline_resolution = on;
+}
+int fp_tcp_nat_resolver_running(const fp_tcp_nat *s) {
+    return s && s->resolver && s->resolver->started;
+}
 static uint16_t be16(const uint8_t *p) { return (uint16_t)((unsigned)p[0] << 8 | p[1]); }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 
@@ -75,6 +315,7 @@ static void family_close(fp_tcp_family *k) {
     k->inflight = 0;
     k->phase = 0;
     k->resolving = 0;
+    k->awaiting = 0;
     k->prepared = 0;
 }
 void fp_tcp_nat_init(fp_tcp_nat *s) {
@@ -124,6 +365,7 @@ int fp_tcp_nat_configure(fp_tcp_nat *s, json_object *servers) {
     return 0;
 }
 void fp_tcp_nat_close(fp_tcp_nat *s) {
+    resolver_stop(s, 1);
     for (int f = 0; f < OP_FAM_COUNT; ++f)
         family_close(&s->family[f]);
 }
@@ -138,13 +380,14 @@ void fp_tcp_nat_close(fp_tcp_nat *s) {
  * kicked. The list is therefore walked one name per step call (see family_resolve_step);
  * prepared stays 0 until the walk is done. */
 static void family_begin(fp_tcp_family *k, const op_addr *gateway, int index,
-                         const fp_stun_server *servers, unsigned count) {
+                         const fp_stun_server *servers, unsigned count, int have_worker) {
     k->samples = k->destinations = 0;
     k->next_cycle = 0;
     k->type = FP_NAT_UNKNOWN;
     k->prepared = 0;
     k->target_count = 0;
     k->resolving = 0;
+    k->awaiting = 0;
     k->resolve_index = k->resolved = 0;
     k->next_resolve_at = 0;
     k->resolve_cost = 0;
@@ -163,7 +406,12 @@ static void family_begin(fp_tcp_family *k, const op_addr *gateway, int index,
         k->target_count = 2;
     }
     if (index == OP_FAM_V4 && count) {
-        k->resolving = 1; /* the walk below fills the rest, one name per tick */
+        /* With a worker the answers arrive on their own; without one the walk below takes
+         * over. Either way the ladder waits until every name has an answer. */
+        if (have_worker)
+            k->awaiting = count;
+        else
+            k->resolving = 1;
         return;
     }
     /* One destination cannot tell whether the mapping follows the destination, so an
@@ -171,9 +419,33 @@ static void family_begin(fp_tcp_family *k, const op_addr *gateway, int index,
     if (k->target_count >= 2)
         k->prepared = 1;
 }
-/* Resolve one more witness, at most once per interval. The interval widens to twice the
- * time the previous lookup actually took: a resolver that needs a second per name then
- * spends one second in the loop, not ten names' worth in one call. */
+/* Append one resolved witness, keeping the configured order and dropping an address that is
+ * already in the list. */
+static void family_add_target(fp_tcp_family *k, const op_addr *address, uint16_t port) {
+    op_addr resolved = *address;
+    op_addr_set_port(&resolved, port);
+    for (unsigned q = 0; q < k->target_count; ++q)
+        if (op_addr_equal(&resolved, &k->targets[q].address) &&
+            op_addr_port(&resolved) == op_addr_port(&k->targets[q].address))
+            return;
+    if (k->target_count < FP_TCP_PROBE_MAX)
+        k->targets[k->target_count++] = (fp_tcp_probe_target){.address = resolved, .stun = 1};
+}
+/* Take the worker's answers in the order they were queued, which is the order the names were
+ * submitted, so the target list keeps the configured order. */
+static void family_apply_answers(fp_tcp_family *k, const fp_tcp_resolve_answer *batch, unsigned n) {
+    for (unsigned i = 0; i < n && k->awaiting; ++i) {
+        if (batch[i].ok)
+            family_add_target(k, &batch[i].address, batch[i].port);
+        ++k->resolved;
+        --k->awaiting;
+    }
+    if (!k->awaiting && !k->resolving && k->target_count >= 2)
+        k->prepared = 1;
+}
+/* Fallback: no worker could be started, so resolve one name per step call, spaced out. The
+ * spacing widens to whatever the last lookup took, which keeps a slow resolver's share of
+ * the loop bounded instead of letting it take the whole call. */
 static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_server *servers,
                                 unsigned count, uint64_t now) {
     if (!k->resolving || now < k->next_resolve_at)
@@ -181,27 +453,10 @@ static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_serve
     if (k->resolve_index < count) {
         const fp_stun_server *server = &servers[k->resolve_index++];
         uint64_t started = op_monotonic_ns();
-        struct addrinfo hints = {0}, *addresses = NULL;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (!getaddrinfo(server->host, NULL, &hints, &addresses)) {
-            op_addr resolved;
-            memset(&resolved, 0, sizeof(resolved));
-            resolved.len = (op_socklen)addresses->ai_addrlen;
-            if (resolved.len > (op_socklen)sizeof(resolved.u.storage))
-                resolved.len = (op_socklen)sizeof(resolved.u.storage);
-            memcpy(&resolved.u.storage, addresses->ai_addr, resolved.len);
-            freeaddrinfo(addresses);
-            op_addr_set_port(&resolved, server->port);
-            int duplicate = 0;
-            for (unsigned q = 0; q < k->target_count; ++q)
-                if (op_addr_equal(&resolved, &k->targets[q].address) &&
-                    op_addr_port(&resolved) == op_addr_port(&k->targets[q].address))
-                    duplicate = 1;
-            if (!duplicate && k->target_count < FP_TCP_PROBE_MAX)
-                k->targets[k->target_count++] =
-                    (fp_tcp_probe_target){.address = resolved, .stun = 1};
-        }
+        op_addr resolved;
+        memset(&resolved, 0, sizeof(resolved));
+        if (!platform_resolve(server->host, server->port, &resolved))
+            family_add_target(k, &resolved, server->port);
         ++k->resolved;
         k->resolve_cost = op_monotonic_ns() - started;
         uint64_t wait = k->resolve_cost > TCP_RESOLVE_INTERVAL ? k->resolve_cost : TCP_RESOLVE_INTERVAL;
@@ -213,12 +468,23 @@ static void family_resolve_step(fp_tcp_family *k, int index, const fp_stun_serve
         k->prepared = 1;
 }
 void fp_tcp_nat_prepare(fp_tcp_nat *s, const op_addr gateway[OP_FAM_COUNT], int families) {
-    fp_tcp_nat_close(s);
+    resolver_stop(s, 0); /* a reconfigure happens in the loop: never wait for a lookup */
+    for (int f = 0; f < OP_FAM_COUNT; ++f) family_close(&s->family[f]);
+    /* One worker for the client, started here because this is where the names to resolve
+     * arrive. A platform that cannot give one leaves resolver NULL and every family uses the
+     * fallback walk. */
+    if (!s->inline_resolution && !resolver_start(s))
+        s->resolver = NULL;
     for (int f = 0; f < OP_FAM_COUNT; ++f) {
         fp_tcp_family *k = &s->family[f];
         if (!(families & (1 << f)))
             continue;
-        family_begin(k, &gateway[f], f, s->servers, s->server_count);
+        family_begin(k, &gateway[f], f, s->servers, s->server_count, s->resolver != NULL);
+        if (f == OP_FAM_V4 && k->awaiting && !resolver_submit(s, s->servers, s->server_count)) {
+            /* The queue would not take them: walk instead, so no name is lost. */
+            k->awaiting = 0;
+            k->resolving = 1;
+        }
     }
 }
 static int connected(op_socket fd) {
@@ -453,10 +719,16 @@ static int family_step(fp_tcp_family *k, int family, uint64_t now) {
     return 0;
 }
 int fp_tcp_nat_step(fp_tcp_nat *s, uint64_t now) {
+    /* Answers first: the worker has been resolving in parallel with everything else, and the
+     * drain is a try-lock plus a bounded copy, so this call never waits for it. */
+    fp_tcp_resolve_answer batch[FP_TCP_RESOLVE_QUEUE];
+    unsigned answered = resolver_drain(s, batch, FP_TCP_RESOLVE_QUEUE);
+    if (answered)
+        family_apply_answers(&s->family[OP_FAM_V4], batch, answered);
     int done = 0;
     for (int f = 0; f < OP_FAM_COUNT; ++f) {
-        /* One name per call at most, and none at all while the throttle window is open: the
-         * step loop also carries the control channel, and a lookup blocks it. */
+        /* The fallback walk still resolves at most one name per call, and the probe ladder
+         * only runs once the family is prepared. */
         family_resolve_step(&s->family[f], f, s->servers, s->server_count, now);
         if (family_step(&s->family[f], f, now)) done |= 1 << f;
     }

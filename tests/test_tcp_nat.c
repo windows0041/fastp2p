@@ -121,15 +121,36 @@ static void real_echo(int changed,int malformed) {
     fp_tcp_nat_close(&state);
     for(unsigned i=0;i<2;++i){if(peers[i]>=0)op_close(peers[i]);op_close(listeners[i]);}
 }
-/* The witness walk resolves at most one name per step call, so a test that wants the final
- * target list has to drive it - with the clock moved past the throttle window each time. */
+/* Drive the witness list to completion. With the resolver worker running that means stepping
+ * until every name has an answer; on the fallback path the clock also has to move past the
+ * throttle window between calls. */
 static void walk_witness_list(fp_tcp_nat *state) {
     uint64_t now = op_monotonic_ns();
-    for (unsigned i = 0; i < 64 && state->family[OP_FAM_V4].resolving; ++i) {
+    for (unsigned i = 0; i < 400; ++i) {
+        const fp_tcp_family *k = &state->family[OP_FAM_V4];
+        if (!k->resolving && !k->awaiting)
+            break;
         now += UINT64_C(300000000);
         fp_tcp_nat_step(state, now);
+        op_sleep_ms(2);
     }
     assert(!state->family[OP_FAM_V4].resolving);
+    assert(!state->family[OP_FAM_V4].awaiting);
+}
+
+/* The worker is what keeps the loop free; a platform that cannot start one falls back to the
+ * walk above, which is why the incremental tests below force that path. */
+static void resolver_worker_starts_by_default(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    assert(!fp_tcp_nat_resolver_running(&state));
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    assert(fp_tcp_nat_resolver_running(&state));
+    fp_tcp_nat_close(&state);
+    assert(!fp_tcp_nat_resolver_running(&state));
 }
 
 /* A gateway on our own network is not a mapping destination: its two probe ports were
@@ -317,6 +338,7 @@ static void one_failed_target_still_completes_the_batch(void) {
 static void witness_resolution_is_spread_over_the_step_loop(void) {
     fp_tcp_nat state;
     fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_inline_resolution(&state, 1);
     for (unsigned i = 0; i < 8; ++i) {
         snprintf(state.servers[i].host, sizeof(state.servers[i].host), "127.0.0.%u", i + 1);
         state.servers[i].port = 3478;
@@ -350,6 +372,7 @@ static void witness_resolution_is_spread_over_the_step_loop(void) {
 static void unresolvable_witness_is_skipped(void) {
     fp_tcp_nat state;
     fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_inline_resolution(&state, 1);
     state.servers[0] = (fp_stun_server){.host = "127.0.0.1", .port = 3478};
     state.servers[1] = (fp_stun_server){.host = "127.0.0.256", .port = 3478};
     state.servers[2] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
@@ -370,6 +393,7 @@ static void unresolvable_witness_is_skipped(void) {
 static void witness_walk_keeps_order_and_drops_duplicates(void) {
     fp_tcp_nat state;
     fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_inline_resolution(&state, 1);
     state.servers[0] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
     state.servers[1] = (fp_stun_server){.host = "127.0.0.1", .port = 3478};
     state.servers[2] = (fp_stun_server){.host = "127.0.0.2", .port = 3478};
@@ -390,12 +414,116 @@ static void witness_walk_keeps_order_and_drops_duplicates(void) {
     fp_tcp_nat_close(&state);
 }
 
+/* A fake lookup that answers instantly but not uniquely: names w1..w3 map to .11, .12, .11,
+ * so the ordering and de-duplication rules are exercised through the worker path. */
+static int fake_resolve(const char *host, uint16_t port, op_addr *out) {
+    unsigned last = (unsigned)(host[strlen(host) - 1] - '0');
+    char text[32];
+    snprintf(text, sizeof(text), "203.0.113.%u", 10 + (last == 3 ? 1 : last));
+    return op_addr_from_text(out, text, port) ? -1 : 0;
+}
+
+/* The answer to the field failure: a lookup that takes seconds must cost the step loop
+ * nothing. The fake resolver sleeps two seconds; prepare and every step call are timed. */
+static int slow_resolve(const char *host, uint16_t port, op_addr *out) {
+    (void)host;
+    op_sleep_ms(2000);
+    return op_addr_from_text(out, "203.0.113.77", port) ? -1 : 0;
+}
+
+static void slow_resolver_does_not_block_the_step_loop(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_resolver(&state, slow_resolve);
+    state.servers[0] = (fp_stun_server){.host = "slow.example", .port = 3478};
+    state.server_count = 1;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    uint64_t started = op_monotonic_ns();
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    /* prepare only queues the name; it must not wait for the lookup */
+    assert(op_monotonic_ns() - started < UINT64_C(50000000));
+    assert(fp_tcp_nat_resolver_running(&state));
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->prepared == 0 && k->awaiting == 1);
+    uint64_t worst = 0, now = op_monotonic_ns();
+    uint64_t deadline = started + UINT64_C(8000000000);
+    while (op_monotonic_ns() < deadline && !k->prepared) {
+        uint64_t t0 = op_monotonic_ns();
+        now += UINT64_C(1000000);
+        fp_tcp_nat_step(&state, now);
+        uint64_t spent = op_monotonic_ns() - t0;
+        if (spent > worst) worst = spent;
+        op_sleep_ms(5);
+    }
+    assert(k->prepared == 1 && k->awaiting == 0 && k->resolved == 1);
+    /* The whole point: no single step call waited for the two second lookup. */
+    assert(worst < UINT64_C(50000000));
+    printf("slow resolver: worst step %.3f ms while one lookup slept 2000 ms\n", (double)worst * 1e-6);
+    assert(k->target_count == 3);
+    /* Shutdown waits for the lookup in flight, not for the queue to be walked. */
+    uint64_t closing = op_monotonic_ns();
+    fp_tcp_nat_close(&state);
+    assert(op_monotonic_ns() - closing < UINT64_C(4000000000));
+}
+
+/* Answers arrive in the order the names were queued, and a name that resolves to an address
+ * already in the list is dropped - the same rules the synchronous version applied. */
+static void resolver_answers_keep_order_and_drop_duplicates(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_resolver(&state, fake_resolve);
+    state.servers[0] = (fp_stun_server){.host = "w1", .port = 3478};
+    state.servers[1] = (fp_stun_server){.host = "w2", .port = 3478};
+    state.servers[2] = (fp_stun_server){.host = "w3", .port = 3478};
+    state.server_count = 3;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    assert(fp_tcp_nat_resolver_running(&state));
+    walk_witness_list(&state);
+    const fp_tcp_family *k = &state.family[OP_FAM_V4];
+    assert(k->resolved == 3 && k->prepared == 1 && k->target_count == 4);
+    char text[OP_ADDR_TEXT];
+    assert(!op_addr_text(&k->targets[2].address, text, sizeof(text)) && !strcmp(text, "203.0.113.11"));
+    assert(!op_addr_text(&k->targets[3].address, text, sizeof(text)) && !strcmp(text, "203.0.113.12"));
+    fp_tcp_nat_close(&state);
+}
+
+/* A reconfigure (pushed configuration, changed path) runs inside the step loop, so it must not
+ * wait for the lookup the worker is in the middle of: the old worker is orphaned and reclaims
+ * itself, the new list gets a fresh one. */
+static void reconfigure_does_not_wait_for_a_lookup(void) {
+    fp_tcp_nat state;
+    fp_tcp_nat_init(&state);
+    fp_tcp_nat_set_resolver(&state, slow_resolve);
+    state.servers[0] = (fp_stun_server){.host = "slowname", .port = 3478};
+    state.server_count = 1;
+    op_addr gateway[OP_FAM_COUNT];
+    memset(gateway, 0, sizeof(gateway));
+    assert(!op_addr_from_text(&gateway[OP_FAM_V4], "139.199.4.226", 27183));
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    op_sleep_ms(200); /* let the worker pick the name up and start the slow lookup */
+    uint64_t started = op_monotonic_ns();
+    fp_tcp_nat_prepare(&state, gateway, 1 << OP_FAM_V4);
+    uint64_t spent = op_monotonic_ns() - started;
+    printf("reconfigure with a lookup in flight: %.3f ms\n", (double)spent * 1e-6);
+    assert(spent < UINT64_C(50000000));
+    assert(fp_tcp_nat_resolver_running(&state));
+    fp_tcp_nat_close(&state);
+}
+
 int main(void) {
     assert(!op_platform_init());parser();private_gateway_is_not_a_destination();config();real_echo(0,0);real_echo(1,0);real_echo(0,1);
     six_probes_at_once();samples_keep_target_order();one_failed_target_still_completes_the_batch();
+    resolver_worker_starts_by_default();resolver_answers_keep_order_and_drop_duplicates();
+    slow_resolver_does_not_block_the_step_loop();reconfigure_does_not_wait_for_a_lookup();
     witness_resolution_is_spread_over_the_step_loop();unresolvable_witness_is_skipped();
     witness_walk_keeps_order_and_drops_duplicates();
     puts("TCP STUN framing, transaction validation, configuration, fragmented echo, same-port sampling, "
-         "separate mapping results, six parallel probes and an incremental witness walk passed");
+         "separate mapping results, six parallel probes, a resolver worker that never blocks the loop "
+         "and an incremental fallback walk passed");
     return 0;
 }

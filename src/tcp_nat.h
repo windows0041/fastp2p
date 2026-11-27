@@ -23,6 +23,13 @@ typedef struct {
     op_addr address;
     int stun;
 } fp_tcp_probe_target;
+/* One witness lookup. Injectable so a test can make it slow: the whole point of the worker
+ * below is that a slow lookup costs the step loop nothing. */
+typedef int (*fp_tcp_resolve_fn)(const char *host, uint16_t port, op_addr *out);
+/* The resolver is one worker thread with an input and an output queue. Opaque here so the
+ * platform's thread types stay out of this header. */
+typedef struct fp_tcp_resolver fp_tcp_resolver;
+#define FP_TCP_RESOLVE_QUEUE 32
 /* How many probes may be in flight at once. Each one costs a TCP handshake to a different
  * witness, and the batch is what a witness list needs: six in parallel finish in the time
  * one used to take, without ever blocking the step loop that also drives the control
@@ -57,12 +64,12 @@ typedef struct {
     int fresh_source;
     int phase, prepared;
     uint64_t next_cycle;
-    /* Witness names are resolved one per step call, spaced out: a lookup blocks this
-     * single-threaded loop, and the loop also carries the control channel. prepared stays 0
-     * until the walk is done, so the probe ladder never starts on a half-built target list.
-     * resolve_cost is how long the last lookup took, which widens the spacing. */
+    /* Witness names are resolved by one worker thread, because a single lookup can block for
+     * the resolver's whole timeout and this loop also carries the control channel. prepared
+     * stays 0 until every name of the current list has an answer. awaiting counts the names
+     * still with the worker; resolving is the fallback walk used when no worker runs. */
     int resolving;
-    unsigned resolve_index, resolved;
+    unsigned resolve_index, resolved, awaiting;
     uint64_t next_resolve_at, resolve_cost;
     /* Parallel probing. Results are kept per target and appended in target order when the
      * batch ends, so neither the verdict nor the step calculation depends on the order the
@@ -77,6 +84,12 @@ typedef struct {
     fp_stun_server servers[FP_TCP_STUN_MAX];
     unsigned server_count;
     fp_tcp_family family[OP_FAM_COUNT];
+    /* The resolver worker, started with the first prepare and stopped by close. A platform
+     * that cannot start one leaves this NULL and the families fall back to the incremental
+     * walk, so a lookup is never lost - only its cost moves into the loop. */
+    fp_tcp_resolver *resolver;
+    fp_tcp_resolve_fn resolve;   /* NULL keeps the platform lookup */
+    int inline_resolution;       /* tests only: exercise the fallback walk */
 } fp_tcp_nat;
 
 void fp_tcp_nat_init(fp_tcp_nat *state);
@@ -109,4 +122,9 @@ int fp_tcp_stun_response(const uint8_t *data, size_t length, const uint8_t trans
                          struct sockaddr_in *mapped);
 /* V3 echoes "addr:port" for IPv4 and "[addr]:port" for IPv6 (SPEC §3). */
 int fp_tcp_echo_response(const uint8_t *data, size_t length, op_addr *mapped);
+/* Test hooks: replace the lookup the worker performs, force the fallback walk, and ask
+ * whether a worker is running. Production calls none of them. */
+void fp_tcp_nat_set_resolver(fp_tcp_nat *state, fp_tcp_resolve_fn resolve);
+void fp_tcp_nat_set_inline_resolution(fp_tcp_nat *state, int on);
+int fp_tcp_nat_resolver_running(const fp_tcp_nat *state);
 #endif
