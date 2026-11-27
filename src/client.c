@@ -9263,6 +9263,18 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
                      f->type == FP_NAT_DEPENDENT ? "destination-dependent" : "unknown",
                      f->samples, f->destinations);
             emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, message);
+            /* One line per destination. A long witness list is how the address axis gets
+             * measured across providers: a mapping that keeps its address is a
+             * one-dimensional search for a peer, a mapping whose address follows the
+             * destination leaves it nothing to aim at, and the verdict above cannot say
+             * which of the two a NAT is. */
+            for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i) {
+                char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[224];
+                op_addr_text(&f->target_used[i], via, sizeof(via));
+                op_addr_text(&f->mapped[i], seen, sizeof(seen));
+                snprintf(note, sizeof(note), "TCP mapping via %s -> %s", via, seen);
+                emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
+            }
         }
         if (c->ws_connected)
             report_nat(c);

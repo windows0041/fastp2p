@@ -13,7 +13,7 @@ enum { FP_NAT_STABLE = 1, FP_NAT_DEPENDENT = 2, FP_NAT_UNKNOWN = 314 };
  * peer as unknown, which is exactly what they do today. */
 enum { FP_TCP_MAP_NONE, FP_TCP_MAP_STABLE, FP_TCP_MAP_INCREMENT, FP_TCP_MAP_DECREMENT,
        FP_TCP_MAP_UNPREDICTABLE };
-#define FP_TCP_STUN_MAX 4
+#define FP_TCP_STUN_MAX 32
 #define FP_TCP_PROBE_MAX (2 + FP_TCP_STUN_MAX)
 typedef struct {
     char host[254];

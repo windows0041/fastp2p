@@ -47,9 +47,23 @@ static void config(void) {
     assert(state.server_count==2 && state.servers[1].port==49152);
     const char *invalid[]={"{}","[1]","[\"host:0\"]","[\"host:65536\"]","[\"host:-1\"]",
         "[\"host:999999999999999999\"]","[\"tcp://host:3478\"]","[\"[::1]:3478\"]",
-        "[\"x\\u0000.example\"]","[\"a\",\"b\",\"c\",\"d\",\"e\"]"};
+        "[\"x\\u0000.example\"]"};
     for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);++i){
         j=json_tokener_parse(invalid[i]);assert(j && fp_tcp_nat_configure(&state,j)==-1);json_object_put(j);
+        assert(state.server_count==2 && !strcmp(state.servers[0].host,"stun.example.org"));
+    }
+    /* One more witness than the cap is refused, whatever the cap happens to be: the
+     * list is a measurement aid, and an unbounded one would turn the probe cycle into
+     * an unbounded number of held sockets. */
+    {
+        json_object *many=json_object_new_array();
+        for(unsigned i=0;i<=FP_TCP_STUN_MAX;++i){
+            char entry[40];
+            snprintf(entry,sizeof(entry),"w%u.example.org:3478",i);
+            json_object_array_add(many,json_object_new_string(entry));
+        }
+        assert(fp_tcp_nat_configure(&state,many)==-1);
+        json_object_put(many);
         assert(state.server_count==2 && !strcmp(state.servers[0].host,"stun.example.org"));
     }
     fp_tcp_nat_close(&state);fp_tcp_nat_close(&state);
