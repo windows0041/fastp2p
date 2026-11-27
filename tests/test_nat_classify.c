@@ -2106,6 +2106,67 @@ static void address_axis_is_separate_from_the_port_axis(void) {
     nat_mapping_axes(&mapped, &empty, 40000, &address_stable, &port_stable);
     assert(address_stable == 1 && port_stable == 1);
 }
+/* A mapping pool is derived from whatever the samples show: distinct addresses, and port
+ * intervals from clustering the observed ports. Measured on a mobile CGNAT, the ports came
+ * out as two blocks of 256 and the addresses as six values - but nothing here assumes
+ * either number, so the same code has to read any shape out of the data. */
+static void mapping_pool_is_derived_from_the_samples(void) {
+    fp_tcp_family f = {0};
+    static const uint16_t ports[] = {2, 100, 255, 8448, 8600, 8703};
+    static const char *ips[] = {"223.104.85.222", "223.104.85.223", "223.104.85.222",
+                                "223.104.72.209", "223.104.72.211", "223.104.85.217"};
+    f.samples = sizeof(ports) / sizeof(ports[0]);
+    for (unsigned i = 0; i < f.samples; ++i)
+        assert(!op_addr_from_text(&f.mapped[i], ips[i], ports[i]));
+    op_addr addrs[TCP_POOL_ADDR_MAX];
+    unsigned na = tcp_pool_addrs(&f, addrs, TCP_POOL_ADDR_MAX);
+    assert(na == 5); /* .222 appears twice and is published once */
+    uint16_t lo[TCP_POOL_SPAN_MAX], hi[TCP_POOL_SPAN_MAX];
+    unsigned ns = tcp_pool_spans(&f, lo, hi, TCP_POOL_SPAN_MAX);
+    assert(ns == 2);
+    /* Padded by TCP_POOL_PAD on both sides, clamped at 1. */
+    assert(lo[0] == 1 && hi[0] == 255 + TCP_POOL_PAD);
+    assert(lo[1] == 8448 - TCP_POOL_PAD && hi[1] == 8703 + TCP_POOL_PAD);
+    /* A gap wider than TCP_POOL_GAP splits the interval instead of merging it. */
+    fp_tcp_family g = {0};
+    g.samples = 2;
+    assert(!op_addr_from_text(&g.mapped[0], "10.0.0.1", 1000));
+    assert(!op_addr_from_text(&g.mapped[1], "10.0.0.1", 1000 + TCP_POOL_GAP + 1));
+    assert(tcp_pool_spans(&g, lo, hi, TCP_POOL_SPAN_MAX) == 2);
+    /* An unbounded pool is narrowed to the spray budget, not published as it stands. */
+    uint16_t wide_lo[1] = {1}, wide_hi[1] = {65535};
+    tcp_pool_narrow(TCP_POOL_ADDR_MAX, wide_lo, wide_hi, 1);
+    assert((unsigned)(wide_hi[0] - wide_lo[0] + 1) * TCP_POOL_ADDR_MAX <= TCP_POOL_TARGET_MAX);
+}
+
+/* The spray walks exactly the product the peer published: address-major, intervals in
+ * order, bounded by the budget. */
+static void pool_spray_covers_the_published_product(void) {
+    tunnel t = {0};
+    t.peer_pool_addr_count = 2;
+    assert(!op_addr_from_text(&t.peer_pool_addrs[0], "203.0.113.10", 1));
+    assert(!op_addr_from_text(&t.peer_pool_addrs[1], "203.0.113.11", 1));
+    t.peer_pool_span_count = 2;
+    t.peer_pool_lo[0] = 10; t.peer_pool_hi[0] = 12;
+    t.peer_pool_lo[1] = 100; t.peer_pool_hi[1] = 101;
+    assert(tcp_pool_target_count(&t) == 2 * (3 + 2));
+    static const uint16_t expect_ports[] = {10, 11, 12, 100, 101};
+    for (unsigned i = 0; i < 10; ++i) {
+        op_addr target;
+        assert(tcp_pool_target(&t, i, &target) == 0);
+        assert(op_addr_family(&target) == AF_INET);
+        assert(op_addr_port(&target) == expect_ports[i % 5]);
+        char text[OP_ADDR_TEXT];
+        assert(!op_addr_text(&target, text, sizeof(text)));
+        assert(!strcmp(text, (i < 5) ? "203.0.113.10" : "203.0.113.11"));
+    }
+    op_addr beyond;
+    assert(tcp_pool_target(&t, 10, &beyond) == -1);
+    /* An empty pool is not a spray: the caller keeps its single-address window. */
+    tunnel none = {0};
+    assert(tcp_pool_target_count(&none) == 0);
+    assert(tcp_pool_target(&none, 0, &beyond) == -1);
+}
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2152,7 +2213,11 @@ int main(void) {
     {
         fastp2p_client probes = {0};
         assert(fp_client_tcp_nat_config(&probes, NULL) == FASTP2P_OK);
-        assert(probes.tcp_nat.server_count == 2);
+        /* The built-in witnesses have to be spread over several networks: one outside
+         * address cannot show the set a carrier allocates from, and the pool a
+         * destination-dependent host publishes is built from what they observe. */
+        assert(probes.tcp_nat.server_count ==
+               sizeof(FP_DEFAULT_TCP_MAPPING_POOL) / sizeof(FP_DEFAULT_TCP_MAPPING_POOL[0]));
         assert(!strcmp(probes.tcp_nat.servers[0].host, "stun.fastp2p.top"));
         assert(probes.tcp_nat.servers[0].port == 3478);
         assert(!strcmp(probes.tcp_nat.servers[1].host, "stun.nextcloud.com"));
@@ -2313,5 +2378,7 @@ int main(void) {
     dialer_array_leaves_undiallable_peers_alone();
     spray_aims_ahead_of_an_unpredictable_peer();
     address_axis_is_separate_from_the_port_axis();
+    mapping_pool_is_derived_from_the_samples();
+    pool_spray_covers_the_published_product();
     return 0;
 }

@@ -134,6 +134,20 @@
 #define TCP_PUNCH_ARRAY_LIMIT 512u
 /* Descriptors the whole client may hold for source-port arrays at once. */
 #define TCP_ARRAY_CLIENT_LIMIT 512u
+/* Pool publishing for a peer whose mapping moves. A carrier NAT hands a mapping out of
+ * a small set, not out of the whole port range: measured on one mobile CGNAT, every
+ * destination saw one of six public addresses, and the ports fell into two blocks of
+ * 256 (0-255 and 8448-8703). The side that cannot be dialled therefore measures its own
+ * pool - the addresses its witnesses saw, and the intervals its observed ports cluster
+ * into - and publishes it; the other side sprays the product instead of guessing one
+ * address. None of that is specific to those numbers: the intervals come out of the
+ * samples (ports closer than TCP_POOL_GAP belong together), and the caps below bound the
+ * product no matter what a peer publishes. */
+#define TCP_POOL_ADDR_MAX 8
+#define TCP_POOL_SPAN_MAX 4
+#define TCP_POOL_TARGET_MAX 4096
+#define TCP_POOL_GAP 256
+#define TCP_POOL_PAD 8
 /* Who sprays and who keeps dialling. A cone mapping has one reachable port, so
  * that side opens the window; a destination-dependent mapping cannot be dialled,
  * so that side keeps dialling the cone's stable port for the whole window. */
@@ -383,6 +397,13 @@ typedef struct {
      * predict. */
     int tcp_step, peer_tcp_step;
     uint16_t tcp_last_port, peer_tcp_last_port;
+    /* The pool a peer with a moving mapping published: the addresses it was seen at and
+     * the port intervals those observations cluster into. Empty means it published none
+     * (an older build, or a mapping stable enough not to need one). */
+    op_addr peer_pool_addrs[TCP_POOL_ADDR_MAX];
+    unsigned peer_pool_addr_count;
+    uint16_t peer_pool_lo[TCP_POOL_SPAN_MAX], peer_pool_hi[TCP_POOL_SPAN_MAX];
+    unsigned peer_pool_span_count;
     /* How far the dial has walked around the port the peer reported. A carrier NAT
      * allocates the mapping for a new destination from a pool, so the port that is
      * reachable from this side is near, but not equal to, the reported one. */
@@ -1283,6 +1304,15 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
  * symmetric-to-symmetric punching relies on would never enable. */
 #define FP_DEFAULT_TCP_MAPPING_SERVERS "stun.fastp2p.top:3478"
 #define FP_DEFAULT_TCP_MAPPING_SERVERS_ALT "stun.nextcloud.com:443"
+/* The mapping verdict needs destinations on different addresses, and the pool a
+ * destination-dependent host publishes is only as good as the witnesses it sampled: a
+ * single outside address cannot show a carrier's set. These are spread over separate
+ * networks so the observed addresses cover the pool, and a missing one costs a few
+ * seconds of probe time rather than the verdict. */
+static const char *const FP_DEFAULT_TCP_MAPPING_POOL[] = {
+    "stun.fastp2p.top:3478", "stun.nextcloud.com:443", "stun.sip.us:3478",
+    "stun.diallog.com:3478", "stun.signalwire.com:3478", "stun.tula.nu:3478",
+};
 
 /* Adopt new TCP mapping servers at runtime. Only the parse happens here: the
  * destinations have to be resolved, and the step loop does that on its next tick so a
@@ -1297,13 +1327,13 @@ int fp_client_tcp_nat_reconfigure(fastp2p_client *c, json_object *servers) {
 int fp_client_tcp_nat_config(fastp2p_client *c, json_object *servers) {
     if (servers)
         return fp_tcp_nat_configure(&c->tcp_nat, servers) ? FASTP2P_EINVAL : FASTP2P_OK;
-    /* No key at all falls back to the two built-in destinations. An empty array is
-     * an explicit opt-out, so a hermetic deployment still gets no external traffic. */
+    /* No key at all falls back to the built-in witnesses. An empty array is an explicit
+     * opt-out, so a hermetic deployment still gets no external traffic. */
     json_object *fallback = json_object_new_array();
     if (!fallback)
         return FASTP2P_EIO;
-    json_object_array_add(fallback, json_object_new_string(FP_DEFAULT_TCP_MAPPING_SERVERS));
-    json_object_array_add(fallback, json_object_new_string(FP_DEFAULT_TCP_MAPPING_SERVERS_ALT));
+    for (unsigned i = 0; i < sizeof(FP_DEFAULT_TCP_MAPPING_POOL) / sizeof(FP_DEFAULT_TCP_MAPPING_POOL[0]); ++i)
+        json_object_array_add(fallback, json_object_new_string(FP_DEFAULT_TCP_MAPPING_POOL[i]));
     int configured = fp_tcp_nat_configure(&c->tcp_nat, fallback);
     json_object_put(fallback);
     return configured ? FASTP2P_EINVAL : FASTP2P_OK;
@@ -2501,6 +2531,80 @@ static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port, int 
  * published. That second path matters for a responder: it never samples (the gate
  * below needs an initiator or a peer that already published), so without it a
  * stable endpoint stays silent and the peer walks its neighbour ports for nothing. */
+/* --- Mapping pools ---------------------------------------------------------
+ * A destination-dependent mapping is not one port but a small set of them: carriers
+ * allocate out of a pool. These helpers turn the samples a host took into the pool a peer
+ * could aim at, and enumerate that pool for the spray. Everything is derived from the
+ * data - no block size, address count or port range is assumed. */
+static unsigned tcp_pool_addrs(const fp_tcp_family *f, op_addr *out, unsigned max) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i) {
+        const op_addr *m = &f->mapped[i];
+        if (!m->len)
+            continue;
+        unsigned k;
+        for (k = 0; k < count; ++k)
+            if (op_addr_equal(&out[k], m))
+                break;
+        if (k == count && count < max)
+            out[count++] = *m;
+    }
+    return count;
+}
+/* The port intervals the observations cluster into: sorted ports whose neighbours are no
+ * more than TCP_POOL_GAP apart belong together, padded by TCP_POOL_PAD on both sides
+ * because the next allocation can land beside the sampled one. */
+static unsigned tcp_pool_spans(const fp_tcp_family *f, uint16_t *lo, uint16_t *hi, unsigned max) {
+    uint16_t ports[FP_TCP_PROBE_MAX];
+    unsigned n = 0;
+    for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i)
+        if (f->mapped[i].len)
+            ports[n++] = op_addr_port(&f->mapped[i]);
+    for (unsigned i = 1; i < n; ++i) {
+        uint16_t value = ports[i];
+        unsigned j = i;
+        while (j && ports[j - 1] > value) {
+            ports[j] = ports[j - 1];
+            --j;
+        }
+        ports[j] = value;
+    }
+    unsigned count = 0;
+    for (unsigned i = 0; i < n;) {
+        unsigned low = ports[i], high = low;
+        unsigned j = i + 1;
+        while (j < n && (unsigned)ports[j] - high <= TCP_POOL_GAP) {
+            high = ports[j];
+            ++j;
+        }
+        if (count < max) {
+            lo[count] = (uint16_t)(low > TCP_POOL_PAD ? low - TCP_POOL_PAD : 1);
+            hi[count] = (uint16_t)(high + TCP_POOL_PAD > 65535 ? 65535 : high + TCP_POOL_PAD);
+            ++count;
+        }
+        i = j;
+    }
+    return count;
+}
+/* Keep the product inside the spray budget by halving every interval around its centre.
+ * A pool above the budget is narrowed, never published as it stands: the spray is a burst
+ * on a shared link and the peer has no way to refuse it. */
+static void tcp_pool_narrow(unsigned addr_count, uint16_t *lo, uint16_t *hi, unsigned spans) {
+    if (!addr_count || !spans)
+        return;
+    for (;;) {
+        unsigned total = 0;
+        for (unsigned s = 0; s < spans; ++s)
+            total += (unsigned)(hi[s] - lo[s] + 1);
+        if (total * addr_count <= TCP_POOL_TARGET_MAX)
+            return;
+        for (unsigned s = 0; s < spans; ++s) {
+            unsigned centre = ((unsigned)lo[s] + hi[s]) / 2;
+            lo[s] = (uint16_t)(centre > 4 ? centre - 4 : 1);
+            hi[s] = (uint16_t)(centre + 4 > 65535 ? 65535 : centre + 4);
+        }
+    }
+}
 static void publish_tcp_mapping(const fastp2p_client *c, const tunnel *t, json_object *j) {
     if (t->tcp_mapping) {
         op_ju(j, "tcpPunchMap", t->tcp_mapping);
@@ -2526,6 +2630,43 @@ static void publish_tcp_mapping(const fastp2p_client *c, const tunnel *t, json_o
         op_ju(j, "tcpPunchMap", FP_TCP_MAP_UNPREDICTABLE);
         op_ju(j, "tcpPunchLastPort", t->tcp_last_port);
     }
+}
+/* Hand the whole pool to the peer: the addresses this host was seen at and the port
+ * intervals its observations clustered into. A peer that only ever sees one address
+ * cannot aim at a mapping that lives on six; with the pool it can spray the product,
+ * which is a few thousand SYNs instead of a lottery. An older peer ignores both keys and
+ * keeps its single-address behaviour. */
+static void publish_tcp_pool(const fastp2p_client *c, const tunnel *t, json_object *j) {
+    if (t->transport != FASTP2P_TRANSPORT_TCP || t->lan)
+        return;
+    if (t->tcp_mapping == FP_TCP_MAP_STABLE || c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_STABLE)
+        return; /* one reachable address: the port is the only question, already published */
+    const fp_tcp_family *f = &c->tcp_nat.family[OP_FAM_V4];
+    op_addr addrs[TCP_POOL_ADDR_MAX];
+    uint16_t lo[TCP_POOL_SPAN_MAX], hi[TCP_POOL_SPAN_MAX];
+    unsigned na = tcp_pool_addrs(f, addrs, TCP_POOL_ADDR_MAX);
+    unsigned ns = tcp_pool_spans(f, lo, hi, TCP_POOL_SPAN_MAX);
+    if (!na || !ns)
+        return;
+    tcp_pool_narrow(na, lo, hi, ns);
+    json_object *list = json_object_new_array();
+    if (!list)
+        return;
+    for (unsigned i = 0; i < na; ++i) {
+        char text[OP_ADDR_TEXT];
+        if (op_addr_text(&addrs[i], text, sizeof(text)))
+            continue;
+        json_object_array_add(list, json_object_new_string(text));
+    }
+    json_object_object_add(j, "tcpPoolAddr", list);
+    json_object *spans = json_object_new_array();
+    if (!spans)
+        return;
+    for (unsigned s = 0; s < ns; ++s) {
+        json_object_array_add(spans, json_object_new_int((int32_t)lo[s]));
+        json_object_array_add(spans, json_object_new_int((int32_t)hi[s]));
+    }
+    json_object_object_add(j, "tcpPoolSpan", spans);
 }
 /* Time left until the gateway's shared start instant, in nanoseconds; zero when it
  * sent none or the instant has already passed. */
@@ -2567,6 +2708,40 @@ static void learn_tcp_mapping(tunnel *t, json_object *j) {
         if (step >= -4096 && step <= 4096 && step != 0)
             t->peer_tcp_step = (int)step;
     }
+    /* The pool the peer measured for itself. Anything malformed is dropped whole rather
+     * than half-read: a spray aimed at half a pool is a burst nobody benefits from. */
+    t->peer_pool_addr_count = 0;
+    t->peer_pool_span_count = 0;
+    json_object *addrs = json_object_object_get(j, "tcpPoolAddr");
+    json_object *spans = json_object_object_get(j, "tcpPoolSpan");
+    if (!addrs || !spans || !json_object_is_type(addrs, json_type_array) ||
+        !json_object_is_type(spans, json_type_array))
+        return;
+    unsigned na = (unsigned)json_object_array_length(addrs);
+    unsigned ns = (unsigned)json_object_array_length(spans);
+    if (!na || na > TCP_POOL_ADDR_MAX || ns < 2 || (ns & 1u) || ns / 2 > TCP_POOL_SPAN_MAX)
+        return;
+    for (unsigned i = 0; i < na; ++i) {
+        const char *text = json_object_get_string(json_object_array_get_idx(addrs, i));
+        if (!text || op_addr_from_text(&t->peer_pool_addrs[i], text, 1))
+            return;
+    }
+    unsigned total = 0;
+    for (unsigned s = 0; s < ns / 2; ++s) {
+        int64_t lo = json_object_get_int64(json_object_array_get_idx(spans, s * 2));
+        int64_t hi = json_object_get_int64(json_object_array_get_idx(spans, s * 2 + 1));
+        if (lo < 1 || hi > 65535 || lo > hi)
+            return;
+        t->peer_pool_lo[s] = (uint16_t)lo;
+        t->peer_pool_hi[s] = (uint16_t)hi;
+        total += (unsigned)(hi - lo + 1);
+    }
+    /* A peer that publishes more than the budget gets the budget, not the pool: the spray
+     * is a burst on a shared link and cannot be refused once started. */
+    if (total * na > TCP_POOL_TARGET_MAX)
+        return;
+    t->peer_pool_addr_count = na;
+    t->peer_pool_span_count = ns / 2;
 }
 /* Offer the peer a window to spray when our own mapping shifts per destination.
  * Both roles publish it: the responder used to be the only one, which left a
@@ -2696,6 +2871,7 @@ static void probe_complete(fastp2p_client *c, int index) {
     if (t->tcp_v2) op_ju(j, "tcpPunchV2", 1);
     if (t->tcp_punch_immediate) op_ju(j, "tcpPunchImmediate", 1);
     publish_tcp_mapping(c, t, j);
+    publish_tcp_pool(c, t, j);
     /* Each family publishes independently: only the pair that was actually
      * measured is written, so a v6 LAN port can never ride in the v4 fields an
      * old peer reads (SPEC). */
@@ -2980,9 +3156,66 @@ static void tcp_spray_window(const tunnel *t, int base, int *low, int *high) {
 /* Open our own NAT towards the ports a destination-dependent peer may use, then
  * listen: the peer's SYN arrives from its real mapping, which is inside the
  * sprayed range, so the filter admits it and the listener accepts. */
+/* Enumeration of a pool spray: address-major, intervals in the order the peer listed
+ * them. Pure so the coverage can be tested without opening a socket. */
+static unsigned tcp_pool_target_count(const tunnel *t) {
+    unsigned spans = 0;
+    for (unsigned s = 0; s < t->peer_pool_span_count; ++s)
+        spans += (unsigned)(t->peer_pool_hi[s] - t->peer_pool_lo[s] + 1);
+    unsigned total = spans * t->peer_pool_addr_count;
+    return total > TCP_POOL_TARGET_MAX ? TCP_POOL_TARGET_MAX : total;
+}
+static int tcp_pool_target(const tunnel *t, unsigned index, op_addr *out) {
+    if (!t->peer_pool_addr_count || !t->peer_pool_span_count)
+        return -1;
+    unsigned spans = 0;
+    for (unsigned s = 0; s < t->peer_pool_span_count; ++s)
+        spans += (unsigned)(t->peer_pool_hi[s] - t->peer_pool_lo[s] + 1);
+    if (!spans)
+        return -1;
+    unsigned addr = index / spans, within = index % spans;
+    if (addr >= t->peer_pool_addr_count)
+        return -1;
+    for (unsigned s = 0; s < t->peer_pool_span_count; ++s) {
+        unsigned width = (unsigned)(t->peer_pool_hi[s] - t->peer_pool_lo[s] + 1);
+        if (within < width) {
+            *out = t->peer_pool_addrs[addr];
+            op_addr_set_port(out, (uint16_t)(t->peer_pool_lo[s] + within));
+            return 0;
+        }
+        within -= width;
+    }
+    return -1;
+}
 static void tcp_punch_spray(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    /* A peer that published its pool is reachable at any of (addresses x intervals); the
+     * product covers exactly the space it told us about, which is a few thousand SYNs
+     * instead of a lottery against the whole port range. */
+    unsigned pool = tcp_pool_target_count(t);
+    if (pool) {
+        unsigned sent = 0;
+        for (unsigned i = 0; i < pool; ++i) {
+            op_addr target;
+            if (tcp_pool_target(t, i, &target))
+                break;
+            op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
+            if (fd < 0)
+                continue;
+            (void)op_connect(fd, &target.u.sa, target.len);
+            op_close(fd);
+            ++sent;
+        }
+        if (sent) {
+            char note[224];
+            snprintf(note, sizeof(note),
+                     "TCP punch sprayed the peer's pool: %u targets over %u addresses and %u port spans",
+                     sent, t->peer_pool_addr_count, t->peer_pool_span_count);
+            emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        }
+        return;
+    }
     uint16_t base = tcp_spray_base(t, family);
     if (!base || !t->peer_addr.len)
         return;
