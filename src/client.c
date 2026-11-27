@@ -121,7 +121,15 @@
  * TCP_PUNCH_ARRAY ports and every spent rotation doubles that up to the ceiling,
  * because a wider array costs only descriptors and SYNs and only while the round
  * is already known to be missing. FASTP2P_TCP_ARRAY moves the ceiling (1..512) for
- * hosts that cannot afford the descriptors or the SYNs. */
+ * hosts that cannot afford the descriptors or the SYNs.
+ *
+ * Both numbers stay inside what a path tolerates, and the client keeps its own
+ * simultaneous count far below it: operators size broadband and mobile NATs for at
+ * least a few thousand concurrent connections per subscriber, but that budget is
+ * shared with every other device in the household. TCP_ARRAY_CLIENT_LIMIT caps the
+ * whole client at 512 simultaneous sockets, about a sixth of that floor, and the
+ * spray itself opens one socket at a time, so a rotation is a burst of SYNs rather
+ * than a standing load. */
 #define TCP_PUNCH_ARRAY 64u
 #define TCP_PUNCH_ARRAY_LIMIT 512u
 /* Descriptors the whole client may hold for source-port arrays at once. */
@@ -638,6 +646,11 @@ struct fastp2p_client {
     void *restart_user;
     /* Descriptors held by every tunnel's TCP source-port array right now. */
     unsigned tcp_array_used;
+    /* Connections accepted on the business port or on a punch listener since start:
+     * the only evidence a client can gather about whether the path in front of it
+     * returns anything at all. Zero after a full punch window means the cloud or
+     * carrier never delivers inbound, so spraying there is pointless. */
+    unsigned inbound_seen;
     int validate_only;
     void *user;
     fp_sdwan *sdwan;
@@ -1065,6 +1078,18 @@ static op_socket socket_bound(int udp, const char *ip, uint16_t port, int reuse)
 static uint16_t socket_port(op_socket fd) {
     op_addr a;
     return op_addr_socketname(fd, &a) ? 0 : op_addr_port(&a);
+}
+/* One line per accepted inbound connection, throttled: it is the only evidence a
+ * client can collect about whether the path in front of it returns anything. */
+static void note_inbound(fastp2p_client *c, const op_addr *peer, const char *where) {
+    ++c->inbound_seen;
+    if (c->inbound_seen > 10 && c->inbound_seen % 50 != 0)
+        return;
+    char note[208], text[OP_ADDR_TEXT];
+    op_addr_text(peer, text, sizeof(text));
+    snprintf(note, sizeof(note), "%s accepted a connection from %s:%u (inbound total %u)", where,
+             text, (unsigned)op_addr_port(peer), c->inbound_seen);
+    emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
 }
 static void close_peer_listeners(op_socket listeners[OP_FAM_COUNT]) {
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
@@ -3180,6 +3205,16 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, predicted
                      ? "TCP mapping changes per destination; dialled the predicted window and parked listening"
                      : "TCP mapping changes per destination; sprayed its port range and parked listening");
+                {
+                    /* The number that decides whether waiting is worth anything: zero
+                     * inbound for a whole window means the path in front of this host
+                     * never returns anything, so no amount of spraying will help. */
+                    char note[192];
+                    snprintf(note, sizeof(note),
+                             "punch parked on port %u; inbound connections so far: %u",
+                             (unsigned)t->local_port, c->inbound_seen);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+                }
                 t->tcp_retry_at = 0;
                 t->tcp_timeouts = 0;
                 /* Cover the peer's whole dial window, not the rest of ours. */
@@ -5630,6 +5665,7 @@ static void accept_punch(fastp2p_client *c, int ti) {
     if (fd < 0)
         return;
     op_addr_normalize(&peer);
+    note_inbound(c, &peer, "punch listener");
     /* Connect-back: the port in the offer is what the gateway measured, i.e. the peer's
      * mapping *towards the gateway*. Towards us a destination-dependent NAT allocates
      * something else, so requiring the advertised port here rejected every inbound SYN
@@ -6386,6 +6422,7 @@ static void tick_accept(fastp2p_client *c, uint64_t now) {
         if (fd < 0)
             break;
         op_addr_normalize(&peer);
+        note_inbound(c, &peer, "business port");
         int i;
         for (i = 0; i < NP; ++i)
             if (c->pending[i].fd < 0)
