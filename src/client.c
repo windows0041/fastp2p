@@ -1307,11 +1307,13 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
 /* The mapping verdict needs destinations on different addresses, and the pool a
  * destination-dependent host publishes is only as good as the witnesses it sampled: a
  * single outside address cannot show a carrier's set. These are spread over separate
- * networks so the observed addresses cover the pool, and a missing one costs a few
- * seconds of probe time rather than the verdict. */
+ * networks, picked so that their observed addresses cover the pool measured on a mobile
+ * CGNAT (five distinct addresses out of six; the sixth comes from the gateway's own probe
+ * ports), and a missing one costs a few seconds of probe time rather than the verdict. */
 static const char *const FP_DEFAULT_TCP_MAPPING_POOL[] = {
     "stun.fastp2p.top:3478", "stun.nextcloud.com:443", "stun.sip.us:3478",
     "stun.diallog.com:3478", "stun.signalwire.com:3478", "stun.tula.nu:3478",
+    "stun.freeswitch.org:3478", "stun.fitauto.ru:3478",
 };
 
 /* Adopt new TCP mapping servers at runtime. Only the parse happens here: the
