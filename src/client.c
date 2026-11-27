@@ -1326,22 +1326,47 @@ static uint64_t local_transport_nat(const fastp2p_client *c, int transport) {
  * the level unmeasured rather than merely slow. */
 /* The project runs its own witness, and it is the only one a deployment can count on:
  * it answers STUN over both transports, and it answers a change-request from another
- * address, which is what the filter verdict needs. Everything else comes from the
- * gateway: an operator lists the extra witnesses they trust and the console pushes them,
- * so a deployment is never stuck with a public server that disappeared. */
-#define FP_DEFAULT_STUN_SERVERS "stun.fastp2p.top:3478"
-#define FP_DEFAULT_STUN_SERVERS_ALT "stun.fastp2p.top:3478"
+ * address, which is what the filter verdict needs. The rest of the list is built in rather
+ * than pushed: a node has to be able to measure itself before (and without) any console. */
+#define FP_DEFAULT_STUN_SERVERS_COUNT \
+    (sizeof(FP_DEFAULT_STUN_SERVERS) / sizeof(FP_DEFAULT_STUN_SERVERS[0]))
 /* TCP filtering needs a callback probe server; the project's own host, dedicated
  * port. It answers a plain-text "mapped <ip> <port>" line, not STUN. */
 #define FP_DEFAULT_TCP_NAT_PROBE "stun.fastp2p.top:3479"
-/* The built-in witness for every ladder is the project's own server. The TCP mapping
- * verdict still has two destinations to compare - the gateway's own probe ports are one
- * address and this witness is another - so a mapping that depends on the destination is
- * told apart from a stable one even before an operator pushes anything. Everything else
- * is an operator decision: the console sends network.TCPSTUNServers, and a deployment
- * behind a filter can name a witness it can actually reach. */
+/* The built-in witnesses for both ladders. The project's own server comes first in each list -
+ * it answers STUN over both transports, answers a change-request from another address, and is
+ * the one address we control - and the rest are public STUN servers kept in code so a node can
+ * measure itself without a pushed list. A configuration still wins when it names witnesses
+ * (network.UDPSTUNServers / network.TCPSTUNServers), so the list stays overridable; it is just
+ * no longer something the gateway has to supply. */
+static const char *const FP_DEFAULT_STUN_SERVERS[] = {
+    "stun.fastp2p.top:3478",
+    "stun.hitv.com:3478",
+    "stun.miwifi.com:3478",
+    "stun.tel2.co.uk:3478",
+    "stun.business-isp.nl:3478",
+    "stun.hicare.net:3478",
+    "stun.skydrone.aero:3478",
+    "stun.sonetel.com:3478",
+    "stun.sonetel.net:3478",
+    "stun.wtfismyip.com:3478",
+    "stun.futurasp.es:3478",
+};
+/* The TCP mapping verdict compares destinations: the gateway's own probe ports are one address
+ * and these witnesses are others, so a mapping that follows the destination is told apart from a
+ * stable one even before anything is configured. */
 static const char *const FP_DEFAULT_TCP_MAPPING_POOL[] = {
     "stun.fastp2p.top:3478",
+    "stun.business-isp.nl:3478",
+    "stun.freeswitch.org:3478",
+    "stun.tel2.co.uk:3478",
+    "stun.skydrone.aero:3478",
+    "stun.sonetel.com:3478",
+    "stun.sonetel.net:3478",
+    "stun.hot-chilli.net:3478",
+    "stun.lovense.com:3478",
+    "stun.zentauron.de:3478",
+    "stun.tula.nu:3478",
 };
 
 /* Adopt new TCP mapping servers at runtime. Only the parse happens here: the
@@ -8090,11 +8115,15 @@ static int stun_entry(fastp2p_client *c, const char *text, int count) {
      * without any per-machine configuration. An empty array is an explicit opt-out
      * for operators who do not want the client to contact anything. */
     if (!servers) {
-        if (stun_entry(c, FP_DEFAULT_STUN_SERVERS, 0) ||
-            stun_entry(c, FP_DEFAULT_STUN_SERVERS_ALT, 1))
-            return FASTP2P_EINVAL;
-        c->stun_count = 2;
-        return FASTP2P_OK;
+        /* The built-in list, in order: our own witness first, then the public ones. An entry the
+         * parser refuses is skipped rather than costing the whole list. */
+        int count = 0;
+        for (unsigned i = 0; i < FP_DEFAULT_STUN_SERVERS_COUNT; ++i) {
+            if (!stun_entry(c, FP_DEFAULT_STUN_SERVERS[i], count))
+                ++count;
+        }
+        c->stun_count = count;
+        return count ? FASTP2P_OK : FASTP2P_EINVAL;
     }
     if (!json_object_is_type(servers, json_type_array) ||
         json_object_array_length(servers) > FP_STUN_MAX_SERVERS)

@@ -2254,16 +2254,19 @@ int main(void) {
          * destination-dependent host publishes is built from what they observe. */
         assert(probes.tcp_nat.server_count ==
                sizeof(FP_DEFAULT_TCP_MAPPING_POOL) / sizeof(FP_DEFAULT_TCP_MAPPING_POOL[0]));
-        /* Only the project's own witness is built in; everything else an operator pushes. */
+        /* The pool is built in too; a configured TCPSTUNServers array still wins. */
         assert(!strcmp(probes.tcp_nat.servers[0].host, "stun.fastp2p.top"));
         assert(probes.tcp_nat.servers[0].port == 3478);
         assert(fp_client_stun_config(&probes, NULL) == FASTP2P_OK);
-        assert(probes.stun_count == 2);
-        /* The UDP ladder's built-in witness is the project's own server too: it answers
-         * STUN and it answers a change-request from another address, so a deployment that
-         * has no witness list still gets a verdict. Everything else is pushed. */
+        /* Both ladders are built in now: the defaults are what a node measures with before any
+         * configuration arrives, so their length and their first entry are part of the contract. */
+        assert(probes.stun_count == (int)(sizeof(FP_DEFAULT_STUN_SERVERS) /
+                                          sizeof(FP_DEFAULT_STUN_SERVERS[0])));
+        /* Our own witness comes first: it answers STUN and it answers a change-request from
+         * another address, so a deployment with no configured list still gets a verdict. */
         assert(!strcmp(probes.stun_host[0], "stun.fastp2p.top") && probes.stun_port[0] == 3478);
-        assert(!strcmp(probes.stun_host[1], "stun.fastp2p.top") && probes.stun_port[1] == 3478);
+        assert(!strcmp(probes.stun_host[1], "stun.hitv.com") && probes.stun_port[1] == 3478);
+        assert(probes.stun_count > 2);
         /* An explicit empty array still opts out of leaving the host. */
         json_object *none = json_object_new_array();
         assert(none);
