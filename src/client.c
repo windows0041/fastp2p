@@ -397,6 +397,14 @@ typedef struct {
      * predict. */
     int tcp_step, peer_tcp_step;
     uint16_t tcp_last_port, peer_tcp_last_port;
+    /* The pool this host measured for itself, from the probe that walked every distinct
+     * destination from its own punch port: the addresses it is published on and the port
+     * intervals those observations clustered into. Published to the peer so it can spray
+     * the product instead of one address. */
+    op_addr pool_addrs[TCP_POOL_ADDR_MAX];
+    unsigned pool_addr_count;
+    uint16_t pool_lo[TCP_POOL_SPAN_MAX], pool_hi[TCP_POOL_SPAN_MAX];
+    unsigned pool_span_count;
     /* The pool a peer with a moving mapping published: the addresses it was seen at and
      * the port intervals those observations cluster into. Empty means it published none
      * (an older build, or a mapping stable enough not to need one). */
@@ -2643,20 +2651,14 @@ static void publish_tcp_pool(const fastp2p_client *c, const tunnel *t, json_obje
         return;
     if (t->tcp_mapping == FP_TCP_MAP_STABLE || c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_STABLE)
         return; /* one reachable address: the port is the only question, already published */
-    const fp_tcp_family *f = &c->tcp_nat.family[OP_FAM_V4];
-    op_addr addrs[TCP_POOL_ADDR_MAX];
-    uint16_t lo[TCP_POOL_SPAN_MAX], hi[TCP_POOL_SPAN_MAX];
-    unsigned na = tcp_pool_addrs(f, addrs, TCP_POOL_ADDR_MAX);
-    unsigned ns = tcp_pool_spans(f, lo, hi, TCP_POOL_SPAN_MAX);
-    if (!na || !ns)
+    if (!t->pool_addr_count || !t->pool_span_count)
         return;
-    tcp_pool_narrow(na, lo, hi, ns);
     json_object *list = json_object_new_array();
     if (!list)
         return;
-    for (unsigned i = 0; i < na; ++i) {
+    for (unsigned i = 0; i < t->pool_addr_count; ++i) {
         char text[OP_ADDR_TEXT];
-        if (op_addr_text(&addrs[i], text, sizeof(text)))
+        if (op_addr_text(&t->pool_addrs[i], text, sizeof(text)))
             continue;
         json_object_array_add(list, json_object_new_string(text));
     }
@@ -2664,9 +2666,9 @@ static void publish_tcp_pool(const fastp2p_client *c, const tunnel *t, json_obje
     json_object *spans = json_object_new_array();
     if (!spans)
         return;
-    for (unsigned s = 0; s < ns; ++s) {
-        json_object_array_add(spans, json_object_new_int((int32_t)lo[s]));
-        json_object_array_add(spans, json_object_new_int((int32_t)hi[s]));
+    for (unsigned s = 0; s < t->pool_span_count; ++s) {
+        json_object_array_add(spans, json_object_new_int((int32_t)t->pool_lo[s]));
+        json_object_array_add(spans, json_object_new_int((int32_t)t->pool_hi[s]));
     }
     json_object_object_add(j, "tcpPoolSpan", spans);
 }
@@ -6338,6 +6340,31 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
                  * the computed port instead of a blind window. */
                 t->tcp_mapping = t->tcp_step > 0 ? FP_TCP_MAP_INCREMENT
                                  : t->tcp_step < 0 ? FP_TCP_MAP_DECREMENT : FP_TCP_MAP_NONE;
+            }
+            /* The sample probed every distinct destination from one local port, which is
+             * exactly the view a pool needs: the addresses this host is published on, and
+             * the ports it was given towards each of them. Derive it here, before the
+             * probe state goes, and log the pairs so the pool can be checked against what
+             * the witnesses actually reported. */
+            t->pool_addr_count = tcp_pool_addrs(t->tcp_sample, t->pool_addrs, TCP_POOL_ADDR_MAX);
+            t->pool_span_count = tcp_pool_spans(t->tcp_sample, t->pool_lo, t->pool_hi, TCP_POOL_SPAN_MAX);
+            tcp_pool_narrow(t->pool_addr_count, t->pool_lo, t->pool_hi, t->pool_span_count);
+            for (unsigned i = 0; i < t->tcp_sample->samples && i < FP_TCP_PROBE_MAX; ++i) {
+                char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[256];
+                op_addr_text(&t->tcp_sample->target_used[i], via, sizeof(via));
+                op_addr_text(&t->tcp_sample->mapped[i], seen, sizeof(seen));
+                snprintf(note, sizeof(note), "TCP mapping via %s:%u -> %s:%u", via,
+                         (unsigned)op_addr_port(&t->tcp_sample->target_used[i]), seen,
+                         (unsigned)op_addr_port(&t->tcp_sample->mapped[i]));
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+            }
+            if (t->pool_addr_count && t->pool_span_count) {
+                char note[224];
+                snprintf(note, sizeof(note),
+                         "TCP pool: %u addresses x %u port spans (first %u-%u)",
+                         t->pool_addr_count, t->pool_span_count, (unsigned)t->pool_lo[0],
+                         (unsigned)t->pool_hi[0]);
+                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
             }
             fp_tcp_punch_sample_free(t->tcp_sample);
             t->tcp_sample = NULL;
