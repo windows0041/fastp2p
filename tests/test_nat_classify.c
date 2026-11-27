@@ -293,9 +293,27 @@ static void peer_listener_port_conflict(void) {
  * a carrier that re-NATs a node, invalidates the mapping, the filter levels, the TCP
  * mapping and the remembered punch ports in one go - and the relay budget grew to four
  * direct rounds so a symmetric pair has time to find a predictable step. */
+/* A zero-initialised client has descriptor 0 in every slot, and closing slot 0 closes
+ * whatever really holds it. fastp2p_client_create() marks them all closed; these tests
+ * build the struct by hand, so they do the same. */
+static void probe_fds_closed(fastp2p_client *c) {
+    for (int family = 0; family < OP_FAM_COUNT; ++family) {
+        c->nat[family].fd = c->nat[family].fd2 = -1;
+        c->tcp_nat.family[family].fd = -1;
+    }
+    c->stun.fd = -1;
+    c->tcp_level.listener = c->tcp_level.dialer = -1;
+}
+static void count_restart(void *user) {
+    ++*(int *)user;
+}
 static void nat_remeasure_follows_the_path(void) {
     assert(PUBLIC_PUNCH_ROUNDS == 4);
+    assert(NAT_PATH_RECHECK == 3600 * NS);
+    assert(NAT_FILTER_REFRESH == 3600 * NS);
+    assert(NAT_FILTER_MAX_AGE == 7200 * NS);
     fastp2p_client c = {0};
+    probe_fds_closed(&c);
     snprintf(c.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.7");
     nat_filter_record(&c.udp_filter, 3, NS);
     nat_filter_record(&c.tcp_filter, 2, NS);
@@ -320,8 +338,39 @@ static void nat_remeasure_follows_the_path(void) {
     assert(c.punch_ports[0].port == 0 && !c.punch_ports[0].peer[0]);
     assert(!strcmp(c.path_public, "198.51.100.9"));
 
+    /* Periodic recheck is 1 hour (3600 s), not 5 minutes (300 s). */
+    c.tcp_nat_reprepare = 0;
+    nat_filter_record(&c.udp_filter, 3, 20 * NS);
+    watch_network_path(&c, 20 * NS + 300 * NS);
+    assert(!c.tcp_nat_reprepare && c.udp_filter.level == 3);
+    watch_network_path(&c, 20 * NS + NAT_PATH_RECHECK);
+    assert(c.tcp_nat_reprepare && c.udp_filter.level == 0);
+
+    /* A gateway restart frame (3/11) invokes the restart handler and immediately
+     * triggers a full NAT re-measurement even inside the settle window. */
+    {
+        int restarts = 0;
+        c.tcp_nat_reprepare = 0;
+        c.tcp_handoff_at = 50 * NS;
+        nat_filter_record(&c.udp_filter, 1, 50 * NS);
+        nat_filter_record(&c.tcp_filter, 2, 50 * NS);
+        c.login_ok = 1;
+        c.report_ok = 1;
+        c.path_remeasure_at = 999999 * NS;
+        c.path_recheck_at = 999999 * NS;
+        fastp2p_client_set_restart_handler(&c, count_restart, &restarts);
+        control_message(&c, 3, 11, NULL, 0);
+        assert(restarts == 1 && c.restart_remeasure == 1);
+        watch_network_path(&c, 51 * NS);
+        assert(c.restart_remeasure == 0);
+        assert(c.tcp_nat_reprepare == 2);
+        assert(c.udp_filter.level == 0 && c.tcp_filter.level == 0 && c.tcp_handoff_at == 0);
+    }
+
     /* A second change inside the settle window is ignored (a flapping carrier). */
     c.tcp_nat_reprepare = 0;
+    c.path_remeasure_at = 20 * NS + NAT_PATH_SETTLE;
+    c.path_recheck_at = UINT64_MAX;
     snprintf(c.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.8");
     watch_network_path(&c, 21 * NS);
     assert(!c.tcp_nat_reprepare);
@@ -337,6 +386,7 @@ static void nat_remeasure_follows_the_path(void) {
 
     /* Nothing is measured while the control connection is down. */
     fastp2p_client offline = {0};
+    probe_fds_closed(&offline);
     snprintf(offline.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.7");
     watch_network_path(&offline, NS);
     snprintf(offline.ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "203.0.113.99");
@@ -347,17 +397,26 @@ static void nat_remeasure_follows_the_path(void) {
     offline.ws_connected = 1;
     watch_network_path(&offline, 40 * NS);
     assert(offline.tcp_nat_reprepare);
-}
-/* A zero-initialised client has descriptor 0 in every slot, and closing slot 0 closes
- * whatever really holds it. fastp2p_client_create() marks them all closed; these tests
- * build the struct by hand, so they do the same. */
-static void probe_fds_closed(fastp2p_client *c) {
-    for (int family = 0; family < OP_FAM_COUNT; ++family) {
-        c->nat[family].fd = c->nat[family].fd2 = -1;
-        c->tcp_nat.family[family].fd = -1;
+
+    /* Fresh start / restart schedules the post-login TCP mapping probe instead of
+     * clobbering tcp_nat_reprepare back to zero, and clears cached filter levels. */
+    {
+        const char *json = "{\"network\":{\"ServerHost\":\"127.0.0.1\",\"ServerPort\":27183,"
+                           "\"Node\":\"restart-node\",\"Token\":1000000000000001,"
+                           "\"AutoPortMapping\":false}}";
+        fastp2p_client *started = NULL;
+        assert(fastp2p_client_create_json(json, NULL, NULL, NULL, NULL, &started) == FASTP2P_OK);
+        nat_filter_record(&started->udp_filter, 2, 10 * NS);
+        nat_filter_record(&started->tcp_filter, 3, 10 * NS);
+        started->tcp_handoff_at = 10 * NS;
+        assert(fastp2p_client_start(started) == FASTP2P_OK);
+        assert(started->tcp_nat_reprepare == 3);
+        assert(started->udp_filter.level == 0 && started->tcp_filter.level == 0);
+        assert(started->tcp_handoff_at == 0);
+        assert(started->nat[OP_FAM_V4].phase == 1);
+        fastp2p_client_stop(started);
+        fastp2p_client_destroy(started);
     }
-    c->stun.fd = -1;
-    c->tcp_level.listener = c->tcp_level.dialer = -1;
 }
 /* The mapping ladder borrows the peer-port listener when one exists: the mapping an
  * operator has to open is that one, and classifying an ephemeral port described a port
@@ -2133,10 +2192,24 @@ static void mapping_pool_is_derived_from_the_samples(void) {
     assert(!op_addr_from_text(&g.mapped[0], "10.0.0.1", 1000));
     assert(!op_addr_from_text(&g.mapped[1], "10.0.0.1", 1000 + TCP_POOL_GAP + 1));
     assert(tcp_pool_spans(&g, lo, hi, TCP_POOL_SPAN_MAX) == 2);
-    /* An unbounded pool is narrowed to the spray budget, not published as it stands. */
+    /* An unbounded pool is narrowed to the spray budget by halving, not collapsed to 9 ports. */
     uint16_t wide_lo[1] = {1}, wide_hi[1] = {65535};
     tcp_pool_narrow(TCP_POOL_ADDR_MAX, wide_lo, wide_hi, 1);
-    assert((unsigned)(wide_hi[0] - wide_lo[0] + 1) * TCP_POOL_ADDR_MAX <= TCP_POOL_TARGET_MAX);
+    unsigned narrowed = (unsigned)(wide_hi[0] - wide_lo[0] + 1);
+    assert(narrowed * TCP_POOL_ADDR_MAX <= TCP_POOL_TARGET_MAX);
+    assert(narrowed >= (TCP_POOL_TARGET_MAX / TCP_POOL_ADDR_MAX) / 2);
+
+    /* Multi-IP carrier NAT pool addresses across distinct /24s are accepted on TCP punch accept. */
+    tunnel pool_t = {0};
+    snprintf(pool_t.ip, sizeof(pool_t.ip), "%s", "223.104.85.223");
+    pool_t.peer_pool_addr_count = 2;
+    assert(!op_addr_from_text(&pool_t.peer_pool_addrs[0], "223.104.85.223", 1));
+    assert(!op_addr_from_text(&pool_t.peer_pool_addrs[1], "223.104.72.211", 1));
+    op_addr from_pool, from_other;
+    assert(!op_addr_from_text(&from_pool, "223.104.72.211", 41234));
+    assert(!op_addr_from_text(&from_other, "198.51.100.9", 41234));
+    assert(tcp_peer_addr_matches(&pool_t, &from_pool));
+    assert(!tcp_peer_addr_matches(&pool_t, &from_other));
 }
 
 /* The spray walks exactly the product the peer published: address-major, intervals in
@@ -2194,11 +2267,47 @@ static void config_push_is_bound_without_an_embedder(void) {
     assert(!fp_client_config_push_supported(&c)); /* the state a phone was stuck in */
     assert(!fastp2p_client_set_config_path(&c, "/data/user/0/top.fastp2p/files/fastp2p.json"));
     assert(fp_client_config_push_supported(&c));
-    /* And with no path at all: the built-in applier takes the push in memory. */
+    /* And with no path at all: the built-in applier takes the push in memory,
+     * including forwarding and SOCKS5 rules pushed over 3/19. */
     fastp2p_client d = {0};
     d.callback = print_event;
     assert(!fastp2p_client_set_config_path(&d, NULL));
     assert(fp_client_config_push_supported(&d));
+
+    fastp2p_client *live = NULL;
+    fastp2p_config cfg = {.struct_size = sizeof(cfg),
+                          .abi_version = FASTP2P_ABI_VERSION,
+                          .gateway_host = "127.0.0.1",
+                          .gateway_port = 27183,
+                          .node = "builtin-apply-node",
+                          .token = UINT64_C(9999999999999999),
+                          .on_event = print_event};
+    assert(fastp2p_client_create(&cfg, &live) == FASTP2P_OK && live);
+    assert(!fastp2p_client_set_config_path(live, NULL));
+    live->running = 1;
+    /* Pick a guaranteed-free localhost port for the pushed SOCKS5 rule. */
+    op_socket probe = socket_bound(0, "127.0.0.1", 0, 0);
+    assert(probe >= 0);
+    uint16_t free_port = socket_port(probe);
+    op_close(probe);
+    char pushed[256];
+    snprintf(pushed, sizeof(pushed),
+             "{\"apps\":[],\"socks5\":[{\"Name\":\"pushed-socks\",\"SrcPort\":%u,"
+             "\"PeerNode\":\"builtin-peer-node\",\"UnderlayProtocol\":\"tcp\",\"Enabled\":true}]}",
+             (unsigned)free_port);
+    assert(client_config_apply(pushed, 7, live) == FASTP2P_OK);
+    int found_socks = 0;
+    for (int i = 0; i < NA; ++i) {
+        if (live->apps[i].used && live->apps[i].socks && live->apps[i].port == free_port) {
+            found_socks = 1;
+            assert(live->apps[i].fd >= 0);
+        }
+    }
+    assert(found_socks);
+    assert(client_config_apply("{\"apps\":\"bad\"}", 8, live) == FASTP2P_EINVAL);
+    live->running = 0;
+    fastp2p_client_destroy(live);
+
     printf("config_push_supported: bound=%d unbound_path=%d\n",
            fp_client_config_push_supported(&c), fp_client_config_push_supported(&d));
 }

@@ -45,7 +45,7 @@ EasyTier 用 9 个值，实际判定路径只会产出其中 7 个：
      - 新端口比此前最大端口大且差值 < 100 → `SymmetricEasyInc`
      - 新端口比此前最小端口小且差值 < 100 → `SymmetricEasyDec`
      - 否则 → `Symmetric`
-4. 判定完成后 10 分钟重测一次；未判定成功则 10 秒后重试。
+4. 判定完成后 1 小时重测一次（路径变化或网关触发重启时立即重测）；未判定成功则 30 秒后重试。
 
 对应常见中文编号（README 提到 NAT4-NAT4）：NAT1 ≈ Open/NoPat/FullCone，NAT2 ≈ Restricted，NAT3 ≈ PortRestricted，NAT4 ≈ Symmetric。
 

@@ -133,6 +133,19 @@
  * than a standing load. */
 #define TCP_PUNCH_ARRAY 64u
 #define TCP_PUNCH_ARRAY_LIMIT 512u
+/* How long one dialler rotation keeps its sockets in SYN_SENT. 250 ms closed every
+ * socket before the first kernel SYN retransmit, so the carrier mapping each one
+ * created was gone again by the time the opener's spray (or its retransmit) reached
+ * it. A little over a second lets one retransmit fire and keeps the mappings alive
+ * across the opener's spray pass. */
+#define TCP_ARRAY_HOLD_MS 1200u
+/* Opener spray sockets held in SYN_SENT per pass, how long a pass is held, and how
+ * many passes a round may make. Each pass sprays the whole published pool again and
+ * holds a different slice of it, so the peer's rotating array keeps meeting fresh
+ * live tuples on our side for most of the parked window. */
+#define TCP_SPRAY_HOLD_MAX 384u
+#define TCP_SPRAY_HOLD_MS 3000u
+#define TCP_SPRAY_PASSES 8u
 /* Descriptors the whole client may hold for source-port arrays at once. */
 #define TCP_ARRAY_CLIENT_LIMIT 512u
 /* Pool publishing for a peer whose mapping moves. A carrier NAT hands a mapping out of
@@ -172,13 +185,13 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define TCP_KEEPALIVE_MS 3000u
 #define UDP_DIRECT_WAIT (5 * NS)
 #define NAT_FILTER_RETRY (30 * NS)
-#define NAT_FILTER_REFRESH (600 * NS)
-#define NAT_FILTER_MAX_AGE (1200 * NS)
+#define NAT_FILTER_REFRESH (3600 * NS)
+#define NAT_FILTER_MAX_AGE (7200 * NS)
 /* The path a client is measured on can change without anything local noticing: a laptop
  * that moves from Wi-Fi to a mobile network keeps its control connection while the
  * address the gateway sees becomes another one. Re-measuring the ladder periodically is
  * the only signal that covers that case, and one probe costs two datagrams. */
-#define NAT_PATH_RECHECK (300 * NS)
+#define NAT_PATH_RECHECK (3600 * NS)
 /* A carrier can flap between addresses; one ladder per ten seconds is plenty. */
 #define NAT_PATH_SETTLE (10 * NS)
 /* A peer whose mapping moves with every destination still allocates the next
@@ -442,6 +455,13 @@ typedef struct {
     op_socket *array;
     unsigned array_count, array_slots, array_width;
     uint64_t array_until;
+    /* Opener-side spray sockets kept in SYN_SENT. Closing them right after the SYN
+     * left nothing to answer the peer's simultaneous-open SYN-ACK: the kernel sent an
+     * RST and the peer saw its array socket connect and die in the same instant.
+     * Charged against the same client-wide budget as the dialler array. */
+    op_socket *spray;
+    unsigned spray_count, spray_slots, spray_passes;
+    uint64_t spray_until;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
@@ -621,6 +641,7 @@ struct fastp2p_client {
      * measurement taken so far describes a path this host is no longer on. */
     char path_local[OP_ADDR_TEXT], path_public[OP_ADDR_TEXT];
     uint64_t path_recheck_at, path_remeasure_at;
+    int restart_remeasure;
     /* 1 when a pushed configuration replaced the TCP mapping servers: their
      * destinations have to be resolved, which the step loop does outside the callback. */
     int tcp_nat_reprepare;
@@ -735,6 +756,9 @@ static int refresh_families(fastp2p_client *);
 static void control_message(fastp2p_client *, uint16_t, uint16_t, const uint8_t *, size_t);
 static void close_tunnel(fastp2p_client *, int, const char *);
 static void tcp_array_close(fastp2p_client *, tunnel *);
+static void tcp_spray_close(fastp2p_client *, tunnel *);
+static int same_host(const op_addr *, const op_addr *);
+static int peer_host_matches(const op_addr *, const op_addr *);
 static uint64_t app_retry_delay(unsigned);
 static void release_relay(fastp2p_client *, int);
 static void bind_pending_key(fastp2p_client *, int);
@@ -1241,7 +1265,18 @@ static int connect_ready(op_socket fd) {
     int error = 0;
     op_socklen n = sizeof(error);
     if (op_getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &n) || error) {
-        errno = error;
+        errno = error ? error : ECONNRESET;
+        return -1;
+    }
+    /* A simultaneous-open socket reset in SYN_RECV can return POLLOUT|POLLHUP with
+     * SO_ERROR == 0 on Linux; verify the socket is genuinely connected before adopting it. */
+    if (p.revents & (POLLERR | POLLHUP)) {
+        errno = ECONNRESET;
+        return -1;
+    }
+    op_addr peer;
+    if (op_addr_peername(fd, &peer)) {
+        errno = ECONNRESET;
         return -1;
     }
     return 1;
@@ -1778,6 +1813,7 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
         op_close(t->alternate_fd);
     close_tcp_candidates(t);
     tcp_array_close(c, t);
+    tcp_spray_close(c, t);
     close_udp_candidates(t);
     fp_tcp_punch_sample_free(t->tcp_sample);
     op_buffer_clear(&t->rx);
@@ -2696,11 +2732,20 @@ static void tcp_pool_narrow(unsigned addr_count, uint16_t *lo, uint16_t *hi, uns
             total += (unsigned)(hi[s] - lo[s] + 1);
         if (total * addr_count <= TCP_POOL_TARGET_MAX)
             return;
+        int shrunk = 0;
         for (unsigned s = 0; s < spans; ++s) {
+            unsigned width = (unsigned)(hi[s] - lo[s] + 1);
+            if (width <= 1)
+                continue;
             unsigned centre = ((unsigned)lo[s] + hi[s]) / 2;
-            lo[s] = (uint16_t)(centre > 4 ? centre - 4 : 1);
-            hi[s] = (uint16_t)(centre + 4 > 65535 ? 65535 : centre + 4);
+            unsigned half = width / 4; /* the new width is half of the old one */
+            lo[s] = (uint16_t)(centre > half ? centre - half : 1);
+            hi[s] = (uint16_t)(centre + half > 65535 ? 65535 : centre + half);
+            if ((unsigned)(hi[s] - lo[s] + 1) < width)
+                shrunk = 1;
         }
+        if (!shrunk)
+            return;
     }
 }
 static void publish_tcp_mapping(const fastp2p_client *c, const tunnel *t, json_object *j) {
@@ -3279,31 +3324,69 @@ static int tcp_pool_target(const tunnel *t, unsigned index, op_addr *out) {
     }
     return -1;
 }
+static void tcp_spray_close(fastp2p_client *c, tunnel *t) {
+    if (t->spray) {
+        for (unsigned i = 0; i < t->spray_count; ++i)
+            if (t->spray[i] >= 0)
+                op_close(t->spray[i]);
+        free(t->spray);
+        t->spray = NULL;
+    }
+    if (t->spray_slots) {
+        c->tcp_array_used = c->tcp_array_used > t->spray_slots ? c->tcp_array_used - t->spray_slots : 0;
+        t->spray_slots = 0;
+    }
+    t->spray_count = 0;
+    t->spray_until = 0;
+}
+/* Keep a spray socket in SYN_SENT when the budget allows, otherwise close it: the SYN
+ * has left either way, but only a kept socket can complete a simultaneous open. */
+static void tcp_spray_keep(fastp2p_client *c, tunnel *t, op_socket fd) {
+    if (!t->spray && c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT)
+        t->spray = calloc(TCP_SPRAY_HOLD_MAX, sizeof(*t->spray));
+    if (!t->spray || t->spray_count >= TCP_SPRAY_HOLD_MAX ||
+        c->tcp_array_used >= TCP_ARRAY_CLIENT_LIMIT) {
+        op_close(fd);
+        return;
+    }
+    t->spray[t->spray_count++] = fd;
+    ++t->spray_slots;
+    ++c->tcp_array_used;
+}
 static void tcp_punch_spray(fastp2p_client *c, int index) {
     tunnel *t = &c->tunnels[index];
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
+    tcp_spray_close(c, t);
+    unsigned pass = t->spray_passes++;
+    t->spray_until = mono() + TCP_SPRAY_HOLD_MS * MS;
     /* A peer that published its pool is reachable at any of (addresses x intervals); the
      * product covers exactly the space it told us about, which is a few thousand SYNs
      * instead of a lottery against the whole port range. */
     unsigned pool = tcp_pool_target_count(t);
     if (pool) {
         unsigned sent = 0;
+        /* Every pass sprays the whole pool but holds a different slice of it, so the
+         * kept sockets walk across all addresses over the passes. */
+        unsigned start = (pass * TCP_SPRAY_HOLD_MAX) % pool;
         for (unsigned i = 0; i < pool; ++i) {
             op_addr target;
-            if (tcp_pool_target(t, i, &target))
-                break;
+            if (tcp_pool_target(t, (start + i) % pool, &target))
+                continue;
             op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
             if (fd < 0)
                 continue;
-            (void)op_connect(fd, &target.u.sa, target.len);
-            op_close(fd);
+            if (op_connect(fd, &target.u.sa, target.len) && errno != EINPROGRESS) {
+                op_close(fd);
+                continue;
+            }
+            tcp_spray_keep(c, t, fd);
             ++sent;
         }
         if (sent) {
             char note[224];
             snprintf(note, sizeof(note),
-                     "TCP punch sprayed the peer's pool: %u targets over %u addresses and %u port spans",
-                     sent, t->peer_pool_addr_count, t->peer_pool_span_count);
+                     "TCP punch sprayed the peer's pool: %u targets over %u addresses and %u port spans (pass %u, holding %u)",
+                     sent, t->peer_pool_addr_count, t->peer_pool_span_count, pass + 1, t->spray_count);
             emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         }
         return;
@@ -3324,8 +3407,13 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
         op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
         if (fd < 0)
             continue;
-        (void)op_connect(fd, &target.u.sa, target.len);
-        op_close(fd); /* the SYN created the mapping and the filter entry */
+        if (op_connect(fd, &target.u.sa, target.len) && errno != EINPROGRESS) {
+            op_close(fd);
+            continue;
+        }
+        /* The SYN created the mapping and the filter entry; a kept socket can also
+         * complete a simultaneous open with the peer's own SYN. */
+        tcp_spray_keep(c, t, fd);
         ++sent;
     }
     /* Name the window: "sprayed 8192 ports" alone cannot tell an aimed window from
@@ -3527,10 +3615,11 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
             if (predicted)
                 tcp_punch_predict(c, index);
             else {
-                /* Two bets in one round: the advertised port may still be the right
-                 * one, and if it is not, the sweep is already walking the range. */
+                /* When the peer published its measured pool, spray that pool without
+                 * immediately polluting our NAT conntrack table with a blind /24 sweep. */
                 tcp_punch_spray(c, index);
-                tcp_punch_sweep(c, index);
+                if (!tcp_pool_target_count(t))
+                    tcp_punch_sweep(c, index);
             }
             if (tcp_punch_listen(c, index) == 0) {
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, predicted
@@ -3662,7 +3751,7 @@ static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
     t->array_slots = opened;
     t->array_width = width;
     c->tcp_array_used += opened;
-    t->array_until = now + TCP_PUNCH_ATTEMPT_MS * MS;
+    t->array_until = now + TCP_ARRAY_HOLD_MS * MS;
     /* One line per round, not per rotation: a refused rotation turns over in tens
      * of milliseconds and would otherwise bury the log. */
     if (t->tcp_attempts <= 1) {
@@ -3771,6 +3860,74 @@ static int tcp_array_tick(fastp2p_client *c, int index, uint64_t now) {
     errno = refused ? ECONNREFUSED : ETIMEDOUT;
     tcp_punch_failed(c, index, now);
     return -1;
+}
+/* A kept spray socket completed: either the peer's SYN crossed ours (simultaneous
+ * open) or our SYN reached a live mapping. Same ownership rules as a single dial. */
+static void tcp_spray_adopt(fastp2p_client *c, int index, op_socket fd, uint64_t now) {
+    tunnel *t = &c->tunnels[index];
+    for (unsigned i = 0; i < t->spray_count; ++i)
+        if (t->spray[i] == fd)
+            t->spray[i] = -1;
+    tcp_spray_close(c, t);
+    tcp_array_close(c, t);
+    if (t->fd >= 0 && t->fd != fd)
+        op_close(t->fd);
+    t->fd = fd;
+    t->state = T_HANDSHAKE;
+    t->deadline = now + 10 * NS;
+    if (!t->server && t->listen_fd >= 0) {
+        op_close(t->listen_fd);
+        t->listen_fd = -1;
+    }
+    uint8_t id[8];
+    op_put64(id, t->id);
+    tframe(t, TUN_HELLO, id, sizeof(id));
+    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "TCP punch spray socket connected (simultaneous open)");
+}
+/* Poll the held spray sockets. 1 = adopted. When a pass expires the pool is sprayed
+ * again, which renews our filter entries and meets the peer's next array rotation. */
+static int tcp_spray_tick(fastp2p_client *c, int index, uint64_t now) {
+    tunnel *t = &c->tunnels[index];
+    if (!t->spray_until)
+        return 0;
+    op_pollfd fds[64];
+    unsigned slots[64];
+    for (unsigned base = 0; t->spray && base < t->spray_count; base += 64) {
+        unsigned n = 0;
+        for (unsigned i = base; i < t->spray_count && i < base + 64; ++i) {
+            if (t->spray[i] < 0)
+                continue;
+            fds[n].fd = t->spray[i];
+            fds[n].events = POLLOUT;
+            fds[n].revents = 0;
+            slots[n++] = i;
+        }
+        if (!n || op_poll(fds, n, 0) <= 0)
+            continue;
+        for (unsigned k = 0; k < n; ++k) {
+            if (!fds[k].revents)
+                continue;
+            op_socket fd = t->spray[slots[k]];
+            int ready = connect_ready(fd);
+            if (ready > 0) {
+                tcp_spray_adopt(c, index, fd, now);
+                return 1;
+            }
+            if (ready < 0) {
+                op_close(fd);
+                t->spray[slots[k]] = -1;
+            }
+        }
+    }
+    if (now < t->spray_until)
+        return 0;
+    tcp_spray_close(c, t);
+    /* A pool spray is bounded by TCP_POOL_TARGET_MAX; a window spray can be thousands
+     * of SYNs, so it gets one repeat at most. */
+    unsigned passes = tcp_pool_target_count(t) ? TCP_SPRAY_PASSES : 2u;
+    if (t->spray_passes < passes && now + TCP_SPRAY_HOLD_MS * MS < t->deadline)
+        tcp_punch_spray(c, index);
+    return 0;
 }
 /* 1 when this host can actually open a socket in `family`; a host with no IPv6
  * address must never punch there, however dual-stack the peer looks. */
@@ -4479,6 +4636,8 @@ static void tunnel_active(fastp2p_client *c, int index) {
     if (t->alternate_fd >= 0)
         op_close(t->alternate_fd);
     t->listen_fd = t->alternate_fd = -1;
+    tcp_spray_close(c, t);
+    tcp_array_close(c, t);
     op_buffer_clear(&t->alternate_rx);
     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
          t->transport == FASTP2P_TRANSPORT_TCP ? "TCP tunnel connected" : "QUIC tunnel connected");
@@ -5085,6 +5244,10 @@ static void control_message(fastp2p_client *c, uint16_t main, uint16_t sub, cons
     }
     if (main == 3 && sub == 11) {
         if (c->login_ok && c->report_ok && !c->stopping && c->restart_handler) {
+            emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, "gateway requested restart; re-measuring the NAT");
+            c->restart_remeasure = 1;
+            c->path_remeasure_at = 0;
+            c->path_recheck_at = 0;
             c->in_callback = 1;
             c->restart_handler(c->restart_user);
             c->in_callback = 0;
@@ -5995,25 +6158,33 @@ static void read_tunnel_frames(fastp2p_client *c, int ti) {
         free(body);
     }
 }
+/* A multi-IP carrier NAT (CGNAT) can originate the peer's TCP punch SYN from any
+ * address in the pool it measured, not only the single IP the gateway observed. */
+static int tcp_peer_addr_matches(const tunnel *t, const op_addr *from) {
+    op_addr expected;
+    memset(&expected, 0, sizeof(expected));
+    if (!op_addr_from_text(&expected, t->ip, 0) && peer_host_matches(from, &expected))
+        return 1;
+    for (unsigned i = 0; i < t->peer_pool_addr_count; ++i)
+        if (same_host(from, &t->peer_pool_addrs[i]))
+            return 1;
+    return 0;
+}
 static void accept_punch(fastp2p_client *c, int ti) {
     tunnel *t = &c->tunnels[ti];
     if (t->listen_fd < 0 || (t->state != T_TCP_CONNECT && t->state != T_HANDSHAKE))
         return;
-    op_addr peer, peer_len_probe;
+    op_addr peer;
     memset(&peer, 0, sizeof(peer));
-    memset(&peer_len_probe, 0, sizeof(peer_len_probe));
     peer.len = (op_socklen)sizeof(peer.u.storage);
     op_socket fd = op_accept(t->listen_fd, &peer.u.sa, &peer.len);
     if (fd < 0)
         return;
     op_addr_normalize(&peer);
     note_inbound(c, &peer, "punch listener");
-    /* Connect-back: the port in the offer is what the gateway measured, i.e. the peer's
-     * mapping *towards the gateway*. Towards us a destination-dependent NAT allocates
-     * something else, so requiring the advertised port here rejected every inbound SYN
-     * that actually made it - the one connection that proves the hole is open. Accept it
-     * from the peer's address whatever the port; the session secret rejects impostors. */
-    int from_peer = !op_addr_from_text(&peer_len_probe, t->ip, 0) && op_addr_equal(&peer, &peer_len_probe);
+    /* Connect-back: accept from the peer's advertised host/pool whatever the port;
+     * the tunnel id and session secret reject impostors. */
+    int from_peer = tcp_peer_addr_matches(t, &peer);
     if (!from_peer && !t->inbound_logged) {
         /* A SYN from an address we did not expect is still evidence the hole is open; a rejected one names the
          * address the peer really uses, which may differ from the address it published. */
@@ -6027,10 +6198,11 @@ static void accept_punch(fastp2p_client *c, int ti) {
     }
     if (from_peer && t->remote_port && op_addr_port(&peer) != t->remote_port) {
         if (!t->inbound_logged) {
-            char note[160];
+            char note[160], text[OP_ADDR_TEXT];
+            op_addr_text(&peer, text, sizeof(text));
             t->inbound_logged = 1;
-            snprintf(note, sizeof(note), "inbound punch SYN from %s:%u (advertised %u); answering it",
-                     t->ip, (unsigned)op_addr_port(&peer), (unsigned)t->remote_port);
+            snprintf(note, sizeof(note), "inbound punch SYN from %s:%u (advertised %s:%u); answering it",
+                     text, (unsigned)op_addr_port(&peer), t->ip, (unsigned)t->remote_port);
             emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         }
     }
@@ -6049,7 +6221,9 @@ static void accept_punch(fastp2p_client *c, int ti) {
     if (!t->server && t->state == T_TCP_CONNECT) {
         if (t->fd >= 0)
             op_close(t->fd);
-t->fd = fd;
+        tcp_spray_close(c, t);
+        tcp_array_close(c, t);
+        t->fd = fd;
         t->state = T_HANDSHAKE;
         op_close(t->listen_fd);
         t->listen_fd = -1;
@@ -6622,6 +6796,12 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
     }
     if (t->state == T_TCP_CONNECT && t->tcp_predict_role)
         tcp_predict_tick(c, ti, now);
+    /* Held spray sockets can complete a simultaneous open at any time while parked. */
+    if (t->state == T_TCP_CONNECT && t->spray_until) {
+        (void)tcp_spray_tick(c, ti, now);
+        if (!t->state)
+            return;
+    }
     /* The dialler's source-port array owns the attempt while it is armed. */
     if (t->state == T_TCP_CONNECT && t->array_count) {
         (void)tcp_array_tick(c, ti, now);
@@ -8668,6 +8848,7 @@ static int nat_remeasure(fastp2p_client *c) {
     memset(c->punch_ports, 0, sizeof(c->punch_ports));
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
+    c->tcp_handoff_at = 0;
     c->tcp_nat_reprepare = 2; /* the path changed, not the servers */
     c->tcp_nat_reprepare_at = mono() + TCP_REPREPARE_DELAY_MS * MS;
     if (c->stun.fd >= 0) {
@@ -8707,7 +8888,9 @@ static void watch_network_path(fastp2p_client *c, uint64_t now) {
     if (!c->path_public[0] && *observed)
         snprintf(c->path_public, sizeof(c->path_public), "%s", observed);
     const char *why = NULL;
-    if (local_known && c->path_local[0] && strcmp(local, c->path_local))
+    if (c->restart_remeasure)
+        why = "gateway requested restart";
+    else if (local_known && c->path_local[0] && strcmp(local, c->path_local))
         why = "the local source address changed";
     else if (*observed && c->path_public[0] && strcmp(observed, c->path_public))
         why = "the address the gateway sees changed";
@@ -8719,7 +8902,7 @@ static void watch_network_path(fastp2p_client *c, uint64_t now) {
     if (!c->ws_connected)
         return;
     /* A carrier can flap: one ladder per ten seconds is enough. */
-    if (now < c->path_remeasure_at)
+    if (!c->restart_remeasure && now < c->path_remeasure_at)
         return;
     if (why) {
         char note[192];
@@ -8734,6 +8917,7 @@ static void watch_network_path(fastp2p_client *c, uint64_t now) {
         c->path_remeasure_at = now + 2 * NS;
         return;
     }
+    c->restart_remeasure = 0;
     c->path_remeasure_at = now + NAT_PATH_SETTLE;
     c->path_recheck_at = now + NAT_PATH_RECHECK;
     if (local_known)
@@ -8886,38 +9070,102 @@ static int client_config_apply(const char *fields, uint64_t revision, void *user
     snprintf(note, sizeof(note), "config: push received revision=%llu bytes=%llu",
              (unsigned long long)revision, (unsigned long long)(fields ? strlen(fields) : 0));
     emit(c, FASTP2P_EVENT_TUNNEL, 0, 0, note);
-    if (!patch) {
+    if (!patch || !json_object_is_type(patch, json_type_object)) {
+        if (patch)
+            json_object_put(patch);
         emit(c, FASTP2P_EVENT_ERROR, revision, FASTP2P_EINVAL,
              "config: push rejected (not a JSON document)");
         return FASTP2P_EINVAL;
     }
     int result = FASTP2P_OK;
     unsigned udp = 0, tcp = 0;
-    json_object *network = NULL;
-    if (json_object_object_get_ex(patch, "network", &network) &&
-        json_object_is_type(network, json_type_object)) {
-        json_object *list = NULL;
-        if (json_object_object_get_ex(network, "UDPSTUNServers", &list) && list) {
-            udp = json_object_is_type(list, json_type_array)
-                      ? (unsigned)json_object_array_length(list) : 0;
-            if (fp_client_stun_config(c, list))
-                result = FASTP2P_EINVAL;
-        }
-        if (!result && json_object_object_get_ex(network, "TCPSTUNServers", &list) && list) {
-            tcp = json_object_is_type(list, json_type_array)
-                      ? (unsigned)json_object_array_length(list) : 0;
-            if (fp_client_tcp_nat_reconfigure(c, list))
-                result = FASTP2P_EINVAL;
-        }
-        if (!result && json_object_object_get_ex(network, "TCPNatProbe", &list) && list &&
-            fp_client_tcp_level_config(c, list))
+    fp_rule_update *rules = NULL;
+    json_object *apps = NULL, *socks5 = NULL;
+    int has_apps = json_object_object_get_ex(patch, "apps", &apps);
+    int has_socks5 = json_object_object_get_ex(patch, "socks5", &socks5);
+    if (has_apps || has_socks5) {
+        if ((has_apps && (!apps || !json_object_is_type(apps, json_type_array))) ||
+            (has_socks5 && (!socks5 || !json_object_is_type(socks5, json_type_array)))) {
             result = FASTP2P_EINVAL;
-        if (!result && json_object_object_get_ex(network, "AutoPortMapping", &list) && list)
-            fp_client_set_auto_port_mapping(c, json_object_get_boolean(list) ? 1 : 0);
+        } else {
+            json_object *synth = json_object_new_object();
+            json_object *net = json_object_new_object();
+            if (!synth || !net) {
+                if (synth)
+                    json_object_put(synth);
+                if (net)
+                    json_object_put(net);
+                result = FASTP2P_ENOMEM;
+            } else {
+                json_object_object_add(synth, "network", net);
+                json_object_object_add(net, "ServerHost",
+                                       json_object_new_string(c->host[0] ? c->host : "127.0.0.1"));
+                json_object_object_add(net, "ServerPort",
+                                       json_object_new_uint64(c->port ? c->port : 27183));
+                if (c->automatic_node) {
+                    json_object_object_add(net, "AutoNode", json_object_new_boolean(1));
+                    const char *hint = c->node[0] ? c->node : c->node_hint;
+                    if (*hint)
+                        json_object_object_add(net, "NodeHint", json_object_new_string(hint));
+                    if (c->device_id[0])
+                        json_object_object_add(net, "DeviceID", json_object_new_string(c->device_id));
+                } else if (c->node[0]) {
+                    json_object_object_add(net, "Node", json_object_new_string(c->node));
+                }
+                json_object_object_add(net, "UDPSTUNServers", json_object_new_array());
+                json_object_object_add(net, "TCPSTUNServers", json_object_new_array());
+                if (has_apps)
+                    json_object_object_add(synth, "apps", json_object_get(apps));
+                if (has_socks5)
+                    json_object_object_add(synth, "socks5", json_object_get(socks5));
+                const char *synth_text =
+                    json_object_to_json_string_ext(synth, JSON_C_TO_STRING_PLAIN);
+                result = synth_text ? fp_client_rules_prepare(c, synth_text, &rules) : FASTP2P_ENOMEM;
+                json_object_put(synth);
+            }
+        }
+    }
+    json_object *sdwan = NULL;
+    if (!result && json_object_object_get_ex(patch, "sdwan", &sdwan) && sdwan) {
+        if (!json_object_is_type(sdwan, json_type_object)) {
+            result = FASTP2P_EINVAL;
+        } else {
+            char detail[96] = "";
+            result = fp_client_sdwan_reconfigure(c, sdwan, detail, sizeof(detail));
+        }
+    }
+    json_object *network = NULL;
+    if (!result && json_object_object_get_ex(patch, "network", &network) && network) {
+        if (!json_object_is_type(network, json_type_object)) {
+            result = FASTP2P_EINVAL;
+        } else {
+            json_object *list = NULL;
+            if (json_object_object_get_ex(network, "UDPSTUNServers", &list) && list) {
+                udp = json_object_is_type(list, json_type_array)
+                          ? (unsigned)json_object_array_length(list) : 0;
+                if (fp_client_stun_config(c, list))
+                    result = FASTP2P_EINVAL;
+            }
+            if (!result && json_object_object_get_ex(network, "TCPSTUNServers", &list) && list) {
+                tcp = json_object_is_type(list, json_type_array)
+                          ? (unsigned)json_object_array_length(list) : 0;
+                if (fp_client_tcp_nat_reconfigure(c, list))
+                    result = FASTP2P_EINVAL;
+            }
+            if (!result && json_object_object_get_ex(network, "TCPNatProbe", &list) && list &&
+                fp_client_tcp_level_config(c, list))
+                result = FASTP2P_EINVAL;
+            if (!result && json_object_object_get_ex(network, "AutoPortMapping", &list) && list)
+                fp_client_set_auto_port_mapping(c, json_object_get_boolean(list) ? 1 : 0);
+        }
     }
     if (result) {
+        if (rules)
+            fp_client_rules_abort(rules);
         emit(c, FASTP2P_EVENT_ERROR, revision, result, "config: push rejected by the running client");
     } else {
+        if (rules)
+            fp_client_rules_commit(rules);
         snprintf(note, sizeof(note), "config: applied revision=%llu bytes=%llu hot=1 udp=%u tcp=%u",
                  (unsigned long long)revision,
                  (unsigned long long)(fields ? strlen(fields) : 0), udp, tcp);
@@ -9721,15 +9969,18 @@ int fastp2p_client_start(fastp2p_client *c) {
      * single-threaded loop, and doing it while the control channel is still handshaking
      * starves the heartbeat the gateway expects. The step loop starts the probe once the
      * session is authenticated. */
-    c->tcp_nat_reprepare = 1;
+    c->tcp_nat_reprepare = 3;
     c->tcp_nat_reprepare_at = 0;
+    c->udp_filter = c->tcp_filter = (nat_filter){0};
+    c->tcp_level.phase = 0;
+    c->tcp_handoff_at = 0;
+    c->restart_remeasure = 0;
     c->stopping = 0;
     c->reconnect_at = 0;
     c->nat_settled = 0;
     c->path_local[0] = c->path_public[0] = 0;
     c->path_recheck_at = mono() + NAT_PATH_RECHECK;
     c->path_remeasure_at = 0;
-    c->tcp_nat_reprepare = 0;
     snprintf(c->ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "0.0.0.0");
     for (int family = 0; family < OP_FAM_COUNT; ++family) {
         c->nat[family].type = NAT_UNKNOWN;
@@ -9775,15 +10026,17 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
     watch_network_path(c, now);
     if (c->tcp_nat_reprepare && c->ws && c->login_ok && now >= c->tcp_nat_reprepare_at) {
         /* 1 = a pushed configuration replaced the servers, 2 = the path changed and every
-         * measurement has to be retaken. Resolving destinations belongs here rather than
-         * in the configuration callback, which runs inside this loop and must not block. */
+         * measurement has to be retaken, 3 = initial/restarted session start. Resolving
+         * destinations belongs here rather than in the configuration callback, which runs
+         * inside this loop and must not block. */
         int reason = c->tcp_nat_reprepare;
         c->tcp_nat_reprepare = 0;
         fp_tcp_nat_close(&c->tcp_nat);
         fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
-             reason == 2 ? "path changed; re-measuring the TCP mapping"
-                         : "TCP probe servers changed; re-measuring the TCP mapping");
+             reason == 3 ? "measuring the TCP mapping"
+                         : reason == 2 ? "path changed; re-measuring the TCP mapping"
+                                       : "TCP probe servers changed; re-measuring the TCP mapping");
         {
             /* Which way the names are resolved matters when reading a disconnect: with the
              * worker a slow lookup costs the loop nothing, without it the walk blocks it. */
@@ -9871,7 +10124,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
          * the TCP listener for the probe window and rebuild it below. */
         c->tcp_relisten = 0;
         if (c->public_port && c->listener[OP_FAM_V4] >= 0 &&
-            now - c->tcp_handoff_at >= NAT_FILTER_REFRESH) {
+            (!c->tcp_handoff_at || now - c->tcp_handoff_at >= NAT_FILTER_REFRESH)) {
             close_peer_listeners(c->listener);
             c->tcp_relisten = 1;
             c->tcp_handoff_at = now;

@@ -10,7 +10,7 @@ TCP/UDP 分开检测映射并选择重试策略。新版 TCP 打洞支持双方�
 
 UDP 和 TCP 的 NAT 等级分别使用映射和入站过滤的观测。默认通过 `stun.fastp2p.top:3478` 做 UDP STUN 过滤探测，通过 `stun.fastp2p.top:3479` 做 TCP 回连探测。UDP 探测把实际回包的源地址和端口与请求目标比较。TCP 探测需要同地址换端口和换地址两项结果。
 
-过滤证据不足时，客户端会在 30 秒后重测。测出等级后每 10 分钟更新，短暂超时会保留最近确认的等级，满 20 分钟未重新确认会回到过滤待判定。可通过 `network.UDPSTUNServers` 和 `network.TCPNatProbe` 指定探测服务。自建 UDP 服务需支持 CHANGE-REQUEST。 [NAT 穿越说明](NAT-TRAVERSAL-ZH.md) · [自建探测服务](scripts/stun/README.md)
+过滤证据不足时，客户端会在 30 秒后重测。测出等级后每 1 小时更新，短暂超时会保留最近确认的等级，满 2 小时未重新确认会回到过滤待判定；网络路径变化或网关下发客户端重启时会立即重测。可通过 `network.UDPSTUNServers` 和 `network.TCPNatProbe` 指定探测服务。自建 UDP 服务需支持 CHANGE-REQUEST。 [NAT 穿越说明](NAT-TRAVERSAL-ZH.md) · [自建探测服务](scripts/stun/README.md)
 
 ## 安装与运行
 

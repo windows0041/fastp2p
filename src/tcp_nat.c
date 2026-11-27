@@ -648,7 +648,7 @@ static void cycle_finish(fp_tcp_family *k, uint64_t now) {
     }
     k->inflight = 0;
     k->phase = 0;
-    k->next_cycle = now + (k->type == FP_NAT_UNKNOWN ? 30 : 600) * SECOND;
+    k->next_cycle = now + (k->type == FP_NAT_UNKNOWN ? 30 : 3600) * SECOND;
 }
 int fp_tcp_echo_response(const uint8_t *p, size_t n, op_addr *out) {
     const uint8_t *end = memchr(p, '\n', n);
