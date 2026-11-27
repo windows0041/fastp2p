@@ -2203,6 +2203,56 @@ static void config_push_is_bound_without_an_embedder(void) {
            fp_client_config_push_supported(&c), fp_client_config_push_supported(&d));
 }
 
+/* The field bug: a destination-dependent host publishes out of a small set of addresses (six were
+ * measured on the mobile network), but the pool was built from the per-tunnel sample alone - and
+ * that sample probes one destination, so it sees one address. The published pool has to aggregate
+ * the whole measurement, or the spray lands on one address while the peer's mapping sits in
+ * another. */
+static void pool_aggregates_every_measured_address(void) {
+    fp_tcp_family catalog = {0};
+    static const char *ips[] = {"223.104.85.223", "223.104.85.222", "223.104.85.219",
+                                "223.104.85.217", "223.104.72.211", "223.104.72.209"};
+    static const uint16_t ports[] = {40305, 40311, 40317, 40323, 40329, 40335};
+    catalog.samples = sizeof(ips) / sizeof(ips[0]);
+    for (unsigned i = 0; i < catalog.samples; ++i)
+        assert(!op_addr_from_text(&catalog.mapped[i], ips[i], ports[i]));
+    /* The per-tunnel sample: one destination, one address - the field log's "1 addresses". */
+    fp_tcp_family sample = {0};
+    sample.samples = 1;
+    assert(!op_addr_from_text(&sample.mapped[0], "223.104.85.223", 40305));
+
+    op_addr seen[FP_TCP_PROBE_MAX];
+    unsigned nseen = tcp_pool_collect(&catalog, &sample, seen);
+    assert(nseen == 7); /* six witnesses plus the sample's own view */
+    tunnel t = {0};
+    t.pool_addr_count = tcp_pool_addrs_from(seen, nseen, t.pool_addrs, TCP_POOL_ADDR_MAX);
+    t.pool_span_count = tcp_pool_spans_from(seen, nseen, t.pool_lo, t.pool_hi, TCP_POOL_SPAN_MAX);
+    tcp_pool_narrow(t.pool_addr_count, t.pool_lo, t.pool_hi, t.pool_span_count);
+    printf("pool: %u addresses x %u port spans\n", t.pool_addr_count, t.pool_span_count);
+    assert(t.pool_addr_count == 6); /* every measured address, and only those */
+    assert(t.pool_span_count >= 1);
+    /* Publish it the way the tunnel does and count the spray it produces. */
+    t.peer_pool_addr_count = t.pool_addr_count;
+    t.peer_pool_span_count = t.pool_span_count;
+    unsigned widths = 0;
+    for (unsigned s = 0; s < t.pool_span_count; ++s) {
+        t.peer_pool_addrs[s] = t.pool_addrs[s];
+        t.peer_pool_lo[s] = t.pool_lo[s];
+        t.peer_pool_hi[s] = t.pool_hi[s];
+        widths += (unsigned)(t.pool_hi[s] - t.pool_lo[s] + 1);
+    }
+    assert(tcp_pool_target_count(&t) == 6 * widths);
+    assert(tcp_pool_target_count(&t) >= 6 * t.pool_span_count);
+
+    /* A stable mapping still publishes one address: this fix must not widen that case. */
+    fp_tcp_family stable = {0};
+    stable.samples = 3;
+    for (unsigned i = 0; i < stable.samples; ++i)
+        assert(!op_addr_from_text(&stable.mapped[i], "203.0.113.7", (uint16_t)(40000 + i)));
+    nseen = tcp_pool_collect(&stable, &stable, seen);
+    assert(tcp_pool_addrs_from(seen, nseen, t.pool_addrs, TCP_POOL_ADDR_MAX) == 1);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2445,6 +2495,7 @@ int main(void) {
     config_ack_says_failed_when_nothing_was_applied();
     config_push_is_bound_without_an_embedder();
     mapping_pool_is_derived_from_the_samples();
+    pool_aggregates_every_measured_address();
     pool_spray_covers_the_published_product();
     return 0;
 }

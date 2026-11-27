@@ -2602,10 +2602,30 @@ static uint16_t tcp_predict_next_port(unsigned mapping, uint16_t last_port, int 
  * allocate out of a pool. These helpers turn the samples a host took into the pool a peer
  * could aim at, and enumerate that pool for the spray. Everything is derived from the
  * data - no block size, address count or port range is assumed. */
-static unsigned tcp_pool_addrs(const fp_tcp_family *f, op_addr *out, unsigned max) {
+/* The pool's sources, in order: the catalog first, because that is the measurement - one probe
+ * per witness, so it holds every address the carrier published this host on - and then the
+ * per-tunnel sample, which only adds its own view: for one destination that is exactly one
+ * address, and using it alone is how a six-address CGNAT pool was published as one address. */
+static unsigned tcp_pool_collect(const fp_tcp_family *catalog, const fp_tcp_family *sample,
+                                 op_addr *out) {
+    const fp_tcp_family *sources[2] = {catalog, sample};
+    unsigned n = 0;
+    for (unsigned s = 0; s < 2; ++s) {
+        const fp_tcp_family *f = sources[s];
+        if (!f)
+            continue;
+        for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX && n < FP_TCP_PROBE_MAX; ++i)
+            if (f->mapped[i].len)
+                out[n++] = f->mapped[i];
+    }
+    return n;
+}
+/* Distinct addresses, first appearance kept. Address-only comparison, so six samples over three
+ * addresses are published as three. */
+static unsigned tcp_pool_addrs_from(const op_addr *mapped, unsigned n, op_addr *out, unsigned max) {
     unsigned count = 0;
-    for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i) {
-        const op_addr *m = &f->mapped[i];
+    for (unsigned i = 0; i < n; ++i) {
+        const op_addr *m = &mapped[i];
         if (!m->len)
             continue;
         unsigned k;
@@ -2620,12 +2640,14 @@ static unsigned tcp_pool_addrs(const fp_tcp_family *f, op_addr *out, unsigned ma
 /* The port intervals the observations cluster into: sorted ports whose neighbours are no
  * more than TCP_POOL_GAP apart belong together, padded by TCP_POOL_PAD on both sides
  * because the next allocation can land beside the sampled one. */
-static unsigned tcp_pool_spans(const fp_tcp_family *f, uint16_t *lo, uint16_t *hi, unsigned max) {
+static unsigned tcp_pool_spans_from(const op_addr *mapped, unsigned n, uint16_t *lo, uint16_t *hi,
+                                    unsigned max) {
     uint16_t ports[FP_TCP_PROBE_MAX];
-    unsigned n = 0;
-    for (unsigned i = 0; i < f->samples && i < FP_TCP_PROBE_MAX; ++i)
-        if (f->mapped[i].len)
-            ports[n++] = op_addr_port(&f->mapped[i]);
+    unsigned count_in = 0;
+    for (unsigned i = 0; i < n && count_in < FP_TCP_PROBE_MAX; ++i)
+        if (mapped[i].len)
+            ports[count_in++] = op_addr_port(&mapped[i]);
+    n = count_in;
     for (unsigned i = 1; i < n; ++i) {
         uint16_t value = ports[i];
         unsigned j = i;
@@ -2652,11 +2674,21 @@ static unsigned tcp_pool_spans(const fp_tcp_family *f, uint16_t *lo, uint16_t *h
     }
     return count;
 }
+/* One source's view, for the tests and for callers that have a single family at hand. */
+static unsigned tcp_pool_addrs(const fp_tcp_family *f, op_addr *out, unsigned max) {
+    op_addr mapped[FP_TCP_PROBE_MAX];
+    unsigned n = f ? tcp_pool_collect(f, NULL, mapped) : 0;
+    return tcp_pool_addrs_from(mapped, n, out, max);
+}
+static unsigned tcp_pool_spans(const fp_tcp_family *f, uint16_t *lo, uint16_t *hi, unsigned max) {
+    op_addr mapped[FP_TCP_PROBE_MAX];
+    unsigned n = f ? tcp_pool_collect(f, NULL, mapped) : 0;
+    return tcp_pool_spans_from(mapped, n, lo, hi, max);
+}
 /* Keep the product inside the spray budget by halving every interval around its centre.
  * A pool above the budget is narrowed, never published as it stands: the spray is a burst
  * on a shared link and the peer has no way to refuse it. */
-static void tcp_pool_narrow(unsigned addr_count, uint16_t *lo, uint16_t *hi, unsigned spans) {
-    if (!addr_count || !spans)
+static void tcp_pool_narrow(unsigned addr_count, uint16_t *lo, uint16_t *hi, unsigned spans) {    if (!addr_count || !spans)
         return;
     for (;;) {
         unsigned total = 0;
@@ -6413,8 +6445,16 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
              * the ports it was given towards each of them. Derive it here, before the
              * probe state goes, and log the pairs so the pool can be checked against what
              * the witnesses actually reported. */
-            t->pool_addr_count = tcp_pool_addrs(t->tcp_sample, t->pool_addrs, TCP_POOL_ADDR_MAX);
-            t->pool_span_count = tcp_pool_spans(t->tcp_sample, t->pool_lo, t->pool_hi, TCP_POOL_SPAN_MAX);
+            /* The pool has to cover every address this measurement saw, not the one a single
+             * destination happened to return: a carrier publishes out of a small set (six
+             * addresses on the mobile network we measured), and the peer's mapping may land on
+             * any of them. The catalog is the measurement; the per-tunnel sample only adds its
+             * own view. */
+            op_addr seen[FP_TCP_PROBE_MAX];
+            unsigned nseen = tcp_pool_collect(&c->tcp_nat.family[t->family], t->tcp_sample, seen);
+            t->pool_addr_count = tcp_pool_addrs_from(seen, nseen, t->pool_addrs, TCP_POOL_ADDR_MAX);
+            t->pool_span_count = tcp_pool_spans_from(seen, nseen, t->pool_lo, t->pool_hi,
+                                                     TCP_POOL_SPAN_MAX);
             tcp_pool_narrow(t->pool_addr_count, t->pool_lo, t->pool_hi, t->pool_span_count);
             for (unsigned i = 0; i < t->tcp_sample->samples && i < FP_TCP_PROBE_MAX; ++i) {
                 char via[OP_ADDR_TEXT], seen[OP_ADDR_TEXT], note[256];
