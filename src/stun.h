@@ -9,7 +9,12 @@
  * address, and ask it to answer from a different address or port so the inbound
  * filter of the NAT in front of us becomes observable. */
 #define FP_STUN_MAGIC 0x2112A442u
-#define FP_STUN_MAX_SERVERS 4
+/* How many public witnesses an operator may name. The ladder itself needs a couple, but
+ * the list arrives from the console and a deployment picks its own; four was the old
+ * built-in count and turned every longer list into a configuration the client refused
+ * outright - a push carrying ten witnesses failed validation and nothing was applied. The
+ * storage cost is a few kilobytes, so the cap follows what the gateway accepts. */
+#define FP_STUN_MAX_SERVERS 16
 #define FP_STUN_NONCE 12
 
 /* Mapped endpoint a server reported for us. */

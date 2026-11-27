@@ -2236,6 +2236,29 @@ int main(void) {
         assert(fp_client_stun_config(&probes, none) == FASTP2P_OK);
         assert(probes.stun_count == 0);
         json_object_put(none);
+        /* A witness list longer than the old built-in count must be accepted. The console
+         * pushes what an operator typed; with a cap of four, a ten-witness list made the
+         * whole pushed document invalid and nothing - not even the TCP list - was applied. */
+        {
+            json_object *many = json_object_new_array();
+            for (unsigned i = 0; i < 10; ++i) {
+                char entry[40];
+                snprintf(entry, sizeof(entry), "stun%u.example.org:3478", i);
+                json_object_array_add(many, json_object_new_string(entry));
+            }
+            assert(fp_client_stun_config(&probes, many) == FASTP2P_OK);
+            assert(probes.stun_count == 10);
+            /* One more than the cap is still refused, so the parser keeps a bound. */
+            json_object_array_add(many, json_object_new_string("stun-over.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over2.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over3.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over4.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over5.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over6.example.org:3478"));
+            json_object_array_add(many, json_object_new_string("stun-over7.example.org:3478"));
+            assert(fp_client_stun_config(&probes, many) == FASTP2P_EINVAL);
+            json_object_put(many);
+        }
     }
     /* Dense start: the first half second decides a cone-to-cone punch. */
     assert(punch_interval(0) == 50 * MS);
