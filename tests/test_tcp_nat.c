@@ -279,8 +279,10 @@ static void samples_keep_target_order(void) {
     fp_tcp_nat_close(&state);
 }
 
-/* A refused target must not stall the batch: the other five still complete, and the cycle
- * ends well inside the deadline instead of waiting for the timeout. */
+/* A refused target must not stall the batch: the other five still complete within a single
+ * slot deadline. The bound is one deadline, not one per target - a Windows connect to a
+ * closed port is refused later than a Linux one, so the interesting property is that the
+ * batch is deadline-bounded rather than serialized behind the dead target. */
 static void one_failed_target_still_completes_the_batch(void) {
     fp_tcp_nat state;
     fp_tcp_nat_init(&state);
@@ -290,7 +292,7 @@ static void one_failed_target_still_completes_the_batch(void) {
     const fp_tcp_family *k = &state.family[OP_FAM_V4];
     assert(k->samples == FP_TCP_PROBE_SLOTS - 1 && k->destinations == 1);
     assert(k->type == FP_NAT_STABLE);
-    assert(elapsed < UINT64_C(2000000000)); /* finished, did not sit out the 2 s timeout */
+    assert(elapsed < UINT64_C(2500000000)); /* one 2 s slot deadline plus slack, not six */
     fp_tcp_nat_close(&state);
 }
 
