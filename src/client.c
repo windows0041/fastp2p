@@ -3478,22 +3478,36 @@ static void probe_complete(fastp2p_client *c, int index) {
         }
         if (!t->lan && family == OP_FAM_V4) {
             const char *ip = t->mapped_text[OP_FAM_V4];
+            op_addr peer_v4;
+            int local_peer = t->peer_ready[OP_FAM_V4] &&
+                                     !op_addr_from_text(&peer_v4, t->peer_text[OP_FAM_V4], 0)
+                                 ? peer_is_local(&peer_v4)
+                                 : peer_is_local(&t->peer_addr);
             uint16_t mapped_tcp = public_mapping_port(ip, c->mapped_listener.tcp, c->mapped_listener.tcp_wan);
             if (t->tcp_direct_port && mapped_tcp)
                 t->tcp_direct_port = mapped_tcp;
-            else if (t->tcp_direct_port && (t->lan || peer_is_local(&t->peer_addr)))
+            else if (t->tcp_direct_port && local_peer)
                 /* A peer on the same host or LAN reaches the listener this client
                  * keeps for it, so that port is the one to publish. Swapping in the
                  * probe mapping here is what stopped the two local test clients from
                  * ever finding each other. */
                 t->tcp_direct_port = c->public_port;
-            else if (t->tcp_direct_port && t->mapped_port)
-                /* Without UPnP the only port the peer can reach is the one the
-                 * carrier NAT actually allocated: a CGNAT rewrites the source
-                 * port, so advertising the local listener port gives the peer a
-                 * port that was never open. t->mapped_port is what the gateway's
-                 * probe observed for the very socket this punch will use. */
-                t->tcp_direct_port = t->mapped_port;
+            else if (t->tcp_direct_port) {
+                /* Unsolicited inbound TCP connections are dropped behind filtered or
+                 * symmetric NATs unless mapped via UPnP/NAT-PMP or coming from a local
+                 * peer. Skipping the dead direct-connect dial avoids wasting
+                 * TCP_DIRECT_WAIT (1 s) and keeps opener spray aligned with the dialer array. */
+                int tcp_level = tcp_nat_level(c);
+                if (tcp_level == 2 || tcp_level == 3 || tcp_level == 4 || tcp_level == 7)
+                    t->tcp_direct_port = 0;
+                else if (t->mapped_port)
+                    /* Without UPnP the only port the peer can reach is the one the
+                     * carrier NAT actually allocated: a CGNAT rewrites the source
+                     * port, so advertising the local listener port gives the peer a
+                     * port that was never open. t->mapped_port is what the gateway's
+                     * probe observed for the very socket this punch will use. */
+                    t->tcp_direct_port = t->mapped_port;
+            }
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
@@ -3505,11 +3519,6 @@ static void probe_complete(fastp2p_client *c, int index) {
                  * mapped via UPnP/NAT-PMP or coming from a local peer. Skipping the
                  * dead direct-listener dial avoids wasting UDP_DIRECT_WAIT + 2 s on
                  * Attempt 1 before falling back to hole punching. */
-                op_addr peer_v4;
-                int local_peer = t->peer_ready[OP_FAM_V4] &&
-                                         !op_addr_from_text(&peer_v4, t->peer_text[OP_FAM_V4], 0)
-                                     ? peer_is_local(&peer_v4)
-                                     : peer_is_local(&t->peer_addr);
                 if (!local_peer) {
                     int level = nat_level(c);
                     if (c->udp_listener[OP_FAM_V4] < 0 ||
@@ -4583,7 +4592,9 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
             t->listen_fd = -1;
         }
         int single_ip_random = !t->pool_blade_count && !t->tcp_step &&
-                               c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT;
+                               !peer_is_local(&t->peer_addr) &&
+                               (c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT ||
+                                t->pool_addr_count == 1);
         if ((t->pool_blade_count > 0 || single_ip_random) && !t->array_width) {
             unsigned ceiling = tcp_array_config_width();
             unsigned start_w = single_ip_random ? TCP_BIRTHDAY_DIALER_START : TCP_BLADE_DIALER_START;

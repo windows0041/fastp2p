@@ -2500,7 +2500,7 @@ static void udp_direct_skipped_for_filtered_ipv4_nat(void) {
         c->ws = (struct lws *)c;
         c->running = 1;
         c->families_wanted = c->gateway_families = FAM_V4;
-        strcpy(c->local_ip[OP_FAM_V4], "192.168.1.10");
+        strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
         strcpy(c->ip[OP_FAM_V4], "36.140.165.200");
         c->udp_listener[OP_FAM_V4] = listener;
         c->udp_listener[OP_FAM_V6] = -1;
@@ -2731,6 +2731,94 @@ static void tcp_birthday_selection_and_hit_rate(void) {
     }
     printf("TCP birthday Monte-Carlo hit rate (3 passes): %u/200\n", hits);
     assert(hits >= 195);
+}
+
+static void tcp_direct_skipped_for_filtered_ipv4_nat(void) {
+    struct {
+        int tcp_type;
+        int tcp_filter;
+        int udp_filter;
+        const char *peer_ip;
+        uint16_t mapped_tcp;
+        uint16_t expect_direct_port;
+    } cases[] = {
+        {FP_NAT_STABLE, 3, 0, "223.104.85.10", 0, 0},
+        {FP_NAT_STABLE, 2, 0, "223.104.85.10", 0, 0},
+        {FP_NAT_DEPENDENT, 1, 0, "223.104.85.10", 0, 0},
+        {FP_NAT_STABLE, 0, 7, "223.104.85.10", 0, 0},
+        {FP_NAT_STABLE, 1, 0, "223.104.85.10", 0, 44199},
+        {FP_NAT_STABLE, 0, 0, "223.104.85.10", 0, 44199},
+        {FP_NAT_STABLE, 3, 0, "223.104.85.10", 1510, 1510},
+        {FP_NAT_STABLE, 3, 0, "127.0.0.1", 0, 1510},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+        strcpy(c->node, "responder-node");
+        c->node_id = op_node_id(c->node);
+        c->ws = (struct lws *)c;
+        c->running = 1;
+        c->families_wanted = c->gateway_families = FAM_V4;
+        strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+        strcpy(c->ip[OP_FAM_V4], "36.140.165.200");
+        c->public_port = 1510;
+        c->tcp_nat.family[OP_FAM_V4].type = cases[i].tcp_type;
+        if (cases[i].tcp_filter)
+            nat_filter_record(&c->tcp_filter, cases[i].tcp_filter, mono());
+        if (cases[i].udp_filter)
+            nat_filter_record(&c->udp_filter, cases[i].udp_filter, mono());
+        if (cases[i].mapped_tcp) {
+            c->mapped_listener.tcp = cases[i].mapped_tcp;
+            c->mapped_listener.tcp_wan = inet_addr("36.140.165.200");
+        }
+
+        int ti = new_tunnel(c, "phone-node", 900u + i, FASTP2P_TRANSPORT_TCP, 0);
+        assert(ti >= 0);
+        tunnel *t = &c->tunnels[ti];
+        t->server = 1;
+        strcpy(t->mode, "tcppunch");
+        t->tcp_v2 = 1;
+        t->family = OP_FAM_V4;
+        strcpy(t->mapped_text[OP_FAM_V4], "36.140.165.200");
+        t->mapped_ports[OP_FAM_V4] = 44199;
+        t->mapped_port = 44199;
+        t->tcp_direct_port = c->public_port;
+        assert(!tunnel_learn_peer(t, cases[i].peer_ip, 44755));
+
+        probe_complete(c, ti);
+        assert(t->tcp_direct_port == cases[i].expect_direct_port);
+
+        close_tunnel(c, ti, NULL);
+        op_buffer_clear(&c->ws_tx);
+        free(c);
+    }
+
+    /* Dialer keeps 256-port fast-start during c->tcp_nat re-measurement when
+     * single-IP pool metadata (pool_addr_count == 1) is present on the tunnel. */
+    fastp2p_client *dc = calloc(1, sizeof(*dc));
+    assert(dc);
+    strcpy(dc->local_ip[OP_FAM_V4], "127.0.0.1");
+    int dti = new_tunnel(dc, "opener-node", 950u, FASTP2P_TRANSPORT_TCP, 1);
+    assert(dti >= 0);
+    tunnel *dt = &dc->tunnels[dti];
+    strcpy(dt->mode, "tcppunch");
+    dt->tcp_v2 = 1;
+    dt->family = OP_FAM_V4;
+    dt->state = T_TCP_CONNECT;
+    dt->deadline = mono() + 5 * NS;
+    dt->punch_role = TCP_PUNCH_DIALER;
+    dt->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    dt->pool_addr_count = 1;
+    dt->remote_ports[OP_FAM_V4] = dt->remote_port = 44199;
+    assert(!op_addr_from_text(&dt->peer_addr, "36.140.165.200", 44199));
+    assert(!dt->array_width);
+    unsigned single_ip_random = !dt->pool_blade_count && !dt->tcp_step &&
+                                !peer_is_local(&dt->peer_addr) &&
+                                (dc->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT ||
+                                 dt->pool_addr_count == 1);
+    assert(single_ip_random == 1);
+    close_tunnel(dc, dti, NULL);
+    free(dc);
 }
 
 int main(void) {
@@ -2983,5 +3071,6 @@ int main(void) {
     udp_punch_receiver_prefers_sub1_over_sub0();
     udp_birthday_permutation_and_hit_rate();
     tcp_birthday_selection_and_hit_rate();
+    tcp_direct_skipped_for_filtered_ipv4_nat();
     return 0;
 }
