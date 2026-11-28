@@ -157,6 +157,10 @@
 #define TCP_BLADE_SAMPLE_DEADLINE_MS 1200u
 #define TCP_BLADE_DIALER_START 256u
 #define TCP_BLADE_OPENER_DEFER_MS 150u
+/* Single-IP random-port NAT4 TCP birthday-paradox punching: dialer starts at
+ * 256->512 source ports while opener sprays up to TCP_SPRAY_HOLD_MAX fresh
+ * non-repeating pseudo-random ports per pass. */
+#define TCP_BIRTHDAY_DIALER_START 256u
 /* Descriptors the whole client may hold for source-port arrays at once. */
 #define TCP_ARRAY_CLIENT_LIMIT 512u
 /* Pool publishing for a peer whose mapping moves. A carrier NAT hands a mapping out of
@@ -528,6 +532,10 @@ typedef struct {
     int spray_deferred;
     unsigned spray_plan_total, spray_plan_cursor, spray_plan_per_blade, spray_plan_pass;
     double spray_plan_elapsed_s;
+    int spray_plan_birthday;
+    unsigned spray_plan_pool_prefix;
+    uint16_t tcp_birthday_seed, tcp_birthday_step;
+    unsigned tcp_birthday_cursor;
     op_socket fd, listen_fd, alternate_fd;
     uint64_t id, peer_id, deadline, at, last_rx, last_hb, punch_next, punch_started;
     uint64_t last_session_push, silent_logged, last_payload, active_since, detached_at;
@@ -3703,6 +3711,26 @@ static int tcp_pool_target(const tunnel *t, unsigned index, op_addr *out) {
     }
     return -1;
 }
+static int tcp_peer_birthday(const tunnel *t) {
+    if (t->lan || !t->peer_addr.len || peer_is_local(&t->peer_addr))
+        return 0;
+    if (t->peer_blade_count > 0 || t->peer_tcp_step != 0)
+        return 0;
+    if (t->peer_pool_addr_count > 1)
+        return 0;
+    return t->peer_tcp_dependent &&
+           (t->peer_tcp_mapping == FP_TCP_MAP_NONE ||
+            t->peer_tcp_mapping == FP_TCP_MAP_UNPREDICTABLE);
+}
+static uint16_t tcp_birthday_port(tunnel *t, unsigned idx) {
+    static const uint16_t steps[] = {251, 389, 509, 641, 769, 997, 1223, 1511};
+    if (!t->tcp_birthday_step) {
+        uint64_t r = random_id();
+        t->tcp_birthday_seed = (uint16_t)(r % 64512u);
+        t->tcp_birthday_step = steps[(r >> 16) % (sizeof(steps) / sizeof(steps[0]))];
+    }
+    return (uint16_t)(1024u + (((uint32_t)t->tcp_birthday_seed + idx * (uint32_t)t->tcp_birthday_step) % 64512u));
+}
 static void tcp_spray_close(fastp2p_client *c, tunnel *t) {
     if (t->spray) {
         for (unsigned i = 0; i < t->spray_count; ++i)
@@ -3722,6 +3750,8 @@ static void tcp_spray_close(fastp2p_client *c, tunnel *t) {
     t->spray_plan_cursor = 0;
     t->spray_plan_per_blade = 0;
     t->spray_plan_pass = 0;
+    t->spray_plan_birthday = 0;
+    t->spray_plan_pool_prefix = 0;
 }
 /* Keep a spray socket in SYN_SENT when the budget allows, otherwise close it: the SYN
  * has left either way, but only a kept socket can complete a simultaneous open. */
@@ -3744,7 +3774,7 @@ static void tcp_spray_keep(fastp2p_client *c, tunnel *t, op_socket fd, uint64_t 
     ++c->tcp_array_used;
 }
 static void tcp_spray_inject_batch(fastp2p_client *c, tunnel *t, uint64_t now) {
-    if (!t->peer_blade_count || t->spray_plan_cursor >= t->spray_plan_total)
+    if ((!t->peer_blade_count && !t->spray_plan_birthday) || t->spray_plan_cursor >= t->spray_plan_total)
         return;
     int family = t->family >= 0 ? t->family : OP_FAM_V4;
     unsigned cap = t->spray_cap ? t->spray_cap : tcp_spray_budget_cap();
@@ -3752,12 +3782,23 @@ static void tcp_spray_inject_batch(fastp2p_client *c, tunnel *t, uint64_t now) {
     while (injected < TCP_SPRAY_BURST_TICK && t->spray_plan_cursor < t->spray_plan_total &&
            t->spray_count < cap && c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT) {
         unsigned idx = t->spray_plan_cursor++;
-        unsigned b = idx % t->peer_blade_count;
-        unsigned s = idx / t->peer_blade_count;
-        uint16_t port = tcp_blade_comb_port(&t->peer_blades[b], t->spray_plan_elapsed_s,
-                                            t->spray_plan_pass, s, t->spray_plan_per_blade);
-        op_addr target = t->peer_blades[b].addr;
-        op_addr_set_port(&target, port);
+        op_addr target;
+        if (t->spray_plan_birthday) {
+            if (idx < t->spray_plan_pool_prefix) {
+                if (tcp_pool_target(t, idx, &target))
+                    continue;
+            } else {
+                target = t->peer_pool_addr_count == 1 ? t->peer_pool_addrs[0] : t->peer_addr;
+                op_addr_set_port(&target, tcp_birthday_port(t, t->tcp_birthday_cursor++));
+            }
+        } else {
+            unsigned b = idx % t->peer_blade_count;
+            unsigned s = idx / t->peer_blade_count;
+            uint16_t port = tcp_blade_comb_port(&t->peer_blades[b], t->spray_plan_elapsed_s,
+                                                t->spray_plan_pass, s, t->spray_plan_per_blade);
+            target = t->peer_blades[b].addr;
+            op_addr_set_port(&target, port);
+        }
         op_socket fd = socket_bound(0, source_text(c, family), t->local_port, 1);
         if (fd < 0) {
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS)
@@ -3802,6 +3843,36 @@ static void tcp_punch_spray(fastp2p_client *c, int index) {
                  "TCP punch blade comb spray: planning %u held SYNs across %u blades (%u/blade, stride %u, elapsed %.2fs, pass %u)",
                  t->spray_plan_total, t->peer_blade_count, per_blade, TCP_BLADE_STRIDE, elapsed_s,
                  pass + 1);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+        return;
+    }
+    if (tcp_peer_birthday(t)) {
+        unsigned avail = c->tcp_array_used < TCP_ARRAY_CLIENT_LIMIT
+                             ? TCP_ARRAY_CLIENT_LIMIT - c->tcp_array_used
+                             : 0;
+        unsigned cap = tcp_spray_budget_cap();
+        unsigned budget = avail < cap ? avail : cap;
+        if (!budget)
+            return;
+        unsigned pool_prefix = 0;
+        if (pass == 0 && t->peer_pool_addr_count == 1 && t->peer_pool_span_count == 1) {
+            unsigned pool_count = tcp_pool_target_count(t);
+            if (pool_count && pool_count <= budget / 2u)
+                pool_prefix = pool_count;
+        }
+        t->spray_plan_birthday = 1;
+        t->spray_plan_pool_prefix = pool_prefix;
+        t->spray_plan_total = budget;
+        t->spray_plan_cursor = 0;
+        t->spray_plan_pass = pass;
+        tcp_spray_inject_batch(c, t, now);
+        op_addr target_addr = t->peer_pool_addr_count == 1 ? t->peer_pool_addrs[0] : t->peer_addr;
+        char who[OP_ADDR_TEXT] = "?";
+        op_addr_text(&target_addr, who, sizeof(who));
+        char note[224];
+        snprintf(note, sizeof(note),
+                 "TCP punch birthday spray: planning %u held SYNs to %s (pass %u/%u, pool prefix %u)",
+                 t->spray_plan_total, who, pass + 1, TCP_SPRAY_PASSES, pool_prefix);
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
         return;
     }
@@ -4065,7 +4136,7 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
                 /* When the peer published its measured pool, spray that pool without
                  * immediately polluting our NAT conntrack table with a blind /24 sweep. */
                 tcp_punch_spray(c, index);
-                if (!tcp_pool_target_count(t))
+                if (!tcp_pool_target_count(t) && !tcp_peer_birthday(t))
                     tcp_punch_sweep(c, index);
             }
             if (tcp_punch_listen(c, index) == 0) {
@@ -4391,7 +4462,9 @@ static int tcp_spray_tick(fastp2p_client *c, int index, uint64_t now) {
     tcp_spray_close(c, t);
     /* A pool or blade comb spray stays bounded by TCP_SPRAY_HOLD_MAX; a blind window
      * spray can be thousands of SYNs, so it gets two passes at most. */
-    unsigned passes = (t->peer_blade_count || tcp_pool_target_count(t)) ? TCP_SPRAY_PASSES : 2u;
+    unsigned passes = (t->peer_blade_count || tcp_pool_target_count(t) || tcp_peer_birthday(t))
+                          ? TCP_SPRAY_PASSES
+                          : 2u;
     if (t->spray_passes < passes && now + TCP_SPRAY_HOLD_MS * MS < t->deadline)
         tcp_punch_spray(c, index);
     return 0;
@@ -4509,9 +4582,12 @@ static void tcp_punch_dial(fastp2p_client *c, int index, uint64_t now) {
             op_close(t->listen_fd);
             t->listen_fd = -1;
         }
-        if (t->pool_blade_count > 0 && !t->array_width) {
+        int single_ip_random = !t->pool_blade_count && !t->tcp_step &&
+                               c->tcp_nat.family[OP_FAM_V4].type == FP_NAT_DEPENDENT;
+        if ((t->pool_blade_count > 0 || single_ip_random) && !t->array_width) {
             unsigned ceiling = tcp_array_config_width();
-            t->array_width = ceiling < TCP_BLADE_DIALER_START ? ceiling : TCP_BLADE_DIALER_START;
+            unsigned start_w = single_ip_random ? TCP_BIRTHDAY_DIALER_START : TCP_BLADE_DIALER_START;
+            t->array_width = ceiling < start_w ? ceiling : start_w;
         }
         if (tcp_array_open(c, t, now) == 0) {
             t->tcp_attempt_deadline = t->array_until;
@@ -4833,12 +4909,14 @@ static void start_underlay(fastp2p_client *c, int index) {
             }
             return;
         }
-        if (t->punch_role == TCP_PUNCH_OPENER && t->peer_blade_count > 0 &&
+        if (t->punch_role == TCP_PUNCH_OPENER && (t->peer_blade_count > 0 || tcp_peer_birthday(t)) &&
             !t->lan && !peer_is_local(&t->peer_addr)) {
             t->spray_deferred = 1;
             t->tcp_retry_at = now + TCP_BLADE_OPENER_DEFER_MS * MS;
             emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
-                 "TCP punch strategy: paced strided held-SYN blade comb (deferring 150 ms for dialer burst)");
+                 t->peer_blade_count > 0
+                     ? "TCP punch strategy: paced strided held-SYN blade comb (deferring 150 ms for dialer burst)"
+                     : "TCP punch strategy: paced birthday held-SYN spray (deferring 150 ms for dialer burst)");
             return;
         }
         tcp_punch_dial(c, index, now);
@@ -7647,7 +7725,9 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             if (tcp_punch_listen(c, ti) == 0) {
                 t->deadline = now + 30 * NS;
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0,
-                     "TCP blade spray launched and parked listening");
+                     t->peer_blade_count > 0
+                         ? "TCP blade spray launched and parked listening"
+                         : "TCP birthday spray launched and parked listening");
             } else {
                 close_tunnel(c, ti, "TCP punch listener failed");
                 return;

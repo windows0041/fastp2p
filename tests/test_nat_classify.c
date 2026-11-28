@@ -2646,6 +2646,93 @@ static void udp_birthday_permutation_and_hit_rate(void) {
     assert(hits >= 190);
 }
 
+static void tcp_birthday_selection_and_hit_rate(void) {
+    tunnel t = {0};
+    assert(!op_addr_from_text(&t.peer_addr, "223.104.85.10", 43627));
+    t.peer_tcp_dependent = 1;
+    t.peer_tcp_mapping = FP_TCP_MAP_NONE;
+    assert(tcp_peer_birthday(&t) == 1);
+
+    t.peer_tcp_mapping = FP_TCP_MAP_UNPREDICTABLE;
+    assert(tcp_peer_birthday(&t) == 1);
+
+    t.peer_pool_addr_count = 1;
+    assert(!op_addr_from_text(&t.peer_pool_addrs[0], "223.104.85.10", 1));
+    assert(tcp_peer_birthday(&t) == 1);
+
+    /* Excluded cases must not trigger birthday spray. */
+    t.peer_pool_addr_count = 2;
+    assert(tcp_peer_birthday(&t) == 0);
+    t.peer_pool_addr_count = 1;
+
+    t.peer_blade_count = 1;
+    assert(tcp_peer_birthday(&t) == 0);
+    t.peer_blade_count = 0;
+
+    t.peer_tcp_step = 4;
+    assert(tcp_peer_birthday(&t) == 0);
+    t.peer_tcp_step = 0;
+
+    t.lan = 1;
+    assert(tcp_peer_birthday(&t) == 0);
+    t.lan = 0;
+
+    t.peer_tcp_dependent = 0;
+    assert(tcp_peer_birthday(&t) == 0);
+    t.peer_tcp_dependent = 1;
+
+    assert(!op_addr_from_text(&t.peer_addr, "127.0.0.1", 43627));
+    assert(tcp_peer_birthday(&t) == 0);
+    assert(!op_addr_from_text(&t.peer_addr, "223.104.85.10", 43627));
+
+    /* All 10 passes x 384 ports = 3,840 strictly distinct ports in [1024..65535]. */
+    unsigned total = TCP_SPRAY_HOLD_MAX * TCP_SPRAY_PASSES;
+    uint8_t *seen = calloc(65536, 1);
+    assert(seen);
+    for (unsigned idx = 0; idx < total; ++idx) {
+        uint16_t port = tcp_birthday_port(&t, idx);
+        assert(port >= 1024u);
+        assert(!seen[port]);
+        seen[port] = 1;
+    }
+    free(seen);
+
+    /* Monte-Carlo: Pass 1 (256 x 384) + Pass 2 (512 x 384) + Pass 3 (512 x 384). */
+    unsigned hits = 0;
+    uint64_t rng = 0x517cc1b727220a95ULL;
+    for (unsigned trial = 0; trial < 200; ++trial) {
+        tunnel st = {0};
+        uint8_t *dialer = calloc(65536, 1);
+        assert(dialer);
+        for (unsigned r = 0; r < TCP_BIRTHDAY_DIALER_START; ++r) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            dialer[1024u + ((rng >> 32) % 64512u)] = 1;
+        }
+        int matched = 0;
+        unsigned cursor = 0;
+        for (unsigned pass = 0; pass < 3u && !matched; ++pass) {
+            if (pass == 1u) {
+                memset(dialer, 0, 65536);
+                for (unsigned r = 0; r < TCP_PUNCH_ARRAY_LIMIT; ++r) {
+                    rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                    dialer[1024u + ((rng >> 32) % 64512u)] = 1;
+                }
+            }
+            for (unsigned s = 0; s < TCP_SPRAY_HOLD_MAX; ++s) {
+                if (dialer[tcp_birthday_port(&st, cursor++)]) {
+                    matched = 1;
+                    break;
+                }
+            }
+        }
+        if (matched)
+            ++hits;
+        free(dialer);
+    }
+    printf("TCP birthday Monte-Carlo hit rate (3 passes): %u/200\n", hits);
+    assert(hits >= 195);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2895,5 +2982,6 @@ int main(void) {
     udp_direct_skipped_for_filtered_ipv4_nat();
     udp_punch_receiver_prefers_sub1_over_sub0();
     udp_birthday_permutation_and_hit_rate();
+    tcp_birthday_selection_and_hit_rate();
     return 0;
 }
