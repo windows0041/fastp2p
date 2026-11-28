@@ -2472,6 +2472,80 @@ static void udp_blade_wire_and_pigeonhole_comb(void) {
     assert(hits_r1 >= 2 && hits_r2 >= 2);
 }
 
+static void udp_direct_skipped_for_filtered_ipv4_nat(void) {
+    op_socket listener = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(listener >= 0);
+    struct {
+        int nat_type;
+        int filter_level;
+        const char *peer_ip;
+        uint16_t mapped_udp;
+        int expect_direct;
+    } cases[] = {
+        {NAT_CONE, 3, "223.104.85.223", 0, 0},
+        {NAT_CONE, 2, "223.104.85.223", 0, 0},
+        {NAT_HARD_SYM, 1, "223.104.85.223", 0, 0},
+        {NAT_CONE, 7, "223.104.85.223", 0, 0},
+        {NAT_CONE, 1, "223.104.85.223", 0, 1},
+        {NAT_CONE, 6, "223.104.85.223", 0, 1},
+        {NAT_CONE, 0, "223.104.85.223", 0, 1},
+        {NAT_CONE, 3, "223.104.85.223", 1510, 1},
+        {NAT_CONE, 3, "127.0.0.1", 0, 1},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        fastp2p_client *c = calloc(1, sizeof(*c));
+        assert(c);
+        strcpy(c->node, "responder-node");
+        c->node_id = op_node_id(c->node);
+        c->ws = (struct lws *)c;
+        c->running = 1;
+        c->families_wanted = c->gateway_families = FAM_V4;
+        strcpy(c->local_ip[OP_FAM_V4], "192.168.1.10");
+        strcpy(c->ip[OP_FAM_V4], "36.140.165.200");
+        c->udp_listener[OP_FAM_V4] = listener;
+        c->udp_listener[OP_FAM_V6] = -1;
+        c->public_port = 1510;
+        c->nat[OP_FAM_V4].type = cases[i].nat_type;
+        if (cases[i].filter_level)
+            nat_filter_record(&c->udp_filter, cases[i].filter_level, mono());
+        if (cases[i].mapped_udp) {
+            c->mapped_listener.udp = cases[i].mapped_udp;
+            c->mapped_listener.udp_wan = inet_addr("36.140.165.200");
+        }
+
+        int ti = new_tunnel(c, "phone-node", 800u + i, FASTP2P_TRANSPORT_QUIC, 0);
+        assert(ti >= 0);
+        tunnel *t = &c->tunnels[ti];
+        t->server = 1;
+        strcpy(t->mode, "udppunch");
+        t->family = OP_FAM_V4;
+        strcpy(t->mapped_text[OP_FAM_V4], "36.140.165.200");
+        t->mapped_ports[OP_FAM_V4] = 51812;
+        t->mapped_port = 51812;
+        t->udp_direct_port = c->public_port;
+        t->udp_punch_order = 1;
+        t->udp_peer_kind = 2;
+        t->sym_base = 45671;
+        t->sym_count = 128;
+        assert(!tunnel_learn_peer(t, cases[i].peer_ip, 45671));
+
+        probe_complete(c, ti);
+        if (cases[i].expect_direct) {
+            assert(t->udp_direct_port == c->public_port);
+            assert(t->state == T_UDP_DIRECT);
+        } else {
+            assert(t->udp_direct_port == 0);
+            assert(t->state == T_TIME);
+            assert(t->udp_punch_role ==
+                   (cases[i].nat_type == NAT_HARD_SYM ? UDP_PUNCH_RECEIVE : UDP_PUNCH_SEND));
+        }
+        close_tunnel(c, ti, NULL);
+        op_buffer_clear(&c->ws_tx);
+        free(c);
+    }
+    op_close(listener);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2718,5 +2792,6 @@ int main(void) {
     pool_spray_covers_the_published_product();
     blade_velocity_and_pigeonhole_comb();
     udp_blade_wire_and_pigeonhole_comb();
+    udp_direct_skipped_for_filtered_ipv4_nat();
     return 0;
 }

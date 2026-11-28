@@ -836,6 +836,7 @@ static void punch_port_note(fastp2p_client *, const char *, uint16_t);
 static void punch_port_forget(fastp2p_client *, const char *);
 static void report_client(fastp2p_client *);
 static int nat_filter_level(const nat_filter *filter, uint64_t now);
+static int nat_level(const fastp2p_client *c);
 static int addr_text_set(const char *text);
 static int local_is_public(const char *text);
 static void report_nat(fastp2p_client *);
@@ -3468,13 +3469,34 @@ static void probe_complete(fastp2p_client *c, int index) {
             uint16_t mapped_udp = public_mapping_port(ip, c->mapped_listener.udp, c->mapped_listener.udp_wan);
             if (t->udp_direct_port && mapped_udp) {
                 t->udp_direct_port = mapped_udp;
-            } else {
+            } else if (t->udp_reverse_port) {
                 reverse_port = t->udp_reverse_port;
+            } else if (t->udp_direct_port) {
+                /* Unsolicited inbound packets to c->public_port are dropped behind
+                 * restricted-cone/symmetric NATs or a symmetric UDP firewall unless
+                 * mapped via UPnP/NAT-PMP or coming from a local peer. Skipping the
+                 * dead direct-listener dial avoids wasting UDP_DIRECT_WAIT + 2 s on
+                 * Attempt 1 before falling back to hole punching. */
+                op_addr peer_v4;
+                int local_peer = t->peer_ready[OP_FAM_V4] &&
+                                         !op_addr_from_text(&peer_v4, t->peer_text[OP_FAM_V4], 0)
+                                     ? peer_is_local(&peer_v4)
+                                     : peer_is_local(&t->peer_addr);
+                if (!local_peer) {
+                    int level = nat_level(c);
+                    if (c->udp_listener[OP_FAM_V4] < 0 ||
+                        level == 2 || level == 3 || level == 4 || level == 7)
+                        t->udp_direct_port = 0;
+                }
             }
-        } else if (!t->lan && family == OP_FAM_V6 && t->udp_reverse_port6) {
-            op_ju(j, "udpReverse6Cap", 1);
-            if (t->udp_reverse6_retry || !t->udp_direct_port || c->udp_listener[OP_FAM_V6] < 0)
-                reverse_port = t->udp_reverse_port6;
+        } else if (!t->lan && family == OP_FAM_V6) {
+            if (t->udp_reverse_port6) {
+                op_ju(j, "udpReverse6Cap", 1);
+                if (t->udp_reverse6_retry || !t->udp_direct_port || c->udp_listener[OP_FAM_V6] < 0)
+                    reverse_port = t->udp_reverse_port6;
+            } else if (c->udp_listener[OP_FAM_V6] < 0) {
+                t->udp_direct_port = 0;
+            }
         }
         if (reverse_port) {
             t->server = 0;
