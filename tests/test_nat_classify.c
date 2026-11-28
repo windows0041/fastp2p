@@ -2821,6 +2821,82 @@ static void tcp_direct_skipped_for_filtered_ipv4_nat(void) {
     free(dc);
 }
 
+static void tcp_predict_timeout_closes_array_without_leak(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    snprintf(c->local_ip[OP_FAM_V4], OP_ADDR_TEXT, "%s", "127.0.0.1");
+    uint16_t remote = 0;
+    op_socket endpoint = bound_port(&remote);
+    assert(!op_listen(endpoint, 8));
+
+    int ti = new_tunnel(c, "predict-leak", 960u, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    snprintf(t->mode, sizeof(t->mode), "%s", "tcppunch");
+    t->tcp_v2 = 1;
+    t->family = OP_FAM_V4;
+    t->state = T_TCP_CONNECT;
+    t->deadline = mono() + 10 * NS;
+    t->punch_role = TCP_PUNCH_DIALER;
+    t->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    t->tcp_predict_role = TCP_PREDICT_DIAL;
+    t->tcp_predict_until = mono();
+    t->remote_ports[OP_FAM_V4] = t->remote_port = remote;
+    assert(!op_addr_from_text(&t->peer_addr, "127.0.0.1", remote));
+
+    assert(tcp_array_open(c, t, mono()) == 0);
+    unsigned first_count = t->array_count;
+    assert(first_count >= 2 && c->tcp_array_used == first_count);
+
+    /* Calling tcp_array_open twice without closing first must not double-charge. */
+    assert(tcp_array_open(c, t, mono()) == 0);
+    assert(c->tcp_array_used == t->array_count);
+
+    /* Prediction timeout releases any active array and resets array_width cleanly. */
+    tick_tunnel(c, ti, t->tcp_predict_until + 1);
+    assert(t->tcp_predict_role == TCP_PREDICT_NONE);
+    assert(t->array_count >= 2);
+    assert(c->tcp_array_used == t->array_count);
+
+    close_tunnel(c, ti, NULL);
+    assert(c->tcp_array_used == 0);
+    op_close(endpoint);
+    free(c);
+}
+
+static void udp_birthday_sym_bands_and_hit_rate(void) {
+    assert(udp_birthday_sym_bands(0) == 0);
+    assert(udp_birthday_sym_bands(16) == 1);
+    assert(udp_birthday_sym_bands(17) == 2);
+    assert(udp_birthday_sym_bands(50) == 4);
+    assert(udp_birthday_sym_bands(100) == UDP_BIRTHDAY_SYM_MAX_BANDS);
+
+    unsigned total = UDP_BIRTHDAY_SLOTS_PER_PASS * UDP_BIRTHDAY_SYM_SPRAY_ROUNDS;
+    unsigned hits = 0;
+    uint64_t rng = 0xa0761d6478bd642fULL;
+    for (unsigned trial = 0; trial < 200; ++trial) {
+        tunnel st = {0};
+        uint8_t *rx_map = calloc(65536, 1);
+        assert(rx_map);
+        for (unsigned r = 0; r < UDP_BIRTHDAY_SYM_ARRAY + 1u; ++r) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            rx_map[1024u + ((rng >> 32) % 64512u)] = 1;
+        }
+        int matched = 0;
+        for (unsigned idx = 0; idx < total; ++idx) {
+            if (rx_map[udp_birthday_port(&st, idx)]) {
+                matched = 1;
+                break;
+            }
+        }
+        if (matched)
+            ++hits;
+        free(rx_map);
+    }
+    printf("UDP birthday-sym Monte-Carlo hit rate (128 x 2048): %u/200\n", hits);
+    assert(hits >= 190);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -3072,5 +3148,7 @@ int main(void) {
     udp_birthday_permutation_and_hit_rate();
     tcp_birthday_selection_and_hit_rate();
     tcp_direct_skipped_for_filtered_ipv4_nat();
+    tcp_predict_timeout_closes_array_without_leak();
+    udp_birthday_sym_bands_and_hit_rate();
     return 0;
 }

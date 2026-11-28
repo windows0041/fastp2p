@@ -264,6 +264,15 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define UDP_BIRTHDAY_SPRAY_ROUNDS 6u
 #define UDP_BIRTHDAY_SPRAY_GAP (350 * MS)
 #define UDP_BIRTHDAY_KEEPALIVE_GAP (2 * NS)
+/* NAT4 (Easy-Sym) <-> NAT4 (Hard-Sym) UDP birthday-paradox parameters:
+ * use 127+1 sockets on the Hard-Sym receiver so each burst opens a 16-port
+ * band (~2,032 packets/mappings, staying safely within carrier CGNAT quotas)
+ * across the peer's directional window, and give an Easy-Sym sender 8 passes
+ * (2,048 random ports) so all bands overlap with >92-98% single-round hits. */
+#define UDP_BIRTHDAY_SYM_ARRAY 127u
+#define UDP_BIRTHDAY_SYM_BAND 16u
+#define UDP_BIRTHDAY_SYM_MAX_BANDS 4u
+#define UDP_BIRTHDAY_SYM_SPRAY_ROUNDS 8u
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
 /* A datagram larger than its buffer must be recognised as truncated instead of
@@ -4235,6 +4244,7 @@ static void tcp_array_close(fastp2p_client *c, tunnel *t) {
 }
 /* Arm one rotation. Returns 0 when at least two sockets are dialling. */
 static int tcp_array_open(fastp2p_client *c, tunnel *t, uint64_t now) {
+    tcp_array_close(c, t);
     int family = t->family >= 0 && t->family < OP_FAM_COUNT ? t->family : OP_FAM_V4;
     uint16_t target_port = t->remote_ports[family];
     if (!target_port || !t->peer_addr.len)
@@ -6937,6 +6947,29 @@ static void send_udp_punch_window(const tunnel *t, op_socket fd, op_addr peer,
     }
 }
 
+static unsigned send_udp_punch_window_slice(const tunnel *t, op_socket fd, op_addr peer,
+                                            json_object *message, uint16_t offset,
+                                            uint16_t count) {
+    if (t->sym_split || !t->sym_count || !count)
+        return 0;
+    uint16_t start = sym_window_base(t->sym_base, t->sym_up, t->sym_count);
+    uint16_t span = sym_window_span(t->sym_base, t->sym_up, t->sym_count);
+    unsigned sent = 0;
+    for (uint16_t i = offset; i < span && (unsigned)(i - offset) < count; ++i) {
+        op_addr_set_port(&peer, (uint16_t)(t->sym_up ? start + i : start - i));
+        if (!udp_packet(fd, &peer, 4, 0, message))
+            ++sent;
+    }
+    return sent;
+}
+
+static unsigned udp_birthday_sym_bands(uint16_t sym_count) {
+    if (!sym_count)
+        return 0;
+    unsigned bands = ((unsigned)sym_count + UDP_BIRTHDAY_SYM_BAND - 1u) / UDP_BIRTHDAY_SYM_BAND;
+    return bands > UDP_BIRTHDAY_SYM_MAX_BANDS ? UDP_BIRTHDAY_SYM_MAX_BANDS : bands;
+}
+
 /* Local sockets the receiver sprays from. Each one is a separate (socket, destination)
  * pair for the NAT, so it carries its own external mapping: sixteen of them give the
  * peer sixteen ports to hit instead of one. */
@@ -7349,11 +7382,15 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         int birthday_rx = t->udp_punch_role == UDP_PUNCH_RECEIVE &&
                           t->udp_punch_kind == 2 && t->udp_pool_blade_count == 0 &&
                           !t->lan && !peer_is_local(&peer);
-        int burst = !blade_comb && !birthday_tx && t->sym_count && t->sym_sprayed < SYM_SPRAY_ROUNDS &&
-                    now >= t->sym_spray_at;
+        int birthday_sym_rx = birthday_rx && t->sym_count > 0 && !t->sym_split;
+        unsigned sym_rounds = birthday_sym_rx ? udp_birthday_sym_bands(t->sym_count) : SYM_SPRAY_ROUNDS;
+        unsigned birthday_rounds = t->udp_punch_kind ? UDP_BIRTHDAY_SYM_SPRAY_ROUNDS
+                                                     : UDP_BIRTHDAY_SPRAY_ROUNDS;
+        int burst = !blade_comb && !birthday_tx && t->sym_count &&
+                    (unsigned)t->sym_sprayed < sym_rounds && now >= t->sym_spray_at;
         int blade_burst = blade_comb && (unsigned)t->sym_sprayed < UDP_BLADE_SPRAY_ROUNDS &&
                           now >= t->sym_spray_at;
-        int birthday_burst = birthday_tx && (unsigned)t->sym_sprayed < UDP_BIRTHDAY_SPRAY_ROUNDS &&
+        int birthday_burst = birthday_tx && (unsigned)t->sym_sprayed < birthday_rounds &&
                              now >= t->sym_spray_at;
         /* Sending to the observed port first can spend the very next mapping
          * that a peer with a predictable allocator expects us to use. */
@@ -7363,19 +7400,44 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE) {
             if (t->udp_pool_blade_count > 0)
                 open_udp_blade_candidates(c, t);
+            else if (birthday_sym_rx)
+                open_udp_candidates_capped(c, t, UDP_BIRTHDAY_SYM_ARRAY, UDP_BIRTHDAY_CLIENT_ARRAY);
             else if (birthday_rx)
                 open_udp_birthday_candidates(c, t);
             else if (t->udp_punch_kind == 2)
                 open_udp_candidates(c, t);
         }
         if (burst) {
-            ++t->sym_sprayed;
+            unsigned pass = (unsigned)t->sym_sprayed++;
             t->sym_spray_at = now + SYM_SPRAY_GAP;
             send_udp_punch_window(t, t->fd, peer, message, t->sym_count);
-            uint16_t count = t->sym_count < UDP_PUNCH_EXTRA_WINDOW ? t->sym_count : UDP_PUNCH_EXTRA_WINDOW;
-            for (unsigned i = 0; i < t->udp_candidate_count; ++i) {
-                send_udp_punch_window(t, t->udp_candidates[i], peer, message, count);
-                udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
+            if (birthday_sym_rx) {
+                uint16_t offset = (uint16_t)(pass * UDP_BIRTHDAY_SYM_BAND);
+                uint16_t span = sym_window_span(t->sym_base, t->sym_up, t->sym_count);
+                for (unsigned i = 0; i < t->udp_candidate_count; ++i) {
+                    send_udp_punch_window_slice(t, t->udp_candidates[i], peer, message,
+                                                offset, UDP_BIRTHDAY_SYM_BAND);
+                    if (pass == 0)
+                        udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
+                }
+                if (offset < span) {
+                    unsigned end = (unsigned)offset + UDP_BIRTHDAY_SYM_BAND;
+                    if (end > (unsigned)span)
+                        end = (unsigned)span;
+                    char bnote[160];
+                    snprintf(bnote, sizeof(bnote),
+                             "UDP punch birthday-sym band %u/%u: %u sockets x %c%u..%c%u",
+                             pass + 1, sym_rounds, t->udp_candidate_count + 1,
+                             t->sym_up ? '+' : '-', (unsigned)offset + 1u,
+                             t->sym_up ? '+' : '-', end);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
+                }
+            } else {
+                uint16_t count = t->sym_count < UDP_PUNCH_EXTRA_WINDOW ? t->sym_count : UDP_PUNCH_EXTRA_WINDOW;
+                for (unsigned i = 0; i < t->udp_candidate_count; ++i) {
+                    send_udp_punch_window(t, t->udp_candidates[i], peer, message, count);
+                    udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
+                }
             }
         } else {
             if (blade_burst) {
@@ -7424,7 +7486,7 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
                     op_addr_text(&peer, who, sizeof(who));
                     snprintf(bnote, sizeof(bnote),
                              "UDP punch birthday spray: %u random ports to %s (pass %u/%u)",
-                             sent, who, pass + 1, UDP_BIRTHDAY_SPRAY_ROUNDS);
+                             sent, who, pass + 1, birthday_rounds);
                     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
                 }
             }
@@ -7705,6 +7767,9 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
         /* The predicted port can miss even when the original mapped endpoint
          * works. Use the rest of the original budget for the standard punch. */
         close_tcp_candidates(t);
+        tcp_array_close(c, t);
+        tcp_spray_close(c, t);
+        t->array_width = 0;
         if (t->fd >= 0)
             op_close(t->fd);
         t->fd = -1;
