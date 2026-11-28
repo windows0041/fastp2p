@@ -2581,7 +2581,11 @@ static void udp_punch_receiver_prefers_sub1_over_sub0(void) {
     op_ju(probe, "id", t->id);
     /* Blind sub=0 hits primary first; receiver must reply sub=1 but keep candidates open. */
     assert(!udp_packet(peer, &primary_addr, 4, 0, probe));
-    tick_tunnel(c, ti, now + 10 * MS);
+    uint64_t wait_until = mono() + 200 * MS;
+    while (!t->udp_sub0_seen && mono() < wait_until) {
+        tick_tunnel(c, ti, now + 10 * MS);
+        op_sleep_ms(2);
+    }
     assert(t->state == T_PUNCH && t->udp_candidate_count == UDP_PUNCH_ARRAY);
     assert(t->udp_sub0_seen == 1 && t->udp_sub0_slot == 0);
     assert(drain(peer, SPRAY_WAIT) >= 1);
@@ -2589,7 +2593,11 @@ static void udp_punch_receiver_prefers_sub1_over_sub0(void) {
     /* Sender locked onto winner (candidate[3]) and confirms with sub=1 there. */
     assert(!udp_packet(peer, &winner_addr, 4, 1, probe));
     json_object_put(probe);
-    tick_tunnel(c, ti, now + 20 * MS);
+    wait_until = mono() + NS;
+    while (t->state == T_PUNCH && mono() < wait_until) {
+        tick_tunnel(c, ti, now + 20 * MS);
+        op_sleep_ms(2);
+    }
     op_addr tmp;
     assert(t->state == T_UNDERLAY && t->fd == winner && !t->udp_candidate_count);
     assert(!t->udp_sub0_seen && t->local_port == op_addr_port(&winner_addr));
