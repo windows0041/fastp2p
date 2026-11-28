@@ -2608,6 +2608,44 @@ static void udp_punch_receiver_prefers_sub1_over_sub0(void) {
     free(c);
 }
 
+static void udp_birthday_permutation_and_hit_rate(void) {
+    tunnel t = {0};
+    unsigned total = UDP_BIRTHDAY_SLOTS_PER_PASS * UDP_BIRTHDAY_SPRAY_ROUNDS;
+    uint8_t *seen = calloc(65536, 1);
+    assert(seen);
+    for (unsigned idx = 0; idx < total; ++idx) {
+        uint16_t port = udp_birthday_port(&t, idx);
+        assert(port >= 1024u);
+        assert(!seen[port]);
+        seen[port] = 1;
+    }
+    unsigned hits = 0;
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    for (unsigned trial = 0; trial < 200; ++trial) {
+        tunnel st = {0};
+        uint8_t *rx_map = calloc(65536, 1);
+        assert(rx_map);
+        for (unsigned r = 0; r < UDP_BIRTHDAY_ARRAY + 1u; ++r) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            uint16_t p = (uint16_t)(1024u + ((rng >> 32) % 64512u));
+            rx_map[p] = 1;
+        }
+        int matched = 0;
+        for (unsigned idx = 0; idx < total; ++idx) {
+            if (rx_map[udp_birthday_port(&st, idx)]) {
+                matched = 1;
+                break;
+            }
+        }
+        if (matched)
+            ++hits;
+        free(rx_map);
+    }
+    free(seen);
+    printf("UDP birthday Monte-Carlo hit rate: %u/200\n", hits);
+    assert(hits >= 190);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2856,5 +2894,6 @@ int main(void) {
     udp_blade_wire_and_pigeonhole_comb();
     udp_direct_skipped_for_filtered_ipv4_nat();
     udp_punch_receiver_prefers_sub1_over_sub0();
+    udp_birthday_permutation_and_hit_rate();
     return 0;
 }

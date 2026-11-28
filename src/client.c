@@ -233,7 +233,7 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
  * instead of one; 16 is where the extra coverage stops paying for the extra datagrams,
  * and FASTP2P_UDP_ARRAY (2..64) moves it without a rebuild. */
 #define UDP_PUNCH_ARRAY 16
-#define UDP_PUNCH_ARRAY_LIMIT 128
+#define UDP_PUNCH_ARRAY_LIMIT 256
 /* One punching tunnel may hold this many extra sockets, and the whole client this many:
  * a hard-symmetric pair punches in both directions at the same time. */
 #define UDP_PUNCH_CLIENT_ARRAY 48
@@ -250,6 +250,16 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define UDP_BLADE_SLOTS_PER_BLADE 128u
 #define UDP_BLADE_SPRAY_ROUNDS 4u
 #define UDP_BLADE_SPRAY_GAP (500 * MS)
+/* Single-IP hard-symmetric (random port) UDP punching via birthday paradox:
+ * open 255+1 source sockets on the NAT4 receiver and spray 256 fresh
+ * non-repeating pseudo-random ports per pass (6 passes = 1,536 ports,
+ * paced 350 ms apart) from the NAT3 peer -> 99.8% single-round hit rate. */
+#define UDP_BIRTHDAY_ARRAY 255u
+#define UDP_BIRTHDAY_CLIENT_ARRAY 512u
+#define UDP_BIRTHDAY_SLOTS_PER_PASS 256u
+#define UDP_BIRTHDAY_SPRAY_ROUNDS 6u
+#define UDP_BIRTHDAY_SPRAY_GAP (350 * MS)
+#define UDP_BIRTHDAY_KEEPALIVE_GAP (2 * NS)
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
 /* A datagram larger than its buffer must be recognised as truncated instead of
@@ -560,6 +570,8 @@ typedef struct {
     unsigned udp_sub0_slot;
     op_addr udp_sub0_from;
     uint64_t udp_sub0_at;
+    uint64_t udp_candidates_tx_at;
+    uint16_t udp_birthday_seed, udp_birthday_step;
     uint64_t active_at;
     /* Endpoint text is canonical address text (no brackets, no %scope) in
      * whichever family it was learned, so an IPv6 peer no longer truncates into
@@ -6852,12 +6864,12 @@ static unsigned udp_array_width(void) {
     }
     return width;
 }
-static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
+static void open_udp_candidates_capped(fastp2p_client *c, tunnel *t, unsigned width,
+                                       unsigned client_cap) {
     unsigned in_use = 0;
     for (int i = 0; i < NT; ++i)
         in_use += c->tunnels[i].udp_candidate_count;
-    unsigned width = udp_array_width();
-    while (t->udp_candidate_count < width && in_use < UDP_PUNCH_CLIENT_ARRAY) {
+    while (t->udp_candidate_count < width && in_use < client_cap) {
         op_socket fd = socket_bound(1, source_text(c, OP_FAM_V4), 0, 0);
         if (fd < 0)
             break;
@@ -6865,17 +6877,25 @@ static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
         ++in_use;
     }
 }
+static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
+    open_udp_candidates_capped(c, t, udp_array_width(), UDP_PUNCH_CLIENT_ARRAY);
+}
 static void open_udp_blade_candidates(fastp2p_client *c, tunnel *t) {
-    unsigned in_use = 0;
-    for (int i = 0; i < NT; ++i)
-        in_use += c->tunnels[i].udp_candidate_count;
-    while (t->udp_candidate_count < UDP_BLADE_ARRAY && in_use < UDP_BLADE_CLIENT_ARRAY) {
-        op_socket fd = socket_bound(1, source_text(c, OP_FAM_V4), 0, 0);
-        if (fd < 0)
-            break;
-        t->udp_candidates[t->udp_candidate_count++] = fd;
-        ++in_use;
+    open_udp_candidates_capped(c, t, UDP_BLADE_ARRAY, UDP_BLADE_CLIENT_ARRAY);
+}
+static void open_udp_birthday_candidates(fastp2p_client *c, tunnel *t) {
+    open_udp_candidates_capped(c, t, UDP_BIRTHDAY_ARRAY, UDP_BIRTHDAY_CLIENT_ARRAY);
+}
+static uint16_t udp_birthday_port(tunnel *t, unsigned idx) {
+    /* Steps are all prime > 7 so gcd(step, 64512) == 1, guaranteeing 64,512
+     * strictly distinct pseudo-random ports over [1024..65535]. */
+    static const uint16_t steps[] = {251, 389, 509, 641, 769, 997, 1223, 1511};
+    if (!t->udp_birthday_step) {
+        uint64_t r = random_id();
+        t->udp_birthday_seed = (uint16_t)(r % 64512u);
+        t->udp_birthday_step = steps[(r >> 16) % (sizeof(steps) / sizeof(steps[0]))];
     }
+    return (uint16_t)(1024u + (((uint32_t)t->udp_birthday_seed + idx * (uint32_t)t->udp_birthday_step) % 64512u));
 }
 static int udp_blade_sample_start(fastp2p_client *c, tunnel *t, uint64_t now) {
     const fp_tcp_family *cat = &c->tcp_nat.family[OP_FAM_V4];
@@ -7235,10 +7255,17 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
     int first = !t->punch_next;
     if (now >= t->punch_next) {
         int blade_comb = t->udp_punch_role == UDP_PUNCH_SEND && t->peer_udp_blade_count > 0;
-        int burst = !blade_comb && t->sym_count && t->sym_sprayed < SYM_SPRAY_ROUNDS &&
+        int birthday_tx = !blade_comb && t->udp_punch_role == UDP_PUNCH_SEND &&
+                          t->udp_peer_kind == 2 && !t->lan && !peer_is_local(&peer);
+        int birthday_rx = t->udp_punch_role == UDP_PUNCH_RECEIVE &&
+                          t->udp_punch_kind == 2 && t->udp_pool_blade_count == 0 &&
+                          !t->lan && !peer_is_local(&peer);
+        int burst = !blade_comb && !birthday_tx && t->sym_count && t->sym_sprayed < SYM_SPRAY_ROUNDS &&
                     now >= t->sym_spray_at;
         int blade_burst = blade_comb && (unsigned)t->sym_sprayed < UDP_BLADE_SPRAY_ROUNDS &&
                           now >= t->sym_spray_at;
+        int birthday_burst = birthday_tx && (unsigned)t->sym_sprayed < UDP_BIRTHDAY_SPRAY_ROUNDS &&
+                             now >= t->sym_spray_at;
         /* Sending to the observed port first can spend the very next mapping
          * that a peer with a predictable allocator expects us to use. */
         int predict_first = (burst || blade_burst) && t->udp_punch_role && !t->sym_split;
@@ -7247,6 +7274,8 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE) {
             if (t->udp_pool_blade_count > 0)
                 open_udp_blade_candidates(c, t);
+            else if (birthday_rx)
+                open_udp_birthday_candidates(c, t);
             else if (t->udp_punch_kind == 2)
                 open_udp_candidates(c, t);
         }
@@ -7284,9 +7313,40 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
                              UDP_BLADE_STRIDE, elapsed_s, pass + 1);
                     emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
                 }
+            } else if (birthday_burst) {
+                unsigned pass = (unsigned)t->sym_sprayed++;
+                t->sym_spray_at = now + UDP_BIRTHDAY_SPRAY_GAP;
+                if (pass == 0) {
+                    if (t->sym_base)
+                        send_udp_centered(t->fd, peer, message, t->sym_base, 64, 1);
+                    if (t->sym_alt_base)
+                        send_udp_centered(t->fd, peer, message, t->sym_alt_base, 32, 1);
+                }
+                unsigned sent = 0;
+                for (unsigned s = 0; s < UDP_BIRTHDAY_SLOTS_PER_PASS; ++s) {
+                    uint16_t port = udp_birthday_port(t, pass * UDP_BIRTHDAY_SLOTS_PER_PASS + s);
+                    op_addr dst = peer;
+                    op_addr_set_port(&dst, port);
+                    if (!udp_packet(t->fd, &dst, 4, 0, message))
+                        ++sent;
+                }
+                if (sent) {
+                    char who[OP_ADDR_TEXT], bnote[200];
+                    op_addr_text(&peer, who, sizeof(who));
+                    snprintf(bnote, sizeof(bnote),
+                             "UDP punch birthday spray: %u random ports to %s (pass %u/%u)",
+                             sent, who, pass + 1, UDP_BIRTHDAY_SPRAY_ROUNDS);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
+                }
             }
-            for (unsigned i = 0; i < t->udp_candidate_count; ++i)
-                udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
+            int send_candidates = t->udp_candidate_count <= UDP_PUNCH_ARRAY ||
+                                  !t->udp_candidates_tx_at || now >= t->udp_candidates_tx_at;
+            if (send_candidates) {
+                for (unsigned i = 0; i < t->udp_candidate_count; ++i)
+                    udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
+                if (t->udp_candidate_count > UDP_PUNCH_ARRAY)
+                    t->udp_candidates_tx_at = now + UDP_BIRTHDAY_KEEPALIVE_GAP;
+            }
         }
         if (predict_first)
             udp_packet(t->fd, &peer, 4, 0, message);
