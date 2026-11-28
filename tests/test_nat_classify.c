@@ -2418,6 +2418,60 @@ static void blade_velocity_and_pigeonhole_comb(void) {
     assert(hits >= 7);
 }
 
+static void udp_blade_wire_and_pigeonhole_comb(void) {
+    fastp2p_client c = {0};
+    c.nat[OP_FAM_V4].type = NAT_EASY_SYM_INC;
+    tunnel pub = {0};
+    pub.transport = FASTP2P_TRANSPORT_QUIC;
+    pub.family = OP_FAM_V4;
+    pub.mapped_port = 42511;
+    static const char *ips[] = {"223.104.85.223", "223.104.85.222", "223.104.85.219",
+                                "223.104.85.217", "223.104.72.211", "223.104.72.209"};
+    static const uint16_t ports[] = {42511, 51200, 39800, 44100, 40500, 41900};
+    static const uint16_t rates[] = {0, 600, 580, 550, 610, 590};
+    pub.udp_pool_blade_count = 6;
+    for (unsigned i = 0; i < 6; ++i) {
+        assert(!op_addr_from_text(&pub.udp_pool_blades[i].addr, ips[i], ports[i]));
+        pub.udp_pool_blades[i].port = ports[i];
+        pub.udp_pool_blades[i].rate = rates[i];
+    }
+    json_object *wire = json_object_new_object();
+    assert(wire);
+    assert(announce_sym_window(&c, &pub, wire, OP_FAM_V4) == 1);
+
+    tunnel sub = {0};
+    learn_sym_window(&sub, wire);
+    json_object_put(wire);
+    assert(sub.peer_udp_blade_count == 6);
+    assert(sub.peer_udp_blades[1].port == 51200 && sub.peer_udp_blades[1].rate == 600);
+
+    op_addr adv_peer, cross24_blade, stranger;
+    assert(!op_addr_from_text(&adv_peer, "223.104.85.223", 42511));
+    assert(!op_addr_from_text(&cross24_blade, "223.104.72.211", 40890));
+    assert(!op_addr_from_text(&stranger, "198.51.100.77", 40890));
+    assert(udp_peer_addr_matches(&sub, &cross24_blade, &adv_peer));
+    assert(!udp_peer_addr_matches(&sub, &stranger, &adv_peer));
+
+    /* Round 1 (rate==0 on blade 0, 600 ports/s over 2.1s = +1,260 drift) vs 65-port wall. */
+    uint16_t wall_r1 = tcp_port_wrap_add(sub.peer_udp_blades[0].port, 1260);
+    unsigned hits_r1 = 0;
+    for (unsigned s = 0; s < UDP_BLADE_SLOTS_PER_BLADE; ++s) {
+        uint16_t p = udp_blade_comb_port(&sub.peer_udp_blades[0], 2.1, 0, s);
+        if (tcp_port_fwd_diff(p, wall_r1) < 65u)
+            ++hits_r1;
+    }
+    /* Round 2 (rate==600 on blade 1, +250 jitter after 2.1s) vs 65-port wall. */
+    uint16_t wall_r2 = tcp_port_wrap_add(sub.peer_udp_blades[1].port, (int32_t)(600 * 2.1) + 250);
+    unsigned hits_r2 = 0;
+    for (unsigned s = 0; s < UDP_BLADE_SLOTS_PER_BLADE; ++s) {
+        uint16_t p = udp_blade_comb_port(&sub.peer_udp_blades[1], 2.1, 0, s);
+        if (tcp_port_fwd_diff(p, wall_r2) < 65u)
+            ++hits_r2;
+    }
+    printf("UDP blade comb pigeonhole hits: r1(rate=0)=%u r2(rate=600)=%u\n", hits_r1, hits_r2);
+    assert(hits_r1 >= 2 && hits_r2 >= 2);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2663,5 +2717,6 @@ int main(void) {
     pool_aggregates_every_measured_address();
     pool_spray_covers_the_published_product();
     blade_velocity_and_pigeonhole_comb();
+    udp_blade_wire_and_pigeonhole_comb();
     return 0;
 }

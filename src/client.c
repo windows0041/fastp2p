@@ -151,7 +151,7 @@
 #define TCP_SPRAY_FD_RESERVE 256u
 #define TCP_SPRAY_BURST_TICK 48u
 #define TCP_BLADE_STRIDE 32u
-#define TCP_BLADE_RATE_MAX 2000u
+#define TCP_BLADE_RATE_MAX 4000u
 #define TCP_BLADE_RATE_MIN_DT_MS 500u
 #define TCP_BLADE_RATE_MAX_DT_S 150u
 #define TCP_BLADE_SAMPLE_DEADLINE_MS 1200u
@@ -229,12 +229,23 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
  * instead of one; 16 is where the extra coverage stops paying for the extra datagrams,
  * and FASTP2P_UDP_ARRAY (2..64) moves it without a rebuild. */
 #define UDP_PUNCH_ARRAY 16
-#define UDP_PUNCH_ARRAY_LIMIT 64
+#define UDP_PUNCH_ARRAY_LIMIT 128
 /* One punching tunnel may hold this many extra sockets, and the whole client this many:
  * a hard-symmetric pair punches in both directions at the same time. */
 #define UDP_PUNCH_CLIENT_ARRAY 48
 /* Window ports each extra socket sprays, besides the observed one. */
 #define UDP_PUNCH_EXTRA_WINDOW 4
+/* Multi-blade CGNAT UDP punching: sample each blade's UDP STUN port right before
+ * publishing, open a 64+1 socket contiguous source wall on the NAT4 side, and
+ * spray a 4,096-port strided comb across all blades from the NAT3 peer. */
+#define UDP_BLADE_PROBES_MAX 12u
+#define UDP_BLADE_SAMPLE_DEADLINE_MS 600u
+#define UDP_BLADE_ARRAY 64u
+#define UDP_BLADE_CLIENT_ARRAY 128u
+#define UDP_BLADE_STRIDE 32u
+#define UDP_BLADE_SLOTS_PER_BLADE 128u
+#define UDP_BLADE_SPRAY_ROUNDS 4u
+#define UDP_BLADE_SPRAY_GAP (500 * MS)
 #define WIRE_VERSION FASTP2P_VERSION
 #define WIRE_PROTOCOL "fastp2p2"
 /* A datagram larger than its buffer must be recognised as truncated instead of
@@ -289,6 +300,7 @@ enum tunnel_state {
      * T_NAT_CONNECT/READ/UDP detail. */
     T_PROBE,
     T_TCP_SAMPLE,
+    T_UDP_SAMPLE,
     T_NAT_CONNECT,
     T_NAT_READ,
     T_NAT_UDP,
@@ -418,6 +430,17 @@ typedef struct {
     uint64_t born_ns;
 } tcp_spray_slot;
 typedef struct {
+    op_socket fd;
+    unsigned probe_count;
+    unsigned blade_count;
+    unsigned answered_blades;
+    op_addr target[UDP_BLADE_PROBES_MAX];
+    uint8_t tid[UDP_BLADE_PROBES_MAX][FP_STUN_NONCE];
+    unsigned blade_idx[UDP_BLADE_PROBES_MAX];
+    uint8_t blade_done[TCP_POOL_ADDR_MAX];
+    op_addr blade_mapped[TCP_POOL_ADDR_MAX];
+} udp_blade_sample;
+typedef struct {
     int state, server, initiator, transport, notified;
     int tcp_v2, tcp_punch_immediate;
     uint16_t tcp_direct_port, udp_direct_port, udp_reverse_port, udp_reverse_port6;
@@ -522,6 +545,12 @@ typedef struct {
     int udp_dual_punch, udp_peer_cone;
     unsigned udp_candidate_count;
     op_socket udp_candidates[UDP_PUNCH_ARRAY_LIMIT];
+    udp_blade_sample udp_sample;
+    tcp_blade udp_pool_blades[TCP_POOL_ADDR_MAX];
+    unsigned udp_pool_blade_count;
+    tcp_blade peer_udp_blades[TCP_POOL_ADDR_MAX];
+    unsigned peer_udp_blade_count;
+    uint64_t peer_udp_blades_at;
     uint64_t udp_punch_ack_until;
     uint64_t active_at;
     /* Endpoint text is canonical address text (no brackets, no %scope) in
@@ -708,6 +737,8 @@ struct fastp2p_client {
     fp_tcp_nat tcp_nat;
     tcp_blade tcp_blades[TCP_POOL_ADDR_MAX];
     unsigned tcp_blade_count;
+    tcp_blade udp_blades[TCP_POOL_ADDR_MAX];
+    unsigned udp_blade_count;
     int force_relay; /* FASTP2P_FORCE_RELAY diagnostic switch */
     int nat_override; /* FASTP2P_NAT_TYPE diagnostic switch, 0 = use the probe */
     /* Curl writes the detailed TLS reason here; the short error code alone
@@ -797,6 +828,7 @@ static void relay_join(fastp2p_client *, int);
 static void session_ready(fastp2p_client *, int);
 static void probe_complete(fastp2p_client *, int);
 static int tcp_punch_listen(fastp2p_client *, int);
+static int udp_blade_sample_start(fastp2p_client *, tunnel *, uint64_t);
 static int punch_realign_family(fastp2p_client *, int);
 static void sdwan_reconcile(fastp2p_client *);
 static uint16_t punch_port_get(fastp2p_client *, const char *);
@@ -1598,6 +1630,42 @@ static void learn_sym_window(tunnel *t, json_object *j) {
     if (split && width >= 4 && base == op_integer(j, "coneNatPort") &&
         alt && alt <= UINT16_MAX && abs((int)alt - (int)base) >= 2 * SYM_WINDOW_HARD)
         t->sym_alt_base = (uint16_t)alt;
+    t->peer_udp_blade_count = 0;
+    t->peer_udp_blades_at = 0;
+    json_object *ublades = json_object_object_get(j, "udpPoolBlades");
+    if (ublades && json_object_is_type(ublades, json_type_array)) {
+        unsigned nb = (unsigned)json_object_array_length(ublades);
+        if (nb >= 3 && (nb % 3u) == 0 && nb / 3u <= TCP_POOL_ADDR_MAX) {
+            unsigned ncount = nb / 3u;
+            tcp_blade parsed[TCP_POOL_ADDR_MAX] = {0};
+            int valid = 1;
+            for (unsigned i = 0; i < ncount; ++i) {
+                json_object *ip_j = json_object_array_get_idx(ublades, i * 3u);
+                json_object *port_j = json_object_array_get_idx(ublades, i * 3u + 1u);
+                json_object *rate_j = json_object_array_get_idx(ublades, i * 3u + 2u);
+                const char *text = ip_j ? json_object_get_string(ip_j) : NULL;
+                int64_t bport = port_j ? json_object_get_int64(port_j) : 0;
+                int64_t brate = rate_j ? json_object_get_int64(rate_j) : -1;
+                if (!text || bport < 1 || bport > 65535 || brate < 0 ||
+                    brate > (int64_t)TCP_BLADE_RATE_MAX ||
+                    op_addr_from_text(&parsed[i].addr, text, (uint16_t)bport)) {
+                    valid = 0;
+                    break;
+                }
+                parsed[i].port = (uint16_t)bport;
+                parsed[i].rate = (uint16_t)brate;
+            }
+            if (valid) {
+                uint64_t now = mono();
+                for (unsigned i = 0; i < ncount; ++i) {
+                    parsed[i].at = now;
+                    t->peer_udp_blades[i] = parsed[i];
+                }
+                t->peer_udp_blade_count = ncount;
+                t->peer_udp_blades_at = now;
+            }
+        }
+    }
 }
 /* Decide the mapping behaviour from observed mapped ports.  The first two come
  * from the same local socket talking to two different destinations, which is
@@ -1846,6 +1914,10 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     tcp_array_close(c, t);
     tcp_spray_close(c, t);
     close_udp_candidates(t);
+    if (t->udp_sample.fd >= 0) {
+        op_close(t->udp_sample.fd);
+        t->udp_sample.fd = -1;
+    }
     fp_tcp_punch_sample_free(t->tcp_sample);
     op_buffer_clear(&t->rx);
     op_buffer_clear(&t->tx);
@@ -1854,6 +1926,8 @@ static void close_tunnel(fastp2p_client *c, int index, const char *reason) {
     OPENSSL_cleanse(t->secret, sizeof(t->secret));
     memset(t, 0, sizeof(*t));
     t->fd = t->listen_fd = t->alternate_fd = -1;
+    t->udp_sample.fd = -1;
+    t->udp_sample.fd = -1;
     for (int p = 0; p < OP_FAM_COUNT; ++p)
         t->probes[p].fd = -1;
     t->relay_link = -1;
@@ -2028,6 +2102,7 @@ static int new_tunnel(fastp2p_client *c, const char *peer, uint64_t id, int tran
     tunnel *t = &c->tunnels[i];
     memset(t, 0, sizeof(*t));
     t->fd = t->listen_fd = t->alternate_fd = -1;
+    t->udp_sample.fd = -1;
     /* Zero is a valid descriptor: every probe slot must start closed or
      * the first probe would close whatever owns fd 0. */
     for (int p = 0; p < OP_FAM_COUNT; ++p)
@@ -2653,6 +2728,11 @@ static int probe_round(fastp2p_client *c, int index, uint64_t now) {
             return 0;
         }
     }
+    if (adopt == OP_FAM_V4 && t->transport == FASTP2P_TRANSPORT_QUIC && !t->lan &&
+        !t->relay_wait && !strcmp(t->mode, "udppunch") &&
+        sym_window_kind(c->nat[OP_FAM_V4].type) > 0 &&
+        udp_blade_sample_start(c, t, now))
+        return 0;
     probe_complete(c, index);
     return 1;
 }
@@ -2873,6 +2953,14 @@ static uint16_t tcp_blade_comb_port(const tcp_blade *blade, double elapsed_s, un
     (void)slots_per_blade;
     const uint32_t stride = TCP_BLADE_STRIDE;
     int32_t lead = blade->rate > 0 ? -512 : -128;
+    int32_t drift = blade->rate > 0 ? (int32_t)((double)blade->rate * elapsed_s + 0.5) : 0;
+    int32_t phase = (int32_t)((pass * 7u) % stride);
+    return tcp_port_wrap_add(blade->port, drift + lead + phase + (int32_t)(slot_idx * stride));
+}
+static uint16_t udp_blade_comb_port(const tcp_blade *blade, double elapsed_s, unsigned pass,
+                                    unsigned slot_idx) {
+    const uint32_t stride = UDP_BLADE_STRIDE;
+    int32_t lead = blade->rate > 0 ? -1024 : -256;
     int32_t drift = blade->rate > 0 ? (int32_t)((double)blade->rate * elapsed_s + 0.5) : 0;
     int32_t phase = (int32_t)((pass * 7u) % stride);
     return tcp_port_wrap_add(blade->port, drift + lead + phase + (int32_t)(slot_idx * stride));
@@ -3140,6 +3228,24 @@ static int announce_sym_window(fastp2p_client *c, tunnel *t, json_object *j, int
         op_ju(j, "symCount", SYM_WINDOW_HARD);
         op_ju(j, "symUp", 1);
         op_ju(j, "symSplit", 1);
+    }
+    if (t->udp_pool_blade_count > 0) {
+        json_object *ublades = json_object_new_array();
+        if (ublades) {
+            for (unsigned i = 0; i < t->udp_pool_blade_count && i < TCP_POOL_ADDR_MAX; ++i) {
+                char text[OP_ADDR_TEXT];
+                if (!t->udp_pool_blades[i].port ||
+                    op_addr_text(&t->udp_pool_blades[i].addr, text, sizeof(text)))
+                    continue;
+                json_object_array_add(ublades, json_object_new_string(text));
+                json_object_array_add(ublades, json_object_new_int((int32_t)t->udp_pool_blades[i].port));
+                json_object_array_add(ublades, json_object_new_int((int32_t)t->udp_pool_blades[i].rate));
+            }
+            if (json_object_array_length(ublades) >= 3)
+                json_object_object_add(j, "udpPoolBlades", ublades);
+            else
+                json_object_put(ublades);
+        }
     }
     return kind;
 }
@@ -6729,6 +6835,186 @@ static void open_udp_candidates(fastp2p_client *c, tunnel *t) {
         ++in_use;
     }
 }
+static void open_udp_blade_candidates(fastp2p_client *c, tunnel *t) {
+    unsigned in_use = 0;
+    for (int i = 0; i < NT; ++i)
+        in_use += c->tunnels[i].udp_candidate_count;
+    while (t->udp_candidate_count < UDP_BLADE_ARRAY && in_use < UDP_BLADE_CLIENT_ARRAY) {
+        op_socket fd = socket_bound(1, source_text(c, OP_FAM_V4), 0, 0);
+        if (fd < 0)
+            break;
+        t->udp_candidates[t->udp_candidate_count++] = fd;
+        ++in_use;
+    }
+}
+static int udp_blade_sample_start(fastp2p_client *c, tunnel *t, uint64_t now) {
+    const fp_tcp_family *cat = &c->tcp_nat.family[OP_FAM_V4];
+    if (!cat->collected || cat->samples < 2)
+        return 0;
+    op_addr blades[TCP_POOL_ADDR_MAX];
+    unsigned blade_count = 0;
+    for (unsigned i = 0; i < cat->samples && i < FP_TCP_PROBE_MAX && blade_count < TCP_POOL_ADDR_MAX; ++i) {
+        if (!cat->mapped[i].len || !op_addr_port(&cat->mapped[i]))
+            continue;
+        unsigned k;
+        for (k = 0; k < blade_count; ++k)
+            if (same_host(&blades[k], &cat->mapped[i]))
+                break;
+        if (k == blade_count) {
+            blades[blade_count] = cat->mapped[i];
+            op_addr_set_port(&blades[blade_count], 0);
+            ++blade_count;
+        }
+    }
+    if (blade_count < 2)
+        return 0;
+    op_socket fd = socket_bound(1, source_text(c, OP_FAM_V4), 0, 0);
+    if (fd < 0)
+        return 0;
+    memset(&t->udp_sample, 0, sizeof(t->udp_sample));
+    t->udp_sample.fd = fd;
+    t->udp_sample.blade_count = blade_count;
+    op_addr gw_mapped = {0};
+    int have_gw = !op_addr_from_text(&gw_mapped, t->mapped_ip, t->mapped_port);
+    for (unsigned b = 0; b < blade_count; ++b) {
+        if (have_gw && same_host(&gw_mapped, &blades[b])) {
+            t->udp_sample.blade_done[b] = 1;
+            t->udp_sample.blade_mapped[b] = gw_mapped;
+            ++t->udp_sample.answered_blades;
+            continue;
+        }
+        unsigned added = 0;
+        for (int pass = 0; pass < 2 && added < 2; ++pass) {
+            for (unsigned i = 0; i < cat->samples && i < FP_TCP_PROBE_MAX && added < 2 &&
+                                 t->udp_sample.probe_count < UDP_BLADE_PROBES_MAX; ++i) {
+                if (!same_host(&cat->mapped[i], &blades[b]))
+                    continue;
+                uint16_t dport = op_addr_port(&cat->target_used[i]);
+                if (!dport || dport == 27180 || dport == 27181)
+                    continue;
+                if (pass == 0 && dport != 3478)
+                    continue;
+                if (pass == 1 && dport == 3478)
+                    continue;
+                int dup = 0;
+                for (unsigned p = 0; p < t->udp_sample.probe_count; ++p)
+                    if (op_addr_equal(&t->udp_sample.target[p], &cat->target_used[i]) &&
+                        op_addr_port(&t->udp_sample.target[p]) == dport) {
+                        dup = 1;
+                        break;
+                    }
+                if (dup)
+                    continue;
+                unsigned pi = t->udp_sample.probe_count;
+                for (int k = 0; k < FP_STUN_NONCE; ++k)
+                    t->udp_sample.tid[pi][k] = (uint8_t)random_id();
+                uint8_t req[64];
+                size_t rlen = fp_stun_request(req, sizeof(req), t->udp_sample.tid[pi], 0, 0);
+                if (!rlen)
+                    continue;
+                op_addr dst = cat->target_used[i];
+                op_addr_set_port(&dst, dport);
+                if (op_sendto(fd, req, rlen, MSG_DONTWAIT, &dst.u.sa, dst.len) < 0)
+                    continue;
+                t->udp_sample.target[pi] = dst;
+                t->udp_sample.blade_idx[pi] = b;
+                ++t->udp_sample.probe_count;
+                ++added;
+            }
+        }
+    }
+    if (!t->udp_sample.probe_count) {
+        op_close(fd);
+        t->udp_sample.fd = -1;
+        return 0;
+    }
+    t->state = T_UDP_SAMPLE;
+    t->deadline = now + UDP_BLADE_SAMPLE_DEADLINE_MS * MS;
+    return 1;
+}
+static void udp_blade_sample_tick(fastp2p_client *c, int ti, uint64_t now) {
+    tunnel *t = &c->tunnels[ti];
+    udp_blade_sample *s = &t->udp_sample;
+    if (s->fd >= 0) {
+        uint8_t buf[1024];
+        op_addr from;
+        for (int k = 0; k < 32; ++k) {
+            memset(&from, 0, sizeof(from));
+            from.len = (op_socklen)sizeof(from.u.storage);
+            op_ssize n = op_recvfrom(s->fd, buf, sizeof(buf), MSG_DONTWAIT, &from.u.sa, &from.len);
+            if (n < 0)
+                break;
+            for (unsigned p = 0; p < s->probe_count; ++p) {
+                fp_stun_mapped mapped;
+                if (!fp_stun_response(buf, (size_t)n, s->tid[p], &mapped) || !mapped.valid ||
+                    !op_addr_port(&mapped.address))
+                    continue;
+                unsigned b = s->blade_idx[p];
+                if (b < s->blade_count && !s->blade_done[b]) {
+                    s->blade_done[b] = 1;
+                    s->blade_mapped[b] = mapped.address;
+                    ++s->answered_blades;
+                }
+                break;
+            }
+        }
+    }
+    if (s->answered_blades < s->blade_count && now < t->deadline)
+        return;
+    if (s->fd >= 0) {
+        op_close(s->fd);
+        s->fd = -1;
+    }
+    op_addr answered[TCP_POOL_ADDR_MAX];
+    unsigned n_ans = 0;
+    for (unsigned b = 0; b < s->blade_count && n_ans < TCP_POOL_ADDR_MAX; ++b)
+        if (s->blade_done[b] && s->blade_mapped[b].len && op_addr_port(&s->blade_mapped[b]))
+            answered[n_ans++] = s->blade_mapped[b];
+    if (n_ans)
+        tcp_blades_update(c->udp_blades, &c->udp_blade_count, answered, n_ans, now);
+    t->udp_pool_blade_count = tcp_blades_export(c->udp_blades, c->udp_blade_count, now,
+                                                  t->udp_pool_blades, TCP_POOL_ADDR_MAX);
+    const fp_tcp_family *cat = &c->tcp_nat.family[OP_FAM_V4];
+    for (unsigned i = 0; i < cat->samples && i < FP_TCP_PROBE_MAX &&
+                         t->udp_pool_blade_count < TCP_POOL_ADDR_MAX; ++i) {
+        if (!cat->mapped[i].len)
+            continue;
+        int seen = 0;
+        for (unsigned k = 0; k < t->udp_pool_blade_count; ++k)
+            if (same_host(&t->udp_pool_blades[k].addr, &cat->mapped[i])) {
+                seen = 1;
+                break;
+            }
+        if (!seen && t->mapped_port) {
+            tcp_blade *fb = &t->udp_pool_blades[t->udp_pool_blade_count++];
+            memset(fb, 0, sizeof(*fb));
+            fb->addr = cat->mapped[i];
+            op_addr_set_port(&fb->addr, t->mapped_port);
+            fb->port = t->mapped_port;
+            fb->rate = 0;
+            fb->at = now;
+        }
+    }
+    if (t->udp_pool_blade_count) {
+        char first[OP_ADDR_TEXT] = "";
+        op_addr_text(&t->udp_pool_blades[0].addr, first, sizeof(first));
+        char note[224];
+        snprintf(note, sizeof(note),
+                 "UDP blade pool: %u blades (%u fresh; first %s:%u rate %u/s)",
+                 t->udp_pool_blade_count, n_ans, first, (unsigned)t->udp_pool_blades[0].port,
+                 (unsigned)t->udp_pool_blades[0].rate);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
+    }
+    probe_complete(c, ti);
+}
+static int udp_peer_addr_matches(const tunnel *t, const op_addr *from, const op_addr *peer) {
+    if (peer_host_matches(from, peer))
+        return 1;
+    for (unsigned i = 0; i < t->peer_udp_blade_count; ++i)
+        if (same_host(from, &t->peer_udp_blades[i].addr))
+            return 1;
+    return 0;
+}
 
 /* The punch exchange cares about the host, not the port: a symmetric NAT gives the peer
  * a different port towards us than the one in the offer, and the offer's port was
@@ -6786,7 +7072,7 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
                 emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
             }
             if (n < 8 || op_u32(data) != (uint32_t)(n - 8) || op_u16(data + 4) != 4 ||
-                !peer_host_matches(&from, &peer))
+                !udp_peer_addr_matches(t, &from, &peer))
                 continue;
             if (!op_addr_equal(&from, &peer)) {
                 /* Learn the port the peer really uses towards us and answer that: its
@@ -6860,13 +7146,14 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         else
             op_addr_text(&t->peer_addr, where, sizeof(where));
         snprintf(note, sizeof(note),
-                 "punch %s: role=%s peer=%s peerWindow=%u%s%s%s ownWindow=%d",
+                 "punch %s: role=%s peer=%s peerWindow=%u%s%s%s ownWindow=%d blades=%u peerBlades=%u",
                  t->mode, t->udp_punch_role == UDP_PUNCH_SEND ? "send"
                           : t->udp_punch_role == UDP_PUNCH_RECEIVE ? "receive" : "legacy",
                  where, (unsigned)t->sym_count,
                  t->udp_peer_kind == 2 ? " split" : "",
                  t->sym_up ? " up" : " down",
-                 t->udp_punch_order ? " ordered" : "", t->udp_punch_kind);
+                 t->udp_punch_order ? " ordered" : "", t->udp_punch_kind,
+                 t->udp_pool_blade_count, t->peer_udp_blade_count);
         emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, note);
     }
     if (t->udp_punch_role == UDP_PUNCH_SEND && !t->udp_punch_ready &&
@@ -6877,25 +7164,59 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
     op_ju(message, "id", t->id);
     int first = !t->punch_next;
     if (now >= t->punch_next) {
-        int burst = t->sym_count && t->sym_sprayed < SYM_SPRAY_ROUNDS && now >= t->sym_spray_at;
+        int blade_comb = t->udp_punch_role == UDP_PUNCH_SEND && t->peer_udp_blade_count > 0;
+        int burst = !blade_comb && t->sym_count && t->sym_sprayed < SYM_SPRAY_ROUNDS &&
+                    now >= t->sym_spray_at;
+        int blade_burst = blade_comb && (unsigned)t->sym_sprayed < UDP_BLADE_SPRAY_ROUNDS &&
+                          now >= t->sym_spray_at;
         /* Sending to the observed port first can spend the very next mapping
          * that a peer with a predictable allocator expects us to use. */
-        int predict_first = burst && t->udp_punch_role && !t->sym_split;
+        int predict_first = (burst || blade_burst) && t->udp_punch_role && !t->sym_split;
         if (!predict_first)
             udp_packet(t->fd, &peer, 4, 0, message);
+        if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE) {
+            if (t->udp_pool_blade_count > 0)
+                open_udp_blade_candidates(c, t);
+            else if (t->udp_punch_kind == 2)
+                open_udp_candidates(c, t);
+        }
         if (burst) {
             ++t->sym_sprayed;
             t->sym_spray_at = now + SYM_SPRAY_GAP;
             send_udp_punch_window(t, t->fd, peer, message, t->sym_count);
-            /* Spreading our receivers over several ports only makes sense when the
-             * window we published is the centred one. */
-            if (first && t->udp_punch_role == UDP_PUNCH_RECEIVE && t->udp_punch_kind == 2)
-                open_udp_candidates(c, t);
             uint16_t count = t->sym_count < UDP_PUNCH_EXTRA_WINDOW ? t->sym_count : UDP_PUNCH_EXTRA_WINDOW;
             for (unsigned i = 0; i < t->udp_candidate_count; ++i) {
                 send_udp_punch_window(t, t->udp_candidates[i], peer, message, count);
                 udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
             }
+        } else {
+            if (blade_burst) {
+                unsigned pass = (unsigned)t->sym_sprayed++;
+                t->sym_spray_at = now + UDP_BLADE_SPRAY_GAP;
+                double elapsed_s = (t->peer_udp_blades_at && now > t->peer_udp_blades_at)
+                                       ? (double)(now - t->peer_udp_blades_at) / (double)NS
+                                       : 0.0;
+                unsigned sent = 0;
+                for (unsigned b = 0; b < t->peer_udp_blade_count; ++b) {
+                    for (unsigned s = 0; s < UDP_BLADE_SLOTS_PER_BLADE; ++s) {
+                        uint16_t port = udp_blade_comb_port(&t->peer_udp_blades[b], elapsed_s, pass, s);
+                        op_addr dst = t->peer_udp_blades[b].addr;
+                        op_addr_set_port(&dst, port);
+                        if (!udp_packet(t->fd, &dst, 4, 0, message))
+                            ++sent;
+                    }
+                }
+                if (sent) {
+                    char bnote[200];
+                    snprintf(bnote, sizeof(bnote),
+                             "UDP punch blade comb: %u packets across %u blades (%u/blade, stride %u, elapsed %.2fs, pass %u)",
+                             sent, t->peer_udp_blade_count, UDP_BLADE_SLOTS_PER_BLADE,
+                             UDP_BLADE_STRIDE, elapsed_s, pass + 1);
+                    emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, bnote);
+                }
+            }
+            for (unsigned i = 0; i < t->udp_candidate_count; ++i)
+                udp_packet(t->udp_candidates[i], &peer, 4, 0, message);
         }
         if (predict_first)
             udp_packet(t->fd, &peer, 4, 0, message);
@@ -7027,6 +7348,10 @@ static void tick_tunnel(fastp2p_client *c, int ti, uint64_t now) {
             if (!t->state)
                 return;
         }
+    }
+    if (t->state == T_UDP_SAMPLE) {
+        udp_blade_sample_tick(c, ti, now);
+        return;
     }
     /* A tunnel that is still probing owns its deadline: dropping the preferred
      * family must not close a tunnel whose other family already answered. */
@@ -9215,6 +9540,7 @@ static int punch_in_flight(const fastp2p_client *c) {
         switch (c->tunnels[i].state) {
         case T_PROBE:
         case T_TCP_SAMPLE:
+        case T_UDP_SAMPLE:
         case T_TIME:
         case T_TCP_CONNECT:
         case T_TCP_DIRECT_CONNECT:
@@ -10359,6 +10685,7 @@ int fastp2p_client_start(fastp2p_client *c) {
     c->tcp_nat_reprepare = 3;
     c->tcp_nat_reprepare_at = 0;
     c->tcp_blade_count = 0;
+    c->udp_blade_count = 0;
     c->udp_filter = c->tcp_filter = (nat_filter){0};
     c->tcp_level.phase = 0;
     c->tcp_handoff_at = 0;
@@ -10420,6 +10747,7 @@ int fastp2p_client_step(fastp2p_client *c, unsigned wait_ms) {
         int reason = c->tcp_nat_reprepare;
         c->tcp_nat_reprepare = 0;
         c->tcp_blade_count = 0;
+        c->udp_blade_count = 0;
         fp_tcp_nat_close(&c->tcp_nat);
         fp_tcp_nat_prepare(&c->tcp_nat, c->gateway_addr, c->families_wanted);
         emit(c, FASTP2P_EVENT_TUNNEL, 0, 0,
@@ -10604,6 +10932,7 @@ int fastp2p_client_stop(fastp2p_client *c) {
     c->port_mapping_wait_until = 0;
     fp_tcp_nat_close(&c->tcp_nat);
     c->tcp_blade_count = 0;
+    c->udp_blade_count = 0;
     if (c->stun.fd >= 0)
         op_close(c->stun.fd);
     c->stun = (nat_stun){.fd = -1};
