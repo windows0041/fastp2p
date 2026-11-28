@@ -4113,17 +4113,20 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
     }
     /* A refused dial comes back in a few milliseconds, so retrying it is nearly
      * free and the peer may still answer: keep dialling for the whole window.
-     * A dial that times out was filtered or the advertised endpoint is stale;
-     * both make the rest of the window useless, so end the round and let the
-     * rule ladder retry with a freshly measured mapping. */
-    if (saved == ETIMEDOUT) {
+     * The exception is a destination-dependent peer with a measured step: the
+     * port it published to the gateway is already stale, so even an RST means
+     * dial the predicted window and park listening after a few attempts. */
+    int peer_kind = tcp_peer_kind(t);
+    int stale_refused = saved == ECONNREFUSED && peer_kind == TCP_PEER_MOVES &&
+                        t->peer_tcp_step != 0 && !t->lan && !peer_is_local(&t->peer_addr);
+    if (saved == ETIMEDOUT || stale_refused) {
         ++t->tcp_timeouts;
         /* Silent dials: walk the window around the reported port, because the
          * peer's mapping for our destination is not the one it reported. The
          * window wraps so a later pass retries the same ports, which also keeps
          * our own NAT filter open towards them. A stable peer is the exception:
          * its reported port is the reachable one, so there is no window to walk. */
-        if (tcp_peer_kind(t) != TCP_PEER_STABLE) {
+        if (saved == ETIMEDOUT && peer_kind != TCP_PEER_STABLE) {
             if (t->tcp_scan < TCP_PUNCH_SCAN)
                 ++t->tcp_scan;
             else
@@ -4137,7 +4140,6 @@ static int punch_role_decide(const fastp2p_client *c, const tunnel *t) {
      * reported port gets only a few attempts: each second spent dialling is a
      * second its own SYN is filtered. A cone peer keeps the longer walk because
      * its reported port is usually the reachable one. */
-    int peer_kind = tcp_peer_kind(t);
     unsigned limit = t->punch_role == TCP_PUNCH_OPENER ? TCP_OPENER_QUICK_ATTEMPTS
                    : peer_kind == TCP_PEER_MOVES      ? TCP_PUNCH_QUICK_ATTEMPTS
                    : peer_kind == TCP_PEER_STABLE     ? TCP_PUNCH_STABLE_ATTEMPTS

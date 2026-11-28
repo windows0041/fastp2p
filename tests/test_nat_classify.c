@@ -2897,6 +2897,58 @@ static void udp_birthday_sym_bands_and_hit_rate(void) {
     assert(hits >= 190);
 }
 
+static void stepped_dependent_peer_parks_on_refused(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    c->node_id = op_node_id("local-node");
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "remote-stepped", 970u, FASTP2P_TRANSPORT_TCP, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    strcpy(t->mode, "tcppunch");
+    t->tcp_v2 = 1;
+    t->state = T_TCP_CONNECT;
+    t->peer_tcp_dependent = 1;
+    t->peer_tcp_step = 1;
+    t->peer_tcp_last_port = 53000;
+    t->family = OP_FAM_V4;
+    assert(!op_addr_from_text(&t->peer_addr, "203.0.113.10", 52996));
+    t->remote_ports[OP_FAM_V4] = 52996;
+    op_socket local = socket_bound(0, "127.0.0.1", 0, 1);
+    assert(local >= 0);
+    t->local_port = socket_port(local);
+    op_close(local);
+    t->deadline = mono() + 5 * NS;
+
+    for (unsigned k = 0; k < TCP_PUNCH_QUICK_ATTEMPTS; ++k) {
+        ++t->tcp_attempts;
+        errno = ECONNREFUSED;
+        tcp_punch_failed(c, ti, mono());
+    }
+    assert(t->state == T_TCP_CONNECT && t->listen_fd >= 0);
+    assert(t->tcp_retry_at == 0);
+    close_tunnel(c, ti, NULL);
+
+    /* A stable peer still resets tcp_timeouts on ECONNREFUSED instead of parking. */
+    int sti = new_tunnel(c, "remote-stable", 971u, FASTP2P_TRANSPORT_TCP, 1);
+    assert(sti >= 0);
+    tunnel *st = &c->tunnels[sti];
+    strcpy(st->mode, "tcppunch");
+    st->tcp_v2 = 1;
+    st->state = T_TCP_CONNECT;
+    st->peer_tcp_mapping = FP_TCP_MAP_STABLE;
+    st->family = OP_FAM_V4;
+    assert(!op_addr_from_text(&st->peer_addr, "203.0.113.10", 41000));
+    st->remote_ports[OP_FAM_V4] = 41000;
+    st->tcp_timeouts = 2;
+    st->tcp_attempts = 3;
+    errno = ECONNREFUSED;
+    tcp_punch_failed(c, sti, mono());
+    assert(st->tcp_timeouts == 0 && st->listen_fd < 0);
+    close_tunnel(c, sti, NULL);
+    free(c);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -3150,5 +3202,6 @@ int main(void) {
     tcp_direct_skipped_for_filtered_ipv4_nat();
     tcp_predict_timeout_closes_array_without_leak();
     udp_birthday_sym_bands_and_hit_rate();
+    stepped_dependent_peer_parks_on_refused();
     return 0;
 }
