@@ -2546,6 +2546,60 @@ static void udp_direct_skipped_for_filtered_ipv4_nat(void) {
     op_close(listener);
 }
 
+static void udp_punch_receiver_prefers_sub1_over_sub0(void) {
+    fastp2p_client *c = calloc(1, sizeof(*c));
+    assert(c);
+    strcpy(c->local_ip[OP_FAM_V4], "127.0.0.1");
+    int ti = new_tunnel(c, "regular-node", 506, FASTP2P_TRANSPORT_QUIC, 1);
+    assert(ti >= 0);
+    tunnel *t = &c->tunnels[ti];
+    op_socket peer = socket_bound(1, "127.0.0.1", 0, 0);
+    t->fd = socket_bound(1, "127.0.0.1", 0, 0);
+    assert(peer >= 0 && t->fd >= 0);
+    assert(!op_addr_socketname(peer, &t->peer_addr));
+    t->state = T_PUNCH;
+    t->udp_punch_role = UDP_PUNCH_RECEIVE;
+    t->udp_punch_kind = 2;
+    t->sym_base = t->remote_port = socket_port(peer);
+    t->sym_count = SYM_WINDOW_MAX;
+    t->sym_up = 1;
+    uint64_t now = mono();
+    t->punch_started = now;
+    t->deadline = now + 5 * NS;
+    for (int attempt = 0; attempt < 24 && t->udp_candidate_count < UDP_PUNCH_ARRAY; ++attempt) {
+        tick_tunnel(c, ti, now);
+        op_sleep_ms(2);
+    }
+    assert(t->udp_candidate_count == UDP_PUNCH_ARRAY);
+    assert(drain(peer, SPRAY_WAIT));
+
+    op_socket primary = t->fd, winner = t->udp_candidates[3];
+    op_addr primary_addr, winner_addr;
+    assert(!op_addr_socketname(primary, &primary_addr));
+    assert(!op_addr_socketname(winner, &winner_addr));
+    json_object *probe = json_object_new_object();
+    op_ju(probe, "id", t->id);
+    /* Blind sub=0 hits primary first; receiver must reply sub=1 but keep candidates open. */
+    assert(!udp_packet(peer, &primary_addr, 4, 0, probe));
+    tick_tunnel(c, ti, now + 10 * MS);
+    assert(t->state == T_PUNCH && t->udp_candidate_count == UDP_PUNCH_ARRAY);
+    assert(t->udp_sub0_seen == 1 && t->udp_sub0_slot == 0);
+    assert(drain(peer, SPRAY_WAIT) >= 1);
+
+    /* Sender locked onto winner (candidate[3]) and confirms with sub=1 there. */
+    assert(!udp_packet(peer, &winner_addr, 4, 1, probe));
+    json_object_put(probe);
+    tick_tunnel(c, ti, now + 20 * MS);
+    op_addr tmp;
+    assert(t->state == T_UNDERLAY && t->fd == winner && !t->udp_candidate_count);
+    assert(!t->udp_sub0_seen && t->local_port == op_addr_port(&winner_addr));
+    assert(op_addr_socketname(primary, &tmp) != 0);
+    close_tunnel(c, ti, NULL);
+    op_buffer_clear(&c->ws_tx);
+    op_close(peer);
+    free(c);
+}
+
 int main(void) {
     assert(!op_platform_init());
     punch_role_follows_both_nat_types();
@@ -2793,5 +2847,6 @@ int main(void) {
     blade_velocity_and_pigeonhole_comb();
     udp_blade_wire_and_pigeonhole_comb();
     udp_direct_skipped_for_filtered_ipv4_nat();
+    udp_punch_receiver_prefers_sub1_over_sub0();
     return 0;
 }

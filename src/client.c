@@ -224,6 +224,10 @@ enum { TCP_PUNCH_AUTO, TCP_PUNCH_OPENER, TCP_PUNCH_DIALER };
 #define SYM_SPRAY_GAP (400 * MS)
 #define UDP_PUNCH_READY_WAIT (1500 * MS)
 #define UDP_PUNCH_ACK_WINDOW (2 * NS)
+/* How long a multi-socket receiver waits for a confirmed lock-on (sub=1)
+ * on any open candidate socket after seeing a blind sub=0 spray packet
+ * before falling back to committing the sub=0 socket (for legacy peers). */
+#define UDP_PUNCH_CONFIRM_WAIT (250 * MS)
 /* Local sockets the receiving side sprays from. A symmetric mapping allocates one
  * external port per (socket, destination), so N sockets offer the peer N ports to hit
  * instead of one; 16 is where the extra coverage stops paying for the extra datagrams,
@@ -552,6 +556,10 @@ typedef struct {
     unsigned peer_udp_blade_count;
     uint64_t peer_udp_blades_at;
     uint64_t udp_punch_ack_until;
+    int udp_sub0_seen;
+    unsigned udp_sub0_slot;
+    op_addr udp_sub0_from;
+    uint64_t udp_sub0_at;
     uint64_t active_at;
     /* Endpoint text is canonical address text (no brackets, no %scope) in
      * whichever family it was learned, so an IPv6 peer no longer truncates into
@@ -7066,6 +7074,30 @@ static int peer_host_matches(const op_addr *from, const op_addr *peer) {
     uint32_t b = ntohl(peer->u.in.sin_addr.s_addr);
     return (a & 0xFFFFFF00u) == (b & 0xFFFFFF00u);
 }
+static void udp_punch_commit(fastp2p_client *c, int ti, unsigned slot, const op_addr *from,
+                             json_object *message, uint64_t now) {
+    tunnel *t = &c->tunnels[ti];
+    op_socket fd = slot ? t->udp_candidates[slot - 1] : t->fd;
+    if (slot) {
+        op_close(t->fd);
+        t->fd = fd;
+        t->udp_candidates[slot - 1] = -1;
+        t->local_port = socket_port(fd);
+        emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP punch selected another local socket");
+    }
+    close_udp_candidates(t);
+    t->udp_sub0_seen = 0;
+    t->remote_port = op_addr_port(from);
+    op_addr_copy(&t->peer_addr, from);
+    udp_packet(t->fd, from, 4, 1, message);
+    if (t->transport == FASTP2P_TRANSPORT_QUIC) {
+        t->udp_punch_ack_until = now + UDP_PUNCH_ACK_WINDOW;
+        t->punch_next = now + 50 * MS;
+    }
+    /* Either role now has the peer's real endpoint, so the underlay (QUIC or
+     * TCP) can start: the sender opens the handshake towards it. */
+    start_underlay(c, ti);
+}
 static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object *message, uint64_t now) {
     tunnel *t = &c->tunnels[ti];
     for (unsigned slot = 0; slot <= t->udp_candidate_count; ++slot) {
@@ -7078,6 +7110,21 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
             if (n < 0)
                 break;
             op_addr_normalize(&from);
+            if (peer_is_local(&from)) {
+                int self_sock = 0;
+                for (unsigned check = 0; check <= t->udp_candidate_count; ++check) {
+                    op_socket sfd = check ? t->udp_candidates[check - 1] : t->fd;
+                    op_addr self_addr;
+                    if (sfd >= 0 && !op_addr_socketname(sfd, &self_addr) &&
+                        op_addr_equal(&self_addr, &from) &&
+                        op_addr_port(&self_addr) == op_addr_port(&from)) {
+                        self_sock = 1;
+                        break;
+                    }
+                }
+                if (self_sock)
+                    continue;
+            }
             ++t->punch_rx_total;
             if (!t->punch_rx_logged) {
                 /* Logged before any filter, so "arrived but rejected" is visible: that
@@ -7131,26 +7178,27 @@ static void read_udp_punch(fastp2p_client *c, int ti, op_addr peer, json_object 
             if (id != t->id)
                 continue;
 
-            if (slot) {
-                op_close(t->fd);
-                t->fd = fd;
-                t->udp_candidates[slot - 1] = -1;
-                t->local_port = socket_port(fd);
-                emit(c, FASTP2P_EVENT_TUNNEL, t->id, 0, "UDP punch selected another local socket");
+            if (sub == 0 && t->udp_punch_role == UDP_PUNCH_RECEIVE && t->udp_candidate_count > 0) {
+                /* Do not commit or close the candidate wall on a blind sub=0 packet:
+                 * the sender may already have locked onto a different candidate socket
+                 * and be sending sub=1 + QUIC Initial there. Answer sub=1 on fd and wait
+                 * briefly for sub=1 confirmation across all open slots. */
+                udp_packet(fd, &from, 4, 1, message);
+                if (!t->udp_sub0_seen) {
+                    t->udp_sub0_seen = 1;
+                    t->udp_sub0_slot = slot;
+                    op_addr_copy(&t->udp_sub0_from, &from);
+                    t->udp_sub0_at = now;
+                }
+                continue;
             }
-            close_udp_candidates(t);
-            t->remote_port = op_addr_port(&from);
-            op_addr_copy(&t->peer_addr, &from);
-            udp_packet(fd, &from, 4, 1, message);
-            if (t->udp_punch_role == UDP_PUNCH_RECEIVE) {
-                t->udp_punch_ack_until = now + UDP_PUNCH_ACK_WINDOW;
-                t->punch_next = now + 50 * MS;
-            }
-            /* Either role now has the peer's real endpoint, so the underlay (QUIC or
-             * TCP) can start: the sender opens the handshake towards it. */
-            start_underlay(c, ti);
+            udp_punch_commit(c, ti, slot, &from, message, now);
             return;
         }
+    }
+    if (t->udp_sub0_seen && t->udp_sub0_slot <= t->udp_candidate_count &&
+        now >= t->udp_sub0_at + UDP_PUNCH_CONFIRM_WAIT) {
+        udp_punch_commit(c, ti, t->udp_sub0_slot, &t->udp_sub0_from, message, now);
     }
 }
 
@@ -7242,6 +7290,9 @@ static void tick_udp_punch(fastp2p_client *c, int ti, uint64_t now) {
         }
         if (predict_first)
             udp_packet(t->fd, &peer, 4, 0, message);
+        if (t->udp_sub0_seen && t->udp_sub0_slot <= t->udp_candidate_count)
+            udp_packet(t->udp_sub0_slot ? t->udp_candidates[t->udp_sub0_slot - 1] : t->fd,
+                       &t->udp_sub0_from, 4, 1, message);
         if (first && !t->punch_tx_logged) {
             /* Name the endpoint with its port and how many sockets carry the spray: a
              * window spread over candidate sockets sends from ports the peer may have
